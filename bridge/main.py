@@ -64,6 +64,7 @@ class Bridge:
         self.current_task: asyncio.Task | None = None
         self.pending_permissions: dict[int, asyncio.Future] = {}
         self.permission_id = 0
+        self.interrupted = False  # Set by interrupt(), checked by query()
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -283,12 +284,15 @@ Be concise. Focus on what matters to the user.""",
             return
 
         prompt = params.get("prompt", "")
+        self.interrupted = False  # Reset at start of query
 
         async def run_query():
             await self.client.query(prompt)
             async for message in self.client.receive_response():
                 await self.emit_message(message)
-            send_result(id, {"status": "complete"})
+            # Check if we were interrupted (set by interrupt() method)
+            status = "interrupted" if self.interrupted else "complete"
+            send_result(id, {"status": status})
 
         self.current_task = asyncio.create_task(run_query())
         try:
@@ -365,10 +369,32 @@ Be concise. Focus on what matters to the user.""",
             })
 
     async def interrupt(self, id: int) -> None:
-        """Interrupt current query."""
+        """Interrupt current query and drain pending messages."""
         if self.current_task and not self.current_task.done():
+            self.interrupted = True  # Signal to query() that we were interrupted
             await self.client.interrupt()
-            self.current_task.cancel()
+            # Cancel any pending permission requests
+            for pid, future in list(self.pending_permissions.items()):
+                if not future.done():
+                    future.set_result(False)  # Deny pending permissions
+            self.pending_permissions.clear()
+            # Don't cancel task - let it drain naturally after interrupt
+            # Wait for the task to complete (it should finish quickly after interrupt)
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"interrupt: waiting for task to drain\n")
+            try:
+                await asyncio.wait_for(self.current_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"interrupt: drain timeout, cancelling\n")
+                self.current_task.cancel()
+                try:
+                    await self.current_task
+                except asyncio.CancelledError:
+                    pass
+            except Exception as e:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"interrupt: drain error: {e}\n")
         send_result(id, {"status": "interrupted"})
 
     async def shutdown(self, id: int) -> None:

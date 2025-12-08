@@ -96,6 +96,21 @@
             </dict>
         </dict>
 
+        <!-- Claude-specific: Interrupted marker -->
+        <dict>
+            <key>name</key>
+            <string>Interrupted</string>
+            <key>scope</key>
+            <string>claude.interrupted</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffad66</string>
+                <key>fontStyle</key>
+                <string>italic</string>
+            </dict>
+        </dict>
+
         <!-- Code block background -->
         <dict>
             <key>name</key>

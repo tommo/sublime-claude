@@ -41,6 +41,10 @@ contexts:
     - match: '^\s*✘ .+$'
       scope: claude.tool.error
 
+    # Interrupted marker
+    - match: '\*\[interrupted\]\*'
+      scope: claude.interrupted
+
     # Permission request
     - match: '^\s*(⚠)\s*(Allow)\s+(\w+)'
       captures:

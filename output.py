@@ -87,6 +87,7 @@ class OutputView:
         self._last_allowed_time: float = 0  # Timestamp of last allow
         self._pending_context_region: tuple = (0, 0)  # Region for context display
         self._cleared_content: Optional[str] = None  # For undo clear
+        self._render_pending: bool = False  # Debounce flag for rendering
 
     def show(self) -> None:
         # If we already have a view, just focus it
@@ -114,17 +115,24 @@ class OutputView:
 
     def set_name(self, name: str) -> None:
         """Update the output view title."""
-        if self.view and self.view.is_valid():
-            # Check if this is the active Claude view
-            window = self.view.window()
-            is_active = window and window.settings().get("claude_active_view") == self.view.id()
-            # ◉ = active+working, ◇ = active+idle, • = inactive+working, (none) = inactive+idle
-            is_working = self.current and self.current.working
-            if is_active:
-                prefix = "◉ " if is_working else "◇ "
-            else:
-                prefix = "• " if is_working else ""
-            self.view.set_name(f"{prefix}Claude: {name}")
+        self._name = name  # Store for refresh_title
+        self._update_title()
+
+    def _update_title(self) -> None:
+        """Refresh the view title based on current state."""
+        if not self.view or not self.view.is_valid():
+            return
+        name = getattr(self, '_name', 'Claude')
+        # Check if this is the active Claude view
+        window = self.view.window()
+        is_active = window and window.settings().get("claude_active_view") == self.view.id()
+        # ◉ = active+working, ◇ = active+idle, • = inactive+working, (none) = inactive+idle
+        is_working = self.current and self.current.working
+        if is_active:
+            prefix = "◉ " if is_working else "◇ "
+        else:
+            prefix = "• " if is_working else ""
+        self.view.set_name(f"{prefix}Claude: {name}")
 
     def _write(self, text: str, pos: Optional[int] = None) -> int:
         """Write text at position (or end). Returns end position."""
@@ -211,6 +219,7 @@ class OutputView:
 
         # Start new
         self.current = Conversation(prompt=text, todos=prev_todos)
+        self._update_title()  # Show working indicator
 
         # Render prompt with optional context indicator
         start = self.view.size()
@@ -635,7 +644,19 @@ class OutputView:
         return False
 
     def _render_current(self) -> None:
-        """Re-render current conversation in place."""
+        """Re-render current conversation in place (debounced)."""
+        if not self.current or not self.view:
+            return
+
+        # Debounce: if render already pending, skip
+        if self._render_pending:
+            return
+        self._render_pending = True
+        sublime.set_timeout(self._do_render, 10)
+
+    def _do_render(self) -> None:
+        """Actually perform the render."""
+        self._render_pending = False
         if not self.current or not self.view:
             return
 
@@ -696,6 +717,9 @@ class OutputView:
         start, end = self.current.region
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)
+
+        # Update title to reflect working state
+        self._update_title()
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string."""

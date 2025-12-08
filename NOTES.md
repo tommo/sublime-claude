@@ -124,6 +124,10 @@ options = ClaudeAgentOptions(..., agents=agents)
    - Track events in arrival order for accurate display
 
 8. **Interrupt handling** - Call `agent.interrupt()` to stop, check `ResultMessage.status == "interrupted"`
+   - After `client.interrupt()`, let query task drain remaining messages (don't cancel immediately)
+   - Set `self.interrupted = True` flag before interrupt, check in query to return correct status
+   - Cancel pending permission futures on interrupt (deny them)
+   - Timeout after 5s if drain takes too long, then force cancel
 
 ### Output View
 - Read-only scratch view controlled by plugin
