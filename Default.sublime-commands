@@ -1,0 +1,90 @@
+[
+    {
+        "caption": "Claude: Query",
+        "command": "claude_code_query"
+    },
+    {
+        "caption": "Claude: Query Selection",
+        "command": "claude_code_query_selection"
+    },
+    {
+        "caption": "Claude: Query File",
+        "command": "claude_code_query_file"
+    },
+    {
+        "caption": "Claude: Add Current File",
+        "command": "claude_code_add_file"
+    },
+    {
+        "caption": "Claude: Add Selection",
+        "command": "claude_code_add_selection"
+    },
+    {
+        "caption": "Claude: Add Open Files",
+        "command": "claude_code_add_open_files"
+    },
+    {
+        "caption": "Claude: Add Current Folder",
+        "command": "claude_code_add_folder"
+    },
+    {
+        "caption": "Claude: Clear Context",
+        "command": "claude_code_clear_context"
+    },
+    {
+        "caption": "Claude: New Session",
+        "command": "claude_code_start"
+    },
+    {
+        "caption": "Claude: Switch Session...",
+        "command": "claude_code_switch"
+    },
+    {
+        "caption": "Claude: Fork Session",
+        "command": "claude_code_fork"
+    },
+    {
+        "caption": "Claude: Fork Session...",
+        "command": "claude_code_fork_from"
+    },
+    {
+        "caption": "Claude: Restart Session",
+        "command": "claude_code_restart"
+    },
+    {
+        "caption": "Claude: Resume Session...",
+        "command": "claude_code_resume"
+    },
+    {
+        "caption": "Claude: Rename Session...",
+        "command": "claude_code_rename"
+    },
+    {
+        "caption": "Claude: Stop Session",
+        "command": "claude_code_stop"
+    },
+    {
+        "caption": "Claude: Toggle Output",
+        "command": "claude_code_toggle"
+    },
+    {
+        "caption": "Claude: Clear Output",
+        "command": "claude_code_clear"
+    },
+    {
+        "caption": "Claude: Interrupt",
+        "command": "claude_code_interrupt"
+    },
+    {
+        "caption": "Claude: Permission Mode...",
+        "command": "claude_code_toggle_permission_mode"
+    },
+    {
+        "caption": "Claude: Add MCP Tools to Project",
+        "command": "claude_code_add_mcp"
+    },
+    {
+        "caption": "Claude: View Blackboard...",
+        "command": "claude_code_blackboard"
+    }
+]

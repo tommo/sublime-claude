@@ -1,0 +1,6 @@
+[
+    {
+        "caption": "Ask Claude",
+        "command": "claude_code_query_selection"
+    }
+]

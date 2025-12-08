@@ -1,0 +1,109 @@
+[
+    {
+        "keys": ["super+alt+\\"],
+        "command": "claude_code_query"
+    },
+    {
+        "keys": ["super+shift+alt+c"],
+        "command": "claude_code_query_selection"
+    },
+    {
+        "keys": ["super+shift+escape"],
+        "command": "claude_code_interrupt"
+    },
+    {
+        "keys": ["super+alt+c"],
+        "command": "claude_code_toggle"
+    },
+    {
+        "keys": ["super+ctrl+alt+c"],
+        "command": "claude_code_clear"
+    },
+    {
+        "keys": ["y"],
+        "command": "claude_permission_allow",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["n"],
+        "command": "claude_permission_deny",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["s"],
+        "command": "claude_permission_allow_session",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["a"],
+        "command": "claude_permission_allow_all",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["enter"],
+        "command": "claude_code_query",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+k"],
+        "command": "claude_code_clear",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+escape"],
+        "command": "claude_code_interrupt",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+z"],
+        "command": "claude_undo_clear",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+s"],
+        "command": "claude_code_blackboard_save",
+        "context": [
+            { "key": "setting.blackboard_key", "operator": "not_equal", "operand": "" }
+        ]
+    },
+    {
+        "keys": ["f"],
+        "command": "claude_quick_prompt",
+        "args": { "key": "refresh" },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["r"],
+        "command": "claude_quick_prompt",
+        "args": { "key": "retry" },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["c"],
+        "command": "claude_quick_prompt",
+        "args": { "key": "continue" },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    }
+]

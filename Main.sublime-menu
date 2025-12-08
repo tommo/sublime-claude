@@ -1,0 +1,42 @@
+[
+    {
+        "id": "tools",
+        "children": [
+            {
+                "caption": "Claude Code",
+                "children": [
+                    {
+                        "caption": "Start Session",
+                        "command": "claude_code_start"
+                    },
+                    {
+                        "caption": "Query Claude",
+                        "command": "claude_code_query"
+                    },
+                    {
+                        "caption": "Query Selection",
+                        "command": "claude_code_query_selection"
+                    },
+                    { "caption": "-" },
+                    {
+                        "caption": "Toggle Output",
+                        "command": "claude_code_toggle"
+                    },
+                    {
+                        "caption": "Clear Output",
+                        "command": "claude_code_clear"
+                    },
+                    {
+                        "caption": "Interrupt",
+                        "command": "claude_code_interrupt"
+                    },
+                    { "caption": "-" },
+                    {
+                        "caption": "Stop Session",
+                        "command": "claude_code_stop"
+                    }
+                ]
+            }
+        ]
+    }
+]

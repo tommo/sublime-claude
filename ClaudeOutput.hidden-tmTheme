@@ -1,0 +1,570 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>name</key>
+    <string>Claude Output (Ayu Mirage)</string>
+    <key>settings</key>
+    <array>
+        <!-- Global settings -->
+        <dict>
+            <key>settings</key>
+            <dict>
+                <key>background</key>
+                <string>#1f2430</string>
+                <key>foreground</key>
+                <string>#cbccc6</string>
+                <key>caret</key>
+                <string>#ffcc66</string>
+                <key>selection</key>
+                <string>#33415e</string>
+                <key>lineHighlight</key>
+                <string>#191e2a</string>
+                <key>gutter</key>
+                <string>#1f2430</string>
+                <key>gutterForeground</key>
+                <string>#707a8c</string>
+            </dict>
+        </dict>
+
+        <!-- Claude-specific: Prompt -->
+        <dict>
+            <key>name</key>
+            <string>Prompt</string>
+            <key>scope</key>
+            <string>claude.prompt</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Claude-specific: Tool pending -->
+        <dict>
+            <key>name</key>
+            <string>Tool Pending</string>
+            <key>scope</key>
+            <string>claude.tool.pending</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffad66</string>
+            </dict>
+        </dict>
+
+        <!-- Claude-specific: Tool done -->
+        <dict>
+            <key>name</key>
+            <string>Tool Done</string>
+            <key>scope</key>
+            <string>claude.tool.done</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#87d96c</string>
+            </dict>
+        </dict>
+
+        <!-- Claude-specific: Tool error -->
+        <dict>
+            <key>name</key>
+            <string>Tool Error</string>
+            <key>scope</key>
+            <string>claude.tool.error</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ff6666</string>
+            </dict>
+        </dict>
+
+        <!-- Claude-specific: Done meta -->
+        <dict>
+            <key>name</key>
+            <string>Done Tag</string>
+            <key>scope</key>
+            <string>claude.meta.done</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#707a8c</string>
+                <key>fontStyle</key>
+                <string>italic</string>
+            </dict>
+        </dict>
+
+        <!-- Code block background -->
+        <dict>
+            <key>name</key>
+            <string>Code Block</string>
+            <key>scope</key>
+            <string>markup.raw.block</string>
+            <key>settings</key>
+            <dict>
+                <key>background</key>
+                <string>#191e2a</string>
+            </dict>
+        </dict>
+
+        <!-- Permission request icon -->
+        <dict>
+            <key>scope</key>
+            <string>claude.permission.icon</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffcc66</string>
+            </dict>
+        </dict>
+
+        <!-- Permission tool name -->
+        <dict>
+            <key>scope</key>
+            <string>claude.permission.tool</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Permission button: Allow -->
+        <dict>
+            <key>scope</key>
+            <string>claude.permission.button.allow</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#87d96c</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Permission button: Deny -->
+        <dict>
+            <key>scope</key>
+            <string>claude.permission.button.deny</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ff6666</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Permission button: Allow All -->
+        <dict>
+            <key>scope</key>
+            <string>claude.permission.button.allowall</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffcc66</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- ========== Standard language scopes (Ayu Mirage) ========== -->
+
+        <!-- Comments -->
+        <dict>
+            <key>scope</key>
+            <string>comment, punctuation.definition.comment</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#5c6773</string>
+                <key>fontStyle</key>
+                <string>italic</string>
+            </dict>
+        </dict>
+
+        <!-- Strings -->
+        <dict>
+            <key>scope</key>
+            <string>string, string.quoted</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#bae67e</string>
+            </dict>
+        </dict>
+
+        <!-- Numbers -->
+        <dict>
+            <key>scope</key>
+            <string>constant.numeric</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffcc66</string>
+            </dict>
+        </dict>
+
+        <!-- Constants -->
+        <dict>
+            <key>scope</key>
+            <string>constant, constant.language, constant.character</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffcc66</string>
+            </dict>
+        </dict>
+
+        <!-- Keywords -->
+        <dict>
+            <key>scope</key>
+            <string>keyword, keyword.control, keyword.operator.word</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffa759</string>
+            </dict>
+        </dict>
+
+        <!-- Operators -->
+        <dict>
+            <key>scope</key>
+            <string>keyword.operator</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#f29e74</string>
+            </dict>
+        </dict>
+
+        <!-- Storage (var, let, const, def, proc, func, etc.) -->
+        <dict>
+            <key>scope</key>
+            <string>storage, storage.type, storage.modifier</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffa759</string>
+            </dict>
+        </dict>
+
+        <!-- Functions -->
+        <dict>
+            <key>scope</key>
+            <string>entity.name.function, meta.function-call, support.function</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffd580</string>
+            </dict>
+        </dict>
+
+        <!-- Classes and types -->
+        <dict>
+            <key>scope</key>
+            <string>entity.name.class, entity.name.type, support.type, support.class</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+            </dict>
+        </dict>
+
+        <!-- Variables -->
+        <dict>
+            <key>scope</key>
+            <string>variable, variable.other</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#cbccc6</string>
+            </dict>
+        </dict>
+
+        <!-- Parameters -->
+        <dict>
+            <key>scope</key>
+            <string>variable.parameter</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#d4bfff</string>
+            </dict>
+        </dict>
+
+        <!-- Entity names (tags, attributes) -->
+        <dict>
+            <key>scope</key>
+            <string>entity.name.tag</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+            </dict>
+        </dict>
+
+        <dict>
+            <key>scope</key>
+            <string>entity.other.attribute-name</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffd580</string>
+            </dict>
+        </dict>
+
+        <!-- Punctuation -->
+        <dict>
+            <key>scope</key>
+            <string>punctuation</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#cbccc6</string>
+            </dict>
+        </dict>
+
+        <!-- Brackets -->
+        <dict>
+            <key>scope</key>
+            <string>punctuation.section, punctuation.definition.block, meta.brace</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#cbccc6</string>
+            </dict>
+        </dict>
+
+        <!-- Support (built-in functions, etc.) -->
+        <dict>
+            <key>scope</key>
+            <string>support</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#5ccfe6</string>
+            </dict>
+        </dict>
+
+        <!-- Invalid -->
+        <dict>
+            <key>scope</key>
+            <string>invalid</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ff6666</string>
+            </dict>
+        </dict>
+
+        <!-- Diff: inserted -->
+        <dict>
+            <key>scope</key>
+            <string>markup.inserted, punctuation.definition.inserted</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#87d96c</string>
+            </dict>
+        </dict>
+
+        <!-- Diff: deleted -->
+        <dict>
+            <key>scope</key>
+            <string>markup.deleted, punctuation.definition.deleted</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ff6666</string>
+            </dict>
+        </dict>
+
+        <!-- Diff: changed -->
+        <dict>
+            <key>scope</key>
+            <string>markup.changed</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffcc66</string>
+            </dict>
+        </dict>
+
+        <!-- Diff: header -->
+        <dict>
+            <key>scope</key>
+            <string>meta.diff.header, meta.diff.index</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+            </dict>
+        </dict>
+
+        <!-- Diff: range -->
+        <dict>
+            <key>scope</key>
+            <string>meta.diff.range</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#d4bfff</string>
+            </dict>
+        </dict>
+
+        <!-- Escape characters -->
+        <dict>
+            <key>scope</key>
+            <string>constant.character.escape</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#95e6cb</string>
+            </dict>
+        </dict>
+
+        <!-- Regular expressions -->
+        <dict>
+            <key>scope</key>
+            <string>string.regexp</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#95e6cb</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown headings -->
+        <dict>
+            <key>scope</key>
+            <string>markup.heading</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#ffd580</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown bold -->
+        <dict>
+            <key>scope</key>
+            <string>markup.bold</string>
+            <key>settings</key>
+            <dict>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown italic -->
+        <dict>
+            <key>scope</key>
+            <string>markup.italic</string>
+            <key>settings</key>
+            <dict>
+                <key>fontStyle</key>
+                <string>italic</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown links -->
+        <dict>
+            <key>scope</key>
+            <string>markup.underline.link</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown list -->
+        <dict>
+            <key>scope</key>
+            <string>markup.list</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#f29e74</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown inline code -->
+        <dict>
+            <key>scope</key>
+            <string>markup.raw.inline</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#d4bfff</string>
+                <key>background</key>
+                <string>#262d3a</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown blockquote -->
+        <dict>
+            <key>scope</key>
+            <string>markup.quote</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#b0b8c6</string>
+                <key>fontStyle</key>
+                <string>italic</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown punctuation (subtle) -->
+        <dict>
+            <key>scope</key>
+            <string>punctuation.definition.heading, punctuation.definition.bold, punctuation.definition.italic, punctuation.definition.raw, punctuation.definition.blockquote, punctuation.definition.list_item</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#5c6773</string>
+            </dict>
+        </dict>
+
+        <!-- Markdown horizontal rule -->
+        <dict>
+            <key>scope</key>
+            <string>punctuation.definition.thematic-break</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#5c6773</string>
+            </dict>
+        </dict>
+
+        <!-- Link title text -->
+        <dict>
+            <key>scope</key>
+            <string>string.other.link.title</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#73d0ff</string>
+            </dict>
+        </dict>
+
+        <!-- Default text -->
+        <dict>
+            <key>scope</key>
+            <string>text.claude</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#cbccc6</string>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

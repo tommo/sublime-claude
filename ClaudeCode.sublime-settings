@@ -1,0 +1,13 @@
+{
+    // Path to Python 3.10+ interpreter for the bridge process
+    // Must have claude-agent-sdk installed: pip install claude-agent-sdk
+    "python_path": "python3",
+
+    // Tools Claude is allowed to use
+    // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
+    "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+
+    // Permission mode for tool execution
+    // Options: "default", "acceptEdits", "plan", "bypassPermissions"
+    "permission_mode": "acceptEdits"
+}
