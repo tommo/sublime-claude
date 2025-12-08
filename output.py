@@ -597,6 +597,9 @@ class OutputView:
             lines.append("".join(self.current.text_chunks))
             if not self.current.text_chunks[-1].endswith("\n"):
                 lines.append("\n")
+        elif self.current.tools:
+            # Add blank line after tools if no text yet
+            lines.append("\n")
 
         # Todo list (if any)
         if self.current.todos:

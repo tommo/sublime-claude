@@ -145,8 +145,9 @@ class MCPSocketServer:
             "bb_delete": self._bb_delete,
             "bb_list": self._bb_list,
             "bb_clear": self._bb_clear,
-            # Session spawn
+            # Session tools
             "spawn_session": self._spawn_session,
+            "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
         }
 
@@ -330,6 +331,27 @@ class MCPSocketServer:
             "spawned": True,
             "name": name or "(unnamed)",
             "view_id": view_id,
+        }
+
+    def _send_to_session(self, view_id: int, prompt: str) -> dict:
+        """Send a message to an existing session."""
+        from . import claude_code
+
+        session = claude_code._sessions.get(view_id)
+        if not session:
+            return {"error": f"Session not found for view_id {view_id}"}
+
+        if session.working:
+            return {"error": "Session is busy", "view_id": view_id}
+
+        if not session.initialized:
+            return {"error": "Session not initialized", "view_id": view_id}
+
+        session.query(prompt)
+        return {
+            "sent": True,
+            "view_id": view_id,
+            "name": session.name or "(unnamed)",
         }
 
     def _list_sessions(self) -> list:

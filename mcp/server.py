@@ -140,7 +140,7 @@ Use for:
                 # ─── Session Tools ────────────────────────────────────────
                 {
                     "name": "spawn_session",
-                    "description": "Spawn a new Claude session with the given prompt",
+                    "description": "Spawn a new Claude session with the given prompt. Returns view_id.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -151,8 +151,20 @@ Use for:
                     }
                 },
                 {
+                    "name": "send_to_session",
+                    "description": "Send a message to an existing session by view_id. Use this to continue a spawned session.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "view_id": {"type": "integer", "description": "The view_id from spawn_session or list_sessions"},
+                            "prompt": {"type": "string", "description": "Message to send"}
+                        },
+                        "required": ["view_id", "prompt"]
+                    }
+                },
+                {
                     "name": "list_sessions",
-                    "description": "List all active Claude sessions in the current window",
+                    "description": "List all active Claude sessions in the current window with their view_ids",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 # ─── Custom Tools ─────────────────────────────────────────
@@ -238,6 +250,10 @@ For simple operations, prefer the dedicated tools above.""",
                 result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r})")
             else:
                 result = send_to_sublime(code=f"return spawn_session({prompt!r})")
+        elif tool_name == "send_to_session":
+            view_id = args.get("view_id")
+            prompt = args.get("prompt", "")
+            result = send_to_sublime(code=f"return send_to_session({view_id}, {prompt!r})")
         elif tool_name == "list_sessions":
             result = send_to_sublime(code="return list_sessions()")
         else:
