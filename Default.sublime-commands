@@ -86,5 +86,9 @@
     {
         "caption": "Claude: View Blackboard...",
         "command": "claude_code_blackboard"
+    },
+    {
+        "caption": "Claude: Reset Input Mode",
+        "command": "claude_code_reset_input"
     }
 ]

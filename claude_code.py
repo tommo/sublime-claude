@@ -575,6 +575,15 @@ class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
             s.output.clear()
 
 
+class ClaudeCodeResetInputCommand(sublime_plugin.WindowCommand):
+    """Force reset input mode state when it gets corrupted."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if s:
+            s.output.reset_input_mode()
+            sublime.status_message("Input mode reset")
+
+
 class ClaudeCodeRenameCommand(sublime_plugin.WindowCommand):
     """Rename the current session."""
     def run(self) -> None:
@@ -781,15 +790,11 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
 
 
 class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
-    """Handle clicks and keys in the Claude output view."""
+    """Handle keys in the Claude output view."""
 
     @classmethod
     def is_applicable(cls, settings):
         return settings.get("claude_output", False)
-
-    def __init__(self, view):
-        super().__init__(view)
-        self._last_click_point = -1
 
     def on_activated(self):
         """Update status bar and title when this output view becomes active."""
@@ -818,27 +823,90 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if switched:
             refresh_claude_input(window, old_session)
 
-    def on_selection_modified(self):
-        """Handle click on permission buttons."""
-        sel = self.view.sel()
-        if not sel or len(sel) != 1:
-            return
 
-        point = sel[0].begin()
 
-        # Debounce - don't handle same point twice
-        if point == self._last_click_point:
-            return
-        self._last_click_point = point
-
-        window = self.view.window()
-        if not window:
-            return
-
+    def on_text_command(self, command_name, args):
+        """Intercept text commands to restrict edits in input mode."""
         s = get_session_for_view(self.view)
-        if s and s.output.handle_permission_click(point):
-            # Clear selection after handling
-            self.view.sel().clear()
+        if not s or not s.output.is_input_mode():
+            return None
+
+        # Allow these commands always
+        if command_name in ("copy", "select_all", "undo", "redo", "claude_submit_input"):
+            return None
+
+        # For insert/delete commands, check if cursor is in input region
+        sel = self.view.sel()
+        if sel:
+            for region in sel:
+                if not s.output.is_in_input_region(region.begin()):
+                    # Block edit outside input region
+                    return ("noop", {})
+
+        return None
+
+    def on_modified(self):
+        """Track modifications for draft saving."""
+        s = get_session_for_view(self.view)
+        if not s or not s.output.is_input_mode():
+            return
+
+        # Save draft
+        s.draft_prompt = s.output.get_input_text()
+
+
+class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
+    """Handle Enter key in input mode - submit the prompt."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if not s:
+            return
+
+        if not s.output.is_input_mode():
+            return
+
+        # Get input text and exit input mode
+        text = s.output.exit_input_mode(keep_text=False)
+        s.draft_prompt = ""
+
+        if text.strip():
+            s.query(text)
+
+
+class ClaudeEnterInputModeCommand(sublime_plugin.TextCommand):
+    """Enter input mode in the Claude output view."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if s:
+            s.output.enter_input_mode()
+            # Restore draft if any
+            if s.draft_prompt:
+                self.view.run_command("append", {"characters": s.draft_prompt})
+                # Move cursor to end
+                end = self.view.size()
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(end, end))
+
+
+class ClaudeExitInputModeCommand(sublime_plugin.TextCommand):
+    """Exit input mode, keeping the draft."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if s and s.output.is_input_mode():
+            # Save draft before exiting
+            s.draft_prompt = s.output.get_input_text()
+            s.output.exit_input_mode(keep_text=False)
+
+
+class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
+    """Insert newline in input mode (Shift+Enter)."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if s and s.output.is_input_mode():
+            # Insert newline at cursor
+            for region in self.view.sel():
+                if s.output.is_in_input_region(region.begin()):
+                    self.view.insert(edit, region.begin(), "\n")
 
 
 class ClaudePermissionAllowCommand(sublime_plugin.TextCommand):

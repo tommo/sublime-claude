@@ -23,35 +23,64 @@
         "keys": ["y"],
         "command": "claude_permission_allow",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
         "keys": ["n"],
         "command": "claude_permission_deny",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
         "keys": ["s"],
         "command": "claude_permission_allow_session",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
         "keys": ["a"],
         "command": "claude_permission_allow_all",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
         "keys": ["enter"],
-        "command": "claude_code_query",
+        "command": "claude_submit_input",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["shift+enter"],
+        "command": "claude_insert_newline",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["enter"],
+        "command": "claude_enter_input_mode",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        "keys": ["escape"],
+        "command": "claude_exit_input_mode",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
         ]
     },
     {
@@ -80,7 +109,8 @@
         "command": "claude_quick_prompt",
         "args": { "key": "refresh" },
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
@@ -88,7 +118,8 @@
         "command": "claude_quick_prompt",
         "args": { "key": "retry" },
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     },
     {
@@ -96,7 +127,8 @@
         "command": "claude_quick_prompt",
         "args": { "key": "continue" },
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
     }
 ]

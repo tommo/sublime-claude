@@ -89,6 +89,10 @@ class OutputView:
         self._pending_context_region: tuple = (0, 0)  # Region for context display
         self._cleared_content: Optional[str] = None  # For undo clear
         self._render_pending: bool = False  # Debounce flag for rendering
+        # Inline input state
+        self._input_mode: bool = False  # True when user can type in input region
+        self._input_start: int = 0  # Start position of editable input region
+        self._input_marker: str = "◎ "  # Marker for input line
 
     def show(self) -> None:
         # If we already have a view, just focus it
@@ -174,6 +178,84 @@ class OutputView:
                 # show_at_center with negative offset to leave padding at bottom
                 self.view.show(end, keep_to_left=False, animate=False)
 
+    # --- Inline Input ---
+
+    def enter_input_mode(self) -> None:
+        """Enter input mode - show prompt marker and allow typing."""
+        if not self.view or not self.view.is_valid():
+            return
+        if self._input_mode:
+            return  # Already in input mode
+
+        # Exit any current conversation's working state
+        if self.current and self.current.working:
+            return  # Can't input while working
+
+        self._input_mode = True
+        self.view.settings().set("claude_input_mode", True)
+        self.view.set_read_only(False)
+
+        # Add input marker at end
+        prefix = "\n" if self.view.size() > 0 else ""
+        self._input_start = self.view.size() + len(prefix)
+        self.view.run_command("append", {"characters": f"{prefix}{self._input_marker}"})
+        self._input_start = self.view.size()  # After the marker
+
+        # Move cursor to input position
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(self._input_start, self._input_start))
+        self.view.show(self._input_start)
+
+    def exit_input_mode(self, keep_text: bool = False) -> str:
+        """Exit input mode and return the input text."""
+        if not self.view or not self._input_mode:
+            return ""
+
+        # Get the input text
+        input_text = self.get_input_text()
+
+        if not keep_text:
+            # Remove the input line (marker + text)
+            line_start = self._input_start - len(self._input_marker)
+            # Find start of line including newline
+            if line_start > 0:
+                line_start -= 1  # Include preceding newline
+            self.view.run_command("claude_replace", {
+                "start": line_start,
+                "end": self.view.size(),
+                "text": ""
+            })
+
+        self._input_mode = False
+        self.view.settings().set("claude_input_mode", False)
+        self.view.set_read_only(True)
+        return input_text
+
+    def get_input_text(self) -> str:
+        """Get current text in input region."""
+        if not self.view or not self._input_mode:
+            return ""
+        return self.view.substr(sublime.Region(self._input_start, self.view.size()))
+
+    def is_input_mode(self) -> bool:
+        """Check if currently in input mode."""
+        return self._input_mode
+
+    def reset_input_mode(self) -> None:
+        """Force reset input mode state - use when state gets corrupted."""
+        if not self.view:
+            return
+        self._input_mode = False
+        self._input_start = 0
+        self.view.settings().set("claude_input_mode", False)
+        self.view.set_read_only(True)
+
+    def is_in_input_region(self, point: int) -> bool:
+        """Check if a point is within the editable input region."""
+        if not self._input_mode:
+            return False
+        return point >= self._input_start
+
     # --- Public API ---
 
     def set_pending_context(self, context_items: list) -> None:
@@ -203,6 +285,16 @@ class OutputView:
     def prompt(self, text: str, context_names: List[str] = None) -> None:
         """Start a new conversation with a prompt."""
         self.show()
+
+        # Exit input mode if active (query is starting)
+        # Save any typed text as draft so it's not lost
+        if self._input_mode:
+            # Get session to save draft
+            from . import claude_code
+            session = claude_code.get_session_for_view(self.view)
+            if session:
+                session.draft_prompt = self.get_input_text()
+            self.exit_input_mode(keep_text=False)
 
         # Clear pending context display
         start, end = self._pending_context_region
@@ -337,6 +429,10 @@ class OutputView:
 
     def clear(self) -> None:
         """Clear all output (can undo with Cmd+Z)."""
+        # Remember if we were in input mode
+        was_input_mode = self._input_mode
+        if self._input_mode:
+            self.exit_input_mode(keep_text=False)
         if self.view and self.view.is_valid():
             # Save content for undo
             self._cleared_content = self.view.substr(sublime.Region(0, self.view.size()))
@@ -348,6 +444,9 @@ class OutputView:
         self.pending_permission = None
         self._permission_queue.clear()
         self.auto_allow_tools.clear()
+        # Re-enter input mode if we were in it
+        if was_input_mode:
+            self.enter_input_mode()
 
     def undo_clear(self) -> None:
         """Restore content from last clear."""
@@ -540,25 +639,6 @@ class OutputView:
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
 
-    def handle_permission_click(self, point: int) -> bool:
-        """Check if point is on a permission button. Returns True if handled."""
-        if not self.pending_permission:
-            return False
-
-        # Check if already responded (callback cleared)
-        if self.pending_permission.callback is None:
-            return False
-
-        perm = self.pending_permission
-        for btn_type, (start, end) in perm.button_regions.items():
-            if start <= point <= end:
-                # Mark as handled immediately to prevent double-processing
-                callback = perm.callback
-                perm.callback = None
-                self._respond_permission_with_callback(btn_type, callback, perm.tool)
-                return True
-        return False
-
     def _respond_permission_with_callback(self, response: str, callback, tool: str) -> None:
         """Respond to a permission request with given callback."""
         import time
@@ -667,6 +747,10 @@ class OutputView:
         if not self.current or not self.view:
             return
 
+        # Don't render while in input mode - it would corrupt the input region
+        if self._input_mode:
+            return
+
         # Build the full text for this conversation
         lines = []
 
@@ -718,9 +802,6 @@ class OutputView:
         if self.current.duration > 0:
             lines.append(f"\n  @done({self.current.duration:.1f}s)\n")
 
-        # Add padding at bottom for better visibility
-        lines.append("\n\n")
-
         text = "".join(lines)
 
         # Replace the region
@@ -730,6 +811,12 @@ class OutputView:
 
         # Update title to reflect working state
         self._update_title()
+
+        # Re-render permission block if pending (it may have been shifted)
+        if self.pending_permission and self.pending_permission.callback:
+            self._remove_permission_block()
+            self._render_permission()
+            self._scroll_to_end()
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string."""
