@@ -152,13 +152,18 @@ After Sublime restarts, orphaned output views are automatically reconnected to t
 The output view shows:
 
 - `◎ prompt ▶` - Your query (multiline supported)
+- `⋯` - Working indicator (disappears when done)
 - `☐ Tool` - Tool pending
 - `✔ Tool` - Tool completed
 - `✘ Tool` - Tool error
 - Response text with syntax highlighting
 - `@done(Xs)` - Completion time
 
-View title shows spinner and current tool when working.
+View title shows session status:
+- `◉` Active + working
+- `◇` Active + idle
+- `•` Inactive + working
+- (no prefix) Inactive + idle
 
 Supports markdown formatting and fenced code blocks with language-specific syntax highlighting.
 

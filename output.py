@@ -47,12 +47,23 @@ class TodoItem:
 class Conversation:
     """A single prompt + tools + response + meta."""
     prompt: str = ""
-    tools: List[ToolCall] = field(default_factory=list)  # ordered list of tool calls
-    text_chunks: List[str] = field(default_factory=list)
+    # Events in time order - either ToolCall or str (text chunk)
+    events: List = field(default_factory=list)
     todos: List[TodoItem] = field(default_factory=list)  # current todo state
     todos_all_done: bool = False  # True when all todos completed (don't carry to next)
+    working: bool = True  # True while processing, False when done
     duration: float = 0.0
     region: tuple = (0, 0)
+
+    @property
+    def tools(self) -> List[ToolCall]:
+        """Get all tool calls (for compatibility)."""
+        return [e for e in self.events if isinstance(e, ToolCall)]
+
+    @property
+    def text_chunks(self) -> List[str]:
+        """Get all text chunks (for compatibility)."""
+        return [e for e in self.events if isinstance(e, str)]
 
 
 class OutputView:
@@ -107,7 +118,12 @@ class OutputView:
             # Check if this is the active Claude view
             window = self.view.window()
             is_active = window and window.settings().get("claude_active_view") == self.view.id()
-            prefix = "◉ " if is_active else ""
+            # ◉ = active+working, ◇ = active+idle, • = inactive+working, (none) = inactive+idle
+            is_working = self.current and self.current.working
+            if is_active:
+                prefix = "◉ " if is_working else "◇ "
+            else:
+                prefix = "• " if is_working else ""
             self.view.set_name(f"{prefix}Claude: {name}")
 
     def _write(self, text: str, pos: Optional[int] = None) -> int:
@@ -133,8 +149,17 @@ class OutputView:
         return start + len(text)
 
     def _scroll_to_end(self) -> None:
-        if self.view and self.view.is_valid():
-            self.view.run_command("move_to", {"to": "eof"})
+        """Scroll to end only if cursor is near the end (auto-follow mode)."""
+        if not self.view or not self.view.is_valid():
+            return
+        # Check if cursor is near end (within last 100 chars or at end)
+        sel = self.view.sel()
+        if sel:
+            cursor = sel[0].end()
+            size = self.view.size()
+            # Auto-scroll if cursor is within 100 chars of end, or view is empty/small
+            if size < 100 or cursor >= size - 100:
+                self.view.run_command("move_to", {"to": "eof"})
 
     # --- Public API ---
 
@@ -172,9 +197,13 @@ class OutputView:
             self._replace(start, end, "")
             self._pending_context_region = (0, 0)
 
-        # Save previous conversation and carry over incomplete todos
+        # Finalize and save previous conversation
         prev_todos = []
         if self.current:
+            # Ensure previous conversation is marked as done
+            if self.current.working:
+                self.current.working = False
+                self._render_current()
             self.conversations.append(self.current)
             # Carry todos forward only if not all completed
             if not self.current.todos_all_done:
@@ -209,7 +238,8 @@ class OutputView:
 
         print(f"[Claude] tool({name}) - adding pending")
         tool_input = tool_input or {}
-        self.current.tools.append(ToolCall(name=name, tool_input=tool_input))
+        tool_call = ToolCall(name=name, tool_input=tool_input)
+        self.current.events.append(tool_call)
 
         # Capture TodoWrite state
         if name == "TodoWrite" and "todos" in tool_input:
@@ -227,15 +257,15 @@ class OutputView:
             print(f"[Claude] tool_done({name}) - no current conversation")
             return
         # Find the last pending tool with this name
-        for tool in reversed(self.current.tools):
-            if tool.name == name and tool.status == PENDING:
-                tool.status = DONE
+        for event in reversed(self.current.events):
+            if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
+                event.status = DONE
                 print(f"[Claude] tool_done({name}) - marked done")
                 self._render_current()
                 return
         # No pending tool found, add as done
         print(f"[Claude] tool_done({name}) - not found pending, adding as done")
-        self.current.tools.append(ToolCall(name=name, tool_input={}, status=DONE))
+        self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE))
         self._render_current()
 
     def tool_error(self, name: str) -> None:
@@ -243,13 +273,13 @@ class OutputView:
         if not self.current:
             return
         # Find the last pending tool with this name
-        for tool in reversed(self.current.tools):
-            if tool.name == name and tool.status == PENDING:
-                tool.status = ERROR
+        for event in reversed(self.current.events):
+            if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
+                event.status = ERROR
                 self._render_current()
                 return
         # No pending tool found, add as error
-        self.current.tools.append(ToolCall(name=name, tool_input={}, status=ERROR))
+        self.current.events.append(ToolCall(name=name, tool_input={}, status=ERROR))
         self._render_current()
 
     def text(self, content: str) -> None:
@@ -257,16 +287,17 @@ class OutputView:
         if not self.current:
             return
 
-        self.current.text_chunks.append(content)
+        self.current.events.append(content)
         self._render_current()
         self._scroll_to_end()
 
     def meta(self, duration: float, cost: float = None) -> None:
-        """Set completion meta."""
+        """Set completion meta - marks conversation as done."""
         if not self.current:
             return
 
         self.current.duration = duration
+        self.current.working = False
         self._render_current()
         self._scroll_to_end()
 
@@ -274,16 +305,17 @@ class OutputView:
         """Show interrupted indicator."""
         if not self.current:
             return
+        self.current.working = False
         # Mark any pending tools as error
-        for tool in self.current.tools:
-            if tool.status == PENDING:
-                tool.status = ERROR
+        for event in self.current.events:
+            if isinstance(event, ToolCall) and event.status == PENDING:
+                event.status = ERROR
         # Clear any pending permission prompt
         if self.pending_permission:
             self._remove_permission_block()
             self.pending_permission = None
         # Append interrupted text
-        self.current.text_chunks.append("\n\n*[interrupted]*\n")
+        self.current.events.append("\n\n*[interrupted]*\n")
         self._render_current()
         self._scroll_to_end()
 
@@ -307,6 +339,42 @@ class OutputView:
             self._write(self._cleared_content)
             self._cleared_content = None
             self._scroll_to_end()
+
+    def reset_active_states(self) -> None:
+        """Reset active states when reconnecting after Sublime restart.
+
+        Clears pending permissions, marks pending tools as interrupted,
+        and resets the view title to remove any stale spinner.
+        """
+        # Clear permission state
+        if self.pending_permission:
+            self._remove_permission_block()
+            self.pending_permission = None
+        self._permission_queue.clear()
+
+        # Mark any pending tools in current conversation as error
+        if self.current:
+            had_pending = False
+            for event in self.current.events:
+                if isinstance(event, ToolCall) and event.status == PENDING:
+                    event.status = ERROR
+                    had_pending = True
+            if had_pending:
+                self.current.events.append("\n\n*[session reconnected]*\n")
+                self._render_current()
+
+    def _remove_permission_block(self) -> None:
+        """Remove permission block from view without callback."""
+        if not self.pending_permission or not self.view:
+            return
+        perm = self.pending_permission
+        start, end = perm.region
+        # Remove button regions
+        for btn_type in perm.button_regions:
+            self.view.erase_regions(f"claude_btn_{btn_type}")
+        # Remove text if region is valid
+        if end > start:
+            self._replace(start, end, "")
 
     # --- Permission UI ---
 
@@ -494,11 +562,22 @@ class OutputView:
         self._clear_permission()
         self.pending_permission = None
 
+        # Move cursor to end so auto-scroll resumes
+        self._move_cursor_to_end()
+
         # Call the callback
         callback(response)
 
         # Process next queued permission if any
         self._process_permission_queue()
+
+    def _move_cursor_to_end(self) -> None:
+        """Move cursor to end of view."""
+        if self.view and self.view.is_valid():
+            end = self.view.size()
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(end, end))
+            self.view.show(end)
 
     def _process_permission_queue(self) -> None:
         """Process the next permission request in queue."""
@@ -573,52 +652,24 @@ class OutputView:
             indented_prompt = self.current.prompt
         lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
 
-        # Tools
-        for tool in self.current.tools:
-            symbol = self.SYMBOLS[tool.status]
-            # Show tool with optional detail
-            detail = ""
-            if tool.tool_input:
-                if tool.name == "Bash" and "command" in tool.tool_input:
-                    cmd = tool.tool_input["command"]
-                    # Truncate long commands
-                    if len(cmd) > 60:
-                        cmd = cmd[:60] + "..."
-                    detail = f": {cmd}"
-                elif tool.name == "Read" and "file_path" in tool.tool_input:
-                    detail = f": {tool.tool_input['file_path']}"
-                elif tool.name == "Edit" and "file_path" in tool.tool_input:
-                    detail = f": {tool.tool_input['file_path']}"
-                    # Show diff for Edit tool
-                    old = tool.tool_input.get("old_string", "")
-                    new = tool.tool_input.get("new_string", "")
-                    if old or new:
-                        diff_lines = []
-                        for line in old.splitlines():
-                            diff_lines.append(f"- {line}")
-                        for line in new.splitlines():
-                            diff_lines.append(f"+ {line}")
-                        if diff_lines:
-                            detail += "\n```diff\n" + "\n".join(diff_lines) + "\n```"
-                elif tool.name == "Write" and "file_path" in tool.tool_input:
-                    detail = f": {tool.tool_input['file_path']}"
-                elif tool.name == "Glob" and "pattern" in tool.tool_input:
-                    detail = f": {tool.tool_input['pattern']}"
-                elif tool.name == "Grep" and "pattern" in tool.tool_input:
-                    detail = f": {tool.tool_input['pattern']}"
-            lines.append(f"  {symbol} {tool.name}{detail}\n")
+        # Events in time order (text chunks and tools interleaved)
+        if self.current.events:
+            lines.append("\n")
+            for event in self.current.events:
+                if isinstance(event, str):
+                    # Text chunk
+                    lines.append(event)
+                    if not event.endswith("\n"):
+                        lines.append("\n")
+                elif isinstance(event, ToolCall):
+                    # Tool call
+                    symbol = self.SYMBOLS[event.status]
+                    detail = self._format_tool_detail(event)
+                    lines.append(f"  {symbol} {event.name}{detail}\n")
 
-        # Text response
-        if self.current.text_chunks:
-            lines.append("\n")
-            # Join chunks, ensuring each ends with newline
-            for chunk in self.current.text_chunks:
-                lines.append(chunk)
-                if not chunk.endswith("\n"):
-                    lines.append("\n")
-        elif self.current.tools:
-            # Add blank line after tools if no text yet
-            lines.append("\n")
+        # Working indicator at bottom
+        if self.current.working:
+            lines.append("  ⋯\n")
 
         # Todo list (if any)
         if self.current.todos:
@@ -645,6 +696,41 @@ class OutputView:
         start, end = self.current.region
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)
+
+    def _format_tool_detail(self, tool: ToolCall) -> str:
+        """Format tool detail string."""
+        detail = ""
+        if not tool.tool_input:
+            return detail
+
+        if tool.name == "Bash" and "command" in tool.tool_input:
+            cmd = tool.tool_input["command"]
+            if len(cmd) > 60:
+                cmd = cmd[:60] + "..."
+            detail = f": {cmd}"
+        elif tool.name == "Read" and "file_path" in tool.tool_input:
+            detail = f": {tool.tool_input['file_path']}"
+        elif tool.name == "Edit" and "file_path" in tool.tool_input:
+            detail = f": {tool.tool_input['file_path']}"
+            # Show diff for Edit tool
+            old = tool.tool_input.get("old_string", "")
+            new = tool.tool_input.get("new_string", "")
+            if old or new:
+                diff_lines = []
+                for line in old.splitlines():
+                    diff_lines.append(f"- {line}")
+                for line in new.splitlines():
+                    diff_lines.append(f"+ {line}")
+                if diff_lines:
+                    detail += "\n```diff\n" + "\n".join(diff_lines) + "\n```"
+        elif tool.name == "Write" and "file_path" in tool.tool_input:
+            detail = f": {tool.tool_input['file_path']}"
+        elif tool.name == "Glob" and "pattern" in tool.tool_input:
+            detail = f": {tool.tool_input['pattern']}"
+        elif tool.name == "Grep" and "pattern" in tool.tool_input:
+            detail = f": {tool.tool_input['pattern']}"
+
+        return detail
 
 
 # --- Helper commands for text manipulation ---

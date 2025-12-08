@@ -30,8 +30,23 @@ def _reconnect_orphaned_views() -> None:
                 # Found orphaned output view - try to get session info from view name
                 name = view.name()
                 session_name = None
+                # Strip status prefix if present (◉ active+working, ◇ active+idle, • inactive+working)
+                if name.startswith(("◉ ", "◇ ", "• ")):
+                    name = name[2:]
                 if name.startswith("Claude: "):
                     session_name = name[8:]
+                    # Strip any " - tool" suffix from stale working state
+                    if " - " in session_name:
+                        session_name = session_name.split(" - ")[0]
+                # Handle spinner prefix (e.g., "⠋ name - thinking")
+                for c in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
+                    if name.startswith(c + " "):
+                        name = name[2:]
+                        if " - " in name:
+                            session_name = name.split(" - ")[0]
+                        else:
+                            session_name = name
+                        break
 
                 # Look for matching saved session
                 saved = load_saved_sessions()
@@ -46,6 +61,15 @@ def _reconnect_orphaned_views() -> None:
                 session.name = session_name
                 session.output.view = view  # Reuse existing view
                 _sessions[view.id()] = session
+
+                # Reset active states (pending tools, permissions, stale title)
+                session.output.reset_active_states()
+                # Reset view title to clean state
+                if session_name:
+                    view.set_name(f"Claude: {session_name}")
+                else:
+                    view.set_name("Claude")
+
                 session.start()
 
                 if session_name:
@@ -105,6 +129,8 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         if text.strip():
             s = get_active_session(self.window)
             if s:
+                s.output.show()
+                s.output._move_cursor_to_end()
                 s.query(text)
 
 
@@ -299,6 +325,8 @@ class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
         if text.strip():
             s = get_active_session(self.window)
             if s:
+                s.output.show()
+                s.output._move_cursor_to_end()
                 s.query(text)
 
 
@@ -326,6 +354,8 @@ class ClaudeCodeQuerySelectionCommand(sublime_plugin.TextCommand):
         if not s:
             s = create_session(window)
         q = f"{prompt}\n\nFrom `{fname}`:\n```\n{selection}\n```"
+        s.output.show()
+        s.output._move_cursor_to_end()
         if s.initialized:
             s.query(q)
         else:
@@ -360,6 +390,8 @@ class ClaudeCodeQueryFileCommand(sublime_plugin.WindowCommand):
         if not s:
             return
         q = f"{prompt}\n\nFile: `{fname}`\n```\n{content}\n```"
+        s.output.show()
+        s.output._move_cursor_to_end()
         if s.initialized:
             s.query(q)
         else:
@@ -570,7 +602,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         items = []
         for view_id, s in sessions_in_window:
             name = s.name or "(unnamed)"
-            marker = "◉ " if view_id == active_view_id else "  "
+            # ◉ = active+working, ◇ = active+idle, • = inactive+working, (space) = inactive+idle
+            if view_id == active_view_id:
+                marker = "◉ " if s.working else "◇ "
+            else:
+                marker = "• " if s.working else "  "
             status = "working..." if s.working else "ready"
             cost = f"${s.total_cost:.4f}" if s.total_cost > 0 else ""
             detail = f"{status}  {cost}  {s.query_count}q" if cost else f"{status}  {s.query_count}q"

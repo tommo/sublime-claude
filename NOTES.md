@@ -22,26 +22,108 @@ sublime-claude/
 
 ### Claude Agent SDK
 
+**Installation:**
+```bash
+pip install claude-agent-sdk
+```
+
+**Basic Usage:**
+```python
+from claude_agent_sdk import ClaudeAgent, ClaudeAgentOptions
+
+options = ClaudeAgentOptions(
+    cwd="/path/to/project",
+    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    permission_mode="default",  # or "acceptEdits", "bypassPermissions"
+    can_use_tool=my_permission_callback,  # async callback
+    resume=session_id,  # optional: resume from previous session
+    agents=my_agents_dict,  # optional: custom subagents
+)
+
+agent = ClaudeAgent(options)
+async for msg in agent.query("Your prompt here"):
+    # Handle messages
+    pass
+```
+
 **Message Flow:**
-- `SystemMessage` - initialization
-- `AssistantMessage` with `ToolUseBlock` - tool request
-- `can_use_tool` callback - permission check
-- `UserMessage` with `ToolResultBlock` - tool result (not in AssistantMessage!)
-- `AssistantMessage` with `TextBlock` - response text
-- `ResultMessage` - completion (duration_ms, total_cost_usd, etc.)
+```
+SystemMessage           → initialization (subtype: "init" or "compact_boundary")
+AssistantMessage        → contains ToolUseBlock (tool request) or TextBlock (response)
+  ├─ ToolUseBlock       → tool_name, tool_input, tool_use_id
+  └─ TextBlock          → text content
+UserMessage             → contains ToolResultBlock (⚠️ NOT in AssistantMessage!)
+  └─ ToolResultBlock    → tool_use_id, content (result or error)
+ResultMessage           → completion (session_id, duration_ms, total_cost_usd)
+```
 
 **Permission Callback:**
 ```python
+from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
 async def can_use_tool(tool_name: str, tool_input: dict, context) -> PermissionResult:
-    # Must return PermissionResultAllow or PermissionResultDeny dataclasses
-    # NOT plain dicts (SDK docs are outdated)
-    return PermissionResultAllow(updated_input=tool_input)
+    # ⚠️ MUST return dataclass objects, NOT plain dicts
+    if user_allowed:
+        return PermissionResultAllow(updated_input=tool_input)
+    else:
+        return PermissionResultDeny(message="User denied")
 ```
 
-**Key Gotchas:**
-- `ToolResultBlock` is in `UserMessage.content`, not `AssistantMessage`
-- When permission denied, SDK sends `TextBlock` directly (no `ToolResultBlock`)
-- Must mark denied tools as error manually in the permission callback
+**Subagents (AgentDefinition):**
+```python
+from claude_agent_sdk import AgentDefinition
+
+agents = {
+    "my-agent": AgentDefinition(
+        description="When to use this agent",
+        prompt="System prompt for the agent",
+        tools=["Read", "Grep"],  # restrict tools (optional)
+        model="haiku",  # haiku/sonnet/opus (optional)
+    )
+}
+options = ClaudeAgentOptions(..., agents=agents)
+```
+
+**⚠️ PITFALLS:**
+
+1. **ToolResultBlock location** - Results are in `UserMessage.content`, NOT `AssistantMessage`
+   ```python
+   # WRONG: looking for tool result in AssistantMessage
+   # RIGHT: check UserMessage for ToolResultBlock
+   if isinstance(msg, UserMessage):
+       for block in msg.content:
+           if isinstance(block, ToolResultBlock):
+               # Handle result
+   ```
+
+2. **Permission callback return type** - Must return `PermissionResultAllow`/`PermissionResultDeny` dataclasses
+   ```python
+   # WRONG: return {"allow": True}
+   # RIGHT: return PermissionResultAllow(updated_input=tool_input)
+   ```
+
+3. **Denied tool handling** - SDK sends `TextBlock` directly when denied, no `ToolResultBlock`
+   - Must manually mark tool as error in your UI when permission denied
+
+4. **AgentDefinition required** - Agents dict must use `AgentDefinition` objects
+   ```python
+   # WRONG: agents = {"name": {"description": "...", "prompt": "..."}}
+   # RIGHT: agents = {"name": AgentDefinition(description="...", prompt="...")}
+   ```
+
+5. **Async iteration** - Must use `async for` to iterate messages
+   ```python
+   # WRONG: for msg in agent.query(prompt)
+   # RIGHT: async for msg in agent.query(prompt)
+   ```
+
+6. **Session resume** - Pass `resume=session_id` to continue, get new session_id from `ResultMessage`
+
+7. **Text interleaving** - Text and tool calls arrive interleaved in time order
+   - Don't assume all tools come first then text
+   - Track events in arrival order for accurate display
+
+8. **Interrupt handling** - Call `agent.interrupt()` to stop, check `ResultMessage.status == "interrupted"`
 
 ### Output View
 - Read-only scratch view controlled by plugin
@@ -50,6 +132,7 @@ async def can_use_tool(tool_name: str, tool_input: dict, context) -> PermissionR
 - Ayu Mirage theme (ClaudeOutput.hidden-tmTheme)
 - Syntax-specific settings (ClaudeOutput.sublime-settings) for font size
 - Prompt delimiters: `◎ prompt text ▶` (supports multiline with indented continuation)
+- Working indicator: `⋯` shown at bottom while processing
 - `@done(Xs)` pops conversation context in syntax
 
 ### Permission UI
@@ -72,8 +155,13 @@ Multiple permission requests are queued - only one shown at a time.
 - Sessions saved to `.sessions.json` with name, project, cost, query count
 - Resume via session_id passed to SDK
 - `plugin_loaded` hook reconnects orphaned output views after Sublime restart
-- View title shows spinner + current tool when working
 - Closing output view stops its session
+
+**View title status indicators:**
+- `◉` Active + working
+- `◇` Active + idle
+- `•` Inactive + working
+- (no prefix) Inactive + idle
 
 ### UX Details
 - New Session command creates fresh view + immediately opens input prompt
@@ -159,3 +247,7 @@ To modify a read-only view, need custom TextCommands:
 - [x] Todo display from TodoWrite
 - [x] Diff display for Edit tool
 - [x] MCP integration (editor, blackboard, sessions)
+- [x] Time-ordered events (text + tools interleaved as they arrive)
+- [x] View title status indicators (◉/◇/•)
+- [x] Smart auto-scroll (only when cursor near end)
+- [x] Session reconnect resets stale states

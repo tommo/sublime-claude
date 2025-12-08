@@ -178,12 +178,18 @@ class Session:
         status = result.get("status", "")
         if "error" in result:
             self._status("error")
+            # Mark conversation as done on error
+            if self.output.current:
+                self.output.current.working = False
+                self.output._render_current()
         elif status == "interrupted":
             self._status("interrupted")
             self.output.interrupted()
         else:
             self._status("done")
             sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
+        # Update view title to reflect idle state
+        self.output.set_name(self.name or "Claude")
 
     def interrupt(self) -> None:
         if self.client:
@@ -300,11 +306,8 @@ class Session:
         chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         s = chars[self.spinner_frame % len(chars)]
         self.spinner_frame += 1
+        # Show spinner in status bar only (not title - causes cursor flicker)
         self._status(f"{s} {self.current_tool or 'thinking...'}")
-        # Update view title with spinner
-        title = self.name or "Claude"
-        tool_info = self.current_tool or "thinking"
-        self.output.set_name(f"{s} {title} - {tool_info}")
         sublime.set_timeout(self._animate, 100)
 
     def _handle_permission_request(self, params: dict) -> None:
