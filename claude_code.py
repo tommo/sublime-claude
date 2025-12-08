@@ -288,6 +288,8 @@ class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
         elif not s.initialized:
             sublime.set_timeout(self._input, 500)
         else:
+            # Focus the session's output view first
+            s.output.show()
             self._input()
 
     def _input(self) -> None:

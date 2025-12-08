@@ -13,6 +13,7 @@ from typing import Any
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
+    AgentDefinition,
     AssistantMessage,
     UserMessage,
     SystemMessage,
@@ -175,7 +176,7 @@ class Bridge:
     def _load_agents(self, cwd: str) -> dict:
         """Load subagent definitions from project settings, plus built-in agents."""
         settings = self._load_project_settings(cwd)
-        agents = settings.get("agents", {})
+        project_agents = settings.get("agents", {})
 
         # Built-in agents (can be overridden by project settings)
         builtin = {
@@ -208,12 +209,22 @@ Be concise. Focus on what matters to the user.""",
         }
 
         # Merge: project agents override built-ins
-        merged = {**builtin, **agents}
+        merged = {**builtin, **project_agents}
 
-        if merged:
+        # Convert dicts to AgentDefinition objects
+        agents = {}
+        for name, config in merged.items():
+            agents[name] = AgentDefinition(
+                description=config.get("description", ""),
+                prompt=config.get("prompt", ""),
+                tools=config.get("tools"),
+                model=config.get("model"),
+            )
+
+        if agents:
             with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  loaded agents: {list(merged.keys())}\n")
-        return merged
+                f.write(f"  loaded agents: {list(agents.keys())}\n")
+        return agents
 
     async def can_use_tool(self, tool_name: str, tool_input: dict, context=None):
         """Handle permission request - ask Sublime for approval."""
