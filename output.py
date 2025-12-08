@@ -270,6 +270,23 @@ class OutputView:
         self._render_current()
         self._scroll_to_end()
 
+    def interrupted(self) -> None:
+        """Show interrupted indicator."""
+        if not self.current:
+            return
+        # Mark any pending tools as error
+        for tool in self.current.tools:
+            if tool.status == PENDING:
+                tool.status = ERROR
+        # Clear any pending permission prompt
+        if self.pending_permission:
+            self._remove_permission_block()
+            self.pending_permission = None
+        # Append interrupted text
+        self.current.text_chunks.append("\n\n*[interrupted]*\n")
+        self._render_current()
+        self._scroll_to_end()
+
     def clear(self) -> None:
         """Clear all output (can undo with Cmd+Z)."""
         if self.view and self.view.is_valid():
@@ -594,9 +611,11 @@ class OutputView:
         # Text response
         if self.current.text_chunks:
             lines.append("\n")
-            lines.append("".join(self.current.text_chunks))
-            if not self.current.text_chunks[-1].endswith("\n"):
-                lines.append("\n")
+            # Join chunks, ensuring each ends with newline
+            for chunk in self.current.text_chunks:
+                lines.append(chunk)
+                if not chunk.endswith("\n"):
+                    lines.append("\n")
         elif self.current.tools:
             # Add blank line after tools if no text yet
             lines.append("\n")
