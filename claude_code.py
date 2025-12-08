@@ -1,7 +1,7 @@
 """Claude Code plugin for Sublime Text."""
 import sublime
 import sublime_plugin
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable
 
 from .session import Session, load_saved_sessions
 from . import mcp_server
@@ -9,6 +9,10 @@ from . import mcp_server
 
 # Sessions keyed by output view id - allows multiple sessions per window
 _sessions: Dict[int, Session] = {}
+
+# Track active input panel per window for session switching
+# Maps window_id -> input_panel_view
+_active_input_panels: Dict[int, sublime.View] = {}
 
 
 def plugin_loaded() -> None:
@@ -118,20 +122,95 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     return s
 
 
+def show_claude_input(window: sublime.Window, on_done: Callable[[str], None]) -> None:
+    """Show input panel with session-aware draft and label."""
+    s = get_active_session(window)
+    initial = s.draft_prompt if s else ""
+    # Build label with session name
+    if s and s.name:
+        label = f"Claude [{s.name}]:"
+    else:
+        label = "Claude:"
+
+    def on_change(text: str) -> None:
+        s = get_active_session(window)
+        if s:
+            s.draft_prompt = text
+
+    def on_cancel() -> None:
+        _active_input_panels.pop(window.id(), None)
+
+    def done_wrapper(text: str) -> None:
+        _active_input_panels.pop(window.id(), None)
+        s = get_active_session(window)
+        if s:
+            s.draft_prompt = ""  # Clear draft on submit
+        on_done(text)
+
+    # Show and track the input panel view
+    panel_view = window.show_input_panel(label, initial, done_wrapper, on_change, on_cancel)
+    _active_input_panels[window.id()] = panel_view
+
+
+def refresh_claude_input(window: sublime.Window, old_session: Session = None) -> None:
+    """Refresh the input panel if open, loading the new session's draft.
+
+    Args:
+        window: The window containing the input panel
+        old_session: The previous session to save draft to (optional)
+    """
+    panel_view = _active_input_panels.get(window.id())
+    if not panel_view:
+        return
+
+    # Check if panel is still open by checking if view is valid
+    # When panel closes, the view becomes invalid
+    if not panel_view.is_valid():
+        _active_input_panels.pop(window.id(), None)
+        return
+
+    s = get_active_session(window)
+    if not s:
+        return
+
+    # Get current input panel text and save to old session
+    current_text = panel_view.substr(sublime.Region(0, panel_view.size()))
+    if old_session and current_text:
+        old_session.draft_prompt = current_text
+
+    # Close current panel and reopen with new session's draft
+    window.run_command("hide_panel")
+
+    def reopen():
+        def on_done(text: str) -> None:
+            if text.strip():
+                sess = get_active_session(window)
+                if sess:
+                    sess.output.show()
+                    sess.output._move_cursor_to_end()
+                    sess.query(text)
+        show_claude_input(window, on_done)
+
+    # Small delay to let panel close
+    sublime.set_timeout(reopen, 50)
+
+
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
     """Start a new session."""
     def run(self) -> None:
         s = create_session(self.window)
         # Show input panel after session initializes
-        sublime.set_timeout(lambda: self.window.show_input_panel("Claude:", "", self._done, None, None), 300)
+        sublime.set_timeout(self._show_input, 300)
 
-    def _done(self, text: str) -> None:
-        if text.strip():
-            s = get_active_session(self.window)
-            if s:
-                s.output.show()
-                s.output._move_cursor_to_end()
-                s.query(text)
+    def _show_input(self) -> None:
+        def on_done(text: str) -> None:
+            if text.strip():
+                s = get_active_session(self.window)
+                if s:
+                    s.output.show()
+                    s.output._move_cursor_to_end()
+                    s.query(text)
+        show_claude_input(self.window, on_done)
 
 
 class ClaudeCodeAddMcpCommand(sublime_plugin.WindowCommand):
@@ -319,15 +398,14 @@ class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
             self._input()
 
     def _input(self) -> None:
-        self.window.show_input_panel("Claude:", "", self._done, None, None)
-
-    def _done(self, text: str) -> None:
-        if text.strip():
-            s = get_active_session(self.window)
-            if s:
-                s.output.show()
-                s.output._move_cursor_to_end()
-                s.query(text)
+        def on_done(text: str) -> None:
+            if text.strip():
+                s = get_active_session(self.window)
+                if s:
+                    s.output.show()
+                    s.output._move_cursor_to_end()
+                    s.query(text)
+        show_claude_input(self.window, on_done)
 
 
 class ClaudeCodeQuerySelectionCommand(sublime_plugin.TextCommand):
@@ -721,6 +799,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         # Mark this as the "active" session for the window
         old_active = window.settings().get("claude_active_view")
+        switched = old_active != self.view.id()
         window.settings().set("claude_active_view", self.view.id())
 
         # Update this session's status and title
@@ -730,9 +809,14 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             s.output.set_name(s.name or "Claude")
 
         # Remove active marker from previous active session
+        old_session = None
         if old_active and old_active != self.view.id() and old_active in _sessions:
             old_session = _sessions[old_active]
             old_session.output.set_name(old_session.name or "Claude")
+
+        # Refresh input panel if session switched and panel is open
+        if switched:
+            refresh_claude_input(window, old_session)
 
     def on_selection_modified(self):
         """Handle click on permission buttons."""

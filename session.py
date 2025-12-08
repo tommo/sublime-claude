@@ -59,6 +59,8 @@ class Session:
         self.query_count: int = 0
         # Pending context for next query
         self.pending_context: List[ContextItem] = []
+        # Draft prompt (persists across input panel open/close)
+        self.draft_prompt: str = ""
 
     def start(self) -> None:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -221,10 +223,14 @@ class Session:
             print(f"[Claude] tool_use input: {tool_input}")
             self.output.tool(self.current_tool, tool_input)
         elif t == "tool_result":
+            content = params.get("content", "")
+            # Convert content to string if it's a list
+            if isinstance(content, list):
+                content = "\n".join(str(c) for c in content)
             if params.get("is_error"):
-                self.output.tool_error(self.current_tool or "tool")
+                self.output.tool_error(self.current_tool or "tool", content)
             else:
-                self.output.tool_done(self.current_tool or "tool")
+                self.output.tool_done(self.current_tool or "tool", content)
             self.current_tool = None
         elif t == "text":
             self.output.text(params.get("text", ""))

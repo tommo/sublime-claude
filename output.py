@@ -34,6 +34,7 @@ class ToolCall:
     name: str
     tool_input: dict
     status: str = PENDING  # pending, done, error
+    result: Optional[str] = None  # tool result content
 
 
 @dataclass
@@ -167,7 +168,11 @@ class OutputView:
             size = self.view.size()
             # Auto-scroll if cursor is within 100 chars of end, or view is empty/small
             if size < 100 or cursor >= size - 100:
-                self.view.run_command("move_to", {"to": "eof"})
+                end = self.view.size()
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(end, end))
+                # show_at_center with negative offset to leave padding at bottom
+                self.view.show(end, keep_to_left=False, animate=False)
 
     # --- Public API ---
 
@@ -260,7 +265,7 @@ class OutputView:
         self._render_current()
         self._scroll_to_end()
 
-    def tool_done(self, name: str) -> None:
+    def tool_done(self, name: str, result: str = None) -> None:
         """Mark most recent pending tool with this name as done."""
         if not self.current:
             print(f"[Claude] tool_done({name}) - no current conversation")
@@ -269,15 +274,16 @@ class OutputView:
         for event in reversed(self.current.events):
             if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
                 event.status = DONE
+                event.result = result
                 print(f"[Claude] tool_done({name}) - marked done")
                 self._render_current()
                 return
         # No pending tool found, add as done
         print(f"[Claude] tool_done({name}) - not found pending, adding as done")
-        self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE))
+        self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE, result=result))
         self._render_current()
 
-    def tool_error(self, name: str) -> None:
+    def tool_error(self, name: str, result: str = None) -> None:
         """Mark most recent pending tool with this name as error."""
         if not self.current:
             return
@@ -285,6 +291,7 @@ class OutputView:
         for event in reversed(self.current.events):
             if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
                 event.status = ERROR
+                event.result = result
                 self._render_current()
                 return
         # No pending tool found, add as error
@@ -711,6 +718,9 @@ class OutputView:
         if self.current.duration > 0:
             lines.append(f"\n  @done({self.current.duration:.1f}s)\n")
 
+        # Add padding at bottom for better visibility
+        lines.append("\n\n")
+
         text = "".join(lines)
 
         # Replace the region
@@ -724,21 +734,23 @@ class OutputView:
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string."""
         detail = ""
-        if not tool.tool_input:
-            return detail
+        tool_input = tool.tool_input or {}
 
-        if tool.name == "Bash" and "command" in tool.tool_input:
-            cmd = tool.tool_input["command"]
+        if tool.name == "Bash" and "command" in tool_input:
+            cmd = tool_input["command"]
             if len(cmd) > 60:
                 cmd = cmd[:60] + "..."
             detail = f": {cmd}"
-        elif tool.name == "Read" and "file_path" in tool.tool_input:
-            detail = f": {tool.tool_input['file_path']}"
-        elif tool.name == "Edit" and "file_path" in tool.tool_input:
-            detail = f": {tool.tool_input['file_path']}"
+            # Show output for completed Bash commands
+            if tool.result and tool.status in (DONE, ERROR):
+                detail += self._format_bash_result(tool.result)
+        elif tool.name == "Read" and "file_path" in tool_input:
+            detail = f": {tool_input['file_path']}"
+        elif tool.name == "Edit" and "file_path" in tool_input:
+            detail = f": {tool_input['file_path']}"
             # Show diff for Edit tool
-            old = tool.tool_input.get("old_string", "")
-            new = tool.tool_input.get("new_string", "")
+            old = tool_input.get("old_string", "")
+            new = tool_input.get("new_string", "")
             if old or new:
                 diff_lines = []
                 for line in old.splitlines():
@@ -747,14 +759,56 @@ class OutputView:
                     diff_lines.append(f"+ {line}")
                 if diff_lines:
                     detail += "\n```diff\n" + "\n".join(diff_lines) + "\n```"
-        elif tool.name == "Write" and "file_path" in tool.tool_input:
-            detail = f": {tool.tool_input['file_path']}"
-        elif tool.name == "Glob" and "pattern" in tool.tool_input:
-            detail = f": {tool.tool_input['pattern']}"
-        elif tool.name == "Grep" and "pattern" in tool.tool_input:
-            detail = f": {tool.tool_input['pattern']}"
+        elif tool.name == "Write" and "file_path" in tool_input:
+            detail = f": {tool_input['file_path']}"
+        elif tool.name == "Glob" and "pattern" in tool_input:
+            detail = f": {tool_input['pattern']}"
+            # Show file count for completed Glob
+            if tool.result and tool.status == DONE:
+                detail += self._format_glob_result(tool.result)
+        elif tool.name == "Grep" and "pattern" in tool_input:
+            detail = f": {tool_input['pattern']}"
+            # Show match count for completed Grep
+            if tool.result and tool.status == DONE:
+                detail += self._format_grep_result(tool.result)
 
         return detail
+
+    def _format_bash_result(self, result: str) -> str:
+        """Format Bash command output (max 5 lines)."""
+        if not result or not result.strip():
+            return ""
+        lines = result.strip().split("\n")
+        max_lines = 5
+        max_width = 80
+        output_lines = []
+        for line in lines[:max_lines]:
+            truncated = line[:max_width] + "…" if len(line) > max_width else line
+            output_lines.append(f"    │ {truncated}")
+        if len(lines) > max_lines:
+            output_lines.append(f"    │ ... ({len(lines) - max_lines} more lines)")
+        return "\n" + "\n".join(output_lines)
+
+    def _format_glob_result(self, result: str) -> str:
+        """Format Glob result as file count."""
+        if not result or not result.strip():
+            return " → 0 files"
+        lines = [l for l in result.strip().split("\n") if l.strip()]
+        return f" → {len(lines)} files"
+
+    def _format_grep_result(self, result: str) -> str:
+        """Format Grep result as match count."""
+        if not result or not result.strip():
+            return " → 0 matches"
+        lines = [l for l in result.strip().split("\n") if l.strip()]
+        # Try to count unique files
+        files = set()
+        for line in lines:
+            if ":" in line:
+                files.add(line.split(":")[0])
+        if files:
+            return f" → {len(lines)} matches in {len(files)} files"
+        return f" → {len(lines)} matches"
 
 
 # --- Helper commands for text manipulation ---

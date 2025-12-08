@@ -45,6 +45,14 @@ contexts:
     - match: '\*\[interrupted\]\*'
       scope: claude.interrupted
 
+    # Tool output lines (│ prefix)
+    - match: '^\s*│ .+$'
+      scope: claude.tool.output
+
+    # Tool result arrow (→)
+    - match: ' → \d+ (files|matches).*$'
+      scope: claude.tool.result
+
     # Permission request
     - match: '^\s*(⚠)\s*(Allow)\s+(\w+)'
       captures:
