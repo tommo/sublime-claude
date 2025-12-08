@@ -76,13 +76,6 @@
         ]
     },
     {
-        "keys": ["super+s"],
-        "command": "claude_code_blackboard_save",
-        "context": [
-            { "key": "setting.blackboard_key", "operator": "not_equal", "operand": "" }
-        ]
-    },
-    {
         "keys": ["f"],
         "command": "claude_quick_prompt",
         "args": { "key": "refresh" },

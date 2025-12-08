@@ -2,6 +2,9 @@
 
 A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) integration.
 
+![Multi-session chess game demo](sessions_demo.jpg)
+*Multi-agent workflow: A coordinator orchestrating three sessions - White player, Black player, and a Board display - playing chess via MCP tools.*
+
 ## Requirements
 
 - Sublime Text 4

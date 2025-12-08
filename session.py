@@ -175,8 +175,12 @@ class Session:
     def _on_done(self, result: dict) -> None:
         self.working = False
         self.current_tool = None
+        status = result.get("status", "")
         if "error" in result:
             self._status("error")
+        elif status == "interrupted":
+            self._status("interrupted")
+            self.output.interrupted()
         else:
             self._status("done")
             sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
@@ -184,7 +188,7 @@ class Session:
     def interrupt(self) -> None:
         if self.client:
             self.client.send("interrupt", {})
-            self._status("interrupted")
+            self._status("interrupting...")
             self.working = False
 
     def stop(self) -> None:
