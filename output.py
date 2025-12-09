@@ -198,22 +198,17 @@ class OutputView:
 
     def enter_input_mode(self) -> None:
         """Enter input mode - show prompt marker and allow typing."""
-        print(f"[Claude] enter_input_mode: view={self.view}, valid={self.view.is_valid() if self.view else None}")
         if not self.view or not self.view.is_valid():
-            print("[Claude] enter_input_mode: SKIP - no valid view")
             return
         if self._input_mode:
-            print("[Claude] enter_input_mode: SKIP - already in input mode")
             return  # Already in input mode
 
         # Exit any current conversation's working state
         if self.current and self.current.working:
-            print("[Claude] enter_input_mode: SKIP - current is working")
             return  # Can't input while working
 
         # Additional safety: check if there's a pending render that should complete first
         if self._render_pending:
-            print("[Claude] enter_input_mode: DEFER - render pending")
             # Schedule input mode entry after pending render completes
             sublime.set_timeout(self.enter_input_mode, 20)
             return
@@ -221,7 +216,6 @@ class OutputView:
         # Safety: check for and clean up any stale input markers from previous sessions
         # This can happen after Sublime restart when OutputView state is lost but view content remains
         content = self.view.substr(sublime.Region(0, self.view.size()))
-        print(f"[Claude] enter_input_mode: view_size={self.view.size()}, content_tail={repr(content[-100:]) if len(content) > 100 else repr(content)}")
         if content:
             lines = content.split('\n')
             # Check last few lines for stale input markers
@@ -231,7 +225,6 @@ class OutputView:
                 # Input marker: starts with "◎ " but no " ▶" (which prompts have)
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
                 is_context_line = line.startswith('📎 ')
-                print(f"[Claude] enter_input_mode: checking line {i}: {repr(line[:50])}, is_input={is_input_marker}, is_ctx={is_context_line}")
                 if is_input_marker or is_context_line:
                     cleanup_start = len('\n'.join(lines[:i]))
                     if i > 0:
@@ -240,7 +233,6 @@ class OutputView:
                 elif line.strip():
                     break
             if cleanup_start >= 0 and cleanup_start < self.view.size():
-                print(f"[Claude] enter_input_mode: CLEANUP from {cleanup_start} to {self.view.size()}")
                 self.view.set_read_only(False)
                 self.view.run_command("claude_replace", {
                     "start": cleanup_start,
@@ -321,7 +313,6 @@ class OutputView:
 
     def reset_input_mode(self) -> None:
         """Force reset input mode state - use when state gets corrupted."""
-        print(f"[Claude] reset_input_mode: view={self.view}")
         if not self.view:
             return
 
@@ -329,7 +320,6 @@ class OutputView:
         # Input markers are EXACTLY "◎ " (the marker) possibly followed by user text
         # Prompt lines are "◎ ... ▶" (have the arrow indicator)
         content = self.view.substr(sublime.Region(0, self.view.size()))
-        print(f"[Claude] reset_input_mode: view_size={self.view.size()}, content_tail={repr(content[-100:]) if len(content) > 100 else repr(content)}")
         cleanup_start = -1
 
         # Find input area at end - must be input marker (not prompt) or context line
@@ -339,7 +329,6 @@ class OutputView:
             # Input marker line: starts with "◎ " but does NOT contain " ▶" (which prompts have)
             is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
             is_context_line = line.startswith('📎 ')
-            print(f"[Claude] reset_input_mode: line {i}: {repr(line[:50] if len(line) > 50 else line)}, is_input={is_input_marker}, is_ctx={is_context_line}")
             if is_input_marker or is_context_line:
                 # Found input area - calculate position to remove
                 cleanup_start = len('\n'.join(lines[:i]))
@@ -349,11 +338,9 @@ class OutputView:
                 continue
             elif line.strip():
                 # Non-empty line that's not input area - stop looking
-                print(f"[Claude] reset_input_mode: stopping at line {i} (has content)")
                 break
 
         if cleanup_start >= 0 and cleanup_start < self.view.size():
-            print(f"[Claude] reset_input_mode: CLEANUP from {cleanup_start} to {self.view.size()}")
             self.view.set_read_only(False)
             self.view.run_command("claude_replace", {
                 "start": cleanup_start,
@@ -361,8 +348,6 @@ class OutputView:
                 "text": ""
             })
             self.view.set_read_only(True)
-        else:
-            print(f"[Claude] reset_input_mode: no cleanup needed (cleanup_start={cleanup_start})")
 
         self._input_mode = False
         self._input_start = 0
@@ -908,15 +893,12 @@ class OutputView:
 
         # Don't render while in input mode - it would corrupt the input region
         if self._input_mode:
-            print("[Claude] _do_render: SKIP - in input mode")
             return
 
         # Validate region bounds - protect against stale region data
         view_size = self.view.size()
         start, end = self.current.region
-        print(f"[Claude] _do_render: view_size={view_size}, region=({start}, {end})")
         if start > view_size or end > view_size:
-            print(f"[Claude] _do_render: region invalid, recalculating")
             # Region is invalid - recalculate from view content
             # Find last prompt marker and use that as start
             content = self.view.substr(sublime.Region(0, view_size))
@@ -927,10 +909,8 @@ class OutputView:
                 start = last_pos
                 end = view_size
                 self.current.region = (start, end)
-                print(f"[Claude] _do_render: found prompt at {last_pos}, new region=({start}, {end})")
             else:
                 # Can't find our prompt - skip this render
-                print(f"[Claude] _do_render: SKIP - can't find prompt marker")
                 return
 
         # Build the full text for this conversation
