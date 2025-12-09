@@ -987,6 +987,13 @@ class OutputView:
 
         # Replace the region
         start, end = self.current.region
+        view_size = self.view.size()
+        print(f"[Claude] _do_render: region=({start}, {end}), view_size={view_size}, text_len={len(text)}")
+        if end < view_size:
+            print(f"[Claude] WARNING: region end ({end}) < view_size ({view_size}) - content after region!")
+            # Show what's after the region
+            after = self.view.substr(sublime.Region(end, min(end + 100, view_size)))
+            print(f"[Claude] Content after region: {repr(after[:100])}")
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)
 

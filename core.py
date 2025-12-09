@@ -48,9 +48,17 @@ def _reconnect_orphaned_views() -> None:
                             session_name = name
                         break
 
-                # Don't resume - the view already has the content
-                # Just create fresh session to avoid duplicate content
-                session = Session(window)
+                # Try to find session_id from saved sessions to resume with context
+                resume_id = None
+                if session_name:
+                    from .session import load_saved_sessions
+                    for saved in load_saved_sessions():
+                        if saved.get("name") == session_name:
+                            resume_id = saved.get("session_id")
+                            break
+
+                # Create session with resume_id if found
+                session = Session(window, resume_id=resume_id)
                 session.name = session_name
                 session.output.view = view  # Reuse existing view
                 session.draft_prompt = ""  # Clear any stale draft

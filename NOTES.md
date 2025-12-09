@@ -233,6 +233,45 @@ To modify a read-only view, need custom TextCommands:
 - `claude_insert` - insert at position
 - `claude_replace` - replace region
 
+## AI Agent Guidelines
+
+### Critical Invariants
+
+**Session Resume - MUST pass `resume_id` when reconnecting sessions:**
+```python
+# CORRECT - preserves conversation context
+session = Session(window, resume_id=saved_session_id)
+
+# WRONG - loses ALL conversation history (DO NOT do this for reconnects)
+session = Session(window)
+```
+
+**Permission Block Tracking:**
+Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Stored coordinates become stale when text shifts.
+
+### Red Flags - STOP and Verify
+
+1. **Removing function parameters** - likely breaks callers
+2. **Changing default values** - silent behavior change
+3. **"Simplifying" by removing steps** - those steps existed for a reason
+4. **"Avoiding duplicates" by skipping operations** - probably load-bearing
+5. **Any change justified by "cleaner" or "simpler"** - clean != correct
+
+### Rules for AI Agents
+
+1. **No Silent Behavior Changes** - If changing HOW something works, explicitly state:
+   - What the old behavior was
+   - What the new behavior is
+   - Why the change is acceptable
+
+2. **Distrust Your Own Simplifications** - When you want to remove code that seems unnecessary, STOP. Check git history. Ask the user.
+
+3. **Context Loss is the Enemy** - Write critical decisions to blackboard/comments IMMEDIATELY. Don't trust that you'll remember.
+
+4. **Preserve Load-Bearing Code** - Some code looks unnecessary but is critical. "To avoid duplicates" was used to justify breaking session resume - that was WRONG.
+
+5. **Name Things by Purpose** - `resume_id` is better than `session_id` because it implies "this is FOR resuming" - harder to accidentally drop.
+
 ## TODO
 - [ ] Streaming text (currently waits for full response?)
 - [ ] Image/file drag-drop to context

@@ -369,6 +369,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             items.append([f"{marker}{name}", detail])
             actions.append(("focus", s))
 
+        # Add "Restart Session" option when in a session window
+        if in_output_view and active_session:
+            items.append(["Restart Session", "Restart current session, keep output"])
+            actions.append(("restart", active_session))
+
         # Add "New Session" option at end
         items.append(["New Session", "Start a fresh Claude session"])
         actions.append(("new", None))
@@ -376,7 +381,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         def on_select(idx):
             if idx >= 0:
                 action, session = actions[idx]
-                if action == "new":
+                if action == "restart" and session:
+                    # Restart: stop current, start fresh with same view
+                    session.stop()
+                    session.start()
+                elif action == "new":
                     create_session(self.window)
                 elif action == "focus" and session:
                     session.output.show()
