@@ -382,8 +382,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if idx >= 0:
                 action, session = actions[idx]
                 if action == "restart" and session:
-                    # Restart: stop current, start fresh with same view
+                    # Restart: stop current, clear view and title, start fresh
                     session.stop()
+                    session.output.clear()
+                    session.name = None
+                    session.output.set_name("Claude")
                     session.start()
                 elif action == "new":
                     create_session(self.window)
