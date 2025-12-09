@@ -72,6 +72,10 @@
         "command": "claude_code_clear"
     },
     {
+        "caption": "Claude: Copy Conversation",
+        "command": "claude_code_copy"
+    },
+    {
         "caption": "Claude: Interrupt",
         "command": "claude_code_interrupt"
     },

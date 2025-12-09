@@ -95,10 +95,11 @@ class OutputView:
         self._input_area_start: int = 0  # Start of entire input area (context + marker)
         self._input_marker: str = "◎ "  # Marker for input line
 
-    def show(self) -> None:
-        # If we already have a view, just focus it
+    def show(self, focus: bool = True) -> None:
+        # If we already have a view, optionally focus it
         if self.view and self.view.is_valid():
-            self.window.focus_view(self.view)
+            if focus:
+                self.window.focus_view(self.view)
             return
 
         # Create new view
@@ -117,7 +118,8 @@ class OutputView:
             self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
-        self.window.focus_view(self.view)
+        if focus:
+            self.window.focus_view(self.view)
 
     def set_name(self, name: str) -> None:
         """Update the output view title."""
@@ -645,7 +647,7 @@ class OutputView:
     def permission_request(self, pid: int, tool: str, tool_input: dict, callback: Callable[[str], None]) -> None:
         """Show a permission request in the view."""
         import time
-        self.show()
+        self.show(focus=False)  # Don't steal focus from other views
 
         # Check if tool is auto-allowed for session
         if tool in self.auto_allow_tools:

@@ -219,6 +219,16 @@ class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
             s.output.clear()
 
 
+class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
+    """Copy entire conversation to clipboard."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if s and s.output.view and s.output.view.is_valid():
+            content = s.output.view.substr(sublime.Region(0, s.output.view.size()))
+            sublime.set_clipboard(content)
+            sublime.status_message("Conversation copied to clipboard")
+
+
 class ClaudeCodeResetInputCommand(sublime_plugin.WindowCommand):
     """Force reset input mode state when it gets corrupted."""
     def run(self) -> None:
