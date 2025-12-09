@@ -48,7 +48,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 
 | Command | Keybinding | Description |
 |---------|------------|-------------|
-| Query | `Cmd+Alt+\` | Open prompt to query Claude |
+| Switch Session | `Cmd+Alt+\` | Quick panel: active session, new, or switch |
 | Query Selection | `Cmd+Shift+Alt+C` | Query about selected code |
 | Query File | - | Query about current file |
 | Add Current File | - | Add file to context |
@@ -56,7 +56,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Add Open Files | - | Add all open files to context |
 | Add Current Folder | - | Add folder path to context |
 | Clear Context | - | Clear pending context |
-| New Session | - | Start a fresh session (opens input prompt) |
+| New Session | - | Start a fresh session |
 | Restart Session | - | Restart current session, keep output view |
 | Resume Session... | - | Resume a previous session |
 | Switch Session... | - | Switch between active sessions |
@@ -69,12 +69,21 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Interrupt | `Cmd+Shift+Escape` | Stop current query |
 | Permission Mode... | - | Change permission settings |
 
-In the output view:
-- **Enter** - Open input prompt
+### Inline Input Mode
+
+The output view features an inline input area (marked with `◎`) where you type prompts directly:
+
+- **Enter** - Submit prompt
+- **Shift+Enter** - Insert newline (multiline prompts)
+- **@** - Open context menu (add files, selection, folder, or clear context)
 - **Cmd+K** - Clear output
 - **Cmd+Escape** - Interrupt current query
 - **Cmd+Z** - Undo clear (restores cleared content)
+
+When a permission prompt appears:
 - **Y/N/S/A** - Respond to permission prompts
+
+Quick prompts (when not in input mode):
 - **F** - Refresh (re-read docs, continue)
 - **R** - Retry (different approach)
 - **C** - Continue
@@ -295,8 +304,11 @@ bridge process using Python 3.10+ which runs the Claude Agent SDK.
 
 ```
 sublime-claude/
-├── claude_code.py      # Plugin commands
-├── session.py          # Session management
+├── claude_code.py      # Plugin entry point (imports)
+├── core.py             # Session management, plugin lifecycle
+├── commands.py         # All plugin commands
+├── listeners.py        # Event listeners
+├── session.py          # Session class
 ├── rpc.py              # JSON-RPC client
 ├── output.py           # Output view rendering
 └── bridge/

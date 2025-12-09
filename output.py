@@ -585,6 +585,9 @@ class OutputView:
         self.pending_permission = None
         self._permission_queue.clear()
         self.auto_allow_tools.clear()
+        # Clean up any tracked permission region
+        if self.view:
+            self.view.erase_regions("claude_permission_block")
         # Re-enter input mode if we were in it
         if was_input_mode:
             self.enter_input_mode()
@@ -627,13 +630,15 @@ class OutputView:
         if not self.pending_permission or not self.view:
             return
         perm = self.pending_permission
-        start, end = perm.region
         # Remove button regions
         for btn_type in perm.button_regions:
             self.view.erase_regions(f"claude_btn_{btn_type}")
-        # Remove text if region is valid
-        if end > start:
-            self._replace(start, end, "")
+        # Get current region from tracked region (auto-adjusted for text shifts)
+        regions = self.view.get_regions("claude_permission_block")
+        if regions:
+            region = regions[0]
+            self._replace(region.begin(), region.end(), "")
+        self.view.erase_regions("claude_permission_block")
 
     # --- Permission UI ---
 
@@ -737,6 +742,15 @@ class OutputView:
         end = self._write(text)
         perm.region = (start, end)
 
+        # Add tracked region for the whole permission block (auto-adjusts when text shifts)
+        self.view.add_regions(
+            "claude_permission_block",
+            [sublime.Region(start, end)],
+            "",
+            "",
+            sublime.HIDDEN,
+        )
+
         # Calculate button regions (absolute positions)
         btn_start = start + len(text_before_buttons)
         perm.button_regions[PERM_ALLOW] = (btn_start, btn_start + len(btn_y))
@@ -772,14 +786,17 @@ class OutputView:
             return
 
         perm = self.pending_permission
-        start, end = perm.region
 
         # Remove button regions
         for btn_type in perm.button_regions:
             self.view.erase_regions(f"claude_btn_{btn_type}")
 
-        # Remove text
-        self._replace(start, end, "")
+        # Get current region from tracked region (auto-adjusted for text shifts)
+        regions = self.view.get_regions("claude_permission_block")
+        if regions:
+            region = regions[0]
+            self._replace(region.begin(), region.end(), "")
+        self.view.erase_regions("claude_permission_block")
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
 

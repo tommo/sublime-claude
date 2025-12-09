@@ -1,7 +1,7 @@
 [
     {
         "keys": ["super+alt+\\"],
-        "command": "claude_code_query"
+        "command": "claude_code_switch"
     },
     {
         "keys": ["super+shift+alt+c"],

@@ -315,7 +315,7 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
 class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
     """Switch between active sessions in this window."""
     def run(self) -> None:
-        from .core import _sessions
+        from .core import _sessions, create_session
 
         # Get all sessions in this window
         sessions_in_window = []
@@ -323,33 +323,53 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if session.window == self.window:
                 sessions_in_window.append((view_id, session))
 
-        if not sessions_in_window:
-            sublime.status_message("No active sessions")
-            return
-
-        if len(sessions_in_window) == 1:
-            # Only one session - just focus it
-            sessions_in_window[0][1].output.show()
-            return
-
         # Build quick panel items
         active_view_id = self.window.settings().get("claude_active_view")
         items = []
+        actions = []  # ("new", None) | ("focus", session)
+
+        # Add active session at top if exists
+        active_session = None
         for view_id, s in sessions_in_window:
-            name = s.name or "(unnamed)"
             if view_id == active_view_id:
-                marker = "◉ " if s.working else "◇ "
-            else:
-                marker = "• " if s.working else "  "
+                active_session = s
+                break
+
+        # Show "Active:" option only when not in a Claude output view (for quick jumping from file view)
+        current_view = self.window.active_view()
+        in_output_view = current_view and current_view.settings().get("claude_output")
+
+        if active_session and not in_output_view:
+            name = active_session.name or "(unnamed)"
+            status = "working..." if active_session.working else "ready"
+            cost = f"${active_session.total_cost:.4f}" if active_session.total_cost > 0 else ""
+            detail = f"{status}  {cost}  {active_session.query_count}q" if cost else f"{status}  {active_session.query_count}q"
+            items.append([f"Active: {name}", detail])
+            actions.append(("focus", active_session))
+
+        # Add other sessions (not the active one)
+        for view_id, s in sessions_in_window:
+            if view_id == active_view_id:
+                continue  # Already shown at top
+            name = s.name or "(unnamed)"
+            marker = "• " if s.working else "  "
             status = "working..." if s.working else "ready"
             cost = f"${s.total_cost:.4f}" if s.total_cost > 0 else ""
             detail = f"{status}  {cost}  {s.query_count}q" if cost else f"{status}  {s.query_count}q"
             items.append([f"{marker}{name}", detail])
+            actions.append(("focus", s))
+
+        # Add "New Session" option at end
+        items.append(["New Session", "Start a fresh Claude session"])
+        actions.append(("new", None))
 
         def on_select(idx):
             if idx >= 0:
-                view_id, session = sessions_in_window[idx]
-                session.output.show()
+                action, session = actions[idx]
+                if action == "new":
+                    create_session(self.window)
+                elif action == "focus" and session:
+                    session.output.show()
 
         self.window.show_quick_panel(items, on_select)
 
