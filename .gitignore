@@ -4,3 +4,5 @@ __pycache__/
 .sessions.json
 /tmp/
 *.log
+*.sublime-project
+*.sublime-workspace
