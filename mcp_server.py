@@ -97,15 +97,26 @@ class MCPSocketServer:
             result = {"result": None, "error": None}
             done = threading.Event()
 
+            # Check if this is an ask_user call - needs special async handling
+            is_ask_user = "ask_user(" in code
+
             def do_eval():
                 try:
-                    result["result"] = self._eval(code, tool)
+                    if is_ask_user:
+                        # Special handling: ask_user needs to NOT block main thread
+                        # We'll call the method which will show UI and set done when complete
+                        result["result"] = self._eval_ask_user(code, done)
+                    else:
+                        result["result"] = self._eval(code, tool)
+                        done.set()
                 except Exception as e:
                     result["error"] = str(e)
-                done.set()
+                    done.set()
 
             sublime.set_timeout(do_eval, 0)
-            done.wait(timeout=30)
+            # ask_user needs longer timeout (5 min), others use 30s
+            timeout = 300 if is_ask_user else 30
+            done.wait(timeout=timeout)
 
             conn.sendall((json.dumps(result) + "\n").encode())
 
@@ -116,6 +127,80 @@ class MCPSocketServer:
                 pass
         finally:
             conn.close()
+
+    def _eval_ask_user(self, code: str, done_event: threading.Event):
+        """Special eval for ask_user - handles async UI without blocking main thread."""
+        # Parse the ask_user call to extract args
+        # Expected format: return ask_user("question", ["opt1", "opt2"])
+        import re
+        match = re.search(r'ask_user\((.*)\)', code, re.DOTALL)
+        if not match:
+            done_event.set()
+            return {"error": "Invalid ask_user call"}
+
+        # Safely evaluate the arguments
+        args_str = match.group(1)
+        try:
+            # Use ast.literal_eval for safety
+            import ast
+            # Wrap in tuple to parse multiple args
+            args = ast.literal_eval(f"({args_str})")
+            question = args[0] if len(args) > 0 else ""
+            options = args[1] if len(args) > 1 else []
+        except:
+            done_event.set()
+            return {"error": "Failed to parse ask_user arguments"}
+
+        window = sublime.active_window()
+        if not window:
+            done_event.set()
+            return {"error": "No window"}
+
+        # Build items for quick panel
+        items = []
+        for opt in options:
+            items.append([str(opt), ""])
+        items.append(["Other...", "Type a custom response"])
+
+        result = {"answer": None, "cancelled": False}
+
+        def on_select(idx):
+            if idx == -1:
+                result["cancelled"] = True
+                done_event.set()
+            elif idx == len(options):
+                # "Other" selected - show input panel after a delay
+                # (immediate show can be dismissed by quick panel closing)
+                def show_input():
+                    def on_input(text):
+                        result["answer"] = text
+                        done_event.set()
+
+                    def on_cancel():
+                        result["cancelled"] = True
+                        done_event.set()
+
+                    window.show_input_panel(
+                        question,
+                        "",
+                        on_input,
+                        None,
+                        on_cancel
+                    )
+                sublime.set_timeout(show_input, 50)
+            else:
+                result["answer"] = options[idx]
+                done_event.set()
+
+        window.show_quick_panel(
+            items,
+            on_select,
+            placeholder=question
+        )
+
+        # Don't wait here - return the result dict that will be filled async
+        # The socket handler waits on done_event
+        return result
 
     def _eval(self, code: str, tool: str = None):
         """Execute code in Sublime's context."""
@@ -405,7 +490,7 @@ class MCPSocketServer:
         if not window:
             return {"error": "No window"}
 
-        # Find matching terminal
+        # Find matching terminal to get its info
         target = None
         for view in window.views():
             if view.settings().get("terminus_view"):
@@ -418,15 +503,33 @@ class MCPSocketServer:
                     target = view
                     break
 
+        # Open a new terminal if none found
         if not target:
-            return {"error": f"No terminal found" + (f" with tag '{tag}'" if tag else "")}
+            cwd = window.folders()[0] if window.folders() else None
+            open_args = {"panel_name": None}  # None = open as view/tab, not panel
+            if cwd:
+                open_args["cwd"] = cwd
+            if tag:
+                open_args["tag"] = tag
+            window.run_command("terminus_open", open_args)
+            # Find the newly created terminal
+            for view in window.views():
+                if view.settings().get("terminus_view"):
+                    target = view
+                    break
+            if not target:
+                return {"error": "Failed to open terminal"}
 
-        # Send using Terminus command
-        target.run_command("terminus_send_string", {"string": text})
+        # Send using Terminus command on WINDOW (not view)
+        args = {"string": text}
+        target_tag = target.settings().get("terminus_view.tag", "")
+        if target_tag:
+            args["tag"] = target_tag
+        window.run_command("terminus_send_string", args)
         return {
             "sent": True,
             "view_id": target.id(),
-            "tag": target.settings().get("terminus_view.tag", ""),
+            "tag": target_tag,
         }
 
     def _terminus_read(self, tag: str = None, lines: int = 100) -> dict:

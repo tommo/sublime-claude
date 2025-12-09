@@ -375,7 +375,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             actions.append(("restart", active_session))
 
         # Add "New Session" option at end
-        items.append(["New Session", "Start a fresh Claude session"])
+        items.append(["Create Another Session", "Start a fresh Claude session"])
         actions.append(("new", None))
 
         def on_select(idx):
@@ -644,11 +644,15 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if not s.output.is_input_mode():
             return
 
-        text = s.output.exit_input_mode(keep_text=False)
-        s.draft_prompt = ""
+        text = s.output.get_input_text().strip()
 
-        if text.strip():
-            s.query(text)
+        # Ignore empty input
+        if not text:
+            return
+
+        s.output.exit_input_mode(keep_text=False)
+        s.draft_prompt = ""
+        s.query(text)
 
 
 class ClaudeEnterInputModeCommand(sublime_plugin.TextCommand):

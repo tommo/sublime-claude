@@ -185,6 +185,7 @@ Multiple permission requests are queued - only one shown at a time.
 - Blackboard: `bb_write`, `bb_read`, `bb_list`, `bb_delete`
 - Sessions: `spawn_session`, `send_to_session`, `list_sessions`
 - Terminus: `terminus_list`, `terminus_send`, `terminus_read`, `terminus_close`
+- User: `ask_user` - ask questions via quick panel
 - Custom: `sublime_eval`, `sublime_tool`, `list_tools`
 
 **Blackboard patterns:**
@@ -287,6 +288,22 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
 - [ ] Session search/filter
 - [ ] Click to expand/collapse tool sections
 - [ ] MCP tool parameters (pass args to saved tools)
+
+## Recent Changes (2025-12-09)
+
+### Bug Fixes
+- **Garbled output fix** (`output.py:_do_render`): Extended replacement region to `view_size` when orphaned content exists after the conversation region. Prevents fragmented text appearing after `⋯` indicator.
+
+### Improvements
+- **Edit diff format**: Now uses `difflib.unified_diff` for readable diffs with context lines and `@@` hunks, instead of listing all `-` then all `+` lines.
+- **Bash output**: Shows 3 head + 5 tail lines (was 5 head only). Better visibility of command results.
+
+### New Features
+- **`ask_user` MCP tool**: Ask user questions via quick panel. Workaround for missing `AskUserQuestion` support in Agent SDK.
+  ```
+  ask_user("Which auth method?", ["OAuth", "JWT", "Session"])
+  ```
+  Returns `{"answer": "OAuth", "question": "..."}` or `{"cancelled": true}`
 
 ## Done
 - [x] Multi-session per window

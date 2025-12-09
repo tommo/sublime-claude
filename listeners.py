@@ -92,8 +92,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         switched = old_active != self.view.id()
         window.settings().set("claude_active_view", self.view.id())
 
-        # Update this session's status and title
+        # Check if this is an orphaned view that needs reconnection
         s = get_session_for_view(self.view)
+        if not s:
+            self._reconnect_orphaned_view(window)
+            s = get_session_for_view(self.view)
+
+        # Update this session's status and title
         if s:
             s._update_status_bar()
             s.output.set_name(s.name or "Claude")
@@ -106,6 +111,72 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if old_active and old_active != self.view.id() and old_active in _sessions:
             old_session = _sessions[old_active]
             old_session.output.set_name(old_session.name or "Claude")
+
+    def _reconnect_orphaned_view(self, window):
+        """Reconnect an orphaned Claude output view on focus."""
+        from .core import _sessions
+        from .session import Session, load_saved_sessions
+
+        view = self.view
+
+        # Guard against double reconnection
+        if view.id() in _sessions:
+            return
+        if view.settings().get("claude_reconnecting"):
+            return
+        view.settings().set("claude_reconnecting", True)
+
+        name = view.name()
+        session_name = None
+
+        # Strip status prefix if present
+        if name.startswith(("◉ ", "◇ ", "• ")):
+            name = name[2:]
+        if name.startswith("Claude: "):
+            session_name = name[8:]
+            if " - " in session_name:
+                session_name = session_name.split(" - ")[0]
+
+        # Handle spinner prefix
+        for c in "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏":
+            if name.startswith(c + " "):
+                name = name[2:]
+                if " - " in name:
+                    session_name = name.split(" - ")[0]
+                else:
+                    session_name = name
+                break
+
+        # Try to find session_id from saved sessions (only if it was actually used)
+        resume_id = None
+        if session_name:
+            for saved in load_saved_sessions():
+                if saved.get("name") == session_name and saved.get("query_count", 0) > 0:
+                    resume_id = saved.get("session_id")
+                    break
+
+        # Create session - with resume_id if found, fresh otherwise
+        session = Session(window, resume_id=resume_id)
+        session.name = session_name
+        session.output.view = view
+        session.draft_prompt = ""
+        _sessions[view.id()] = session
+
+        # Reset active states
+        session.output.reset_active_states()
+        if session_name:
+            view.set_name(f"Claude: {session_name}")
+        else:
+            view.set_name("Claude")
+
+        session.start()
+
+        # Clear reconnecting flag
+        view.settings().erase("claude_reconnecting")
+
+        if session_name:
+            view.set_status("claude_reconnect", f"Reconnected: {session_name}")
+            sublime.set_timeout(lambda v=view: v.erase_status("claude_reconnect"), 3000)
 
     def on_text_command(self, command_name, args):
         """Intercept text commands to restrict edits in input mode."""

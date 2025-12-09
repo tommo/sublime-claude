@@ -26,6 +26,20 @@ class JsonRpcClient:
         self.running = True
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.reader_thread.start()
+        # Start stderr reader
+        self.stderr_thread = threading.Thread(target=self._stderr_loop, daemon=True)
+        self.stderr_thread.start()
+
+    def _stderr_loop(self) -> None:
+        """Read stderr and print to console."""
+        while self.running and self.proc and self.proc.stderr:
+            try:
+                line = self.proc.stderr.readline()
+                if not line:
+                    break
+                print(f"[Claude Bridge] {line.decode().rstrip()}")
+            except:
+                continue
 
     def stop(self) -> None:
         self.running = False

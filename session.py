@@ -101,7 +101,9 @@ class Session:
 
     def _on_init(self, result: dict) -> None:
         if "error" in result:
-            self._status(f"error: {result['error']['message']}")
+            error_msg = result['error'].get('message', str(result['error']))
+            print(f"[Claude] init error: {error_msg}")
+            self._status(f"error: {error_msg}")
             return
         self.initialized = True
         self._input_mode_entered = False  # Reset for fresh start after init

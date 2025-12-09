@@ -988,12 +988,10 @@ class OutputView:
         # Replace the region
         start, end = self.current.region
         view_size = self.view.size()
-        print(f"[Claude] _do_render: region=({start}, {end}), view_size={view_size}, text_len={len(text)}")
+        # If there's content after our region, extend end to clean it up
+        # This handles race conditions where content was orphaned from previous renders
         if end < view_size:
-            print(f"[Claude] WARNING: region end ({end}) < view_size ({view_size}) - content after region!")
-            # Show what's after the region
-            after = self.view.substr(sublime.Region(end, min(end + 100, view_size)))
-            print(f"[Claude] Content after region: {repr(after[:100])}")
+            end = view_size
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)
 
@@ -1027,13 +1025,7 @@ class OutputView:
             old = tool_input.get("old_string", "")
             new = tool_input.get("new_string", "")
             if old or new:
-                diff_lines = []
-                for line in old.splitlines():
-                    diff_lines.append(f"- {line}")
-                for line in new.splitlines():
-                    diff_lines.append(f"+ {line}")
-                if diff_lines:
-                    detail += "\n```diff\n" + "\n".join(diff_lines) + "\n```"
+                detail += self._format_edit_diff(old, new)
         elif tool.name == "Write" and "file_path" in tool_input:
             detail = f": {tool_input['file_path']}"
         elif tool.name == "Glob" and "pattern" in tool_input:
@@ -1046,22 +1038,46 @@ class OutputView:
             # Show match count for completed Grep
             if tool.result and tool.status == DONE:
                 detail += self._format_grep_result(tool.result)
+        elif tool.name in ("ask_user", "mcp__sublime__ask_user") and "question" in tool_input:
+            question = tool_input["question"]
+            detail = f": {question}"
+            # Show Q&A for completed ask_user
+            if tool.result and tool.status == DONE:
+                detail += self._format_ask_user_result(tool.result, question)
+        # Generic MCP tool result display
+        elif tool.name.startswith("mcp__sublime__") and tool.result and tool.status == DONE:
+            detail += self._format_mcp_result(tool.result)
 
         return detail
 
     def _format_bash_result(self, result: str) -> str:
-        """Format Bash command output (max 5 lines)."""
+        """Format Bash command output (head + tail if long)."""
         if not result or not result.strip():
             return ""
         lines = result.strip().split("\n")
-        max_lines = 5
+        max_head = 3
+        max_tail = 5
         max_width = 80
         output_lines = []
-        for line in lines[:max_lines]:
-            truncated = line[:max_width] + "…" if len(line) > max_width else line
-            output_lines.append(f"    │ {truncated}")
-        if len(lines) > max_lines:
-            output_lines.append(f"    │ ... ({len(lines) - max_lines} more lines)")
+
+        def truncate(line):
+            return line[:max_width] + "…" if len(line) > max_width else line
+
+        if len(lines) <= max_head + max_tail:
+            # Show all lines
+            for line in lines:
+                output_lines.append(f"    │ {truncate(line)}")
+        else:
+            # Show head
+            for line in lines[:max_head]:
+                output_lines.append(f"    │ {truncate(line)}")
+            # Show omitted count
+            omitted = len(lines) - max_head - max_tail
+            output_lines.append(f"    │ ... ({omitted} more lines)")
+            # Show tail
+            for line in lines[-max_tail:]:
+                output_lines.append(f"    │ {truncate(line)}")
+
         return "\n" + "\n".join(output_lines)
 
     def _format_glob_result(self, result: str) -> str:
@@ -1084,6 +1100,111 @@ class OutputView:
         if files:
             return f" → {len(lines)} matches in {len(files)} files"
         return f" → {len(lines)} matches"
+
+    def _format_mcp_result(self, result: str) -> str:
+        """Format generic MCP tool result."""
+        try:
+            import re
+            import ast
+            import json
+
+            # Extract the 'text' field from MCP format: {'type': 'text', 'text': '...'}
+            match = re.search(r"'text':\s*'((?:[^'\\]|\\.)*)'", result)
+            if not match:
+                # Try double quotes
+                match = re.search(r'"text":\s*"((?:[^"\\]|\\.)*)"', result)
+
+            if match:
+                text = match.group(1)
+                # Decode escapes
+                text = text.replace('\\n', '\n').replace("\\'", "'").replace('\\"', '"')
+                # Try to parse as JSON for pretty display
+                try:
+                    data = json.loads(text)
+                    if isinstance(data, dict):
+                        # Compact single-line for small results
+                        compact = json.dumps(data, ensure_ascii=False)
+                        if len(compact) < 60:
+                            return f" → {compact}"
+                        # Multi-line for larger results
+                        lines = []
+                        for k, v in list(data.items())[:5]:
+                            v_str = str(v)[:50]
+                            lines.append(f"    │ {k}: {v_str}")
+                        if len(data) > 5:
+                            lines.append(f"    │ ... ({len(data) - 5} more)")
+                        return "\n" + "\n".join(lines)
+                    elif isinstance(data, list):
+                        return f" → [{len(data)} items]"
+                except:
+                    # Plain text, show truncated
+                    if len(text) > 60:
+                        return f" → {text[:60]}..."
+                    return f" → {text}" if text else ""
+
+            return ""
+        except:
+            return ""
+
+    def _format_ask_user_result(self, result: str, question: str) -> str:
+        """Format ask_user Q&A result."""
+        try:
+            import re
+            import codecs
+            # Extract answer from various formats
+            # Format: {'type': 'text', 'text': '{\n  "answer": "...",\n  "cancelled": false\n}'}
+
+            # Look for "answer": "..." pattern - allow escaped chars inside
+            match = re.search(r'"answer":\s*"((?:[^"\\]|\\.)*)"', result)
+            if match:
+                answer = match.group(1)
+                # Decode unicode escapes (e.g., \\u4e2d -> 中)
+                # Handle double-escaped: \\\\u -> \\u first
+                answer = answer.replace('\\\\u', '\\u')
+                answer = codecs.decode(answer, 'unicode_escape')
+                return f"\n    → {answer}"
+
+            # Check for cancelled
+            if '"cancelled": true' in result or '"cancelled":true' in result:
+                return "\n    → (cancelled)"
+
+            return ""
+        except Exception as e:
+            print(f"[Claude] _format_ask_user_result error: {e}, result={result[:50]}")
+            return ""
+
+    def _format_edit_diff(self, old: str, new: str) -> str:
+        """Format Edit diff using unified diff format."""
+        import difflib
+        if not old and not new:
+            return ""
+
+        old_lines = old.splitlines(keepends=True)
+        new_lines = new.splitlines(keepends=True)
+
+        # Ensure last lines have newlines for clean diff
+        if old_lines and not old_lines[-1].endswith('\n'):
+            old_lines[-1] += '\n'
+        if new_lines and not new_lines[-1].endswith('\n'):
+            new_lines[-1] += '\n'
+
+        diff = list(difflib.unified_diff(old_lines, new_lines, lineterm=''))
+
+        if not diff:
+            return ""
+
+        # Skip the --- and +++ header lines, start from @@
+        diff_lines = []
+        for line in diff:
+            if line.startswith('---') or line.startswith('+++'):
+                continue
+            # Remove trailing newline for display
+            diff_lines.append(line.rstrip('\n'))
+
+        if not diff_lines:
+            return ""
+
+        return "\n```diff\n" + "\n".join(diff_lines) + "\n```"
 
 
 # --- Helper commands for text manipulation ---

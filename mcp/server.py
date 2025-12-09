@@ -238,6 +238,25 @@ For simple operations, prefer the dedicated tools above.""",
                             "tag": {"type": "string", "description": "Optional: terminal tag to close"}
                         }
                     }
+                },
+                # ─── User Interaction ────────────────────────────────────────
+                {
+                    "name": "ask_user",
+                    "description": """Ask the user a question and wait for their response.
+Shows a quick panel with options. Use for clarifying requirements, getting preferences, or confirming actions.
+User can always type a custom response.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string", "description": "The question to ask"},
+                            "options": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of options to choose from (user can also type custom answer)"
+                            }
+                        },
+                        "required": ["question"]
+                    }
                 }
             ]
         })
@@ -318,6 +337,11 @@ For simple operations, prefer the dedicated tools above.""",
                 result = send_to_sublime(code=f"return terminus_close({tag!r})")
             else:
                 result = send_to_sublime(code="return terminus_close()")
+        # User interaction
+        elif tool_name == "ask_user":
+            question = args.get("question", "")
+            options = args.get("options", [])
+            result = send_to_sublime(code=f"return ask_user({question!r}, {options!r})")
         else:
             return make_response(id, error=f"Unknown tool: {tool_name}")
 

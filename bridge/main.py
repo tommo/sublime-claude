@@ -63,7 +63,9 @@ class Bridge:
         self.running = True
         self.current_task: asyncio.Task | None = None
         self.pending_permissions: dict[int, asyncio.Future] = {}
+        self.pending_questions: dict[int, asyncio.Future] = {}  # For AskUserQuestion
         self.permission_id = 0
+        self.question_id = 0
         self.interrupted = False  # Set by interrupt(), checked by query()
 
     async def handle_request(self, req: dict) -> None:
@@ -82,6 +84,8 @@ class Bridge:
                 await self.shutdown(id)
             elif method == "permission_response":
                 await self.handle_permission_response(id, params)
+            elif method == "question_response":
+                await self.handle_question_response(id, params)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -166,9 +170,22 @@ class Bridge:
         return {}
 
     def _load_mcp_servers(self, cwd: str) -> dict:
-        """Load MCP server config from project settings."""
+        """Load MCP server config from project settings, plus built-in sublime server."""
         settings = self._load_project_settings(cwd)
         servers = settings.get("mcpServers", {})
+
+        # Always include the built-in sublime MCP server
+        # Find the mcp/server.py relative to this bridge script
+        bridge_dir = os.path.dirname(os.path.abspath(__file__))
+        plugin_dir = os.path.dirname(bridge_dir)
+        mcp_server_path = os.path.join(plugin_dir, "mcp", "server.py")
+
+        if os.path.exists(mcp_server_path) and "sublime" not in servers:
+            servers["sublime"] = {
+                "command": sys.executable,  # Use same python as bridge
+                "args": [mcp_server_path]
+            }
+
         if servers:
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  loaded MCP servers: {list(servers.keys())}\n")
@@ -229,6 +246,10 @@ Be concise. Focus on what matters to the user.""",
 
     async def can_use_tool(self, tool_name: str, tool_input: dict, context=None):
         """Handle permission request - ask Sublime for approval."""
+        # Auto-allow built-in sublime MCP tools
+        if tool_name.startswith("mcp__sublime__"):
+            return PermissionResultAllow(updated_input=tool_input)
+
         self.permission_id += 1
         pid = self.permission_id
 
