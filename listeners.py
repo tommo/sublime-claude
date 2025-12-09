@@ -181,55 +181,39 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             "text": ""
         })
 
-        # Build menu items with action keys
-        items = []  # (key, [title, description])
+        # Build menu items: browse, clear, then open files
+        items = []  # (action, data, [title, description])
 
-        # Current file
-        active_view = None
-        for v in window.views():
-            if not v.settings().get("claude_output") and v.file_name():
-                active_view = v
-                break
-
-        if active_view and active_view.file_name():
-            name = active_view.file_name().split("/")[-1]
-            items.append(("file", ["@ file", name]))
-
-            # Selection in active view
-            sel = active_view.sel()
-            if sel and not sel[0].empty():
-                preview = active_view.substr(sel[0])[:50].replace("\n", " ")
-                items.append(("selection", ["@ selection", preview]))
-
-        # Open files
-        open_count = sum(1 for v in window.views() if v.file_name() and not v.settings().get("claude_output"))
-        if open_count > 0:
-            items.append(("open", ["@ open", f"{open_count} open files"]))
-
-        # Current folder
-        if active_view and active_view.file_name():
-            import os
-            folder = os.path.dirname(active_view.file_name())
-            items.append(("folder", ["@ folder", folder]))
-
-        # File picker
-        items.append(("browse", ["@ browse...", "Choose file from project"]))
+        # Browse option
+        items.append(("browse", None, ["Browse...", "Choose file from project"]))
 
         # Clear context (only show if there's pending context)
         if session.pending_context:
             count = len(session.pending_context)
-            items.append(("clear", ["@ clear", f"Clear {count} pending item{'s' if count > 1 else ''}"]))
+            items.append(("clear", None, ["Clear context", f"{count} pending item{'s' if count > 1 else ''}"]))
 
-        if not items:
-            return
+        # Open files in this window
+        for v in window.views():
+            if v.file_name() and not v.settings().get("claude_output"):
+                import os
+                name = os.path.basename(v.file_name())
+                path = v.file_name()
+                items.append(("file", v, [name, path]))
 
         def on_select(idx):
             if idx >= 0:
-                key = items[idx][0]
-                self._handle_context_choice(session, cursor, key)
+                action, data, _ = items[idx]
+                if action == "browse":
+                    self._show_file_picker(session)
+                elif action == "clear":
+                    session.clear_context()
+                    sublime.status_message("Context cleared")
+                elif action == "file" and data:
+                    content = data.substr(sublime.Region(0, data.size()))
+                    session.add_context_file(data.file_name(), content)
 
         window.show_quick_panel(
-            [item[1] for item in items],
+            [item[2] for item in items],
             on_select,
             placeholder="Add context..."
         )

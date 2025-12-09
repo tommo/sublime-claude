@@ -149,6 +149,11 @@ class MCPSocketServer:
             "spawn_session": self._spawn_session,
             "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
+            # Terminus tools
+            "terminus_list": self._terminus_list,
+            "terminus_send": self._terminus_send,
+            "terminus_read": self._terminus_read,
+            "terminus_close": self._terminus_close,
         }
 
         # Handle return statements
@@ -373,3 +378,120 @@ class MCPSocketServer:
                     "total_cost": session.total_cost,
                 })
         return result
+
+    # ─── Terminus Tools ───────────────────────────────────────────────────
+
+    def _terminus_list(self) -> list:
+        """List all Terminus terminal views in the current window."""
+        window = sublime.active_window()
+        if not window:
+            return []
+
+        result = []
+        for view in window.views():
+            if view.settings().get("terminus_view"):
+                tag = view.settings().get("terminus_view.tag", "")
+                title = view.name() or "(unnamed)"
+                result.append({
+                    "view_id": view.id(),
+                    "tag": tag,
+                    "title": title,
+                })
+        return result
+
+    def _terminus_send(self, text: str, tag: str = None) -> dict:
+        """Send text/command to a Terminus terminal."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No window"}
+
+        # Find matching terminal
+        target = None
+        for view in window.views():
+            if view.settings().get("terminus_view"):
+                if tag:
+                    if view.settings().get("terminus_view.tag") == tag:
+                        target = view
+                        break
+                else:
+                    # Use first terminal if no tag specified
+                    target = view
+                    break
+
+        if not target:
+            return {"error": f"No terminal found" + (f" with tag '{tag}'" if tag else "")}
+
+        # Send using Terminus command
+        target.run_command("terminus_send_string", {"string": text})
+        return {
+            "sent": True,
+            "view_id": target.id(),
+            "tag": target.settings().get("terminus_view.tag", ""),
+        }
+
+    def _terminus_read(self, tag: str = None, lines: int = 100) -> dict:
+        """Read output from a Terminus terminal."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No window"}
+
+        # Find matching terminal
+        target = None
+        for view in window.views():
+            if view.settings().get("terminus_view"):
+                if tag:
+                    if view.settings().get("terminus_view.tag") == tag:
+                        target = view
+                        break
+                else:
+                    target = view
+                    break
+
+        if not target:
+            return {"error": f"No terminal found" + (f" with tag '{tag}'" if tag else "")}
+
+        # Read last N lines
+        content = target.substr(sublime.Region(0, target.size()))
+        content_lines = content.split("\n")
+        if lines and len(content_lines) > lines:
+            content_lines = content_lines[-lines:]
+
+        return {
+            "view_id": target.id(),
+            "tag": target.settings().get("terminus_view.tag", ""),
+            "content": "\n".join(content_lines),
+            "total_lines": len(content.split("\n")),
+        }
+
+    def _terminus_close(self, tag: str = None) -> dict:
+        """Close a Terminus terminal."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No window"}
+
+        # Find matching terminal
+        target = None
+        for view in window.views():
+            if view.settings().get("terminus_view"):
+                if tag:
+                    if view.settings().get("terminus_view.tag") == tag:
+                        target = view
+                        break
+                else:
+                    target = view
+                    break
+
+        if not target:
+            return {"error": f"No terminal found" + (f" with tag '{tag}'" if tag else "")}
+
+        view_id = target.id()
+        tag_val = target.settings().get("terminus_view.tag", "")
+
+        # Close the terminal
+        target.close()
+
+        return {
+            "closed": True,
+            "view_id": view_id,
+            "tag": tag_val,
+        }

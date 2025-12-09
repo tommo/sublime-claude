@@ -199,6 +199,45 @@ For simple operations, prefer the dedicated tools above.""",
                     "name": "list_tools",
                     "description": "List saved tools in .claude/sublime_tools/ with descriptions",
                     "inputSchema": {"type": "object", "properties": {}}
+                },
+                # ─── Terminus Tools ──────────────────────────────────────────
+                {
+                    "name": "terminus_list",
+                    "description": "List all Terminus terminal views in the current window",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "terminus_send",
+                    "description": "Send text/command to a Terminus terminal. Use \\n for newlines.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string", "description": "Text to send (use \\n for Enter)"},
+                            "tag": {"type": "string", "description": "Optional: terminal tag to target"}
+                        },
+                        "required": ["text"]
+                    }
+                },
+                {
+                    "name": "terminus_read",
+                    "description": "Read output from a Terminus terminal",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tag": {"type": "string", "description": "Optional: terminal tag to read from"},
+                            "lines": {"type": "integer", "description": "Number of lines to read (default 100)"}
+                        }
+                    }
+                },
+                {
+                    "name": "terminus_close",
+                    "description": "Close a Terminus terminal",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "tag": {"type": "string", "description": "Optional: terminal tag to close"}
+                        }
+                    }
                 }
             ]
         })
@@ -256,6 +295,29 @@ For simple operations, prefer the dedicated tools above.""",
             result = send_to_sublime(code=f"return send_to_session({view_id}, {prompt!r})")
         elif tool_name == "list_sessions":
             result = send_to_sublime(code="return list_sessions()")
+        # Terminus tools
+        elif tool_name == "terminus_list":
+            result = send_to_sublime(code="return terminus_list()")
+        elif tool_name == "terminus_send":
+            text = args.get("text", "")
+            tag = args.get("tag")
+            if tag:
+                result = send_to_sublime(code=f"return terminus_send({text!r}, {tag!r})")
+            else:
+                result = send_to_sublime(code=f"return terminus_send({text!r})")
+        elif tool_name == "terminus_read":
+            tag = args.get("tag")
+            lines = args.get("lines", 100)
+            if tag:
+                result = send_to_sublime(code=f"return terminus_read({tag!r}, {lines})")
+            else:
+                result = send_to_sublime(code=f"return terminus_read(lines={lines})")
+        elif tool_name == "terminus_close":
+            tag = args.get("tag")
+            if tag:
+                result = send_to_sublime(code=f"return terminus_close({tag!r})")
+            else:
+                result = send_to_sublime(code="return terminus_close()")
         else:
             return make_response(id, error=f"Unknown tool: {tool_name}")
 

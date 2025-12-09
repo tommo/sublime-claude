@@ -183,7 +183,8 @@ Multiple permission requests are queued - only one shown at a time.
 **MCP Tools:**
 - Editor: `get_open_files`, `get_symbols`, `goto_symbol`
 - Blackboard: `bb_write`, `bb_read`, `bb_list`, `bb_delete`
-- Sessions: `spawn_session`, `list_sessions`
+- Sessions: `spawn_session`, `send_to_session`, `list_sessions`
+- Terminus: `terminus_list`, `terminus_send`, `terminus_read`, `terminus_close`
 - Custom: `sublime_eval`, `sublime_tool`, `list_tools`
 
 **Blackboard patterns:**
@@ -192,6 +193,13 @@ Multiple permission requests are queued - only one shown at a time.
 - `decisions` - key choices and rationale
 - `commands` - project-specific commands that work
 - Data persists across sessions, survives context loss
+
+**Terminus integration:**
+- `terminus_list()` - List open terminals (returns view_id, tag, title)
+- `terminus_send(text, tag?)` - Send command to terminal (use `\n` for newlines)
+- `terminus_read(tag?, lines?)` - Read terminal output (default 100 lines)
+- `terminus_close(tag?)` - Close terminal
+- Tag is optional - if omitted, uses first available terminal
 
 ### Subagents
 - Loaded from `.claude/settings.json` `agents` key
