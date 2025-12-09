@@ -61,6 +61,8 @@ class Session:
         self.pending_context: List[ContextItem] = []
         # Draft prompt (persists across input panel open/close)
         self.draft_prompt: str = ""
+        # Track if we've entered input mode after last query
+        self._input_mode_entered: bool = False
 
     def start(self) -> None:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -98,10 +100,12 @@ class Session:
         return os.getcwd()
 
     def _on_init(self, result: dict) -> None:
+        print(f"[Claude] _on_init: result={result}")
         if "error" in result:
             self._status(f"error: {result['error']['message']}")
             return
         self.initialized = True
+        self._input_mode_entered = False  # Reset for fresh start after init
         # Show loaded MCP servers and agents
         mcp_servers = result.get("mcp_servers", [])
         agents = result.get("agents", [])
@@ -116,6 +120,9 @@ class Session:
             self._status(f"ready ({'; '.join(parts)})")
         else:
             self._status("ready")
+        # Auto-enter input mode when ready
+        print("[Claude] _on_init: calling _enter_input_with_draft")
+        self._enter_input_with_draft()
 
     def add_context_file(self, path: str, content: str) -> None:
         """Add a file to pending context."""
@@ -159,6 +166,7 @@ class Session:
 
         self.working = True
         self.query_count += 1
+        self._input_mode_entered = False  # Reset so input mode can be entered when query completes
         # Build prompt with context
         full_prompt = self._build_prompt_with_context(prompt)
         context_names = [item.name for item in self.pending_context]
@@ -175,6 +183,7 @@ class Session:
         self.client.send("query", {"prompt": full_prompt}, self._on_done)
 
     def _on_done(self, result: dict) -> None:
+        print(f"[Claude] _on_done: result={result}")
         self.working = False
         self.current_tool = None
         status = result.get("status", "")
@@ -192,6 +201,40 @@ class Session:
             sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
         # Update view title to reflect idle state
         self.output.set_name(self.name or "Claude")
+        # Auto-enter input mode when idle
+        print("[Claude] _on_done: scheduling _enter_input_with_draft in 100ms")
+        sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+
+    def _enter_input_with_draft(self) -> None:
+        """Enter input mode and restore draft with cursor at end."""
+        print(f"[Claude] _enter_input_with_draft: is_input_mode={self.output.is_input_mode()}, working={self.working}, _input_mode_entered={self._input_mode_entered}")
+        # Skip if already in input mode or session is working
+        if self.output.is_input_mode() or self.working:
+            print("[Claude] _enter_input_with_draft: SKIP - already in input mode or working")
+            return
+
+        # Skip if we've already entered input mode after the last query
+        # This prevents duplicate entries from multiple callers (on_activated, _on_done, etc.)
+        if self._input_mode_entered:
+            print("[Claude] _enter_input_with_draft: SKIP - already entered after last query")
+            return
+
+        print("[Claude] _enter_input_with_draft: calling enter_input_mode")
+        self.output.enter_input_mode()
+
+        # Check if enter_input_mode actually succeeded (might have deferred)
+        if not self.output.is_input_mode():
+            print("[Claude] _enter_input_with_draft: enter_input_mode did not succeed (deferred?)")
+            return
+
+        self._input_mode_entered = True
+        print(f"[Claude] _enter_input_with_draft: success, draft_prompt={repr(self.draft_prompt[:50]) if self.draft_prompt else None}")
+
+        if self.draft_prompt and self.output.view:
+            self.output.view.run_command("append", {"characters": self.draft_prompt})
+            end = self.output.view.size()
+            self.output.view.sel().clear()
+            self.output.view.sel().add(sublime.Region(end, end))
 
     def interrupt(self) -> None:
         if self.client:

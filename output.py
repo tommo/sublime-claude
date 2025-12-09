@@ -92,6 +92,7 @@ class OutputView:
         # Inline input state
         self._input_mode: bool = False  # True when user can type in input region
         self._input_start: int = 0  # Start position of editable input region
+        self._input_area_start: int = 0  # Start of entire input area (context + marker)
         self._input_marker: str = "◎ "  # Marker for input line
 
     def show(self) -> None:
@@ -161,45 +162,123 @@ class OutputView:
         self.view.set_read_only(True)
         return start + len(text)
 
-    def _scroll_to_end(self) -> None:
-        """Scroll to end only if cursor is near the end (auto-follow mode)."""
+    def _scroll_to_end(self, force: bool = False) -> None:
+        """Scroll to end, respecting user scroll position.
+
+        Args:
+            force: If True, always scroll. If False, only scroll if cursor is near end.
+        """
         if not self.view or not self.view.is_valid():
             return
-        # Check if cursor is near end (within last 100 chars or at end)
-        sel = self.view.sel()
-        if sel:
-            cursor = sel[0].end()
-            size = self.view.size()
-            # Auto-scroll if cursor is within 100 chars of end, or view is empty/small
-            if size < 100 or cursor >= size - 100:
-                end = self.view.size()
-                self.view.sel().clear()
-                self.view.sel().add(sublime.Region(end, end))
-                # show_at_center with negative offset to leave padding at bottom
-                self.view.show(end, keep_to_left=False, animate=False)
+
+        # In input mode, always keep input visible
+        if self._input_mode:
+            self.view.show(self._input_start, keep_to_left=False, animate=False)
+            return
+
+        # Always scroll during active streaming
+        if self.current and self.current.working:
+            force = True
+
+        # Check if we should auto-scroll
+        if not force:
+            sel = self.view.sel()
+            if sel:
+                cursor = sel[0].end()
+                size = self.view.size()
+                # Only auto-scroll if cursor is near end (within 200 chars)
+                if size > 200 and cursor < size - 200:
+                    return  # User scrolled up, don't auto-scroll
+
+        # Scroll to end without moving cursor
+        end = self.view.size()
+        self.view.show(end, keep_to_left=False, animate=False)
 
     # --- Inline Input ---
 
     def enter_input_mode(self) -> None:
         """Enter input mode - show prompt marker and allow typing."""
+        print(f"[Claude] enter_input_mode: view={self.view}, valid={self.view.is_valid() if self.view else None}")
         if not self.view or not self.view.is_valid():
+            print("[Claude] enter_input_mode: SKIP - no valid view")
             return
         if self._input_mode:
+            print("[Claude] enter_input_mode: SKIP - already in input mode")
             return  # Already in input mode
 
         # Exit any current conversation's working state
         if self.current and self.current.working:
+            print("[Claude] enter_input_mode: SKIP - current is working")
             return  # Can't input while working
 
-        self._input_mode = True
-        self.view.settings().set("claude_input_mode", True)
+        # Additional safety: check if there's a pending render that should complete first
+        if self._render_pending:
+            print("[Claude] enter_input_mode: DEFER - render pending")
+            # Schedule input mode entry after pending render completes
+            sublime.set_timeout(self.enter_input_mode, 20)
+            return
+
+        # Safety: check for and clean up any stale input markers from previous sessions
+        # This can happen after Sublime restart when OutputView state is lost but view content remains
+        content = self.view.substr(sublime.Region(0, self.view.size()))
+        print(f"[Claude] enter_input_mode: view_size={self.view.size()}, content_tail={repr(content[-100:]) if len(content) > 100 else repr(content)}")
+        if content:
+            lines = content.split('\n')
+            # Check last few lines for stale input markers
+            cleanup_start = -1
+            for i in range(len(lines) - 1, max(-1, len(lines) - 5), -1):
+                line = lines[i]
+                # Input marker: starts with "◎ " but no " ▶" (which prompts have)
+                is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
+                is_context_line = line.startswith('📎 ')
+                print(f"[Claude] enter_input_mode: checking line {i}: {repr(line[:50])}, is_input={is_input_marker}, is_ctx={is_context_line}")
+                if is_input_marker or is_context_line:
+                    cleanup_start = len('\n'.join(lines[:i]))
+                    if i > 0:
+                        cleanup_start += 1
+                    continue
+                elif line.strip():
+                    break
+            if cleanup_start >= 0 and cleanup_start < self.view.size():
+                print(f"[Claude] enter_input_mode: CLEANUP from {cleanup_start} to {self.view.size()}")
+                self.view.set_read_only(False)
+                self.view.run_command("claude_replace", {
+                    "start": cleanup_start,
+                    "end": self.view.size(),
+                    "text": ""
+                })
+
+        # Set read-only false first but DON'T set _input_mode yet
+        # This prevents on_modified from saving wrong draft during setup
         self.view.set_read_only(False)
 
-        # Add input marker at end
+        # Clear any existing context region since we'll render it with input
+        if self._pending_context_region[1] > self._pending_context_region[0]:
+            self._replace(self._pending_context_region[0], self._pending_context_region[1], "")
+            self._pending_context_region = (0, 0)
+
+        # Build input area (context + marker)
+        self._input_area_start = self.view.size()
         prefix = "\n" if self.view.size() > 0 else ""
-        self._input_start = self.view.size() + len(prefix)
-        self.view.run_command("append", {"characters": f"{prefix}{self._input_marker}"})
+        self.view.run_command("append", {"characters": prefix})
+        self._input_area_start = self.view.size()
+
+        # Add context line if any
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
+        if session and session.pending_context:
+            names = [item.name for item in session.pending_context]
+            ctx_line = f"📎 {', '.join(names)}\n"
+            self.view.run_command("append", {"characters": ctx_line})
+
+        # Add input marker
+        self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
+
+        # NOW set input mode - after _input_start is correctly positioned
+        # This ensures on_modified won't save wrong content as draft
+        self._input_mode = True
+        self.view.settings().set("claude_input_mode", True)
 
         # Move cursor to input position
         self.view.sel().clear()
@@ -215,13 +294,12 @@ class OutputView:
         input_text = self.get_input_text()
 
         if not keep_text:
-            # Remove the input line (marker + text)
-            line_start = self._input_start - len(self._input_marker)
-            # Find start of line including newline
-            if line_start > 0:
-                line_start -= 1  # Include preceding newline
+            # Remove entire input area (context + marker + text)
+            start = getattr(self, '_input_area_start', self._input_start - len(self._input_marker))
+            if start > 0:
+                start -= 1  # Include preceding newline
             self.view.run_command("claude_replace", {
-                "start": line_start,
+                "start": max(0, start),
                 "end": self.view.size(),
                 "text": ""
             })
@@ -243,12 +321,56 @@ class OutputView:
 
     def reset_input_mode(self) -> None:
         """Force reset input mode state - use when state gets corrupted."""
+        print(f"[Claude] reset_input_mode: view={self.view}")
         if not self.view:
             return
+
+        # Try to clean up leftover input markers in view content
+        # Input markers are EXACTLY "◎ " (the marker) possibly followed by user text
+        # Prompt lines are "◎ ... ▶" (have the arrow indicator)
+        content = self.view.substr(sublime.Region(0, self.view.size()))
+        print(f"[Claude] reset_input_mode: view_size={self.view.size()}, content_tail={repr(content[-100:]) if len(content) > 100 else repr(content)}")
+        cleanup_start = -1
+
+        # Find input area at end - must be input marker (not prompt) or context line
+        lines = content.split('\n')
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i]
+            # Input marker line: starts with "◎ " but does NOT contain " ▶" (which prompts have)
+            is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
+            is_context_line = line.startswith('📎 ')
+            print(f"[Claude] reset_input_mode: line {i}: {repr(line[:50] if len(line) > 50 else line)}, is_input={is_input_marker}, is_ctx={is_context_line}")
+            if is_input_marker or is_context_line:
+                # Found input area - calculate position to remove
+                cleanup_start = len('\n'.join(lines[:i]))
+                if i > 0:
+                    cleanup_start += 1  # Account for newline before this line
+                # Continue checking for context lines above
+                continue
+            elif line.strip():
+                # Non-empty line that's not input area - stop looking
+                print(f"[Claude] reset_input_mode: stopping at line {i} (has content)")
+                break
+
+        if cleanup_start >= 0 and cleanup_start < self.view.size():
+            print(f"[Claude] reset_input_mode: CLEANUP from {cleanup_start} to {self.view.size()}")
+            self.view.set_read_only(False)
+            self.view.run_command("claude_replace", {
+                "start": cleanup_start,
+                "end": self.view.size(),
+                "text": ""
+            })
+            self.view.set_read_only(True)
+        else:
+            print(f"[Claude] reset_input_mode: no cleanup needed (cleanup_start={cleanup_start})")
+
         self._input_mode = False
         self._input_start = 0
+        self._input_area_start = 0
         self.view.settings().set("claude_input_mode", False)
         self.view.set_read_only(True)
+        # Also clear any pending context region that might be stale
+        self._pending_context_region = (0, 0)
 
     def is_in_input_region(self, point: int) -> bool:
         """Check if a point is within the editable input region."""
@@ -259,10 +381,26 @@ class OutputView:
     # --- Public API ---
 
     def set_pending_context(self, context_items: list) -> None:
-        """Show pending context at end of view."""
+        """Show pending context - integrated with input mode if active."""
         if not self.view or not self.view.is_valid():
             return
 
+        # If in input mode, re-render the whole input area with new context
+        if self._input_mode:
+            # Save current input text
+            input_text = self.get_input_text()
+            # Exit and re-enter to refresh context display
+            self.exit_input_mode(keep_text=False)
+            self.enter_input_mode()
+            # Restore input text
+            if input_text:
+                self.view.run_command("append", {"characters": input_text})
+                end = self.view.size()
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(end, end))
+            return
+
+        # Not in input mode - show context at end of view
         # Remove old context display
         start, end = self._pending_context_region
         if end > start:
@@ -286,6 +424,9 @@ class OutputView:
         """Start a new conversation with a prompt."""
         self.show()
 
+        # Cancel any pending render - we're starting fresh
+        self._render_pending = False
+
         # Exit input mode if active (query is starting)
         # Save any typed text as draft so it's not lost
         if self._input_mode:
@@ -295,6 +436,21 @@ class OutputView:
             if session:
                 session.draft_prompt = self.get_input_text()
             self.exit_input_mode(keep_text=False)
+        else:
+            # Not in input mode, but check for stale input markers
+            # This can happen after restart or if state got corrupted
+            content = self.view.substr(sublime.Region(0, self.view.size()))
+            lines = content.split('\n')
+            # Check if last non-empty lines look like input area (marker without ▶ or context line)
+            for line in reversed(lines[-5:]):  # Check last 5 lines
+                if not line.strip():
+                    continue
+                is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
+                is_context_line = line.startswith('📎 ')
+                if is_input_marker or is_context_line:
+                    # Found stale input marker - clean it up
+                    self.reset_input_mode()
+                break  # Only check the last non-empty line
 
         # Clear pending context display
         start, end = self._pending_context_region
@@ -459,8 +615,11 @@ class OutputView:
         """Reset active states when reconnecting after Sublime restart.
 
         Clears pending permissions, marks pending tools as interrupted,
-        and resets the view title to remove any stale spinner.
+        resets input mode, and resets the view title to remove any stale spinner.
         """
+        # Reset input mode state (view settings may persist across restart)
+        self.reset_input_mode()
+
         # Clear permission state
         if self.pending_permission:
             self._remove_permission_block()
@@ -749,7 +908,30 @@ class OutputView:
 
         # Don't render while in input mode - it would corrupt the input region
         if self._input_mode:
+            print("[Claude] _do_render: SKIP - in input mode")
             return
+
+        # Validate region bounds - protect against stale region data
+        view_size = self.view.size()
+        start, end = self.current.region
+        print(f"[Claude] _do_render: view_size={view_size}, region=({start}, {end})")
+        if start > view_size or end > view_size:
+            print(f"[Claude] _do_render: region invalid, recalculating")
+            # Region is invalid - recalculate from view content
+            # Find last prompt marker and use that as start
+            content = self.view.substr(sublime.Region(0, view_size))
+            # Look for the last prompt marker that matches our prompt
+            prompt_marker = f"◎ {self.current.prompt[:20]}"
+            last_pos = content.rfind(prompt_marker)
+            if last_pos >= 0:
+                start = last_pos
+                end = view_size
+                self.current.region = (start, end)
+                print(f"[Claude] _do_render: found prompt at {last_pos}, new region=({start}, {end})")
+            else:
+                # Can't find our prompt - skip this render
+                print(f"[Claude] _do_render: SKIP - can't find prompt marker")
+                return
 
         # Build the full text for this conversation
         lines = []

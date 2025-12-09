@@ -68,22 +68,6 @@
         ]
     },
     {
-        "keys": ["enter"],
-        "command": "claude_enter_input_mode",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
-        ]
-    },
-    {
-        "keys": ["escape"],
-        "command": "claude_exit_input_mode",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
-        ]
-    },
-    {
         "keys": ["super+k"],
         "command": "claude_code_clear",
         "context": [

@@ -1,7 +1,7 @@
 """Claude Code plugin for Sublime Text."""
 import sublime
 import sublime_plugin
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional
 
 from .session import Session, load_saved_sessions
 from . import mcp_server
@@ -9,11 +9,6 @@ from . import mcp_server
 
 # Sessions keyed by output view id - allows multiple sessions per window
 _sessions: Dict[int, Session] = {}
-
-# Track active input panel per window for session switching
-# Maps window_id -> input_panel_view
-_active_input_panels: Dict[int, sublime.View] = {}
-
 
 def plugin_loaded() -> None:
     """Called when plugin is loaded. Reconnect orphaned output views and start MCP server."""
@@ -28,9 +23,11 @@ def plugin_unloaded() -> None:
 
 def _reconnect_orphaned_views() -> None:
     """Find Claude output views without sessions and reconnect them."""
+    print("[Claude] _reconnect_orphaned_views: starting")
     for window in sublime.windows():
         for view in window.views():
             if view.settings().get("claude_output") and view.id() not in _sessions:
+                print(f"[Claude] _reconnect_orphaned_views: found orphaned view {view.id()}, name={view.name()}")
                 # Found orphaned output view - try to get session info from view name
                 name = view.name()
                 session_name = None
@@ -52,21 +49,17 @@ def _reconnect_orphaned_views() -> None:
                             session_name = name
                         break
 
-                # Look for matching saved session
-                saved = load_saved_sessions()
-                resume_id = None
-                for s in saved:
-                    if s.get("name") == session_name:
-                        resume_id = s.get("session_id")
-                        break
-
-                # Create new session and attach to existing view
-                session = Session(window, resume_id=resume_id)
+                print(f"[Claude] _reconnect_orphaned_views: creating session, session_name={session_name}")
+                # Don't resume - the view already has the content
+                # Just create fresh session to avoid duplicate content
+                session = Session(window)
                 session.name = session_name
                 session.output.view = view  # Reuse existing view
+                session.draft_prompt = ""  # Clear any stale draft
                 _sessions[view.id()] = session
 
                 # Reset active states (pending tools, permissions, stale title)
+                print("[Claude] _reconnect_orphaned_views: calling reset_active_states")
                 session.output.reset_active_states()
                 # Reset view title to clean state
                 if session_name:
@@ -74,11 +67,13 @@ def _reconnect_orphaned_views() -> None:
                 else:
                     view.set_name("Claude")
 
+                print("[Claude] _reconnect_orphaned_views: calling session.start()")
                 session.start()
 
                 if session_name:
                     view.set_status("claude_reconnect", f"Reconnected: {session_name}")
                     sublime.set_timeout(lambda v=view: v.erase_status("claude_reconnect"), 3000)
+    print("[Claude] _reconnect_orphaned_views: done")
 
 
 def get_session_for_view(view: sublime.View) -> Optional[Session]:
@@ -122,95 +117,19 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     return s
 
 
-def show_claude_input(window: sublime.Window, on_done: Callable[[str], None]) -> None:
-    """Show input panel with session-aware draft and label."""
-    s = get_active_session(window)
-    initial = s.draft_prompt if s else ""
-    # Build label with session name
-    if s and s.name:
-        label = f"Claude [{s.name}]:"
-    else:
-        label = "Claude:"
-
-    def on_change(text: str) -> None:
-        s = get_active_session(window)
-        if s:
-            s.draft_prompt = text
-
-    def on_cancel() -> None:
-        _active_input_panels.pop(window.id(), None)
-
-    def done_wrapper(text: str) -> None:
-        _active_input_panels.pop(window.id(), None)
-        s = get_active_session(window)
-        if s:
-            s.draft_prompt = ""  # Clear draft on submit
-        on_done(text)
-
-    # Show and track the input panel view
-    panel_view = window.show_input_panel(label, initial, done_wrapper, on_change, on_cancel)
-    _active_input_panels[window.id()] = panel_view
-
-
-def refresh_claude_input(window: sublime.Window, old_session: Session = None) -> None:
-    """Refresh the input panel if open, loading the new session's draft.
-
-    Args:
-        window: The window containing the input panel
-        old_session: The previous session to save draft to (optional)
-    """
-    panel_view = _active_input_panels.get(window.id())
-    if not panel_view:
-        return
-
-    # Check if panel is still open by checking if view is valid
-    # When panel closes, the view becomes invalid
-    if not panel_view.is_valid():
-        _active_input_panels.pop(window.id(), None)
-        return
-
-    s = get_active_session(window)
-    if not s:
-        return
-
-    # Get current input panel text and save to old session
-    current_text = panel_view.substr(sublime.Region(0, panel_view.size()))
-    if old_session and current_text:
-        old_session.draft_prompt = current_text
-
-    # Close current panel and reopen with new session's draft
-    window.run_command("hide_panel")
-
-    def reopen():
-        def on_done(text: str) -> None:
-            if text.strip():
-                sess = get_active_session(window)
-                if sess:
-                    sess.output.show()
-                    sess.output._move_cursor_to_end()
-                    sess.query(text)
-        show_claude_input(window, on_done)
-
-    # Small delay to let panel close
-    sublime.set_timeout(reopen, 50)
-
-
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
     """Start a new session."""
     def run(self) -> None:
-        s = create_session(self.window)
-        # Show input panel after session initializes
-        sublime.set_timeout(self._show_input, 300)
+        create_session(self.window)
+        # Input mode is auto-entered when session initializes
 
-    def _show_input(self) -> None:
-        def on_done(text: str) -> None:
-            if text.strip():
-                s = get_active_session(self.window)
-                if s:
-                    s.output.show()
-                    s.output._move_cursor_to_end()
-                    s.query(text)
-        show_claude_input(self.window, on_done)
+
+class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
+    """Open input for query (legacy - now just focuses output and enters input mode)."""
+    def run(self) -> None:
+        s = get_active_session(self.window) or create_session(self.window)
+        s.output.show()
+        s._enter_input_with_draft()
 
 
 class ClaudeCodeAddMcpCommand(sublime_plugin.WindowCommand):
@@ -381,31 +300,6 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
                 _sessions[new_session.output.view.id()] = new_session
         new_session.output.show()
         sublime.status_message("Session restarted")
-
-
-class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
-    def run(self) -> None:
-        s = get_active_session(self.window)
-        if not s:
-            # No session - create one
-            s = create_session(self.window)
-            sublime.set_timeout(self._input, 500)
-        elif not s.initialized:
-            sublime.set_timeout(self._input, 500)
-        else:
-            # Focus the session's output view first
-            s.output.show()
-            self._input()
-
-    def _input(self) -> None:
-        def on_done(text: str) -> None:
-            if text.strip():
-                s = get_active_session(self.window)
-                if s:
-                    s.output.show()
-                    s.output._move_cursor_to_end()
-                    s.query(text)
-        show_claude_input(self.window, on_done)
 
 
 class ClaudeCodeQuerySelectionCommand(sublime_plugin.TextCommand):
@@ -782,6 +676,57 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             for view_id in to_remove:
                 del _sessions[view_id]
 
+    def on_activated(self, view: sublime.View) -> None:
+        """Handle view activated - check if it's for context adding from goto."""
+        import time
+        window = view.window()
+        if not window:
+            return
+
+        # Skip Claude output views
+        if view.settings().get("claude_output"):
+            return
+
+        # Check if we have a pending context session
+        session_view_id = window.settings().get("claude_pending_context_session")
+        if not session_view_id:
+            return
+
+        # Check timestamp - only process if at least 300ms have passed
+        # This prevents processing the initial activation when overlay opens
+        pending_time = window.settings().get("claude_pending_context_time", 0)
+        if time.time() - pending_time < 0.3:
+            return
+
+        # Clear the pending state
+        window.settings().erase("claude_pending_context_session")
+        window.settings().erase("claude_pending_context_time")
+
+        # Get the session
+        session = _sessions.get(session_view_id)
+        if not session:
+            return
+
+        # Add the file as context
+        path = view.file_name()
+        if path:
+            content = view.substr(sublime.Region(0, view.size()))
+            session.add_context_file(path, content)
+            sublime.status_message(f"Added context: {path.split('/')[-1]}")
+
+            # Focus back to Claude output and re-enter input mode
+            def refocus():
+                session.output.show()
+                session.output.enter_input_mode()
+                # Restore draft if any
+                if session.draft_prompt:
+                    session.output.view.run_command("append", {"characters": session.draft_prompt})
+                    end = session.output.view.size()
+                    session.output.view.sel().clear()
+                    session.output.view.sel().add(sublime.Region(end, end))
+
+            sublime.set_timeout(refocus, 100)
+
     def on_close(self, view: sublime.View) -> None:
         # Clean up session when output view is closed
         if view.id() in _sessions:
@@ -813,15 +758,14 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             s._update_status_bar()
             s.output.set_name(s.name or "Claude")
 
+            # Auto-enter input mode if session is idle and not already in input mode
+            if s.initialized and not s.working and not s.output.is_input_mode():
+                s._enter_input_with_draft()
+
         # Remove active marker from previous active session
-        old_session = None
         if old_active and old_active != self.view.id() and old_active in _sessions:
             old_session = _sessions[old_active]
             old_session.output.set_name(old_session.name or "Claude")
-
-        # Refresh input panel if session switched and panel is open
-        if switched:
-            refresh_claude_input(window, old_session)
 
 
 
@@ -845,14 +789,167 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         return None
 
+    def on_selection_modified(self):
+        """Keep cursor within input region when in input mode."""
+        s = get_session_for_view(self.view)
+        if not s or not s.output.is_input_mode():
+            return
+
+        # Check if cursor is before input start
+        input_start = s.output._input_start
+        sel = self.view.sel()
+        needs_fix = False
+
+        for region in sel:
+            if region.begin() < input_start or region.end() < input_start:
+                needs_fix = True
+                break
+
+        if needs_fix:
+            # Move cursor to input start
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(input_start, input_start))
+
     def on_modified(self):
-        """Track modifications for draft saving."""
+        """Track modifications for draft saving and @ autocomplete."""
         s = get_session_for_view(self.view)
         if not s or not s.output.is_input_mode():
             return
 
         # Save draft
-        s.draft_prompt = s.output.get_input_text()
+        input_text = s.output.get_input_text()
+        s.draft_prompt = input_text
+
+        # Check for @ trigger at cursor
+        sel = self.view.sel()
+        if sel and len(sel) == 1:
+            cursor = sel[0].end()
+            # Check if char before cursor is @
+            if cursor > 0:
+                char_before = self.view.substr(cursor - 1)
+                print(f"[Claude] on_modified: cursor={cursor}, char_before={repr(char_before)}")
+                if char_before == "@":
+                    print("[Claude] on_modified: @ detected, showing context popup")
+                    self._show_context_popup(s, cursor)
+
+    def _show_context_popup(self, session: Session, cursor: int) -> None:
+        """Show @ context autocomplete via quick panel."""
+        window = self.view.window()
+        if not window:
+            return
+
+        # Remove the @ character first
+        self.view.run_command("claude_replace", {
+            "start": cursor - 1,
+            "end": cursor,
+            "text": ""
+        })
+
+        # Build menu items with action keys
+        items = []  # (key, [title, description])
+
+        # Current file
+        active_view = None
+        for v in window.views():
+            if not v.settings().get("claude_output") and v.file_name():
+                active_view = v
+                break
+
+        if active_view and active_view.file_name():
+            name = active_view.file_name().split("/")[-1]
+            items.append(("file", ["@ file", name]))
+
+            # Selection in active view
+            sel = active_view.sel()
+            if sel and not sel[0].empty():
+                preview = active_view.substr(sel[0])[:50].replace("\n", " ")
+                items.append(("selection", ["@ selection", preview]))
+
+        # Open files
+        open_count = sum(1 for v in window.views() if v.file_name() and not v.settings().get("claude_output"))
+        if open_count > 0:
+            items.append(("open", ["@ open", f"{open_count} open files"]))
+
+        # Current folder
+        if active_view and active_view.file_name():
+            import os
+            folder = os.path.dirname(active_view.file_name())
+            items.append(("folder", ["@ folder", folder]))
+
+        # File picker
+        items.append(("browse", ["@ browse...", "Choose file from project"]))
+
+        # Clear context (only show if there's pending context)
+        if session.pending_context:
+            count = len(session.pending_context)
+            items.append(("clear", ["@ clear", f"Clear {count} pending item{'s' if count > 1 else ''}"]))
+
+        if not items:
+            return
+
+        def on_select(idx):
+            if idx >= 0:
+                key = items[idx][0]
+                self._handle_context_choice(session, cursor, key)
+
+        window.show_quick_panel(
+            [item[1] for item in items],
+            on_select,
+            placeholder="Add context..."
+        )
+
+    def _handle_context_choice(self, session: Session, cursor: int, choice: str) -> None:
+        """Handle context menu selection."""
+        window = self.view.window()
+        if not window:
+            return
+
+        active_view = None
+        for v in window.views():
+            if not v.settings().get("claude_output") and v.file_name():
+                active_view = v
+                break
+
+        if choice == "file":
+            if active_view and active_view.file_name():
+                content = active_view.substr(sublime.Region(0, active_view.size()))
+                session.add_context_file(active_view.file_name(), content)
+        elif choice == "selection":
+            if active_view:
+                sel = active_view.sel()
+                if sel and not sel[0].empty():
+                    content = active_view.substr(sel[0])
+                    path = active_view.file_name() or "untitled"
+                    session.add_context_selection(path, content)
+        elif choice == "open":
+            for v in window.views():
+                if v.file_name() and not v.settings().get("claude_output"):
+                    content = v.substr(sublime.Region(0, v.size()))
+                    session.add_context_file(v.file_name(), content)
+        elif choice == "folder":
+            if active_view and active_view.file_name():
+                import os
+                folder = os.path.dirname(active_view.file_name())
+                session.add_context_folder(folder)
+        elif choice == "browse":
+            self._show_file_picker(session)
+        elif choice == "clear":
+            session.clear_context()
+            sublime.status_message("Context cleared")
+
+    def _show_file_picker(self, session: Session) -> None:
+        """Show Ctrl+P file picker for context."""
+        import time
+        window = self.view.window()
+        if not window:
+            return
+
+        # Store session and timestamp for the callback
+        window.settings().set("claude_pending_context_session", session.output.view.id())
+        window.settings().set("claude_pending_context_time", time.time())
+
+        # Show the goto file overlay (Ctrl+P)
+        window.run_command("show_overlay", {"overlay": "goto", "show_files": True})
 
 
 class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
