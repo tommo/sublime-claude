@@ -62,11 +62,11 @@ contexts:
 
     # Permission buttons
     - match: '\[Y\] Allow'
-      scope: claude.permission.button.allow markup.inserted
+      scope: claude.permission.button.allow
     - match: '\[N\] Deny'
-      scope: claude.permission.button.deny markup.deleted
+      scope: claude.permission.button.deny
     - match: '\[A\] Allow all \w+'
-      scope: claude.permission.button.allowall markup.changed
+      scope: claude.permission.button.allowall
 
     # Fenced code blocks with language embedding
     - match: '^(\s*)(```)(python|py)\s*$'

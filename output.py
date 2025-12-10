@@ -116,7 +116,7 @@ class OutputView:
         self.view.settings().set("font_size", 12)
         try:
             self.view.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
-            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.sublime-color-scheme")
+            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
         if focus:
