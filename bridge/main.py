@@ -86,6 +86,8 @@ class Bridge:
                 await self.handle_permission_response(id, params)
             elif method == "question_response":
                 await self.handle_question_response(id, params)
+            elif method == "cancel_pending":
+                await self.cancel_pending(id)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -295,7 +297,7 @@ Be concise. Focus on what matters to the user.""",
 
         # Wait for response from Sublime
         try:
-            allowed = await asyncio.wait_for(future, timeout=300)  # 5 min timeout
+            allowed = await asyncio.wait_for(future, timeout=30)  # 30s timeout
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"can_use_tool returning: pid={pid}, allowed={allowed}\n")
             if allowed:
@@ -445,6 +447,25 @@ Be concise. Focus on what matters to the user.""",
                 with open("/tmp/claude_bridge.log", "a") as f:
                     f.write(f"interrupt: drain error: {e}\n")
         send_result(id, {"status": "interrupted"})
+
+    async def cancel_pending(self, id: int) -> None:
+        """Cancel all pending permission/question requests."""
+        count = 0
+        for pid, future in list(self.pending_permissions.items()):
+            if not future.done():
+                future.set_result(False)  # Deny
+                count += 1
+        self.pending_permissions.clear()
+
+        for qid, future in list(self.pending_questions.items()):
+            if not future.done():
+                future.set_result(None)  # Cancel
+                count += 1
+        self.pending_questions.clear()
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"cancel_pending: cancelled {count} requests\n")
+        send_result(id, {"status": "ok", "cancelled": count})
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""

@@ -316,11 +316,12 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
 ## Recent Changes (2025-12-10)
 
 ### Bug Fixes
-- **Stale permission cleanup**: Permission UI now auto-clears when query finishes or when newer permission arrives. Fixes stuck UI when bridge/Claude times out internally.
-- **Bridge health check**: Detects dead bridge process before sending query, shows error message instead of hanging.
+- **Concurrent permission requests**: Fixed bug where multiple tool permissions arriving simultaneously would clear earlier ones as "stale". Now properly queued and processed in order.
+- **Permission timeout reduced**: 5min → 30s. Prevents long hangs when permission UI gets stuck.
+- **Session rename persistence**: `session_id` now set immediately on resume, so renames save before first query completes.
 
 ### Improvements
-- **Tool status colors**: Added `ClaudeOutput.sublime-color-scheme` with distinct colors for tool status (✔ green, ✘ red, ☐ yellow). No longer conflicts with diff highlighting.
+- **Tool status colors**: Distinct muted colors for tool done (`#5a9484` teal) and error (`#a06a74` mauve). No longer conflicts with diff highlighting.
 
 ### New Features
 - **Queued prompt**: Queue a prompt while Claude is working. Auto-sends when current query finishes.
@@ -328,6 +329,7 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
   - Or use `Claude: Queue Prompt` command
   - Shows `⏳ <preview>...` indicator in output view
   - Shows `[queued]` in status bar spinner
+- **View session history**: `Claude: View Session History...` command to browse saved sessions and view user prompts from Claude's stored `.jsonl` files.
 
 ## Recent Changes (2025-12-09)
 

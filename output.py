@@ -731,8 +731,8 @@ class OutputView:
         import time
         self.show(focus=False)  # Don't steal focus from other views
 
-        # Check for stale pending permission first (older pid means bridge moved on)
-        self.clear_stale_permission(pid)
+        # NOTE: Don't call clear_stale_permission here - concurrent permissions are valid
+        # Stale permission cleanup is handled by clear_all_permissions() on query completion
 
         # Check if tool is auto-allowed for session
         if tool in self.auto_allow_tools:
@@ -747,7 +747,6 @@ class OutputView:
             callback(PERM_ALLOW)
             return
 
-        print(f"[Claude] permission_request pid={pid}: showing prompt")
         # Create the request
         perm = PermissionRequest(
             id=pid,
@@ -758,11 +757,12 @@ class OutputView:
 
         # If there's already a pending permission, queue this one
         if self.pending_permission and self.pending_permission.callback:
-            print(f"[Claude] permission_request pid={pid}: queued (existing pending)")
+            print(f"[Claude] permission_request pid={pid}: queued (existing pending pid={self.pending_permission.id})")
             self._permission_queue.append(perm)
             return
 
         # Show this one
+        print(f"[Claude] permission_request pid={pid}: showing prompt (queue={len(self._permission_queue)})")
         self.pending_permission = perm
         self._render_permission()
         self._scroll_to_end()
