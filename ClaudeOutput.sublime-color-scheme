@@ -1,0 +1,64 @@
+{
+    "name": "Claude Output",
+    "globals": {},
+    "rules": [
+        {
+            "name": "Tool Done",
+            "scope": "claude.tool.done",
+            "foreground": "#6A9955"
+        },
+        {
+            "name": "Tool Error",
+            "scope": "claude.tool.error",
+            "foreground": "#F14C4C"
+        },
+        {
+            "name": "Tool Pending",
+            "scope": "claude.tool.pending",
+            "foreground": "#CCA700"
+        },
+        {
+            "name": "Tool Output",
+            "scope": "claude.tool.output",
+            "foreground": "#808080"
+        },
+        {
+            "name": "Tool Result",
+            "scope": "claude.tool.result",
+            "foreground": "#569CD6"
+        },
+        {
+            "name": "Prompt Marker",
+            "scope": "claude.prompt.marker",
+            "foreground": "#C586C0"
+        },
+        {
+            "name": "Prompt Text",
+            "scope": "claude.prompt",
+            "foreground": "#78CFFF",
+            "font_style": "bold"
+        },
+        {
+            "name": "Meta Done",
+            "scope": "claude.meta.done",
+            "foreground": "#6A9955",
+            "font_style": "italic"
+        },
+        {
+            "name": "Interrupted",
+            "scope": "claude.interrupted",
+            "foreground": "#F14C4C",
+            "font_style": "italic"
+        },
+        {
+            "name": "Permission Icon",
+            "scope": "claude.permission.icon",
+            "foreground": "#CCA700"
+        },
+        {
+            "name": "Permission Tool",
+            "scope": "claude.permission.tool",
+            "foreground": "#4EC9B0"
+        }
+    ]
+}

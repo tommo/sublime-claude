@@ -205,6 +205,16 @@ class ClaudeCodeClearContextCommand(sublime_plugin.WindowCommand):
             sublime.status_message("Context cleared")
 
 
+class ClaudeCodeQueuePromptCommand(sublime_plugin.WindowCommand):
+    """Queue a prompt to be sent when current query finishes."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if not s:
+            sublime.status_message("No active session")
+            return
+        s.show_queue_input()
+
+
 class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
@@ -652,7 +662,12 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
         s.output.exit_input_mode(keep_text=False)
         s.draft_prompt = ""
-        s.query(text)
+
+        # If session is working, queue the prompt instead
+        if s.working:
+            s.queue_prompt(text)
+        else:
+            s.query(text)
 
 
 class ClaudeEnterInputModeCommand(sublime_plugin.TextCommand):

@@ -48,9 +48,18 @@ class JsonRpcClient:
             self.proc.wait()
             self.proc = None
 
-    def send(self, method: str, params: dict, callback: Optional[Callable[[dict], None]] = None) -> None:
+    def is_alive(self) -> bool:
+        """Check if bridge process is still running."""
+        return self.proc is not None and self.proc.poll() is None
+
+    def send(self, method: str, params: dict, callback: Optional[Callable[[dict], None]] = None) -> bool:
+        """Send request to bridge. Returns False if bridge is dead."""
         if not self.proc or not self.proc.stdin:
-            return
+            return False
+        if self.proc.poll() is not None:
+            # Process has died
+            print(f"[Claude] Bridge process died with code {self.proc.returncode}")
+            return False
 
         self.request_id += 1
         req = {"jsonrpc": "2.0", "id": self.request_id, "method": method, "params": params}
@@ -60,6 +69,7 @@ class JsonRpcClient:
 
         self.proc.stdin.write((json.dumps(req) + "\n").encode())
         self.proc.stdin.flush()
+        return True
 
     def _read_loop(self) -> None:
         import sublime

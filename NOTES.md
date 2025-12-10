@@ -289,6 +289,22 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
 - [ ] Click to expand/collapse tool sections
 - [ ] MCP tool parameters (pass args to saved tools)
 
+## Recent Changes (2025-12-10)
+
+### Bug Fixes
+- **Stale permission cleanup**: Permission UI now auto-clears when query finishes or when newer permission arrives. Fixes stuck UI when bridge/Claude times out internally.
+- **Bridge health check**: Detects dead bridge process before sending query, shows error message instead of hanging.
+
+### Improvements
+- **Tool status colors**: Added `ClaudeOutput.sublime-color-scheme` with distinct colors for tool status (✔ green, ✘ red, ☐ yellow). No longer conflicts with diff highlighting.
+
+### New Features
+- **Queued prompt**: Queue a prompt while Claude is working. Auto-sends when current query finishes.
+  - Type in input mode + Enter to queue (when working)
+  - Or use `Claude: Queue Prompt` command
+  - Shows `⏳ <preview>...` indicator in output view
+  - Shows `[queued]` in status bar spinner
+
 ## Recent Changes (2025-12-09)
 
 ### Bug Fixes

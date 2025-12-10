@@ -61,6 +61,8 @@ class Session:
         self.pending_context: List[ContextItem] = []
         # Draft prompt (persists across input panel open/close)
         self.draft_prompt: str = ""
+        # Queued prompt - sent automatically when current query finishes
+        self.queued_prompt: Optional[str] = None
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
 
@@ -175,12 +177,22 @@ class Session:
 
         print(f"[Claude] >>> {prompt[:60]}...")
         self.output.show()
+
+        # Check if bridge is alive before sending
+        if not self.client.is_alive():
+            self._status("error: bridge died")
+            self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
+            return
+
         # Auto-name session from first prompt if not already named
         if not self.name:
             self._set_name(prompt[:30].strip() + ("..." if len(prompt) > 30 else ""))
         self.output.prompt(prompt, context_names)
         self._animate()
-        self.client.send("query", {"prompt": full_prompt}, self._on_done)
+        if not self.client.send("query", {"prompt": full_prompt}, self._on_done):
+            self._status("error: bridge died")
+            self.working = False
+            self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
 
     def _on_done(self, result: dict) -> None:
         self.working = False
@@ -200,6 +212,21 @@ class Session:
             sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
         # Update view title to reflect idle state
         self.output.set_name(self.name or "Claude")
+
+        # Clear any stale permission UI (query finished, no more permissions expected)
+        self.output.clear_all_permissions()
+
+        # Check for queued prompt
+        if self.queued_prompt:
+            queued = self.queued_prompt
+            self.queued_prompt = None
+            self.draft_prompt = ""  # Clear draft since we're sending it
+            # Clear the indicator
+            self.output.set_queued_prompt(None)
+            # Small delay to let UI update before starting next query
+            sublime.set_timeout(lambda: self.query(queued), 200)
+            return
+
         # Auto-enter input mode when idle
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
@@ -227,6 +254,34 @@ class Session:
             end = self.output.view.size()
             self.output.view.sel().clear()
             self.output.view.sel().add(sublime.Region(end, end))
+
+    def queue_prompt(self, prompt: str) -> None:
+        """Queue a prompt to be sent when current query finishes."""
+        self.queued_prompt = prompt
+        self._status(f"queued: {prompt[:30]}...")
+        print(f"[Claude] Queued prompt: {prompt[:60]}...")
+        # Update output view indicator
+        self.output.set_queued_prompt(prompt)
+
+    def show_queue_input(self) -> None:
+        """Show input panel to queue a prompt while session is working."""
+        if not self.working:
+            # Not working, just enter normal input mode
+            self._enter_input_with_draft()
+            return
+
+        def on_done(text: str) -> None:
+            text = text.strip()
+            if text:
+                self.queue_prompt(text)
+
+        self.window.show_input_panel(
+            "Queue prompt:",
+            self.draft_prompt,
+            on_done,
+            None,  # on_change
+            None   # on_cancel
+        )
 
     def interrupt(self) -> None:
         if self.client:
@@ -348,7 +403,10 @@ class Session:
         s = chars[self.spinner_frame % len(chars)]
         self.spinner_frame += 1
         # Show spinner in status bar only (not title - causes cursor flicker)
-        self._status(f"{s} {self.current_tool or 'thinking...'}")
+        status = self.current_tool or "thinking..."
+        if self.queued_prompt:
+            status += " [queued]"
+        self._status(f"{s} {status}")
         sublime.set_timeout(self._animate, 100)
 
     def _handle_permission_request(self, params: dict) -> None:

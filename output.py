@@ -87,6 +87,7 @@ class OutputView:
         self._last_allowed_tool: Optional[str] = None  # Track last tool we allowed
         self._last_allowed_time: float = 0  # Timestamp of last allow
         self._pending_context_region: tuple = (0, 0)  # Region for context display
+        self._queued_prompt_region: tuple = (0, 0)  # Region for queued prompt display
         self._cleared_content: Optional[str] = None  # For undo clear
         self._render_pending: bool = False  # Debounce flag for rendering
         # Inline input state
@@ -115,7 +116,7 @@ class OutputView:
         self.view.settings().set("font_size", 12)
         try:
             self.view.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
-            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
+            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.sublime-color-scheme")
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
         if focus:
@@ -257,9 +258,17 @@ class OutputView:
         self.view.run_command("append", {"characters": prefix})
         self._input_area_start = self.view.size()
 
-        # Add context line if any
+        # Add queued prompt indicator if any
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
+        if session and session.queued_prompt:
+            preview = session.queued_prompt[:50]
+            if len(session.queued_prompt) > 50:
+                preview += "..."
+            queue_line = f"⏳ {preview}\n"
+            self.view.run_command("append", {"characters": queue_line})
+
+        # Add context line if any
         if session and session.pending_context:
             names = [item.name for item in session.pending_context]
             ctx_line = f"📎 {', '.join(names)}\n"
@@ -356,8 +365,9 @@ class OutputView:
         self._input_area_start = 0
         self.view.settings().set("claude_input_mode", False)
         self.view.set_read_only(True)
-        # Also clear any pending context region that might be stale
+        # Also clear any pending regions that might be stale
         self._pending_context_region = (0, 0)
+        self._queued_prompt_region = (0, 0)
 
     def is_in_input_region(self, point: int) -> bool:
         """Check if a point is within the editable input region."""
@@ -407,6 +417,44 @@ class OutputView:
         self._pending_context_region = (start, end)
         self._scroll_to_end()
 
+    def set_queued_prompt(self, prompt: Optional[str]) -> None:
+        """Show queued prompt indicator - integrated with input mode if active."""
+        if not self.view or not self.view.is_valid():
+            return
+
+        # If in input mode, re-render the whole input area
+        if self._input_mode:
+            input_text = self.get_input_text()
+            self.exit_input_mode(keep_text=False)
+            self.enter_input_mode()
+            if input_text:
+                self.view.run_command("append", {"characters": input_text})
+                end = self.view.size()
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(end, end))
+            return
+
+        # Not in input mode - show at end of view
+        start, end = self._queued_prompt_region
+        if end > start:
+            self._replace(start, end, "")
+
+        if not prompt:
+            self._queued_prompt_region = (0, 0)
+            return
+
+        # Build queued display
+        preview = prompt[:50]
+        if len(prompt) > 50:
+            preview += "..."
+        text = f"\n⏳ {preview}\n"
+
+        # Write at end
+        start = self.view.size()
+        end = self._write(text)
+        self._queued_prompt_region = (start, end)
+        self._scroll_to_end()
+
     def prompt(self, text: str, context_names: List[str] = None) -> None:
         """Start a new conversation with a prompt."""
         self.show()
@@ -428,13 +476,14 @@ class OutputView:
             # This can happen after restart or if state got corrupted
             content = self.view.substr(sublime.Region(0, self.view.size()))
             lines = content.split('\n')
-            # Check if last non-empty lines look like input area (marker without ▶ or context line)
+            # Check if last non-empty lines look like input area (marker without ▶, context, or queued line)
             for line in reversed(lines[-5:]):  # Check last 5 lines
                 if not line.strip():
                     continue
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
                 is_context_line = line.startswith('📎 ')
-                if is_input_marker or is_context_line:
+                is_queued_line = line.startswith('⏳ ')
+                if is_input_marker or is_context_line or is_queued_line:
                     # Found stale input marker - clean it up
                     self.reset_input_mode()
                 break  # Only check the last non-empty line
@@ -444,6 +493,12 @@ class OutputView:
         if end > start:
             self._replace(start, end, "")
             self._pending_context_region = (0, 0)
+
+        # Clear queued prompt display
+        start, end = self._queued_prompt_region
+        if end > start:
+            self._replace(start, end, "")
+            self._queued_prompt_region = (0, 0)
 
         # Finalize and save previous conversation
         prev_todos = []
@@ -587,6 +642,8 @@ class OutputView:
         self.pending_permission = None
         self._permission_queue.clear()
         self.auto_allow_tools.clear()
+        self._pending_context_region = (0, 0)
+        self._queued_prompt_region = (0, 0)
         # Clean up any tracked permission region
         if self.view:
             self.view.erase_regions("claude_permission_block")
@@ -644,10 +701,33 @@ class OutputView:
 
     # --- Permission UI ---
 
+    def clear_stale_permission(self, current_pid: int) -> None:
+        """Clear permission UI if it's for an older request (bridge moved on)."""
+        if not self.pending_permission:
+            return
+
+        # If pending permission is for an older pid, it's stale
+        if self.pending_permission.id < current_pid:
+            print(f"[Claude] clearing stale permission pid={self.pending_permission.id} (current={current_pid})")
+            self._clear_permission()
+            self.pending_permission = None
+            self._permission_queue.clear()  # Also clear queue - they're all stale
+
+    def clear_all_permissions(self) -> None:
+        """Clear all pending permissions (called when query finishes)."""
+        if self.pending_permission:
+            print(f"[Claude] clearing leftover permission pid={self.pending_permission.id}")
+            self._clear_permission()
+            self.pending_permission = None
+        self._permission_queue.clear()
+
     def permission_request(self, pid: int, tool: str, tool_input: dict, callback: Callable[[str], None]) -> None:
         """Show a permission request in the view."""
         import time
         self.show(focus=False)  # Don't steal focus from other views
+
+        # Check for stale pending permission first (older pid means bridge moved on)
+        self.clear_stale_permission(pid)
 
         # Check if tool is auto-allowed for session
         if tool in self.auto_allow_tools:
