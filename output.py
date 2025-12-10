@@ -87,7 +87,6 @@ class OutputView:
         self._last_allowed_tool: Optional[str] = None  # Track last tool we allowed
         self._last_allowed_time: float = 0  # Timestamp of last allow
         self._pending_context_region: tuple = (0, 0)  # Region for context display
-        self._queued_prompt_region: tuple = (0, 0)  # Region for queued prompt display
         self._cleared_content: Optional[str] = None  # For undo clear
         self._render_pending: bool = False  # Debounce flag for rendering
         # Inline input state
@@ -258,17 +257,9 @@ class OutputView:
         self.view.run_command("append", {"characters": prefix})
         self._input_area_start = self.view.size()
 
-        # Add queued prompt indicator if any
+        # Add context line if any
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
-        if session and session.queued_prompt:
-            preview = session.queued_prompt[:50]
-            if len(session.queued_prompt) > 50:
-                preview += "..."
-            queue_line = f"⏳ {preview}\n"
-            self.view.run_command("append", {"characters": queue_line})
-
-        # Add context line if any
         if session and session.pending_context:
             names = [item.name for item in session.pending_context]
             ctx_line = f"📎 {', '.join(names)}\n"
@@ -367,7 +358,6 @@ class OutputView:
         self.view.set_read_only(True)
         # Also clear any pending regions that might be stale
         self._pending_context_region = (0, 0)
-        self._queued_prompt_region = (0, 0)
 
     def is_in_input_region(self, point: int) -> bool:
         """Check if a point is within the editable input region."""
@@ -417,44 +407,6 @@ class OutputView:
         self._pending_context_region = (start, end)
         self._scroll_to_end()
 
-    def set_queued_prompt(self, prompt: Optional[str]) -> None:
-        """Show queued prompt indicator - integrated with input mode if active."""
-        if not self.view or not self.view.is_valid():
-            return
-
-        # If in input mode, re-render the whole input area
-        if self._input_mode:
-            input_text = self.get_input_text()
-            self.exit_input_mode(keep_text=False)
-            self.enter_input_mode()
-            if input_text:
-                self.view.run_command("append", {"characters": input_text})
-                end = self.view.size()
-                self.view.sel().clear()
-                self.view.sel().add(sublime.Region(end, end))
-            return
-
-        # Not in input mode - show at end of view
-        start, end = self._queued_prompt_region
-        if end > start:
-            self._replace(start, end, "")
-
-        if not prompt:
-            self._queued_prompt_region = (0, 0)
-            return
-
-        # Build queued display
-        preview = prompt[:50]
-        if len(prompt) > 50:
-            preview += "..."
-        text = f"\n⏳ {preview}\n"
-
-        # Write at end
-        start = self.view.size()
-        end = self._write(text)
-        self._queued_prompt_region = (start, end)
-        self._scroll_to_end()
-
     def prompt(self, text: str, context_names: List[str] = None) -> None:
         """Start a new conversation with a prompt."""
         self.show()
@@ -493,12 +445,6 @@ class OutputView:
         if end > start:
             self._replace(start, end, "")
             self._pending_context_region = (0, 0)
-
-        # Clear queued prompt display
-        start, end = self._queued_prompt_region
-        if end > start:
-            self._replace(start, end, "")
-            self._queued_prompt_region = (0, 0)
 
         # Finalize and save previous conversation
         prev_todos = []
@@ -645,7 +591,6 @@ class OutputView:
         self._permission_queue.clear()
         self.auto_allow_tools.clear()
         self._pending_context_region = (0, 0)
-        self._queued_prompt_region = (0, 0)
         self._input_mode = False
         self._input_start = 0
         self._input_area_start = 0

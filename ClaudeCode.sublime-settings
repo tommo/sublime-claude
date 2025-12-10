@@ -10,4 +10,9 @@
     // Permission mode for tool execution
     // Options: "default", "acceptEdits", "plan", "bypassPermissions"
     "permission_mode": "acceptEdits"
+
+    // Profiles and checkpoints are stored in separate files:
+    //   User-level:    ~/.claude-sublime/profiles.json
+    //   Project-level: {project}/.claude/profiles.json
+    // See docs/profiles.md for configuration guide.
 }

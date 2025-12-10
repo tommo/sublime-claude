@@ -44,7 +44,7 @@ def get_active_session(window: sublime.Window) -> Optional[Session]:
     return None
 
 
-def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False) -> Session:
+def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None) -> Session:
     """Create a new session (always creates new, doesn't reuse)."""
     # Clear active marker from previous active session
     old_active = window.settings().get("claude_active_view")
@@ -52,7 +52,7 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         old_session = _sessions[old_active]
         old_session.output.set_name(old_session.name or "Claude")
 
-    s = Session(window, resume_id=resume_id, fork=fork)
+    s = Session(window, resume_id=resume_id, fork=fork, profile=profile)
     s.output.show()  # Create view first
     s.start()
     # Register by view id and mark as active

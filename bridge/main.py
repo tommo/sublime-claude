@@ -67,6 +67,7 @@ class Bridge:
         self.permission_id = 0
         self.question_id = 0
         self.interrupted = False  # Set by interrupt(), checked by query()
+        self.query_id: int | None = None  # Track active query for inject_message
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -88,6 +89,8 @@ class Bridge:
                 await self.handle_question_response(id, params)
             elif method == "cancel_pending":
                 await self.cancel_pending(id)
+            elif method == "inject_message":
+                await self.inject_message(id, params)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -123,6 +126,13 @@ class Bridge:
             "fork_session": fork_session,
             "setting_sources": ["project"],
         }
+
+        # Profile config: model and betas
+        if params.get("model"):
+            options_dict["model"] = params["model"]
+        if params.get("betas"):
+            # betas must be passed via env var ANTHROPIC_BETAS
+            options_dict["env"] = {"ANTHROPIC_BETAS": ",".join(params["betas"])}
 
         # Add MCP servers if found
         if mcp_servers:
@@ -297,7 +307,7 @@ Be concise. Focus on what matters to the user.""",
 
         # Wait for response from Sublime
         try:
-            allowed = await asyncio.wait_for(future, timeout=30)  # 30s timeout
+            allowed = await asyncio.wait_for(future, timeout=3600)  # 1 hour timeout
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"can_use_tool returning: pid={pid}, allowed={allowed}\n")
             if allowed:
@@ -334,9 +344,12 @@ Be concise. Focus on what matters to the user.""",
 
         prompt = params.get("prompt", "")
         self.interrupted = False  # Reset at start of query
+        self.query_id = id  # Store for inject_message to know query is active
 
         async def run_query():
+            # Send initial prompt
             await self.client.query(prompt)
+            # Stream responses
             async for message in self.client.receive_response():
                 await self.emit_message(message)
             # Check if we were interrupted (set by interrupt() method)
@@ -350,6 +363,8 @@ Be concise. Focus on what matters to the user.""",
             await self.current_task
         except asyncio.CancelledError:
             send_result(id, {"status": "interrupted"})
+        finally:
+            self.query_id = None
 
     async def emit_message(self, message: Any) -> None:
         """Emit a message notification."""
@@ -466,6 +481,24 @@ Be concise. Focus on what matters to the user.""",
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"cancel_pending: cancelled {count} requests\n")
         send_result(id, {"status": "ok", "cancelled": count})
+
+    async def inject_message(self, id: int, params: dict) -> None:
+        """Inject a user message into the current conversation."""
+        message = params.get("message", "")
+        if not message:
+            send_error(id, -32602, "Missing message parameter")
+            return
+
+        if not self.query_id:
+            send_error(id, -32002, "No active query to inject into")
+            return
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"inject_message: {message[:60]}...\n")
+
+        # Send as a new query - Claude will see it as a follow-up user message
+        await self.client.query(message)
+        send_result(id, {"status": "ok"})
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""

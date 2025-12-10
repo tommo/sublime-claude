@@ -9,9 +9,86 @@ import sublime
 import sublime_plugin
 
 SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
+USER_PROFILES_PATH = os.path.expanduser("~/.claude-sublime/profiles.json")
 
 _server = None
 _blackboard: dict = {}  # Shared blackboard across sessions
+
+
+def _get_project_profiles_path() -> str:
+    """Get project-level profiles path."""
+    window = sublime.active_window()
+    if window and window.folders():
+        return os.path.join(window.folders()[0], ".claude", "profiles.json")
+    return ""
+
+
+def _load_profiles_and_checkpoints() -> tuple:
+    """Load profiles and checkpoints with cascade: user < project."""
+    profiles = {}
+    checkpoints = {}
+
+    # Load user-level
+    if os.path.exists(USER_PROFILES_PATH):
+        try:
+            with open(USER_PROFILES_PATH, "r") as f:
+                data = json.load(f)
+                profiles.update(data.get("profiles", {}))
+                checkpoints.update(data.get("checkpoints", {}))
+        except Exception as e:
+            print(f"[Claude MCP] Error loading user profiles: {e}")
+
+    # Load project-level (overrides user)
+    project_path = _get_project_profiles_path()
+    if project_path and os.path.exists(project_path):
+        try:
+            with open(project_path, "r") as f:
+                data = json.load(f)
+                profiles.update(data.get("profiles", {}))
+                checkpoints.update(data.get("checkpoints", {}))
+        except Exception as e:
+            print(f"[Claude MCP] Error loading project profiles: {e}")
+
+    return profiles, checkpoints
+
+
+def _save_checkpoint(name: str, session_id: str, description: str, to_project: bool = True) -> bool:
+    """Save a checkpoint to profiles.json."""
+    if to_project:
+        path = _get_project_profiles_path()
+        if not path:
+            return False
+    else:
+        path = USER_PROFILES_PATH
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Load existing
+    data = {"profiles": {}, "checkpoints": {}}
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except:
+            pass
+
+    # Add checkpoint
+    if "checkpoints" not in data:
+        data["checkpoints"] = {}
+    data["checkpoints"][name] = {
+        "session_id": session_id,
+        "description": description,
+    }
+
+    # Save
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[Claude MCP] Error saving checkpoint: {e}")
+        return False
 
 
 def start():
@@ -302,6 +379,7 @@ class MCPSocketServer:
             "bb_list": self._bb_list,
             "bb_clear": self._bb_clear,
             # Session tools
+            "list_profiles": self._list_profiles,
             "spawn_session": self._spawn_session,
             "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
@@ -563,25 +641,6 @@ class MCPSocketServer:
 
         return tools
 
-    def _get_symbols(self, query: str = "", file_path: str = None) -> list:
-        """Get symbols from index."""
-        window = sublime.active_window()
-        if not window:
-            return []
-
-        locations = window.lookup_symbol_in_index(query)
-        results = []
-        for loc in locations[:500]:
-            if file_path and loc[0] != file_path:
-                continue
-            results.append({
-                "name": loc[1],
-                "file": loc[0],
-                "row": loc[2][0],
-                "col": loc[2][1]
-            })
-        return results
-
     def _goto_symbol(self, query: str) -> dict:
         """Navigate to a symbol definition. Returns the symbol info or error."""
         window = sublime.active_window()
@@ -650,7 +709,38 @@ class MCPSocketServer:
 
     # ─── Session Spawn ────────────────────────────────────────────────────
 
-    def _spawn_session(self, prompt: str, name: str = None) -> dict:
+    def _list_profiles(self) -> dict:
+        """List available profiles and checkpoints."""
+        profiles, checkpoints = _load_profiles_and_checkpoints()
+
+        result = {
+            "profiles": [],
+            "checkpoints": [],
+            "paths": {
+                "user": USER_PROFILES_PATH,
+                "project": _get_project_profiles_path() or "(no project)",
+            }
+        }
+
+        for name, config in profiles.items():
+            result["profiles"].append({
+                "name": name,
+                "model": config.get("model", "default"),
+                "description": config.get("description", ""),
+                "has_preload_docs": bool(config.get("preload_docs")),
+                "betas": config.get("betas", []),
+            })
+
+        for name, config in checkpoints.items():
+            result["checkpoints"].append({
+                "name": name,
+                "session_id": config.get("session_id", "")[:8] + "...",
+                "description": config.get("description", ""),
+            })
+
+        return result
+
+    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None) -> dict:
         """Spawn a new Claude session with the given prompt."""
         window = sublime.active_window()
         if not window:
@@ -659,8 +749,26 @@ class MCPSocketServer:
         # Import here to avoid circular import
         from . import claude_code
 
+        profiles, checkpoints = _load_profiles_and_checkpoints()
+        profile_config = None
+        resume_id = None
+        fork = False
+
+        # Load profile config if specified
+        if profile:
+            if profile not in profiles:
+                return {"error": f"Profile '{profile}' not found"}
+            profile_config = profiles[profile]
+
+        # Load checkpoint if specified
+        if checkpoint:
+            if checkpoint not in checkpoints:
+                return {"error": f"Checkpoint '{checkpoint}' not found"}
+            resume_id = checkpoints[checkpoint].get("session_id")
+            fork = True
+
         # Create new session
-        session = claude_code.create_session(window)
+        session = claude_code.create_session(window, resume_id=resume_id, fork=fork, profile=profile_config)
         if name:
             session.name = name
             session.output.set_name(name)
@@ -679,6 +787,8 @@ class MCPSocketServer:
             "spawned": True,
             "name": name or "(unnamed)",
             "view_id": view_id,
+            "profile": profile,
+            "checkpoint": checkpoint,
         }
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:

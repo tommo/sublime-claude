@@ -4,11 +4,14 @@ MCP server for Sublime Text integration.
 Provides sublime_eval tool to execute Python in Sublime's context.
 """
 import json
+import os
 import socket
 import sys
 from typing import Any
 
 SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROFILES_GUIDE = os.path.join(PLUGIN_DIR, "docs", "profiles.md")
 
 
 def send_to_sublime(code: str = "", tool: str = None) -> dict:
@@ -153,13 +156,20 @@ Use for:
                 },
                 # ─── Session Tools ────────────────────────────────────────
                 {
+                    "name": "list_profiles",
+                    "description": f"List available session profiles and checkpoints. Profiles configure model/context for different use cases. Setup guide: {PROFILES_GUIDE}",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
                     "name": "spawn_session",
-                    "description": "Spawn a new Claude session with the given prompt. Returns view_id.",
+                    "description": "Spawn a new Claude session with the given prompt. Returns view_id. Use profile for specialized configurations (e.g. 1M context model with preloaded docs).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "prompt": {"type": "string", "description": "Initial prompt for the new session"},
-                            "name": {"type": "string", "description": "Optional: name for the session"}
+                            "name": {"type": "string", "description": "Optional: name for the session"},
+                            "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
+                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"}
                         },
                         "required": ["prompt"]
                     }
@@ -321,13 +331,14 @@ User can always type a custom response.""",
             key = args.get("key", "")
             result = send_to_sublime(code=f"return bb_delete({key!r})")
         # Session tools
+        elif tool_name == "list_profiles":
+            result = send_to_sublime(code="return list_profiles()")
         elif tool_name == "spawn_session":
             prompt = args.get("prompt", "")
             name = args.get("name")
-            if name:
-                result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r})")
-            else:
-                result = send_to_sublime(code=f"return spawn_session({prompt!r})")
+            profile = args.get("profile")
+            checkpoint = args.get("checkpoint")
+            result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r}, {profile!r}, {checkpoint!r})")
         elif tool_name == "send_to_session":
             view_id = args.get("view_id")
             prompt = args.get("prompt", "")

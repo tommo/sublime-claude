@@ -7,9 +7,60 @@ from .session import Session, load_saved_sessions
 
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
-    """Start a new session."""
-    def run(self) -> None:
-        create_session(self.window)
+    """Start a new session. Shows profile picker if profiles are configured."""
+    def run(self, profile: str = None) -> None:
+        from .mcp_server import _load_profiles_and_checkpoints
+
+        profiles, checkpoints = _load_profiles_and_checkpoints()
+
+        # If profile specified directly, use it
+        if profile:
+            profile_config = profiles.get(profile, {})
+            create_session(self.window, profile=profile_config)
+            return
+
+        # Build options list
+        options = []
+
+        # Profiles
+        for name, config in profiles.items():
+            desc = config.get("description", f"{config.get('model', 'default')} model")
+            options.append(("profile", name, f"📋 {name}", desc))
+
+        # Checkpoints
+        for name, config in checkpoints.items():
+            desc = config.get("description", "Saved checkpoint")
+            options.append(("checkpoint", name, f"📍 {name}", desc))
+
+        # Default option (always available)
+        options.insert(0, ("default", None, "🆕 New Session", "Start fresh with default settings"))
+
+        if len(options) == 1:
+            # Only default, just start
+            create_session(self.window)
+            return
+
+        # Show quick panel
+        items = [[opt[2], opt[3]] for opt in options]
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            opt_type, opt_name, _, _ = options[idx]
+            if opt_type == "default":
+                create_session(self.window)
+            elif opt_type == "profile":
+                profile_config = profiles.get(opt_name, {})
+                create_session(self.window, profile=profile_config)
+            elif opt_type == "checkpoint":
+                checkpoint = checkpoints.get(opt_name, {})
+                session_id = checkpoint.get("session_id")
+                if session_id:
+                    create_session(self.window, resume_id=session_id, fork=True)
+                else:
+                    sublime.error_message(f"Checkpoint '{opt_name}' has no session_id")
+
+        self.window.show_quick_panel(items, on_select)
 
 
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
@@ -239,6 +290,29 @@ class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
             sublime.status_message("Conversation copied to clipboard")
 
 
+class ClaudeCodeSaveCheckpointCommand(sublime_plugin.WindowCommand):
+    """Save current session as a named checkpoint for future forking."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if not s or not s.session_id:
+            sublime.status_message("No active session with ID to checkpoint")
+            return
+
+        def on_done(name: str) -> None:
+            name = name.strip()
+            if not name:
+                return
+
+            from .mcp_server import _save_checkpoint
+            if _save_checkpoint(name, s.session_id, s.name or "Checkpoint"):
+                sublime.status_message(f"Checkpoint '{name}' saved")
+            else:
+                sublime.error_message(f"Failed to save checkpoint '{name}'")
+
+        default_name = (s.name or "checkpoint").lower().replace(" ", "-")[:20]
+        self.window.show_input_panel("Checkpoint name:", default_name, on_done, None, None)
+
+
 class ClaudeCodeViewHistoryCommand(sublime_plugin.WindowCommand):
     """View session history from Claude's stored conversation."""
     def run(self) -> None:
@@ -464,24 +538,99 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             items.append(["Restart Session", "Restart current session, keep output"])
             actions.append(("restart", active_session))
 
+        # Add profiles and checkpoints
+        from .mcp_server import _load_profiles_and_checkpoints
+        profiles, checkpoints = _load_profiles_and_checkpoints()
+
+        for name, config in profiles.items():
+            desc = config.get("description", f"{config.get('model', 'default')} model")
+            items.append([f"📋 {name}", desc])
+            actions.append(("profile", config))
+
+        for name, config in checkpoints.items():
+            desc = config.get("description", "Saved checkpoint")
+            items.append([f"📍 {name}", desc])
+            actions.append(("checkpoint", config))
+
         # Add "New Session" option at end
-        items.append(["Create Another Session", "Start a fresh Claude session"])
+        items.append(["🆕 New Session", "Start fresh with default settings"])
         actions.append(("new", None))
 
         def on_select(idx):
             if idx >= 0:
-                action, session = actions[idx]
-                if action == "restart" and session:
-                    # Restart: stop current, clear view and title, start fresh
-                    session.stop()
-                    session.output.clear()
-                    session.name = None
-                    session.output.set_name("Claude")
-                    session.start()
+                action, data = actions[idx]
+                if action == "restart" and data:
+                    # Show profile picker for restart
+                    self._show_restart_picker(data, profiles, checkpoints)
                 elif action == "new":
                     create_session(self.window)
-                elif action == "focus" and session:
-                    session.output.show()
+                elif action == "profile":
+                    create_session(self.window, profile=data)
+                elif action == "checkpoint":
+                    session_id = data.get("session_id")
+                    if session_id:
+                        create_session(self.window, resume_id=session_id, fork=True)
+                elif action == "focus" and data:
+                    data.output.show()
+
+        self.window.show_quick_panel(items, on_select)
+
+    def _show_restart_picker(self, session, profiles, checkpoints):
+        """Show profile/checkpoint picker for restart."""
+        from .core import _sessions, create_session
+
+        items = []
+        actions = []
+
+        # Default restart
+        items.append(["🆕 Fresh Start", "Restart with default settings"])
+        actions.append(("default", None))
+
+        # Profiles
+        for name, config in profiles.items():
+            desc = config.get("description", f"{config.get('model', 'default')} model")
+            items.append([f"📋 {name}", desc])
+            actions.append(("profile", config))
+
+        # Checkpoints
+        for name, config in checkpoints.items():
+            desc = config.get("description", "Saved checkpoint")
+            items.append([f"📍 {name}", desc])
+            actions.append(("checkpoint", config))
+
+        def on_select(idx):
+            if idx < 0:
+                return
+
+            action, data = actions[idx]
+            old_view = session.output.view
+
+            # Stop old session
+            session.stop()
+            if old_view and old_view.id() in _sessions:
+                del _sessions[old_view.id()]
+
+            # Create new session with selected config
+            if action == "checkpoint":
+                session_id = data.get("session_id")
+                new_session = Session(self.window, resume_id=session_id, fork=True)
+            elif action == "profile":
+                new_session = Session(self.window, profile=data)
+            else:
+                new_session = Session(self.window)
+
+            # Reuse existing view
+            if old_view and old_view.is_valid():
+                new_session.output.view = old_view
+                new_session.output.clear()
+                _sessions[old_view.id()] = new_session
+
+            new_session.start()
+            if new_session.output.view:
+                new_session.output.view.set_name("Claude")
+                if new_session.output.view.id() not in _sessions:
+                    _sessions[new_session.output.view.id()] = new_session
+            new_session.output.show()
 
         self.window.show_quick_panel(items, on_select)
 

@@ -51,6 +51,7 @@ from .commands import (
     ClaudeQuickPromptCommand,
     ClaudeCodeQueuePromptCommand,
     ClaudeCodeCopyCommand,
+    ClaudeCodeSaveCheckpointCommand,
     ClaudeCodeViewHistoryCommand,
 )
 

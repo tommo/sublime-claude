@@ -42,7 +42,7 @@ class ContextItem:
 
 
 class Session:
-    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False):
+    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[Dict] = None):
         self.window = window
         self.client: Optional[JsonRpcClient] = None
         self.output = OutputView(window)
@@ -56,6 +56,7 @@ class Session:
         self.session_id: Optional[str] = resume_id if resume_id and not fork else None
         self.resume_id: Optional[str] = resume_id  # ID to resume from
         self.fork: bool = fork  # Fork from resume_id instead of continuing it
+        self.profile: Optional[Dict] = profile  # Profile config (model, betas, system_prompt, preload_docs)
         self.name: Optional[str] = None
         self.total_cost: float = 0.0
         self.query_count: int = 0
@@ -63,8 +64,6 @@ class Session:
         self.pending_context: List[ContextItem] = []
         # Draft prompt (persists across input panel open/close)
         self.draft_prompt: str = ""
-        # Queued prompt - sent automatically when current query finishes
-        self.queued_prompt: Optional[str] = None
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
 
@@ -83,7 +82,7 @@ class Session:
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}")
+        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}")
         init_params = {
             "cwd": self._cwd(),
             "allowed_tools": allowed_tools,
@@ -93,6 +92,14 @@ class Session:
             init_params["resume"] = self.resume_id
             if self.fork:
                 init_params["fork_session"] = True
+        # Apply profile config
+        if self.profile:
+            if self.profile.get("model"):
+                init_params["model"] = self.profile["model"]
+            if self.profile.get("betas"):
+                init_params["betas"] = self.profile["betas"]
+            if self.profile.get("system_prompt"):
+                init_params["system_prompt"] = self.profile["system_prompt"]
         self.client.send("initialize", init_params, self._on_init)
 
     def _cwd(self) -> str:
@@ -135,8 +142,53 @@ class Session:
             self._status(f"ready ({'; '.join(parts)})")
         else:
             self._status("ready")
+        # Preload docs from profile if configured
+        self._preload_docs()
         # Auto-enter input mode when ready
         self._enter_input_with_draft()
+
+    def _preload_docs(self) -> None:
+        """Load docs from profile preload_docs patterns into pending context."""
+        if not self.profile or not self.profile.get("preload_docs"):
+            return
+
+        import glob as glob_module
+
+        patterns = self.profile["preload_docs"]
+        if isinstance(patterns, str):
+            patterns = [patterns]
+
+        cwd = self._cwd()
+        total_size = 0
+        max_size = 500000  # 500KB limit to avoid overload
+
+        try:
+            for pattern in patterns:
+                # Make pattern relative to cwd
+                full_pattern = os.path.join(cwd, pattern)
+                for filepath in glob_module.glob(full_pattern, recursive=True):
+                    if os.path.isfile(filepath):
+                        try:
+                            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                            total_size += len(content)
+                            if total_size > max_size:
+                                print(f"[Claude] preload_docs: size limit reached, stopping")
+                                break
+                            rel_path = os.path.relpath(filepath, cwd)
+                            # Add directly to pending_context without updating display yet
+                            name = os.path.basename(rel_path)
+                            self.pending_context.append(ContextItem("file", name, f"File: {rel_path}\n```\n{content}\n```"))
+                            print(f"[Claude] preloaded: {rel_path} ({len(content)} bytes)")
+                        except Exception as e:
+                            print(f"[Claude] preload error {filepath}: {e}")
+                if total_size > max_size:
+                    break
+
+            if self.pending_context:
+                print(f"[Claude] preloaded {len(self.pending_context)} docs ({total_size} bytes)")
+        except Exception as e:
+            print(f"[Claude] preload_docs error: {e}")
 
     def add_context_file(self, path: str, content: str) -> None:
         """Add a file to pending context."""
@@ -228,17 +280,6 @@ class Session:
         # Clear any stale permission UI (query finished, no more permissions expected)
         self.output.clear_all_permissions()
 
-        # Check for queued prompt
-        if self.queued_prompt:
-            queued = self.queued_prompt
-            self.queued_prompt = None
-            self.draft_prompt = ""  # Clear draft since we're sending it
-            # Clear the indicator
-            self.output.set_queued_prompt(None)
-            # Small delay to let UI update before starting next query
-            sublime.set_timeout(lambda: self.query(queued), 200)
-            return
-
         # Auto-enter input mode when idle
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
@@ -268,12 +309,16 @@ class Session:
             self.output.view.sel().add(sublime.Region(end, end))
 
     def queue_prompt(self, prompt: str) -> None:
-        """Queue a prompt to be sent when current query finishes."""
-        self.queued_prompt = prompt
-        self._status(f"queued: {prompt[:30]}...")
-        print(f"[Claude] Queued prompt: {prompt[:60]}...")
-        # Update output view indicator
-        self.output.set_queued_prompt(prompt)
+        """Inject a prompt into the current query stream."""
+        print(f"[Claude] Injecting prompt: {prompt[:60]}...")
+        self._status(f"injected: {prompt[:30]}...")
+
+        # Show prompt in output view
+        self.output.text(f"\n**[injected]** {prompt}\n\n")
+
+        # Send to bridge to inject into active query
+        if self.client:
+            self.client.send("inject_message", {"message": prompt})
 
     def show_queue_input(self) -> None:
         """Show input panel to queue a prompt while session is working."""
@@ -416,8 +461,6 @@ class Session:
         self.spinner_frame += 1
         # Show spinner in status bar only (not title - causes cursor flicker)
         status = self.current_tool or "thinking..."
-        if self.queued_prompt:
-            status += " [queued]"
         self._status(f"{s} {status}")
         sublime.set_timeout(self._animate, 100)
 
