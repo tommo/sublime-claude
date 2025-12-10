@@ -134,8 +134,34 @@ class Bridge:
 
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"  options.resume={self.options.resume}, options.fork_session={self.options.fork_session}\n")
+
         self.client = ClaudeSDKClient(options=self.options)
-        await self.client.connect()
+
+        try:
+            await self.client.connect()
+        except Exception as e:
+            error_msg = str(e)
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  connect error: {error_msg}\n")
+
+            # If session not found or command failed during resume, retry without resume
+            # The SDK wraps the actual error, so we check for common patterns
+            is_session_error = (
+                "No conversation found" in error_msg or
+                ("Command failed" in error_msg and resume_id)
+            )
+            if is_session_error and resume_id:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  retrying without resume (stale session)\n")
+
+                options_dict["resume"] = None
+                options_dict["fork_session"] = False
+                self.options = ClaudeAgentOptions(**options_dict)
+                self.client = ClaudeSDKClient(options=self.options)
+                await self.client.connect()
+            else:
+                raise
+
         send_result(id, {
             "status": "initialized",
             "mcp_servers": list(mcp_servers.keys()) if mcp_servers else [],
@@ -313,6 +339,8 @@ Be concise. Focus on what matters to the user.""",
                 await self.emit_message(message)
             # Check if we were interrupted (set by interrupt() method)
             status = "interrupted" if self.interrupted else "complete"
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"query complete: status={status}\n")
             send_result(id, {"status": status})
 
         self.current_task = asyncio.create_task(run_query())

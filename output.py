@@ -637,6 +637,8 @@ class OutputView:
             self.view.set_read_only(False)
             self.view.run_command("claude_clear_all")
             self.view.set_read_only(True)
+            # Reset view settings that might be stale from old session
+            self.view.settings().set("claude_input_mode", False)
         self.conversations = []
         self.current = None
         self.pending_permission = None
@@ -644,6 +646,9 @@ class OutputView:
         self.auto_allow_tools.clear()
         self._pending_context_region = (0, 0)
         self._queued_prompt_region = (0, 0)
+        self._input_mode = False
+        self._input_start = 0
+        self._input_area_start = 0
         # Clean up any tracked permission region
         if self.view:
             self.view.erase_regions("claude_permission_block")

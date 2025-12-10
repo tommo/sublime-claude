@@ -57,18 +57,32 @@ def handle_request(request: dict) -> dict:
             "tools": [
                 # ─── Editor Tools ─────────────────────────────────────────
                 {
-                    "name": "get_open_files",
-                    "description": "Get list of open file paths in Sublime Text",
+                    "name": "get_window_summary",
+                    "description": "Get editor state: open files (with dirty/size), active file with selection, project folders, layout.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
-                    "name": "get_symbols",
-                    "description": "Search project symbol index",
+                    "name": "find_file",
+                    "description": "Fuzzy find files by partial name. Scores: exact > starts with > contains > path contains > fuzzy.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": {"type": "string", "description": "Symbol name to search"},
-                            "file_path": {"type": "string", "description": "Optional: limit to specific file"}
+                            "query": {"type": "string", "description": "Partial filename to search for"},
+                            "pattern": {"type": "string", "description": "Optional glob pattern to filter first (e.g. '*.py')"},
+                            "limit": {"type": "number", "description": "Max results (default 20)"}
+                        },
+                        "required": ["query"]
+                    }
+                },
+                {
+                    "name": "get_symbols",
+                    "description": "Batch lookup symbols in project index. Accepts single symbol, comma-separated, or JSON array.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"description": "Symbol name(s): string, comma-separated, or JSON array"},
+                            "file_path": {"type": "string", "description": "Optional: limit to specific file"},
+                            "limit": {"type": "number", "description": "Max results per symbol (default 10)"}
                         },
                         "required": ["query"]
                     }
@@ -200,38 +214,41 @@ For simple operations, prefer the dedicated tools above.""",
                     "description": "List saved tools in .claude/sublime_tools/ with descriptions",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
-                # ─── Terminus Tools ──────────────────────────────────────────
+                # ─── Terminal Tools ──────────────────────────────────────────
+                # For long-running commands, use terminal_run instead of Bash.
+                # You can monitor output with terminal_read while command runs.
                 {
-                    "name": "terminus_list",
-                    "description": "List all Terminus terminal views in the current window",
+                    "name": "terminal_list",
+                    "description": "List open terminal views in the editor.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
-                    "name": "terminus_send",
-                    "description": "Send text/command to a Terminus terminal. Use \\n for newlines.",
+                    "name": "terminal_run",
+                    "description": "Run a command in a terminal. PREFER THIS over Bash for: long-running commands, interactive commands, or when you need to see live output. Opens dedicated 'Claude Agent' terminal if none exists.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": {"type": "string", "description": "Text to send (use \\n for Enter)"},
-                            "tag": {"type": "string", "description": "Optional: terminal tag to target"}
+                            "command": {"type": "string", "description": "Command to run"},
+                            "wait": {"type": "number", "description": "Wait N seconds then return output. Use small values (1-2s) for quick commands, larger for builds. 0=fire and forget, use terminal_read later."},
+                            "tag": {"type": "string", "description": "Terminal tag (default: claude-agent)"}
                         },
-                        "required": ["text"]
+                        "required": ["command"]
                     }
                 },
                 {
-                    "name": "terminus_read",
-                    "description": "Read output from a Terminus terminal",
+                    "name": "terminal_read",
+                    "description": "Read recent output from a terminal. Use to check command progress or results.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "tag": {"type": "string", "description": "Optional: terminal tag to read from"},
-                            "lines": {"type": "integer", "description": "Number of lines to read (default 100)"}
+                            "tag": {"type": "string", "description": "Optional: terminal tag"},
+                            "lines": {"type": "integer", "description": "Lines to read from end (default 100)"}
                         }
                     }
                 },
                 {
-                    "name": "terminus_close",
-                    "description": "Close a Terminus terminal",
+                    "name": "terminal_close",
+                    "description": "Close a terminal view.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -275,15 +292,18 @@ User can always type a custom response.""",
         elif tool_name == "list_tools":
             result = send_to_sublime(code="return list_tools()")
         # Editor tools
-        elif tool_name == "get_open_files":
-            result = send_to_sublime(code="return get_open_files()")
+        elif tool_name == "get_window_summary":
+            result = send_to_sublime(code="return get_window_summary()")
+        elif tool_name == "find_file":
+            query = args.get("query", "")
+            pattern = args.get("pattern")
+            limit = args.get("limit", 20)
+            result = send_to_sublime(code=f"return find_file({query!r}, {pattern!r}, {limit})")
         elif tool_name == "get_symbols":
             query = args.get("query", "")
             file_path = args.get("file_path")
-            if file_path:
-                result = send_to_sublime(code=f"return get_symbols({query!r}, {file_path!r})")
-            else:
-                result = send_to_sublime(code=f"return get_symbols({query!r})")
+            limit = args.get("limit", 10)
+            result = send_to_sublime(code=f"return get_symbols({query!r}, {file_path!r}, {limit})")
         elif tool_name == "goto_symbol":
             query = args.get("query", "")
             result = send_to_sublime(code=f"return goto_symbol({query!r})")
@@ -314,24 +334,25 @@ User can always type a custom response.""",
             result = send_to_sublime(code=f"return send_to_session({view_id}, {prompt!r})")
         elif tool_name == "list_sessions":
             result = send_to_sublime(code="return list_sessions()")
-        # Terminus tools
-        elif tool_name == "terminus_list":
+        # Terminal tools (uses Terminus plugin)
+        elif tool_name == "terminal_list":
             result = send_to_sublime(code="return terminus_list()")
-        elif tool_name == "terminus_send":
-            text = args.get("text", "")
+        elif tool_name == "terminal_run":
+            command = args.get("command", "")
+            # Ensure command ends with newline to execute
+            if not command.endswith("\n"):
+                command += "\n"
             tag = args.get("tag")
-            if tag:
-                result = send_to_sublime(code=f"return terminus_send({text!r}, {tag!r})")
-            else:
-                result = send_to_sublime(code=f"return terminus_send({text!r})")
-        elif tool_name == "terminus_read":
+            wait = args.get("wait", 0)
+            result = send_to_sublime(code=f"return terminus_run({command!r}, {tag!r}, {wait})")
+        elif tool_name == "terminal_read":
             tag = args.get("tag")
             lines = args.get("lines", 100)
             if tag:
                 result = send_to_sublime(code=f"return terminus_read({tag!r}, {lines})")
             else:
                 result = send_to_sublime(code=f"return terminus_read(lines={lines})")
-        elif tool_name == "terminus_close":
+        elif tool_name == "terminal_close":
             tag = args.get("tag")
             if tag:
                 result = send_to_sublime(code=f"return terminus_close({tag!r})")

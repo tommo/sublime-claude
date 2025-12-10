@@ -105,7 +105,17 @@ class Session:
         if "error" in result:
             error_msg = result['error'].get('message', str(result['error']))
             print(f"[Claude] init error: {error_msg}")
-            self._status(f"error: {error_msg}")
+            self._status("error")
+
+            # Show user-friendly message in view
+            is_session_error = (
+                "No conversation found" in error_msg or
+                "Command failed" in error_msg
+            )
+            if is_session_error:
+                self.output.text("\n*Session expired or not found.*\n\nUse `Claude: Restart Session` (Cmd+Shift+R) to start fresh.\n")
+            else:
+                self.output.text(f"\n*Failed to connect: {error_msg}*\n\nTry `Claude: Restart Session` (Cmd+Shift+R).\n")
             return
         self.initialized = True
         self._input_mode_entered = False  # Reset for fresh start after init

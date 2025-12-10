@@ -181,12 +181,23 @@ Multiple permission requests are queued - only one shown at a time.
 - Status bar shows loaded MCP servers on init
 
 **MCP Tools:**
-- Editor: `get_open_files`, `get_symbols`, `goto_symbol`
+- Editor: `get_window_summary`, `find_file`, `get_symbols`, `goto_symbol`
+- Terminal: `terminal_list`, `terminal_run`, `terminal_read`, `terminal_close`
 - Blackboard: `bb_write`, `bb_read`, `bb_list`, `bb_delete`
 - Sessions: `spawn_session`, `send_to_session`, `list_sessions`
-- Terminus: `terminus_list`, `terminus_send`, `terminus_read`, `terminus_close`
 - User: `ask_user` - ask questions via quick panel
 - Custom: `sublime_eval`, `sublime_tool`, `list_tools`
+
+**Editor tools:**
+- `get_window_summary()` - Open files, active file with selection, project folders, layout
+- `find_file(query, pattern?, limit?)` - Fuzzy find by partial name, optional glob filter
+- `get_symbols(query, file_path?, limit?)` - Batch symbol lookup (comma-separated or JSON array)
+
+**Terminal tools (uses Terminus plugin):**
+- `terminal_run(command, tag?)` - Run command in terminal. PREFER over Bash for long-running/interactive commands
+- `terminal_read(tag?, lines?)` - Read terminal output (default 100 lines from end)
+- `terminal_list()` - List open terminals
+- `terminal_close(tag?)` - Close a terminal
 
 **Blackboard patterns:**
 - `plan` - implementation steps, architecture decisions
@@ -195,12 +206,25 @@ Multiple permission requests are queued - only one shown at a time.
 - `commands` - project-specific commands that work
 - Data persists across sessions, survives context loss
 
-**Terminus integration:**
-- `terminus_list()` - List open terminals (returns view_id, tag, title)
-- `terminus_send(text, tag?)` - Send command to terminal (use `\n` for newlines)
-- `terminus_read(tag?, lines?)` - Read terminal output (default 100 lines)
-- `terminus_close(tag?)` - Close terminal
-- Tag is optional - if omitted, uses first available terminal
+**Terminal usage (Terminus plugin required):**
+- Agent should use `terminal_run` instead of `Bash` for long-running commands
+- Pattern: `terminal_run("make build", wait=2)` → returns output after wait
+- Opens new terminal automatically if none exists (tag: `claude-agent`)
+- Output stays in Terminus view (avoids buffer explosion in Claude output)
+
+**Terminus API notes:**
+- `terminus_open` args: `cmd`, `shell_cmd`, `cwd`, `title`, `tag`, `auto_close`, `focus`, `post_window_hooks`
+- `terminus_send_string` args: `string`, `tag`, `visible_only` - window command, uses tag to target
+- `post_window_hooks`: list of `[command, args]` to run after terminal ready
+- Threading: MCP socket runs in background thread; `sublime.set_timeout` callbacks don't run while sleeping
+- Solution: use `post_window_hooks` to queue command on terminal open
+
+**Terminal wait implementation:**
+- `terminal_run(cmd, wait=N)` - uses `sublime.set_timeout(do_read, delay_ms)` for delay
+- This lets main thread process `terminus_open` + `post_window_hooks` before reading
+- New terminal gets 1s extra startup delay (vs 0.2s for existing)
+- Background thread waits on `Event` for the delayed read to complete
+- `terminus_open` must be scheduled via `set_timeout(do_open, 10)` to actually execute
 
 ### Subagents
 - Loaded from `.claude/settings.json` `agents` key

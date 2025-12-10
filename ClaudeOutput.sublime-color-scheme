@@ -1,6 +1,12 @@
 {
     "name": "Claude Output",
-    "globals": {},
+    "globals": {
+        "background": "#1f2430",
+        "foreground": "#cbccc6",
+        "caret": "#ffcc66",
+        "selection": "#33415e",
+        "line_highlight": "#191e2a"
+    },
     "rules": [
         {
             "name": "Tool Done",
