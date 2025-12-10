@@ -49,6 +49,9 @@ from .commands import (
     ClaudePermissionAllowSessionCommand,
     ClaudePermissionAllowAllCommand,
     ClaudeQuickPromptCommand,
+    ClaudeCodeQueuePromptCommand,
+    ClaudeCodeCopyCommand,
+    ClaudeCodeViewHistoryCommand,
 )
 
 # Event listeners

@@ -94,5 +94,13 @@
     {
         "caption": "Claude: Reset Input Mode",
         "command": "claude_code_reset_input"
+    },
+    {
+        "caption": "Claude: Queue Prompt",
+        "command": "claude_code_queue_prompt"
+    },
+    {
+        "caption": "Claude: View Session History...",
+        "command": "claude_code_view_history"
     }
 ]

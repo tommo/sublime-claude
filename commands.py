@@ -239,6 +239,86 @@ class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
             sublime.status_message("Conversation copied to clipboard")
 
 
+class ClaudeCodeViewHistoryCommand(sublime_plugin.WindowCommand):
+    """View session history from Claude's stored conversation."""
+    def run(self) -> None:
+        from .session import load_saved_sessions
+        sessions = load_saved_sessions()
+        if not sessions:
+            sublime.status_message("No saved sessions")
+            return
+
+        # Build quick panel items
+        items = []
+        for s in sessions:
+            name = s.get("name", "Unnamed")[:40]
+            sid = s.get("session_id", "")[:8]
+            cost = s.get("total_cost", 0)
+            queries = s.get("query_count", 0)
+            project = os.path.basename(s.get("project", ""))
+            items.append([f"{name}", f"{project} | {queries} queries | ${cost:.2f} | {sid}..."])
+
+        def on_select(idx: int) -> None:
+            if idx < 0:
+                return
+            session = sessions[idx]
+            self._show_history(session)
+
+        self.window.show_quick_panel(items, on_select)
+
+    def _show_history(self, session: dict) -> None:
+        """Extract and display user messages from session history."""
+        import json
+
+        sid = session.get("session_id", "")
+        project = session.get("project", "")
+        # Convert project path to Claude's format
+        project_key = project.replace("/", "-").lstrip("-")
+        history_file = os.path.expanduser(f"~/.claude/projects/{project_key}/{sid}.jsonl")
+
+        if not os.path.exists(history_file):
+            sublime.status_message(f"History file not found: {history_file}")
+            return
+
+        # Extract user messages
+        messages = []
+        with open(history_file, "r") as f:
+            for line in f:
+                try:
+                    d = json.loads(line)
+                    if d.get("type") == "user":
+                        msg = d.get("message", {})
+                        content = msg.get("content", [])
+                        if isinstance(content, str):
+                            messages.append(content)
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    text = c.get("text", "")
+                                    if text and not text.startswith("[Request interrupted"):
+                                        messages.append(text)
+                except:
+                    pass
+
+        # Create output view
+        view = self.window.new_file()
+        view.set_name(f"History: {session.get('name', sid[:8])}")
+        view.set_scratch(True)
+        view.assign_syntax("Packages/Markdown/Markdown.sublime-syntax")
+
+        # Format output
+        output = f"# Session: {session.get('name', 'Unnamed')}\n"
+        output += f"**ID:** {sid}\n"
+        output += f"**Project:** {project}\n"
+        output += f"**Queries:** {session.get('query_count', 0)} | **Cost:** ${session.get('total_cost', 0):.2f}\n\n"
+        output += "---\n\n"
+
+        for i, msg in enumerate(messages, 1):
+            output += f"## [{i}]\n{msg}\n\n"
+
+        view.run_command("append", {"characters": output})
+
+
 class ClaudeCodeResetInputCommand(sublime_plugin.WindowCommand):
     """Force reset input mode state when it gets corrupted."""
     def run(self) -> None:

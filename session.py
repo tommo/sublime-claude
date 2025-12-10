@@ -51,7 +51,9 @@ class Session:
         self.current_tool: Optional[str] = None
         self.spinner_frame = 0
         # Session identity
-        self.session_id: Optional[str] = None
+        # When resuming (not forking), use resume_id as session_id immediately
+        # so renames/saves work before first query completes
+        self.session_id: Optional[str] = resume_id if resume_id and not fork else None
         self.resume_id: Optional[str] = resume_id  # ID to resume from
         self.fork: bool = fork  # Fork from resume_id instead of continuing it
         self.name: Optional[str] = None
