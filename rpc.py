@@ -71,6 +71,24 @@ class JsonRpcClient:
         self.proc.stdin.flush()
         return True
 
+    def send_wait(self, method: str, params: dict, timeout: float = 30.0) -> dict:
+        """Send request and wait for response. Returns {"result": ...} or {"error": ...}."""
+        import time
+        result = {}
+        done = threading.Event()
+
+        def callback(response):
+            result.update(response)
+            done.set()
+
+        if not self.send(method, params, callback):
+            return {"error": {"message": "Failed to send request - bridge is dead"}}
+
+        if not done.wait(timeout):
+            return {"error": {"message": f"Request timed out after {timeout}s"}}
+
+        return result
+
     def _read_loop(self) -> None:
         import sublime
         while self.running and self.proc and self.proc.stdout:

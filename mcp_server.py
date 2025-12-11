@@ -773,22 +773,46 @@ class MCPSocketServer:
             session.name = name
             session.output.set_name(name)
 
-        # Queue the prompt to run after initialization
-        def send_prompt():
-            if session.initialized:
-                session.query(prompt)
-            else:
-                sublime.set_timeout(send_prompt, 200)
-
-        sublime.set_timeout(send_prompt, 300)
-
         view_id = session.output.view.id() if session.output.view else None
+
+        # Wait for initialization, then send prompt and wait for completion
+        import time
+        max_wait = 30  # seconds
+        start = time.time()
+
+        # Wait for session to initialize
+        while not session.initialized and time.time() - start < max_wait:
+            time.sleep(0.1)
+
+        if not session.initialized:
+            return {
+                "error": "Session failed to initialize within 30 seconds",
+                "view_id": view_id,
+            }
+
+        # Send the prompt
+        session.query(prompt)
+
+        # Wait for session to finish processing (working becomes False)
+        start = time.time()
+        while session.working and time.time() - start < max_wait:
+            time.sleep(0.1)
+
+        if session.working:
+            return {
+                "error": "Session still processing after 30 seconds",
+                "view_id": view_id,
+                "name": name or "(unnamed)",
+                "working": True,
+            }
+
         return {
             "spawned": True,
             "name": name or "(unnamed)",
             "view_id": view_id,
             "profile": profile,
             "checkpoint": checkpoint,
+            "working": session.working,
         }
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
@@ -844,15 +868,20 @@ class MCPSocketServer:
             return {"error": "Session not initialized", "view_id": view_id}
 
         # Get conversation history from bridge/SDK
-        result = session.client.send_wait("get_history", {}, timeout=5.0)
+        response = session.client.send_wait("get_history", {}, timeout=5.0)
 
-        if "error" in result:
+        if "error" in response:
+            error_msg = response["error"].get("message") if isinstance(response["error"], dict) else str(response["error"])
             return {
-                "error": result["error"].get("message", "Failed to get history"),
+                "error": error_msg,
                 "view_id": view_id,
             }
 
-        messages = result.get("result", {}).get("messages", [])
+        # Response format: {"result": {"messages": [...]}} or {"messages": [...]}
+        if "result" in response:
+            messages = response["result"].get("messages", [])
+        else:
+            messages = response.get("messages", [])
 
         # Optionally limit to last N messages
         if lines and len(messages) > lines:
