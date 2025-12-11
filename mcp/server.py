@@ -229,43 +229,45 @@ For simple operations, prefer the dedicated tools above.""",
                 # You can monitor output with terminal_read while command runs.
                 {
                     "name": "terminal_list",
-                    "description": "List open terminal views in the editor.",
+                    "description": "List open terminal views in the editor. Shows tag and title for each terminal.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
                     "name": "terminal_run",
-                    "description": "Run a command in a terminal. PREFER THIS over Bash for: long-running commands, interactive commands, or when you need to see live output. Opens dedicated 'Claude Agent' terminal if none exists.",
+                    "description": """Run a command in a terminal. PREFER THIS over Bash for: long-running commands, interactive commands, or when you need to see live output.
+
+IMPORTANT: Your session automatically has a dedicated terminal that is reused across calls. DO NOT specify tag or target_id unless you need to share with other sessions. Just call terminal_run(command="...") and it will use your existing terminal.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "command": {"type": "string", "description": "Command to run"},
                             "wait": {"type": "number", "description": "Wait N seconds then return output. Use small values (1-2s) for quick commands, larger for builds. 0=fire and forget, use terminal_read later."},
-                            "target_id": {"type": "string", "description": "Optional: terminal ID for sharing across sessions. Multiple sessions using same target_id share the terminal."},
-                            "tag": {"type": "string", "description": "Terminal tag (default: claude-agent)"}
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use to share terminal with other sessions. Omit to use your session's dedicated terminal."},
+                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to use your session's dedicated terminal."}
                         },
                         "required": ["command"]
                     }
                 },
                 {
                     "name": "terminal_read",
-                    "description": "Read recent output from a terminal. Use to check command progress or results.",
+                    "description": "Read recent output from a terminal. Use to check command progress or results. Without parameters, reads from your session's dedicated terminal.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target_id": {"type": "string", "description": "Optional: terminal ID (shares with terminal_run's target_id)"},
-                            "tag": {"type": "string", "description": "Optional: terminal tag"},
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if reading from a shared terminal. Omit to read your session's terminal."},
+                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to read your session's terminal."},
                             "lines": {"type": "integer", "description": "Lines to read from end (default 100)"}
                         }
                     }
                 },
                 {
                     "name": "terminal_close",
-                    "description": "Close a terminal view.",
+                    "description": "Close a terminal view. Without parameters, closes your session's dedicated terminal. RARELY NEEDED - terminals auto-close with session.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target_id": {"type": "string", "description": "Optional: terminal ID (shares with terminal_run's target_id)"},
-                            "tag": {"type": "string", "description": "Optional: terminal tag to close"}
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if closing a shared terminal. Omit to close your session's terminal."},
+                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to close your session's terminal."}
                         }
                     }
                 },
