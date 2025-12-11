@@ -858,7 +858,7 @@ class MCPSocketServer:
         return result
 
     def _read_session_output(self, view_id: int, lines: int = None) -> dict:
-        """Read conversation history from a session via SDK."""
+        """Read conversation output from a session's view."""
 
         # Debug: log all session view_ids
         all_view_ids = list(sublime._claude_sessions.keys())
@@ -871,35 +871,25 @@ class MCPSocketServer:
                 "available_sessions": all_view_ids,
             }
 
-        if not session.client:
-            return {"error": "Session not initialized", "view_id": view_id}
+        if not session.output or not session.output.view:
+            return {"error": "Session output view not found", "view_id": view_id}
 
-        # Get conversation history from bridge/SDK
-        response = session.client.send_wait("get_history", {}, timeout=5.0)
+        # Read text content from the output view
+        view = session.output.view
+        content = view.substr(sublime.Region(0, view.size()))
 
-        if "error" in response:
-            error_msg = response["error"].get("message") if isinstance(response["error"], dict) else str(response["error"])
-            return {
-                "error": error_msg,
-                "view_id": view_id,
-            }
-
-        # Response format: {"result": {"messages": [...]}} or {"messages": [...]}
-        if "result" in response:
-            messages = response["result"].get("messages", [])
-        else:
-            messages = response.get("messages", [])
-
-        # Optionally limit to last N messages
-        if lines and len(messages) > lines:
-            messages = messages[-lines:]
+        # Optionally limit to last N lines
+        if lines:
+            all_lines = content.split('\n')
+            if len(all_lines) > lines:
+                content = '\n'.join(all_lines[-lines:])
 
         return {
             "view_id": view_id,
             "name": session.name or "(unnamed)",
             "working": session.working,
-            "messages": messages,
-            "message_count": len(messages),
+            "output": content,
+            "line_count": content.count('\n') + 1 if content else 0,
         }
 
     # ─── Terminus Tools ───────────────────────────────────────────────────
