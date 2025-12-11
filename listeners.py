@@ -106,6 +106,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             # Auto-enter input mode if session is idle and not already in input mode
             if s.initialized and not s.working and not s.output.is_input_mode():
                 s._enter_input_with_draft()
+            # If already in input mode, ensure cursor is positioned and view is responsive
+            elif s.output.is_input_mode():
+                # Make sure there's a valid cursor position so clicking works
+                # This fixes mouse selection which requires a valid initial cursor state
+                input_start = s.output._input_start
+                sel = self.view.sel()
+                if len(sel) == 0:
+                    # No selection at all - set cursor to input start
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(input_start, input_start))
 
         # Remove active marker from previous active session
         if old_active and old_active != self.view.id() and old_active in sublime._claude_sessions:
