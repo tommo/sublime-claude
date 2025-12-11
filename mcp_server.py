@@ -814,53 +814,60 @@ class MCPSocketServer:
         }
 
     def _list_sessions(self) -> list:
-        """List all active sessions in the current window."""
-        window = sublime.active_window()
-        if not window:
-            return []
-
+        """List all active sessions across all windows."""
         from . import claude_code
 
         result = []
         for view_id, session in claude_code._sessions.items():
-            if session.window == window:
-                result.append({
-                    "view_id": view_id,
-                    "name": session.name or "(unnamed)",
-                    "working": session.working,
-                    "query_count": session.query_count,
-                    "total_cost": session.total_cost,
-                })
+            result.append({
+                "view_id": view_id,
+                "name": session.name or "(unnamed)",
+                "working": session.working,
+                "query_count": session.query_count,
+                "total_cost": session.total_cost,
+                "window_id": session.window.id() if session.window else None,
+            })
         return result
 
     def _read_session_output(self, view_id: int, lines: int = None) -> dict:
-        """Read conversation output from a session's view."""
+        """Read conversation history from a session via SDK."""
         from . import claude_code
+
+        # Debug: log all session view_ids
+        all_view_ids = list(claude_code._sessions.keys())
+        print(f"[Claude] read_session_output: looking for {view_id}, _sessions={id(claude_code._sessions)}, available: {all_view_ids}")
 
         session = claude_code._sessions.get(view_id)
         if not session:
-            return {"error": f"Session not found for view_id {view_id}"}
+            return {
+                "error": f"Session not found for view_id {view_id}",
+                "available_sessions": all_view_ids,
+            }
 
-        if not session.output.view or not session.output.view.is_valid():
-            return {"error": "Session output view not available", "view_id": view_id}
+        if not session.client:
+            return {"error": "Session not initialized", "view_id": view_id}
 
-        # Read the entire view content
-        view = session.output.view
-        content = view.substr(sublime.Region(0, view.size()))
+        # Get conversation history from bridge/SDK
+        result = session.client.send_wait("get_history", {}, timeout=5.0)
 
-        # Optionally limit to last N lines
-        if lines:
-            content_lines = content.split("\n")
-            if len(content_lines) > lines:
-                content_lines = content_lines[-lines:]
-            content = "\n".join(content_lines)
+        if "error" in result:
+            return {
+                "error": result["error"].get("message", "Failed to get history"),
+                "view_id": view_id,
+            }
+
+        messages = result.get("result", {}).get("messages", [])
+
+        # Optionally limit to last N messages
+        if lines and len(messages) > lines:
+            messages = messages[-lines:]
 
         return {
             "view_id": view_id,
             "name": session.name or "(unnamed)",
             "working": session.working,
-            "content": content,
-            "total_lines": len(content.split("\n")),
+            "messages": messages,
+            "message_count": len(messages),
         }
 
     # ─── Terminus Tools ───────────────────────────────────────────────────

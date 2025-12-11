@@ -91,6 +91,8 @@ class Bridge:
                 await self.cancel_pending(id)
             elif method == "inject_message":
                 await self.inject_message(id, params)
+            elif method == "get_history":
+                await self.get_history(id)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -499,6 +501,36 @@ Be concise. Focus on what matters to the user.""",
         # Send as a new query - Claude will see it as a follow-up user message
         await self.client.query(message)
         send_result(id, {"status": "ok"})
+
+    async def get_history(self, id: int) -> None:
+        """Get conversation history from the SDK."""
+        if not self.client:
+            send_error(id, -32002, "Client not initialized")
+            return
+
+        try:
+            # Try to access SDK's internal conversation state
+            # The SDK stores messages internally for context
+            messages = []
+
+            # Check if client has a messages/history attribute
+            if hasattr(self.client, '_messages'):
+                messages = serialize(self.client._messages)
+            elif hasattr(self.client, 'messages'):
+                messages = serialize(self.client.messages)
+            elif hasattr(self.client, 'conversation'):
+                messages = serialize(self.client.conversation)
+            else:
+                # Fallback: return what we know
+                send_result(id, {
+                    "messages": [],
+                    "note": "SDK conversation history not accessible via standard API"
+                })
+                return
+
+            send_result(id, {"messages": messages})
+        except Exception as e:
+            send_error(id, -32000, f"Failed to get history: {str(e)}")
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""

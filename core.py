@@ -4,7 +4,6 @@ import sublime_plugin
 from typing import Dict, Optional
 
 from .session import Session
-from . import mcp_server
 
 
 # Sessions keyed by output view id - allows multiple sessions per window
@@ -13,11 +12,15 @@ _sessions: Dict[int, Session] = {}
 
 def plugin_loaded() -> None:
     """Called when plugin is loaded. Start MCP server (orphaned views reconnect on focus)."""
+    # Lazy import to avoid circular import with mcp_server
+    from . import mcp_server
     mcp_server.start()
 
 
 def plugin_unloaded() -> None:
     """Called when plugin is unloaded. Stop MCP server."""
+    # Lazy import to avoid circular import with mcp_server
+    from . import mcp_server
     mcp_server.stop()
 
 
@@ -57,6 +60,10 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     s.start()
     # Register by view id and mark as active
     if s.output.view:
-        _sessions[s.output.view.id()] = s
-        window.settings().set("claude_active_view", s.output.view.id())
+        view_id = s.output.view.id()
+        _sessions[view_id] = s
+        window.settings().set("claude_active_view", view_id)
+        print(f"[Claude] create_session: registered view_id={view_id}, _sessions={id(_sessions)}, count={len(_sessions)}, keys={list(_sessions.keys())}")
+    else:
+        print(f"[Claude] create_session: ERROR - no output view!")
     return s

@@ -188,7 +188,7 @@ Use for:
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List all active Claude sessions in the current window with their view_ids",
+                    "description": "List all active Claude sessions (including spawned subsessions) with their view_ids",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
