@@ -313,6 +313,60 @@ class ClaudeCodeSaveCheckpointCommand(sublime_plugin.WindowCommand):
         self.window.show_input_panel("Checkpoint name:", default_name, on_done, None, None)
 
 
+class ClaudeCodeUsageCommand(sublime_plugin.WindowCommand):
+    """Show API usage statistics."""
+    def run(self) -> None:
+        # Get current session usage
+        s = get_active_session(self.window)
+        current_usage = []
+        if s:
+            current_usage = [
+                f"## Current Session: {s.name}",
+                f"",
+                f"Queries: {s.query_count}",
+                f"Total Cost: ${s.total_cost:.4f}",
+                f"",
+            ]
+
+        # Get all saved sessions usage
+        sessions = load_saved_sessions()
+        total_cost = sum(sess.get("total_cost", 0) for sess in sessions)
+        total_queries = sum(sess.get("query_count", 0) for sess in sessions)
+
+        lines = [
+            "# API Usage Statistics",
+            "",
+            f"Total (All Sessions): ${total_cost:.4f} ({total_queries} queries)",
+            "",
+        ]
+
+        if current_usage:
+            lines.extend(current_usage)
+
+        if sessions:
+            lines.extend([
+                "## Recent Sessions",
+                ""
+            ])
+            for sess in sessions[:10]:  # Show last 10
+                name = sess.get("name", "Untitled")
+                cost = sess.get("total_cost", 0)
+                queries = sess.get("query_count", 0)
+                lines.append(f"- {name}: ${cost:.4f} ({queries} queries)")
+
+        # Show in quick panel with monospace font
+        content = "\n".join(lines)
+
+        # Create a new output panel to show usage
+        panel = self.window.create_output_panel("claude_usage")
+        panel.set_read_only(False)
+        panel.run_command("append", {"characters": content})
+        panel.set_read_only(True)
+        panel.settings().set("word_wrap", False)
+        panel.settings().set("gutter", False)
+        self.window.run_command("show_panel", {"panel": "output.claude_usage"})
+
+
 class ClaudeCodeViewHistoryCommand(sublime_plugin.WindowCommand):
     """View session history from Claude's stored conversation."""
     def run(self) -> None:

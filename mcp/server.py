@@ -191,6 +191,18 @@ Use for:
                     "description": "List all active Claude sessions in the current window with their view_ids",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
+                {
+                    "name": "read_session_output",
+                    "description": "Read the conversation output from a Claude session. Use to check results from spawned subsessions.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "view_id": {"type": "integer", "description": "The view_id from spawn_session or list_sessions"},
+                            "lines": {"type": "integer", "description": "Number of lines to read from end (default: all)"}
+                        },
+                        "required": ["view_id"]
+                    }
+                },
                 # ─── Custom Tools ─────────────────────────────────────────
                 {
                     "name": "sublime_eval",
@@ -350,6 +362,13 @@ User can always type a custom response.""",
             result = send_to_sublime(code=f"return send_to_session({view_id}, {prompt!r})")
         elif tool_name == "list_sessions":
             result = send_to_sublime(code="return list_sessions()")
+        elif tool_name == "read_session_output":
+            view_id = args.get("view_id")
+            lines = args.get("lines")
+            if lines:
+                result = send_to_sublime(code=f"return read_session_output({view_id}, {lines})")
+            else:
+                result = send_to_sublime(code=f"return read_session_output({view_id})")
         # Terminal tools (uses Terminus plugin)
         elif tool_name == "terminal_list":
             result = send_to_sublime(code="return terminus_list()")

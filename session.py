@@ -362,22 +362,27 @@ class Session:
         t = params.get("type")
         print(f"[Claude] notification: type={t}")
         if t == "tool_use":
-            # Mark previous tool as done if any
-            if self.current_tool:
+            # Mark previous tool as done if any (skip if empty/anonymous)
+            if self.current_tool and self.current_tool.strip():
                 self.output.tool_done(self.current_tool)
             self.current_tool = params.get("name", "")
             tool_input = params.get("input", {})
             print(f"[Claude] tool_use input: {tool_input}")
             self.output.tool(self.current_tool, tool_input)
         elif t == "tool_result":
+            # Skip anonymous/empty tool results
+            if not self.current_tool or not self.current_tool.strip():
+                self.current_tool = None
+                return
+
             content = params.get("content", "")
             # Convert content to string if it's a list
             if isinstance(content, list):
                 content = "\n".join(str(c) for c in content)
             if params.get("is_error"):
-                self.output.tool_error(self.current_tool or "tool", content)
+                self.output.tool_error(self.current_tool, content)
             else:
-                self.output.tool_done(self.current_tool or "tool", content)
+                self.output.tool_done(self.current_tool, content)
             self.current_tool = None
         elif t == "text":
             self.output.text(params.get("text", ""))

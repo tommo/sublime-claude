@@ -106,5 +106,9 @@
     {
         "caption": "Claude: Save Checkpoint...",
         "command": "claude_code_save_checkpoint"
+    },
+    {
+        "caption": "Claude: Show Usage",
+        "command": "claude_code_usage"
     }
 ]

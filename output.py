@@ -676,6 +676,11 @@ class OutputView:
         import time
         self.show(focus=False)  # Don't steal focus from other views
 
+        # IMPORTANT: Ensure input mode is OFF so permission keys (Y/N/S/A) work
+        # Permission keys require claude_input_mode=false in Default.sublime-keymap
+        if self.view:
+            self.view.settings().set("claude_input_mode", False)
+
         # NOTE: Don't call clear_stale_permission here - concurrent permissions are valid
         # Stale permission cleanup is handled by clear_all_permissions() on query completion
 

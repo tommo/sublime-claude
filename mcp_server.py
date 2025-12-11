@@ -383,6 +383,7 @@ class MCPSocketServer:
             "spawn_session": self._spawn_session,
             "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
+            "read_session_output": self._read_session_output,
             # Terminus tools
             "terminus_list": self._terminus_list,
             "terminus_send": self._terminus_send,
@@ -831,6 +832,36 @@ class MCPSocketServer:
                     "total_cost": session.total_cost,
                 })
         return result
+
+    def _read_session_output(self, view_id: int, lines: int = None) -> dict:
+        """Read conversation output from a session's view."""
+        from . import claude_code
+
+        session = claude_code._sessions.get(view_id)
+        if not session:
+            return {"error": f"Session not found for view_id {view_id}"}
+
+        if not session.output.view or not session.output.view.is_valid():
+            return {"error": "Session output view not available", "view_id": view_id}
+
+        # Read the entire view content
+        view = session.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+
+        # Optionally limit to last N lines
+        if lines:
+            content_lines = content.split("\n")
+            if len(content_lines) > lines:
+                content_lines = content_lines[-lines:]
+            content = "\n".join(content_lines)
+
+        return {
+            "view_id": view_id,
+            "name": session.name or "(unnamed)",
+            "working": session.working,
+            "content": content,
+            "total_lines": len(content.split("\n")),
+        }
 
     # ─── Terminus Tools ───────────────────────────────────────────────────
 
