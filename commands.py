@@ -81,8 +81,8 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
         if old_session:
             old_view = old_session.output.view
             old_session.stop()
-            if old_view and old_view.id() in _sessions:
-                del _sessions[old_view.id()]
+            if old_view and old_view.id() in sublime._claude_sessions:
+                del sublime._claude_sessions[old_view.id()]
 
         # Create new session
         new_session = Session(self.window)
@@ -91,13 +91,13 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
         if old_view and old_view.is_valid():
             new_session.output.view = old_view
             new_session.output.clear()
-            _sessions[old_view.id()] = new_session
+            sublime._claude_sessions[old_view.id()] = new_session
 
         new_session.start()
         if new_session.output.view:
             new_session.output.view.set_name("Claude")
-            if new_session.output.view.id() not in _sessions:
-                _sessions[new_session.output.view.id()] = new_session
+            if new_session.output.view.id() not in sublime._claude_sessions:
+                sublime._claude_sessions[new_session.output.view.id()] = new_session
         new_session.output.show()
         sublime.status_message("Session restarted")
 
@@ -501,8 +501,8 @@ class ClaudeCodeStopCommand(sublime_plugin.WindowCommand):
         if s and s.output.view:
             view_id = s.output.view.id()
             s.stop()
-            if view_id in _sessions:
-                del _sessions[view_id]
+            if view_id in sublime._claude_sessions:
+                del sublime._claude_sessions[view_id]
 
 
 class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
@@ -659,8 +659,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
             # Stop old session
             session.stop()
-            if old_view and old_view.id() in _sessions:
-                del _sessions[old_view.id()]
+            if old_view and old_view.id() in sublime._claude_sessions:
+                del sublime._claude_sessions[old_view.id()]
 
             # Create new session with selected config
             if action == "checkpoint":
@@ -675,13 +675,13 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if old_view and old_view.is_valid():
                 new_session.output.view = old_view
                 new_session.output.clear()
-                _sessions[old_view.id()] = new_session
+                sublime._claude_sessions[old_view.id()] = new_session
 
             new_session.start()
             if new_session.output.view:
                 new_session.output.view.set_name("Claude")
-                if new_session.output.view.id() not in _sessions:
-                    _sessions[new_session.output.view.id()] = new_session
+                if new_session.output.view.id() not in sublime._claude_sessions:
+                    sublime._claude_sessions[new_session.output.view.id()] = new_session
             new_session.output.show()
 
         self.window.show_quick_panel(items, on_select)
@@ -712,7 +712,7 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
         sources = []
 
         # Active sessions in this window
-        for view_id, session in _sessions.items():
+        for view_id, session in sublime._claude_sessions.items():
             if session.window == self.window and session.session_id:
                 name = session.name or "(unnamed)"
                 cost = f"${session.total_cost:.4f}" if session.total_cost > 0 else ""
