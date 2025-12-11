@@ -73,6 +73,9 @@ class Session:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
         python_path = settings.get("python_path", "python3")
 
+        # Build profile docs list early (before init) so we can add to system prompt
+        self._build_profile_docs_list()
+
         self.client = JsonRpcClient(self._on_notification)
         self.client.start([python_path, BRIDGE_SCRIPT])
         self._status("connecting...")
@@ -100,8 +103,13 @@ class Session:
                 init_params["model"] = self.profile["model"]
             if self.profile.get("betas"):
                 init_params["betas"] = self.profile["betas"]
-            if self.profile.get("system_prompt"):
-                init_params["system_prompt"] = self.profile["system_prompt"]
+            # Build system prompt with profile docs info
+            system_prompt = self.profile.get("system_prompt", "")
+            if self.profile_docs:
+                docs_info = f"\n\nProfile Documentation: {len(self.profile_docs)} files available. Use list_profile_docs to see them and read_profile_doc(path) to read their contents."
+                system_prompt = system_prompt + docs_info if system_prompt else docs_info.strip()
+            if system_prompt:
+                init_params["system_prompt"] = system_prompt
         self.client.send("initialize", init_params, self._on_init)
 
     def _cwd(self) -> str:
@@ -144,12 +152,10 @@ class Session:
             self._status(f"ready ({'; '.join(parts)})")
         else:
             self._status("ready")
-        # Preload docs from profile if configured
-        self._preload_docs()
         # Auto-enter input mode when ready
         self._enter_input_with_draft()
 
-    def _preload_docs(self) -> None:
+    def _build_profile_docs_list(self) -> None:
         """Build list of available docs from profile preload_docs patterns (no reading yet)."""
         if not self.profile or not self.profile.get("preload_docs"):
             return
