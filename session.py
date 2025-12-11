@@ -366,6 +366,12 @@ class Session:
             if self.current_tool and self.current_tool.strip():
                 self.output.tool_done(self.current_tool)
             self.current_tool = params.get("name", "")
+
+            # Skip anonymous/empty tool_use notifications
+            if not self.current_tool or not self.current_tool.strip():
+                self.current_tool = None
+                return
+
             tool_input = params.get("input", {})
             print(f"[Claude] tool_use input: {tool_input}")
             self.output.tool(self.current_tool, tool_input)
