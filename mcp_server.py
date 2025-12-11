@@ -741,8 +741,8 @@ class MCPSocketServer:
 
         return result
 
-    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None) -> dict:
-        """Spawn a new Claude session with the given prompt."""
+    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, wait_for_completion: bool = False) -> dict:
+        """Spawn a new Claude session with the given prompt. Always waits for initialization."""
         from .core import create_session
 
         window = sublime.active_window()
@@ -775,12 +775,11 @@ class MCPSocketServer:
 
         view_id = session.output.view.id() if session.output.view else None
 
-        # Wait for initialization, then send prompt and wait for completion
+        # Always wait for initialization
         import time
         max_wait = 30  # seconds
         start = time.time()
 
-        # Wait for session to initialize
         while not session.initialized and time.time() - start < max_wait:
             time.sleep(0.1)
 
@@ -793,18 +792,19 @@ class MCPSocketServer:
         # Send the prompt
         session.query(prompt)
 
-        # Wait for session to finish processing (working becomes False)
-        start = time.time()
-        while session.working and time.time() - start < max_wait:
-            time.sleep(0.1)
+        # Optionally wait for completion
+        if wait_for_completion:
+            start = time.time()
+            while session.working and time.time() - start < max_wait:
+                time.sleep(0.1)
 
-        if session.working:
-            return {
-                "error": "Session still processing after 30 seconds",
-                "view_id": view_id,
-                "name": name or "(unnamed)",
-                "working": True,
-            }
+            if session.working:
+                return {
+                    "error": "Session still processing after 30 seconds",
+                    "view_id": view_id,
+                    "name": name or "(unnamed)",
+                    "working": True,
+                }
 
         return {
             "spawned": True,

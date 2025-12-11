@@ -162,14 +162,15 @@ Use for:
                 },
                 {
                     "name": "spawn_session",
-                    "description": "Spawn a new Claude session with the given prompt. Returns view_id. Use profile for specialized configurations (e.g. 1M context model with preloaded docs).",
+                    "description": "Spawn a new Claude session with the given prompt. Returns view_id. Always waits for initialization. Use profile for specialized configurations (e.g. 1M context model with preloaded docs).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "prompt": {"type": "string", "description": "Initial prompt for the new session"},
                             "name": {"type": "string", "description": "Optional: name for the session"},
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
-                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"}
+                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
+                            "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },
                         "required": ["prompt"]
                     }
@@ -355,7 +356,8 @@ User can always type a custom response.""",
             name = args.get("name")
             profile = args.get("profile")
             checkpoint = args.get("checkpoint")
-            result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r}, {profile!r}, {checkpoint!r})")
+            wait = args.get("wait_for_completion", False)
+            result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r}, {profile!r}, {checkpoint!r}, {wait})")
         elif tool_name == "send_to_session":
             view_id = args.get("view_id")
             prompt = args.get("prompt", "")
