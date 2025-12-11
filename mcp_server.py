@@ -852,21 +852,25 @@ class MCPSocketServer:
                 })
         return result
 
-    def _terminus_run(self, command: str, tag: str = None, wait: float = 0) -> dict:
+    def _terminus_run(self, command: str, tag: str = None, wait: float = 0, target_id: str = None) -> dict:
         """Run command in terminal, optionally wait and return output.
 
         Args:
             command: Command to run (newline appended if missing)
             tag: Terminal tag (default: claude-agent)
             wait: Seconds to wait before reading output (0 = don't wait/read)
+            target_id: Optional terminal ID for sharing across sessions
 
         Returns:
             If wait=0: just confirmation of send
             If wait>0: send confirmation + terminal output after waiting
         """
-        # Default tag uses active Claude session's view ID for isolation
-        # Each session gets its own terminal to avoid state pollution
-        if not tag:
+        # Priority: target_id > tag > session-specific default
+        if target_id:
+            tag = f"claude-agent-{target_id}"
+        elif not tag:
+            # Default tag uses active Claude session's view ID for isolation
+            # Each session gets its own terminal to avoid state pollution
             from . import claude_code
             window = sublime.active_window()
             # Find active session via window's active view setting
@@ -892,7 +896,7 @@ class MCPSocketServer:
             # Store markers for polling
             result_markers = {"start": start_marker, "end": end_marker}
 
-        # Send the command
+        # Send the command (tag already resolved, don't pass target_id again)
         result = self._terminus_send(command, tag)
 
         if result.get("error"):
@@ -910,7 +914,7 @@ class MCPSocketServer:
 
         return result
 
-    def _terminus_send(self, text: str, tag: str = None) -> dict:
+    def _terminus_send(self, text: str, tag: str = None, target_id: str = None) -> dict:
         """Send text/command to a Terminus terminal.
 
         If no tag specified, uses "claude-agent-{window_id}" tag to keep agent commands
@@ -920,8 +924,11 @@ class MCPSocketServer:
         if not window:
             return {"error": "No window"}
 
-        # Default tag uses active Claude session's view ID for isolation
-        if not tag:
+        # Priority: target_id > tag > session-specific default
+        if target_id:
+            tag = f"claude-agent-{target_id}"
+        elif not tag:
+            # Default tag uses active Claude session's view ID for isolation
             from . import claude_code
             active_view_id = window.settings().get("claude_active_view") if window else None
             if active_view_id and active_view_id in claude_code._sessions:
@@ -996,10 +1003,13 @@ class MCPSocketServer:
             "tag": tag,
         }
 
-    def _terminus_read(self, tag: str = None, lines: int = 100) -> dict:
+    def _terminus_read(self, tag: str = None, lines: int = 100, target_id: str = None) -> dict:
         """Read output from a Terminus terminal."""
-        # Default tag uses active Claude session's view ID for isolation
-        if not tag:
+        # Priority: target_id > tag > session-specific default
+        if target_id:
+            tag = f"claude-agent-{target_id}"
+        elif not tag:
+            # Default tag uses active Claude session's view ID for isolation
             from . import claude_code
             window = sublime.active_window()
             active_view_id = window.settings().get("claude_active_view") if window else None
@@ -1037,10 +1047,13 @@ class MCPSocketServer:
             "total_lines": len(content.split("\n")),
         }
 
-    def _terminus_close(self, tag: str = None) -> dict:
+    def _terminus_close(self, tag: str = None, target_id: str = None) -> dict:
         """Close a Terminus terminal."""
-        # Default tag uses active Claude session's view ID for isolation
-        if not tag:
+        # Priority: target_id > tag > session-specific default
+        if target_id:
+            tag = f"claude-agent-{target_id}"
+        elif not tag:
+            # Default tag uses active Claude session's view ID for isolation
             from . import claude_code
             window = sublime.active_window()
             active_view_id = window.settings().get("claude_active_view") if window else None

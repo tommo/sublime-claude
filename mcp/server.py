@@ -240,6 +240,7 @@ For simple operations, prefer the dedicated tools above.""",
                         "properties": {
                             "command": {"type": "string", "description": "Command to run"},
                             "wait": {"type": "number", "description": "Wait N seconds then return output. Use small values (1-2s) for quick commands, larger for builds. 0=fire and forget, use terminal_read later."},
+                            "target_id": {"type": "string", "description": "Optional: terminal ID for sharing across sessions. Multiple sessions using same target_id share the terminal."},
                             "tag": {"type": "string", "description": "Terminal tag (default: claude-agent)"}
                         },
                         "required": ["command"]
@@ -251,6 +252,7 @@ For simple operations, prefer the dedicated tools above.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "target_id": {"type": "string", "description": "Optional: terminal ID (shares with terminal_run's target_id)"},
                             "tag": {"type": "string", "description": "Optional: terminal tag"},
                             "lines": {"type": "integer", "description": "Lines to read from end (default 100)"}
                         }
@@ -262,6 +264,7 @@ For simple operations, prefer the dedicated tools above.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "target_id": {"type": "string", "description": "Optional: terminal ID (shares with terminal_run's target_id)"},
                             "tag": {"type": "string", "description": "Optional: terminal tag to close"}
                         }
                     }
@@ -353,22 +356,19 @@ User can always type a custom response.""",
             # Ensure command ends with newline to execute
             if not command.endswith("\n"):
                 command += "\n"
+            target_id = args.get("target_id")
             tag = args.get("tag")
             wait = args.get("wait", 0)
-            result = send_to_sublime(code=f"return terminus_run({command!r}, {tag!r}, {wait})")
+            result = send_to_sublime(code=f"return terminus_run({command!r}, tag={tag!r}, wait={wait}, target_id={target_id!r})")
         elif tool_name == "terminal_read":
+            target_id = args.get("target_id")
             tag = args.get("tag")
             lines = args.get("lines", 100)
-            if tag:
-                result = send_to_sublime(code=f"return terminus_read({tag!r}, {lines})")
-            else:
-                result = send_to_sublime(code=f"return terminus_read(lines={lines})")
+            result = send_to_sublime(code=f"return terminus_read(tag={tag!r}, lines={lines}, target_id={target_id!r})")
         elif tool_name == "terminal_close":
+            target_id = args.get("target_id")
             tag = args.get("tag")
-            if tag:
-                result = send_to_sublime(code=f"return terminus_close({tag!r})")
-            else:
-                result = send_to_sublime(code="return terminus_close()")
+            result = send_to_sublime(code=f"return terminus_close(tag={tag!r}, target_id={target_id!r})")
         # User interaction
         elif tool_name == "ask_user":
             question = args.get("question", "")
