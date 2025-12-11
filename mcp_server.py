@@ -743,11 +743,11 @@ class MCPSocketServer:
 
     def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None) -> dict:
         """Spawn a new Claude session with the given prompt."""
+        from .core import create_session
+
         window = sublime.active_window()
         if not window:
             return {"error": "No window"}
-
-        # Import here to avoid circular import
 
         profiles, checkpoints = _load_profiles_and_checkpoints()
         profile_config = None
@@ -768,7 +768,7 @@ class MCPSocketServer:
             fork = True
 
         # Create new session
-        session = claude_code.create_session(window, resume_id=resume_id, fork=fork, profile=profile_config)
+        session = create_session(window, resume_id=resume_id, fork=fork, profile=profile_config)
         if name:
             session.name = name
             session.output.set_name(name)
