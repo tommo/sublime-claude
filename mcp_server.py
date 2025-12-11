@@ -748,7 +748,7 @@ class MCPSocketServer:
             return {"error": "No window"}
 
         # Import here to avoid circular import
-        from . import claude_code
+        from . import core
 
         profiles, checkpoints = _load_profiles_and_checkpoints()
         profile_config = None
@@ -794,9 +794,9 @@ class MCPSocketServer:
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
         """Send a message to an existing session."""
-        from . import claude_code
+        from . import core
 
-        session = claude_code._sessions.get(view_id)
+        session = core._sessions.get(view_id)
         if not session:
             return {"error": f"Session not found for view_id {view_id}"}
 
@@ -815,10 +815,10 @@ class MCPSocketServer:
 
     def _list_sessions(self) -> list:
         """List all active sessions across all windows."""
-        from . import claude_code
+        from . import core
 
         result = []
-        for view_id, session in claude_code._sessions.items():
+        for view_id, session in core._sessions.items():
             result.append({
                 "view_id": view_id,
                 "name": session.name or "(unnamed)",
@@ -831,13 +831,13 @@ class MCPSocketServer:
 
     def _read_session_output(self, view_id: int, lines: int = None) -> dict:
         """Read conversation history from a session via SDK."""
-        from . import claude_code
+        from . import core
 
         # Debug: log all session view_ids
-        all_view_ids = list(claude_code._sessions.keys())
-        print(f"[Claude] read_session_output: looking for {view_id}, _sessions={id(claude_code._sessions)}, available: {all_view_ids}")
+        all_view_ids = list(core._sessions.keys())
+        print(f"[Claude] read_session_output: looking for {view_id}, _sessions={id(core._sessions)}, available: {all_view_ids}")
 
-        session = claude_code._sessions.get(view_id)
+        session = core._sessions.get(view_id)
         if not session:
             return {
                 "error": f"Session not found for view_id {view_id}",
@@ -909,12 +909,12 @@ class MCPSocketServer:
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
             # Each session gets its own terminal to avoid state pollution
-            from . import claude_code
+            from . import core
             window = sublime.active_window()
             # Find active session via window's active view setting
             active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in claude_code._sessions:
-                session = claude_code._sessions[active_view_id]
+            if active_view_id and active_view_id in core._sessions:
+                session = core._sessions[active_view_id]
                 tag = f"claude-agent-{active_view_id}"
             else:
                 # Fallback to window ID if no session
@@ -967,9 +967,9 @@ class MCPSocketServer:
             tag = f"claude-agent-{target_id}"
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
-            from . import claude_code
+            from . import core
             active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in claude_code._sessions:
+            if active_view_id and active_view_id in core._sessions:
                 tag = f"claude-agent-{active_view_id}"
             else:
                 tag = f"claude-agent-{window.id()}"
@@ -1048,10 +1048,10 @@ class MCPSocketServer:
             tag = f"claude-agent-{target_id}"
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
-            from . import claude_code
+            from . import core
             window = sublime.active_window()
             active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in claude_code._sessions:
+            if active_view_id and active_view_id in core._sessions:
                 tag = f"claude-agent-{active_view_id}"
             else:
                 window_id = window.id() if window else 0
@@ -1092,10 +1092,10 @@ class MCPSocketServer:
             tag = f"claude-agent-{target_id}"
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
-            from . import claude_code
+            from . import core
             window = sublime.active_window()
             active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in claude_code._sessions:
+            if active_view_id and active_view_id in core._sessions:
                 tag = f"claude-agent-{active_view_id}"
             else:
                 window_id = window.id() if window else 0
