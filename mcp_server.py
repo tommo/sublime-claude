@@ -418,6 +418,8 @@ class MCPSocketServer:
             "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
             "read_session_output": self._read_session_output,
+            "list_profile_docs": self._list_profile_docs,
+            "read_profile_doc": self._read_profile_doc,
             # Terminus tools
             "terminus_list": self._terminus_list,
             "terminus_send": self._terminus_send,
@@ -891,6 +893,69 @@ class MCPSocketServer:
             "output": content,
             "line_count": content.count('\n') + 1 if content else 0,
         }
+
+    def _list_profile_docs(self) -> dict:
+        """List documentation files available from current session's profile."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        # Get active session
+        active_view_id = window.settings().get("claude_active_view")
+        if not active_view_id or active_view_id not in sublime._claude_sessions:
+            return {"error": "No active Claude session"}
+
+        session = sublime._claude_sessions[active_view_id]
+
+        if not session.profile_docs:
+            return {
+                "docs": [],
+                "count": 0,
+                "note": "No profile docs configured for this session"
+            }
+
+        return {
+            "docs": session.profile_docs,
+            "count": len(session.profile_docs),
+            "profile": session.profile.get("description", "") if session.profile else ""
+        }
+
+    def _read_profile_doc(self, path: str) -> dict:
+        """Read a documentation file from current session's profile docset."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        # Get active session
+        active_view_id = window.settings().get("claude_active_view")
+        if not active_view_id or active_view_id not in sublime._claude_sessions:
+            return {"error": "No active Claude session"}
+
+        session = sublime._claude_sessions[active_view_id]
+
+        if path not in session.profile_docs:
+            return {
+                "error": f"File '{path}' not in profile docset",
+                "available": session.profile_docs[:10],  # Show first 10
+                "total": len(session.profile_docs)
+            }
+
+        # Read the file
+        import os
+        cwd = session._cwd()
+        full_path = os.path.join(cwd, path)
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            return {
+                "path": path,
+                "content": content,
+                "size": len(content),
+            }
+        except Exception as e:
+            return {"error": f"Failed to read {path}: {str(e)}"}
 
     # ─── Terminus Tools ───────────────────────────────────────────────────
 

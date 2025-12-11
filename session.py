@@ -62,6 +62,8 @@ class Session:
         self.query_count: int = 0
         # Pending context for next query
         self.pending_context: List[ContextItem] = []
+        # Profile docs available for reading (paths only, not content)
+        self.profile_docs: List[str] = []
         # Draft prompt (persists across input panel open/close)
         self.draft_prompt: str = ""
         # Track if we've entered input mode after last query
@@ -148,7 +150,7 @@ class Session:
         self._enter_input_with_draft()
 
     def _preload_docs(self) -> None:
-        """Load docs from profile preload_docs patterns into pending context."""
+        """Build list of available docs from profile preload_docs patterns (no reading yet)."""
         if not self.profile or not self.profile.get("preload_docs"):
             return
 
@@ -159,8 +161,6 @@ class Session:
             patterns = [patterns]
 
         cwd = self._cwd()
-        total_size = 0
-        max_size = 500000  # 500KB limit to avoid overload
 
         try:
             for pattern in patterns:
@@ -168,25 +168,11 @@ class Session:
                 full_pattern = os.path.join(cwd, pattern)
                 for filepath in glob_module.glob(full_pattern, recursive=True):
                     if os.path.isfile(filepath):
-                        try:
-                            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read()
-                            total_size += len(content)
-                            if total_size > max_size:
-                                print(f"[Claude] preload_docs: size limit reached, stopping")
-                                break
-                            rel_path = os.path.relpath(filepath, cwd)
-                            # Add directly to pending_context without updating display yet
-                            name = os.path.basename(rel_path)
-                            self.pending_context.append(ContextItem("file", name, f"File: {rel_path}\n```\n{content}\n```"))
-                            print(f"[Claude] preloaded: {rel_path} ({len(content)} bytes)")
-                        except Exception as e:
-                            print(f"[Claude] preload error {filepath}: {e}")
-                if total_size > max_size:
-                    break
+                        rel_path = os.path.relpath(filepath, cwd)
+                        self.profile_docs.append(rel_path)
 
-            if self.pending_context:
-                print(f"[Claude] preloaded {len(self.pending_context)} docs ({total_size} bytes)")
+            if self.profile_docs:
+                print(f"[Claude] Profile docs available: {len(self.profile_docs)} files")
         except Exception as e:
             print(f"[Claude] preload_docs error: {e}")
 

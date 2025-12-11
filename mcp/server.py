@@ -204,6 +204,22 @@ Use for:
                         "required": ["view_id"]
                     }
                 },
+                {
+                    "name": "list_profile_docs",
+                    "description": "List documentation files available from your session's profile. These are project-specific docs configured in the profile's preload_docs patterns. Use read_profile_doc to read their contents.",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "read_profile_doc",
+                    "description": "Read a documentation file from your session's profile docset. Use list_profile_docs to see available files. Path is relative to project root.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Relative path to the doc file (from list_profile_docs)"}
+                        },
+                        "required": ["path"]
+                    }
+                },
                 # ─── Custom Tools ─────────────────────────────────────────
                 {
                     "name": "sublime_eval",
@@ -371,6 +387,11 @@ User can always type a custom response.""",
                 result = send_to_sublime(code=f"return read_session_output({view_id}, {lines})")
             else:
                 result = send_to_sublime(code=f"return read_session_output({view_id})")
+        elif tool_name == "list_profile_docs":
+            result = send_to_sublime(code="return list_profile_docs()")
+        elif tool_name == "read_profile_doc":
+            path = args.get("path", "")
+            result = send_to_sublime(code=f"return read_profile_doc({path!r})")
         # Terminal tools (uses Terminus plugin)
         elif tool_name == "terminal_list":
             result = send_to_sublime(code="return terminus_list()")
