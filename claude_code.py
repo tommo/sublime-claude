@@ -11,7 +11,6 @@ from .core import (
     get_session_for_view,
     get_active_session,
     create_session,
-    _sessions,
 )
 
 # All commands

@@ -2,7 +2,7 @@
 import sublime
 import sublime_plugin
 
-from .core import get_session_for_view, get_active_session, _sessions
+from .core import get_session_for_view, get_active_session
 from .session import Session
 
 
@@ -11,12 +11,12 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         if command == "close_window":
             # Stop all sessions in this window
             to_remove = []
-            for view_id, session in _sessions.items():
+            for view_id, session in sublime._claude_sessions.items():
                 if session.window == window:
                     session.stop()
                     to_remove.append(view_id)
             for view_id in to_remove:
-                del _sessions[view_id]
+                del sublime._claude_sessions[view_id]
 
     def on_activated(self, view: sublime.View) -> None:
         """Handle view activated - check if it's for context adding from goto."""
@@ -44,7 +44,7 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         window.settings().erase("claude_pending_context_time")
 
         # Get the session
-        session = _sessions.get(session_view_id)
+        session = sublime._claude_sessions.get(session_view_id)
         if not session:
             return
 
@@ -69,9 +69,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
 
     def on_close(self, view: sublime.View) -> None:
         # Clean up session when output view is closed
-        if view.id() in _sessions:
-            _sessions[view.id()].stop()
-            del _sessions[view.id()]
+        if view.id() in sublime._claude_sessions:
+            sublime._claude_sessions[view.id()].stop()
+            del sublime._claude_sessions[view.id()]
 
 
 class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
@@ -108,19 +108,18 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 s._enter_input_with_draft()
 
         # Remove active marker from previous active session
-        if old_active and old_active != self.view.id() and old_active in _sessions:
-            old_session = _sessions[old_active]
+        if old_active and old_active != self.view.id() and old_active in sublime._claude_sessions:
+            old_session = sublime._claude_sessions[old_active]
             old_session.output.set_name(old_session.name or "Claude")
 
     def _reconnect_orphaned_view(self, window):
         """Reconnect an orphaned Claude output view on focus."""
-        from .core import _sessions
         from .session import Session, load_saved_sessions
 
         view = self.view
 
         # Guard against double reconnection
-        if view.id() in _sessions:
+        if view.id() in sublime._claude_sessions:
             return
         if view.settings().get("claude_reconnecting"):
             return
@@ -160,7 +159,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         session.name = session_name
         session.output.view = view
         session.draft_prompt = ""
-        _sessions[view.id()] = session
+        sublime._claude_sessions[view.id()] = session
 
         # Reset active states
         session.output.reset_active_states()

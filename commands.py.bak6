@@ -541,11 +541,11 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
 class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
     """Switch between active sessions in this window."""
     def run(self) -> None:
-        from .core import create_session
+        from .core import _sessions, create_session
 
         # Get all sessions in this window
         sessions_in_window = []
-        for view_id, session in sublime._claude_sessions.items():
+        for view_id, session in _sessions.items():
             if session.window == self.window:
                 sessions_in_window.append((view_id, session))
 
@@ -629,7 +629,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
     def _show_restart_picker(self, session, profiles, checkpoints):
         """Show profile/checkpoint picker for restart."""
-        from .core import create_session
+        from .core import _sessions, create_session
 
         items = []
         actions = []

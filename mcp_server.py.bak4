@@ -748,6 +748,7 @@ class MCPSocketServer:
             return {"error": "No window"}
 
         # Import here to avoid circular import
+        from . import core
 
         profiles, checkpoints = _load_profiles_and_checkpoints()
         profile_config = None
@@ -793,6 +794,7 @@ class MCPSocketServer:
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
         """Send a message to an existing session."""
+        from . import core
 
         session = sublime._claude_sessions.get(view_id)
         if not session:
@@ -813,6 +815,7 @@ class MCPSocketServer:
 
     def _list_sessions(self) -> list:
         """List all active sessions across all windows."""
+        from . import core
 
         result = []
         for view_id, session in sublime._claude_sessions.items():
@@ -828,6 +831,7 @@ class MCPSocketServer:
 
     def _read_session_output(self, view_id: int, lines: int = None) -> dict:
         """Read conversation history from a session via SDK."""
+        from . import core
 
         # Debug: log all session view_ids
         all_view_ids = list(sublime._claude_sessions.keys())
