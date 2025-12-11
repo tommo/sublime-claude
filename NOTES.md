@@ -181,7 +181,7 @@ Multiple permission requests are queued - only one shown at a time.
 - Status bar shows loaded MCP servers on init
 
 **MCP Tools:**
-- Editor: `get_window_summary`, `find_file`, `get_symbols`, `goto_symbol`
+- Editor: `get_window_summary`, `find_file`, `get_symbols`, `goto_symbol`, `read_view`
 - Terminal: `terminal_list`, `terminal_run`, `terminal_read`, `terminal_close`
 - Blackboard: `bb_write`, `bb_read`, `bb_list`, `bb_delete`
 - Sessions: `spawn_session`, `send_to_session`, `list_sessions`
@@ -192,6 +192,7 @@ Multiple permission requests are queued - only one shown at a time.
 - `get_window_summary()` - Open files, active file with selection, project folders, layout
 - `find_file(query, pattern?, limit?)` - Fuzzy find by partial name, optional glob filter
 - `get_symbols(query, file_path?, limit?)` - Batch symbol lookup (comma-separated or JSON array)
+- `read_view(file_path?, view_name?, head?, tail?, grep?, grep_i?)` - Read content from any view with head/tail/grep filtering
 
 **Terminal tools (uses Terminus plugin):**
 - `terminal_run(command, tag?)` - Run command in terminal. PREFER over Bash for long-running/interactive commands
@@ -312,6 +313,24 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
 - [ ] Session search/filter
 - [ ] Click to expand/collapse tool sections
 - [ ] MCP tool parameters (pass args to saved tools)
+
+## Recent Changes (2025-12-11)
+
+### New Features
+- **`read_view` MCP tool**: Read content from any view (file buffer or scratch) in Sublime Text with filtering.
+  - Accepts `file_path` for file buffers (absolute or relative to project)
+  - Accepts `view_name` for scratch buffers (e.g., output panels, unnamed buffers)
+  - Filtering options (applied in order: grep → head/tail):
+    - `head=N` - Read first N lines
+    - `tail=N` - Read last N lines
+    - `grep="pattern"` - Filter lines matching regex (case-sensitive)
+    - `grep_i="pattern"` - Filter lines matching regex (case-insensitive)
+  - Returns: `content`, `size`, `line_count`, `original_line_count`, and filter info
+  ```python
+  read_view(file_path="src/main.py", head=50)
+  read_view(view_name="Output", grep="ERROR")
+  read_view(file_path="log.txt", grep_i="warning", tail=100)
+  ```
 
 ## Recent Changes (2025-12-10)
 

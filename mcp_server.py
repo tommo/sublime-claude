@@ -404,6 +404,7 @@ class MCPSocketServer:
             "find_file": self._find_file,
             "get_symbols": self._get_symbols,
             "goto_symbol": self._goto_symbol,
+            "read_view": self._read_view,
             "terminus_run": self._terminus_run,
             "list_tools": self._list_tools,
             # Blackboard
@@ -693,6 +694,116 @@ class MCPSocketServer:
         path, name, (row, col) = loc[0], loc[1], loc[2]
         view = window.open_file(f"{path}:{row}:{col}", sublime.ENCODED_POSITION)
         return {"file": path, "name": name, "row": row, "col": col}
+
+    def _read_view(self, file_path: str = None, view_name: str = None, head: int = None, tail: int = None, grep: str = None, grep_i: str = None) -> dict:
+        """Read content from any view by file path or view name with head/tail/grep filtering."""
+        import os
+        import re
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No window"}
+
+        view = None
+        identifier = None
+
+        # Search by view name (for scratch buffers)
+        if view_name:
+            for v in window.views():
+                if v.name() == view_name:
+                    view = v
+                    identifier = view_name
+                    break
+            if not view:
+                return {"error": f"View not found: {view_name}"}
+
+        # Search by file path
+        elif file_path:
+            # Resolve file path (handle relative paths)
+            if not os.path.isabs(file_path):
+                # Try relative to project folders
+                for folder in window.folders():
+                    full_path = os.path.join(folder, file_path)
+                    if os.path.exists(full_path):
+                        file_path = full_path
+                        break
+
+            # Normalize path
+            file_path = os.path.normpath(file_path)
+            identifier = file_path
+
+            # Find existing view with this file
+            for v in window.views():
+                if v.file_name() and os.path.normpath(v.file_name()) == file_path:
+                    view = v
+                    break
+
+            # If not found, try to open it (won't focus, just load)
+            if not view:
+                if os.path.exists(file_path):
+                    view = window.open_file(file_path, sublime.TRANSIENT)
+                    # Wait a bit for file to load
+                    import time
+                    max_wait = 2.0
+                    start = time.time()
+                    while view.is_loading() and time.time() - start < max_wait:
+                        time.sleep(0.05)
+                else:
+                    return {"error": f"File not found: {file_path}"}
+
+        else:
+            return {"error": "Must provide either file_path or view_name"}
+
+        if not view:
+            return {"error": f"Could not open view for: {identifier}"}
+
+        # Read content
+        content = view.substr(sublime.Region(0, view.size()))
+        all_lines = content.split('\n')
+        original_line_count = len(all_lines)
+
+        # Apply grep filter first
+        if grep or grep_i:
+            pattern = grep if grep else grep_i
+            flags = re.IGNORECASE if grep_i else 0
+            try:
+                regex = re.compile(pattern, flags)
+                all_lines = [line for line in all_lines if regex.search(line)]
+            except re.error as e:
+                return {"error": f"Invalid regex pattern: {e}"}
+
+        # Apply head/tail filter
+        if head is not None and tail is not None:
+            return {"error": "Cannot specify both head and tail"}
+        elif head is not None:
+            all_lines = all_lines[:head]
+        elif tail is not None:
+            all_lines = all_lines[-tail:] if tail < len(all_lines) else all_lines
+
+        content = '\n'.join(all_lines)
+
+        result = {
+            "content": content,
+            "size": len(content),
+            "line_count": len(all_lines),
+            "original_line_count": original_line_count,
+        }
+
+        # Include identifier in response
+        if file_path:
+            result["file_path"] = file_path
+        if view_name:
+            result["view_name"] = view_name
+
+        # Include filter info if applied
+        if grep or grep_i:
+            result["grep_pattern"] = grep if grep else grep_i
+            result["grep_case_insensitive"] = bool(grep_i)
+        if head is not None:
+            result["head"] = head
+        if tail is not None:
+            result["tail"] = tail
+
+        return result
 
     # ─── Blackboard ───────────────────────────────────────────────────────
 

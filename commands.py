@@ -570,7 +570,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         if not in_output_view and current_file:
             import os
             filename = os.path.basename(current_file)
-            items.append([f"🆕 New Session with {filename}", "Create session with this file as context"])
+            items.append([f"📋 New with ctx:{filename}", "Create session with this file as context"])
             actions.append(("new_with_file", current_file))
 
         if active_session and not in_output_view:

@@ -833,6 +833,12 @@ class OutputView:
         if regions:
             region = regions[0]
             self._replace(region.begin(), region.end(), "")
+
+            # Update conversation region end to account for removed permission block
+            # This prevents _do_render from extending and overwriting content
+            if self.current:
+                self.current.region = (self.current.region[0], self.view.size())
+
         self.view.erase_regions("claude_permission_block")
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
@@ -1025,7 +1031,8 @@ class OutputView:
         view_size = self.view.size()
         # If there's content after our region, extend end to clean it up
         # This handles race conditions where content was orphaned from previous renders
-        if end < view_size:
+        # BUT: Don't extend if there's a permission block - that's intentional content after the region
+        if end < view_size and not (self.pending_permission and self.pending_permission.callback):
             end = view_size
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)

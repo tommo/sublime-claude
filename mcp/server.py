@@ -112,6 +112,21 @@ def handle_request(request: dict) -> dict:
                         "required": ["query"]
                     }
                 },
+                {
+                    "name": "read_view",
+                    "description": "Read content from any view (file buffer or scratch) in Sublime Text. Specify either file_path for file buffers or view_name for scratch buffers. Supports head/tail/grep filtering.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string", "description": "File path to read (absolute or relative to project)"},
+                            "view_name": {"type": "string", "description": "View name for scratch buffers (e.g. output panels)"},
+                            "head": {"type": "integer", "description": "Read first N lines"},
+                            "tail": {"type": "integer", "description": "Read last N lines"},
+                            "grep": {"type": "string", "description": "Filter lines matching regex pattern (case-sensitive)"},
+                            "grep_i": {"type": "string", "description": "Filter lines matching regex pattern (case-insensitive)"}
+                        }
+                    }
+                },
                 # ─── Blackboard Tools ─────────────────────────────────────
                 # Shared scratchpad for persistent artifacts across sessions.
                 # Common patterns:
@@ -362,6 +377,14 @@ User can always type a custom response.""",
         elif tool_name == "goto_symbol":
             query = args.get("query", "")
             result = send_to_sublime(code=f"return goto_symbol({query!r})")
+        elif tool_name == "read_view":
+            file_path = args.get("file_path")
+            view_name = args.get("view_name")
+            head = args.get("head")
+            tail = args.get("tail")
+            grep = args.get("grep")
+            grep_i = args.get("grep_i")
+            result = send_to_sublime(code=f"return read_view({file_path!r}, {view_name!r}, {head}, {tail}, {grep!r}, {grep_i!r})")
         # Blackboard tools
         elif tool_name == "bb_write":
             key = args.get("key", "")
