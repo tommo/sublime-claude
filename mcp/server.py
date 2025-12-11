@@ -20,8 +20,19 @@ def send_to_sublime(code: str = "", tool: str = None) -> dict:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(SOCKET_PATH)
         sock.sendall((json.dumps({"code": code, "tool": tool}) + "\n").encode())
-        response = sock.recv(65536).decode()
+
+        # Receive all data until newline (responses are newline-terminated)
+        response_bytes = b""
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_bytes += chunk
+            if b"\n" in chunk:
+                break
+
         sock.close()
+        response = response_bytes.decode()
         return json.loads(response)
     except FileNotFoundError:
         return {"error": "Sublime Text not connected. Make sure the plugin is running."}

@@ -949,6 +949,16 @@ class MCPSocketServer:
             with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
+            # Ensure content is JSON-serializable by replacing problematic characters
+            # This shouldn't be necessary since json.dumps handles escaping,
+            # but we ensure clean UTF-8 just in case
+            import json
+            # Test that it can be serialized
+            try:
+                json.dumps(content)
+            except (TypeError, ValueError) as e:
+                return {"error": f"Content not JSON-serializable: {str(e)}"}
+
             return {
                 "path": path,
                 "content": content,
