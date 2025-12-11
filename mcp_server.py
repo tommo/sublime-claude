@@ -195,6 +195,40 @@ class MCPSocketServer:
             timeout = 300 if is_ask_user else 30
             done.wait(timeout=timeout)
 
+            # Handle spawn_session wait - poll for initialization
+            eval_result = result.get("result")
+            if isinstance(eval_result, dict) and eval_result.get("_wait_for_init"):
+                session = eval_result.pop("_session")
+                prompt = eval_result.pop("_prompt")
+                wait_for_completion = eval_result.pop("_wait_for_completion", False)
+                eval_result.pop("_wait_for_init")
+
+                # Wait for initialization (in this background thread, not main thread)
+                import time
+                max_wait = 30
+                start = time.time()
+                while not session.initialized and time.time() - start < max_wait:
+                    time.sleep(0.1)
+
+                if not session.initialized:
+                    eval_result["error"] = "Session failed to initialize within 30 seconds"
+                else:
+                    # Send the prompt from main thread
+                    def send_prompt():
+                        session.query(prompt)
+                    sublime.set_timeout(send_prompt, 0)
+
+                    # Optionally wait for completion
+                    if wait_for_completion:
+                        start = time.time()
+                        while session.working and time.time() - start < max_wait:
+                            time.sleep(0.1)
+                        if session.working:
+                            eval_result["warning"] = "Session still processing after 30 seconds"
+
+                    eval_result["working"] = session.working
+                    eval_result["initialized"] = True
+
             # Handle terminus_run wait - poll for completion marker
             eval_result = result.get("result")
             if isinstance(eval_result, dict) and eval_result.get("_wait_requested"):
@@ -742,7 +776,7 @@ class MCPSocketServer:
         return result
 
     def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, wait_for_completion: bool = False) -> dict:
-        """Spawn a new Claude session with the given prompt. Always waits for initialization."""
+        """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag."""
         from .core import create_session
 
         window = sublime.active_window()
@@ -775,44 +809,17 @@ class MCPSocketServer:
 
         view_id = session.output.view.id() if session.output.view else None
 
-        # Always wait for initialization
-        import time
-        max_wait = 30  # seconds
-        start = time.time()
-
-        while not session.initialized and time.time() - start < max_wait:
-            time.sleep(0.1)
-
-        if not session.initialized:
-            return {
-                "error": "Session failed to initialize within 30 seconds",
-                "view_id": view_id,
-            }
-
-        # Send the prompt
-        session.query(prompt)
-
-        # Optionally wait for completion
-        if wait_for_completion:
-            start = time.time()
-            while session.working and time.time() - start < max_wait:
-                time.sleep(0.1)
-
-            if session.working:
-                return {
-                    "error": "Session still processing after 30 seconds",
-                    "view_id": view_id,
-                    "name": name or "(unnamed)",
-                    "working": True,
-                }
-
+        # Return with flags for background thread to handle waiting
         return {
+            "_wait_for_init": True,  # Signal to wait for initialization
+            "_session": session,  # Session object for polling
+            "_prompt": prompt,  # Prompt to send after init
+            "_wait_for_completion": wait_for_completion,  # Whether to also wait for completion
             "spawned": True,
             "name": name or "(unnamed)",
             "view_id": view_id,
             "profile": profile,
             "checkpoint": checkpoint,
-            "working": session.working,
         }
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
