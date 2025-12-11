@@ -564,6 +564,14 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         # Show "Active:" option only when not in a Claude output view (for quick jumping from file view)
         current_view = self.window.active_view()
         in_output_view = current_view and current_view.settings().get("claude_output")
+        current_file = current_view.file_name() if current_view else None
+
+        # Add "New Session with This File" option when in a non-session file
+        if not in_output_view and current_file:
+            import os
+            filename = os.path.basename(current_file)
+            items.append([f"🆕 New Session with {filename}", "Create session with this file as context"])
+            actions.append(("new_with_file", current_file))
 
         if active_session and not in_output_view:
             name = active_session.name or "(unnamed)"
@@ -614,6 +622,16 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 if action == "restart" and data:
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)
+                elif action == "new_with_file" and data:
+                    # Create new session with current file as context
+                    s = create_session(self.window)
+                    # Read file content and add to context
+                    try:
+                        with open(data, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        s.add_context_file(data, content)
+                    except Exception as e:
+                        print(f"[Claude] Error adding file context: {e}")
                 elif action == "new":
                     create_session(self.window)
                 elif action == "profile":
