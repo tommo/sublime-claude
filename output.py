@@ -106,7 +106,7 @@ class OutputView:
         self.view = self.window.new_file()
         self.view.set_name("Claude")
         self.view.set_scratch(True)
-        self.view.set_read_only(True)
+        self.view.set_read_only(False)  # Keep editable - protection via on_modified
         self.view.settings().set("claude_output", True)
         self.view.settings().set("word_wrap", True)
         self.view.settings().set("gutter", True)
@@ -159,6 +159,11 @@ class OutputView:
         # Keep view editable (Terminus approach) - protection handled by on_modified
         if pos is None:
             pos = self.view.size()
+
+        # Temporarily make editable if needed
+        if self.view.is_read_only():
+            self.view.set_read_only(False)
+
         self.view.run_command("claude_insert", {"pos": pos, "text": text})
         return pos + len(text)
 
@@ -168,6 +173,10 @@ class OutputView:
             return end
 
         # Keep view editable (Terminus approach) - protection handled by on_modified
+        # Temporarily make editable if needed
+        if self.view.is_read_only():
+            self.view.set_read_only(False)
+
         self.view.run_command("claude_replace", {"start": start, "end": end, "text": text})
         return start + len(text)
 
@@ -1050,12 +1059,17 @@ class OutputView:
         # Events in time order (text chunks and tools interleaved)
         if self.current.events:
             lines.append("\n")
+
+            # Check if there are any pending tools - if so, skip text (it's just planning commentary)
+            has_pending_tools = any(isinstance(e, ToolCall) and e.status == PENDING for e in self.current.events)
+
             for event in self.current.events:
                 if isinstance(event, str):
-                    # Text chunk
-                    lines.append(event)
-                    if not event.endswith("\n"):
-                        lines.append("\n")
+                    # Skip text chunks if tools are still pending (agent planning commentary)
+                    if not has_pending_tools:
+                        lines.append(event)
+                        if not event.endswith("\n"):
+                            lines.append("\n")
                 elif isinstance(event, ToolCall):
                     # Tool call
                     symbol = self.SYMBOLS[event.status]

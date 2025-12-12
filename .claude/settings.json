@@ -1,0 +1,31 @@
+{
+  "extraKnownMarketplaces": {
+    "community": {
+      "source": {
+        "source": "github",
+        "repo": "thedotmack/claude-mem"
+      }
+    },
+    "official-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-code",
+        "subdir": "plugins"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "claude-mem": {
+      "enabled": true,
+      "marketplace": "community"
+    },
+    "commit-commands": {
+      "enabled": true,
+      "marketplace": "official-plugins"
+    },
+    "security-guidance": {
+      "enabled": true,
+      "marketplace": "official-plugins"
+    }
+  }
+}

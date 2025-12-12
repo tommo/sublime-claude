@@ -128,6 +128,7 @@ class Bridge:
         mcp_servers = self._load_mcp_servers(cwd)
         agents = self._load_agents(cwd)
         plugins = self._load_plugins(cwd)
+        settings = self._load_project_settings(cwd)
 
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"initialize: params={params}\n")
@@ -136,11 +137,19 @@ class Bridge:
             f.write(f"  agents={list(agents.keys()) if agents else None}\n")
             f.write(f"  plugins={plugins}\n")
 
+        # Build system prompt with project addon
+        system_prompt = params.get("system_prompt", "")
+        addon = settings.get("system_prompt_addon")
+        if addon:
+            system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  injected system_prompt_addon: {len(addon)} chars\n")
+
         options_dict = {
             "allowed_tools": params.get("allowed_tools", []),
             "permission_mode": params.get("permission_mode", "default"),
             "cwd": cwd,
-            "system_prompt": params.get("system_prompt"),
+            "system_prompt": system_prompt,
             "can_use_tool": self.can_use_tool,
             "resume": resume_id,
             "fork_session": fork_session,
