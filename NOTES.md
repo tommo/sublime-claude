@@ -185,6 +185,7 @@ Multiple permission requests are queued - only one shown at a time.
 - Terminal: `terminal_list`, `terminal_run`, `terminal_read`, `terminal_close`
 - Blackboard: `bb_write`, `bb_read`, `bb_list`, `bb_delete`
 - Sessions: `spawn_session`, `send_to_session`, `list_sessions`
+- Alarms: `set_alarm`, `cancel_alarm`
 - User: `ask_user` - ask questions via quick panel
 - Custom: `sublime_eval`, `sublime_tool`, `list_tools`
 
@@ -244,6 +245,61 @@ Multiple permission requests are queued - only one shown at a time.
   "model": "haiku"  // haiku/sonnet/opus
 }
 ```
+
+### Alarm System (Event-Driven Waiting)
+
+Instead of polling for subsession completion or other events, sessions can set alarms to "sleep" and wake when events occur. The alarm fires by injecting a wake_prompt into the session.
+
+**Architecture:**
+- Bridge stores alarms and monitors events asynchronously
+- Uses `asyncio.Event` for subsession completion signaling
+- Uses `asyncio.sleep` for time-based alarms
+- When alarm fires, bridge injects wake_prompt as a new query
+
+**Available as MCP tools:**
+- `set_alarm(event_type, event_params, wake_prompt, alarm_id=None)`
+- `cancel_alarm(alarm_id)`
+
+**Event types:**
+- `time_elapsed` - Fire after N seconds: `{seconds: int}`
+- `subsession_complete` - Fire when subsession finishes: `{subsession_id: str}` (view_id)
+- `agent_complete` - Same as subsession_complete: `{agent_id: str}`
+
+**Usage pattern:**
+1. Main session spawns a subsession
+2. Main session sets alarm to wait for subsession completion
+3. Main session ends query (goes idle, but alarm keeps monitoring)
+4. When subsession completes, it sends notification to bridge
+5. Bridge fires alarm, injecting wake_prompt into main session
+6. Main session wakes up and continues with the wake_prompt
+
+**Example (MCP tools):**
+```python
+# Spawn a subsession to run tests
+result = spawn_session("Run all tests and report results", name="test-runner")
+subsession_id = str(result["view_id"])
+
+# Set alarm to wake when tests complete
+# This allows main session to end its query and go idle
+set_alarm(
+    event_type="subsession_complete",
+    event_params={"subsession_id": subsession_id},
+    wake_prompt="The tests have completed. Check test-runner session output and summarize results."
+)
+```
+
+**Implementation details:**
+- Alarms stored in `Bridge.alarms` dict (alarm_id → alarm config)
+- Monitoring tasks in `Bridge.alarm_tasks` (alarm_id → asyncio.Task)
+- Subsession events in `Bridge.subsession_events` (subsession_id → asyncio.Event)
+- When subsession query completes, it sends `subsession_complete` notification
+- Bridge signals the event, waking any monitoring tasks
+- Monitoring task calls `_fire_alarm()` which injects wake_prompt via `client.query()`
+
+**API:**
+- `session.set_alarm(event_type, event_params, wake_prompt, alarm_id=None, callback=None)`
+- `session.cancel_alarm(alarm_id, callback=None)`
+- Bridge methods: `set_alarm()`, `cancel_alarm()`, `signal_subsession_complete(subsession_id)`
 
 ### Quick Prompts
 Single-key shortcuts in output view (when idle):
@@ -334,6 +390,14 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
     ]
   }
   ```
+- **Alarm system**: Event-driven waiting instead of polling for subsession completion
+  - Sessions can set alarms to "sleep" and wake when events occur
+  - Supports `time_elapsed`, `subsession_complete`, and `agent_complete` events
+  - Alarm fires by injecting wake_prompt into the session as a new query
+  - Uses `asyncio.Event` for efficient async coordination
+  - API: `session.set_alarm(event_type, event_params, wake_prompt, alarm_id=None)`
+  - Subsessions automatically notify bridge when they complete
+  - See "Alarm System" section in NOTES.md for usage patterns
 
 ### Bug Fixes
 - **Mouse selection**: Fixed issue where dragging to select text would make view unresponsive. Dynamic `read_only` toggling based on cursor position now allows selection everywhere while protecting conversation history from edits.

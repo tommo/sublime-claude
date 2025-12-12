@@ -344,6 +344,66 @@ User can always type a custom response.""",
                         },
                         "required": ["question"]
                     }
+                },
+                # ─── Alarm Tools ─────────────────────────────────────────────
+                {
+                    "name": "set_alarm",
+                    "description": """Set an alarm to wake this session when an event occurs.
+
+Instead of polling for subsession completion, sessions can sleep and wake when events fire.
+The alarm fires by injecting the wake_prompt into this session as a new query.
+
+Event types:
+- subsession_complete: Wake when a subsession finishes (requires subsession_id)
+- time_elapsed: Wake after N seconds (requires seconds)
+- agent_complete: Same as subsession_complete (requires agent_id)
+
+Example usage:
+  result = spawn_session("Run tests", name="tester")
+  set_alarm(
+      event_type="subsession_complete",
+      event_params={"subsession_id": str(result["view_id"])},
+      wake_prompt="Tests done! Summarize results from tester session."
+  )
+  # This query ends, alarm monitors in background
+  # When subsession completes, alarm fires and wakes this session""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "event_type": {
+                                "type": "string",
+                                "enum": ["subsession_complete", "time_elapsed", "agent_complete"],
+                                "description": "Type of event to wait for"
+                            },
+                            "event_params": {
+                                "type": "object",
+                                "description": "Event-specific params: {subsession_id: str} | {seconds: int} | {agent_id: str}"
+                            },
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when alarm fires (wakes this session)"
+                            },
+                            "alarm_id": {
+                                "type": "string",
+                                "description": "Optional alarm identifier (auto-generated if omitted)"
+                            }
+                        },
+                        "required": ["event_type", "event_params", "wake_prompt"]
+                    }
+                },
+                {
+                    "name": "cancel_alarm",
+                    "description": "Cancel a pending alarm by its ID. Returns confirmation when cancelled.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "alarm_id": {
+                                "type": "string",
+                                "description": "Alarm identifier from set_alarm response"
+                            }
+                        },
+                        "required": ["alarm_id"]
+                    }
                 }
             ]
         })
@@ -452,6 +512,15 @@ User can always type a custom response.""",
             question = args.get("question", "")
             options = args.get("options", [])
             result = send_to_sublime(code=f"return ask_user({question!r}, {options!r})")
+        elif tool_name == "set_alarm":
+            event_type = args.get("event_type")
+            event_params = args.get("event_params", {})
+            wake_prompt = args.get("wake_prompt")
+            alarm_id = args.get("alarm_id")
+            result = send_to_sublime(code=f"return set_alarm({event_type!r}, {event_params!r}, {wake_prompt!r}, {alarm_id!r})")
+        elif tool_name == "cancel_alarm":
+            alarm_id = args.get("alarm_id")
+            result = send_to_sublime(code=f"return cancel_alarm({alarm_id!r})")
         else:
             return make_response(id, error=f"Unknown tool: {tool_name}")
 

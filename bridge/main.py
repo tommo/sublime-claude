@@ -68,6 +68,12 @@ class Bridge:
         self.question_id = 0
         self.interrupted = False  # Set by interrupt(), checked by query()
         self.query_id: int | None = None  # Track active query for inject_message
+        self.cwd: str | None = None  # Current working directory (set by initialize)
+
+        # Alarm system for efficient event-driven waiting
+        self.alarms: dict[str, dict] = {}  # alarm_id → {event_type, params, wake_prompt}
+        self.alarm_tasks: dict[str, asyncio.Task] = {}  # alarm_id → monitoring task
+        self.subsession_events: dict[str, asyncio.Event] = {}  # subsession_id → completion event
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -93,6 +99,15 @@ class Bridge:
                 await self.inject_message(id, params)
             elif method == "get_history":
                 await self.get_history(id)
+            elif method == "set_alarm":
+                await self.set_alarm(id, params)
+            elif method == "cancel_alarm":
+                await self.cancel_alarm(id, params)
+            elif method == "subsession_complete":
+                # Notification: no response needed
+                subsession_id = params.get("subsession_id")
+                if subsession_id:
+                    self.signal_subsession_complete(subsession_id)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -103,6 +118,7 @@ class Bridge:
         resume_id = params.get("resume")
         fork_session = params.get("fork_session", False)
         cwd = params.get("cwd")
+        self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
 
         # Change to project directory so SDK finds CLAUDE.md etc.
         if cwd and os.path.isdir(cwd):
@@ -741,6 +757,168 @@ Be concise. Focus on what matters to the user.""",
             send_result(id, {"messages": messages})
         except Exception as e:
             send_error(id, -32000, f"Failed to get history: {str(e)}")
+
+    async def set_alarm(self, id: int, params: dict) -> None:
+        """Set an alarm to inject prompt when event occurs.
+
+        Instead of polling for events, session can sleep and wake when event fires.
+        The alarm "wakes" the session by injecting the specified wake_prompt.
+
+        Args:
+            event_type: "agent_complete", "time_elapsed", "subsession_complete"
+            event_params: Event-specific parameters
+                - agent_complete: {agent_id: str}
+                - time_elapsed: {seconds: int}
+                - subsession_complete: {subsession_id: str}
+            wake_prompt: Prompt to inject when alarm fires
+            alarm_id: Optional alarm identifier (generated if not provided)
+        """
+        import uuid
+        import time
+
+        event_type = params.get("event_type")
+        if not event_type:
+            send_error(id, -32602, "Missing required parameter: event_type")
+            return
+
+        wake_prompt = params.get("wake_prompt")
+        if not wake_prompt:
+            send_error(id, -32602, "Missing required parameter: wake_prompt")
+            return
+
+        event_params = params.get("event_params", {})
+        alarm_id = params.get("alarm_id") or str(uuid.uuid4())
+
+        # Store alarm
+        self.alarms[alarm_id] = {
+            "event_type": event_type,
+            "event_params": event_params,
+            "wake_prompt": wake_prompt,
+            "created_at": time.time()
+        }
+
+        # Start monitoring task based on event type
+        if event_type == "time_elapsed":
+            task = asyncio.create_task(self._monitor_time_alarm(alarm_id))
+            self.alarm_tasks[alarm_id] = task
+        elif event_type in ("agent_complete", "subsession_complete"):
+            task = asyncio.create_task(self._monitor_subsession_alarm(alarm_id))
+            self.alarm_tasks[alarm_id] = task
+        else:
+            send_error(id, -32602, f"Unknown event_type: {event_type}")
+            del self.alarms[alarm_id]
+            return
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"[Alarm] Set alarm {alarm_id}: {event_type} → {wake_prompt[:50]}...\n")
+
+        send_result(id, {
+            "alarm_id": alarm_id,
+            "status": "set",
+            "event_type": event_type
+        })
+
+    async def cancel_alarm(self, id: int, params: dict) -> None:
+        """Cancel a pending alarm."""
+        alarm_id = params.get("alarm_id")
+        if not alarm_id:
+            send_error(id, -32602, "Missing required parameter: alarm_id")
+            return
+
+        # Cancel monitoring task
+        if alarm_id in self.alarm_tasks:
+            self.alarm_tasks[alarm_id].cancel()
+            del self.alarm_tasks[alarm_id]
+
+        # Remove alarm
+        if alarm_id in self.alarms:
+            del self.alarms[alarm_id]
+            send_result(id, {"alarm_id": alarm_id, "status": "cancelled"})
+        else:
+            send_error(id, -32602, f"Alarm not found: {alarm_id}")
+
+    async def _monitor_time_alarm(self, alarm_id: str) -> None:
+        """Monitor time-based alarm - sleep then fire."""
+        alarm = self.alarms.get(alarm_id)
+        if not alarm:
+            return
+
+        seconds = alarm["event_params"].get("seconds", 0)
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"[Alarm] Monitoring time alarm {alarm_id}: sleep {seconds}s\n")
+
+        try:
+            await asyncio.sleep(seconds)
+            await self._fire_alarm(alarm_id)
+        except asyncio.CancelledError:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[Alarm] Time alarm {alarm_id} cancelled\n")
+
+    async def _monitor_subsession_alarm(self, alarm_id: str) -> None:
+        """Monitor subsession/agent completion - wait on event then fire."""
+        alarm = self.alarms.get(alarm_id)
+        if not alarm:
+            return
+
+        event_type = alarm["event_type"]
+        subsession_id = alarm["event_params"].get("subsession_id") or alarm["event_params"].get("agent_id")
+
+        if not subsession_id:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[Alarm] ERROR: No subsession_id/agent_id in alarm {alarm_id}\n")
+            return
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"[Alarm] Monitoring subsession alarm {alarm_id}: waiting for {subsession_id}\n")
+
+        # Create event if doesn't exist
+        if subsession_id not in self.subsession_events:
+            self.subsession_events[subsession_id] = asyncio.Event()
+
+        event = self.subsession_events[subsession_id]
+
+        try:
+            # Wait for subsession completion (with timeout to prevent infinite wait)
+            await asyncio.wait_for(event.wait(), timeout=3600)  # 1 hour max
+            await self._fire_alarm(alarm_id)
+        except asyncio.TimeoutError:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[Alarm] Subsession alarm {alarm_id} timed out after 1 hour\n")
+        except asyncio.CancelledError:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[Alarm] Subsession alarm {alarm_id} cancelled\n")
+
+    async def _fire_alarm(self, alarm_id: str) -> None:
+        """Fire an alarm by injecting the wake prompt."""
+        alarm = self.alarms.pop(alarm_id, None)
+        if not alarm:
+            return
+
+        # Clean up task
+        if alarm_id in self.alarm_tasks:
+            del self.alarm_tasks[alarm_id]
+
+        wake_prompt = alarm["wake_prompt"]
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"[Alarm] FIRING alarm {alarm_id}: sending wake notification\n")
+            f.write(f"[Alarm] Bridge PID: {os.getpid()}, Event: {alarm['event_type']}\n")
+
+        # Send notification to session to start a new query with the wake_prompt
+        # This goes through the session's normal query flow, so the output view updates properly
+        send_notification("alarm_wake", {
+            "alarm_id": alarm_id,
+            "event_type": alarm["event_type"],
+            "wake_prompt": wake_prompt
+        })
+
+    def signal_subsession_complete(self, subsession_id: str) -> None:
+        """Signal that a subsession has completed (call this from subsession code)."""
+        if subsession_id in self.subsession_events:
+            self.subsession_events[subsession_id].set()
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[Alarm] Subsession {subsession_id} completed - event signaled\n")
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""

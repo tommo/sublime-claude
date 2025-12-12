@@ -426,6 +426,9 @@ class MCPSocketServer:
             "terminus_send": self._terminus_send,
             "terminus_read": self._terminus_read,
             "terminus_close": self._terminus_close,
+            # Alarm tools
+            "set_alarm": self._set_alarm,
+            "cancel_alarm": self._cancel_alarm,
         }
 
         # Handle return statements
@@ -1333,4 +1336,90 @@ class MCPSocketServer:
             "closed": True,
             "view_id": view_id,
             "tag": tag_val,
+        }
+
+    # ─── Alarm Tools ──────────────────────────────────────────────────────
+
+    def _set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: str = None) -> dict:
+        """Set an alarm to wake current session when an event occurs.
+
+        Instead of polling, the session sleeps and wakes when the event fires.
+
+        Args:
+            event_type: "subsession_complete", "time_elapsed", "agent_complete"
+            event_params: Event-specific parameters
+                - subsession_complete: {subsession_id: str}
+                - time_elapsed: {seconds: int}
+                - agent_complete: {agent_id: str}
+            wake_prompt: Prompt to inject when alarm fires
+            alarm_id: Optional alarm identifier (generated if not provided)
+
+        Returns:
+            {alarm_id: str, status: "set", event_type: str}
+        """
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        # Get executing session (not UI-active session)
+        # When main session spawns subsession, subsession becomes UI-active
+        # but alarm should be set in the session that called set_alarm
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        # Set alarm on the session
+        result = {"pending": True}
+
+        def on_result(alarm_result):
+            result.update(alarm_result)
+
+        session.set_alarm(
+            event_type=event_type,
+            event_params=event_params,
+            wake_prompt=wake_prompt,
+            alarm_id=alarm_id,
+            callback=on_result
+        )
+
+        # Return immediately (alarm is async)
+        return {
+            "status": "alarm_set",
+            "event_type": event_type,
+            "note": "Alarm will fire asynchronously when event occurs"
+        }
+
+    def _cancel_alarm(self, alarm_id: str) -> dict:
+        """Cancel a pending alarm.
+
+        Args:
+            alarm_id: Alarm identifier from set_alarm
+
+        Returns:
+            {alarm_id: str, status: "cancelled"}
+        """
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        # Get executing session (not UI-active session)
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        # Cancel alarm
+        result = {"pending": True}
+
+        def on_result(cancel_result):
+            result.update(cancel_result)
+
+        session.cancel_alarm(alarm_id, callback=on_result)
+
+        return {
+            "status": "cancel_requested",
+            "alarm_id": alarm_id
         }

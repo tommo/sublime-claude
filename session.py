@@ -225,6 +225,14 @@ class Session:
         self.working = True
         self.query_count += 1
         self._input_mode_entered = False  # Reset so input mode can be entered when query completes
+
+        # Mark this session as the currently executing session for MCP tools
+        # MCP tools should operate on the executing session, not the UI-active session
+        # Only set if not already set (don't overwrite parent session when spawning subsessions)
+        self._is_executing_session = False  # Track if we set the marker
+        if self.output.view and not self.window.settings().has("claude_executing_view"):
+            self.window.settings().set("claude_executing_view", self.output.view.id())
+            self._is_executing_session = True
         # Build prompt with context
         full_prompt = self._build_prompt_with_context(prompt)
         context_names = [item.name for item in self.pending_context]
@@ -243,16 +251,28 @@ class Session:
         # Auto-name session from first prompt if not already named
         if not self.name:
             self._set_name(prompt[:30].strip() + ("..." if len(prompt) > 30 else ""))
+        print(f"[Claude] query() - calling output.prompt()")
         self.output.prompt(prompt, context_names)
+        print(f"[Claude] query() - calling _animate()")
         self._animate()
+        print(f"[Claude] query() - sending RPC query request")
         if not self.client.send("query", {"prompt": full_prompt}, self._on_done):
             self._status("error: bridge died")
             self.working = False
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
+        else:
+            print(f"[Claude] query() - RPC query sent successfully")
 
     def _on_done(self, result: dict) -> None:
         self.working = False
         self.current_tool = None
+
+        # Clear executing session marker - MCP tools should no longer target this session
+        # Only clear if this session was the one that set it (don't clear parent session's marker)
+        if self.output.view and getattr(self, '_is_executing_session', False):
+            self.window.settings().erase("claude_executing_view")
+            self._is_executing_session = False
+
         status = result.get("status", "")
         if "error" in result:
             self._status("error")
@@ -271,6 +291,16 @@ class Session:
 
         # Clear any stale permission UI (query finished, no more permissions expected)
         self.output.clear_all_permissions()
+
+        # Notify ALL bridges that this subsession completed (for alarm system)
+        # Other sessions may be waiting on this subsession via alarms
+        # Each session has its own bridge, so we need to broadcast to all
+        if self.output.view:
+            view_id = str(self.output.view.id())
+            # Broadcast to all active sessions' bridges
+            for session in sublime._claude_sessions.values():
+                if session.client:
+                    session.client.send("subsession_complete", {"subsession_id": view_id})
 
         # Auto-enter input mode when idle
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
@@ -343,9 +373,94 @@ class Session:
             self.client.send("shutdown", {}, lambda _: self.client.stop())
         self._clear_status()
 
+    def set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: Optional[str] = None, callback=None) -> None:
+        """Set an alarm to wake this session when an event occurs.
+
+        Instead of polling for events, the session sleeps and wakes when the event fires.
+        The alarm "wakes" the session by injecting the wake_prompt.
+
+        Args:
+            event_type: "agent_complete", "time_elapsed", "subsession_complete"
+            event_params: Event-specific parameters
+                - agent_complete: {agent_id: str}
+                - time_elapsed: {seconds: int}
+                - subsession_complete: {subsession_id: str}
+            wake_prompt: Prompt to inject when alarm fires
+            alarm_id: Optional alarm identifier (generated if not provided)
+            callback: Optional callback for result
+
+        Returns (via callback):
+            {alarm_id: str, status: "set", event_type: str}
+        """
+        if not self.client:
+            return
+
+        params = {
+            "event_type": event_type,
+            "event_params": event_params,
+            "wake_prompt": wake_prompt,
+        }
+        if alarm_id:
+            params["alarm_id"] = alarm_id
+
+        self.client.send("set_alarm", params, callback)
+
+    def cancel_alarm(self, alarm_id: str, callback=None) -> None:
+        """Cancel a pending alarm.
+
+        Args:
+            alarm_id: Alarm identifier returned by set_alarm
+            callback: Optional callback for result
+
+        Returns (via callback):
+            {alarm_id: str, status: "cancelled"}
+        """
+        if not self.client:
+            return
+
+        self.client.send("cancel_alarm", {"alarm_id": alarm_id}, callback)
+
     def _on_notification(self, method: str, params: dict) -> None:
         if method == "permission_request":
             self._handle_permission_request(params)
+            return
+
+        if method == "alarm_wake":
+            # Alarm fired - start a new query with the wake prompt
+            wake_prompt = params.get("wake_prompt", "")
+            alarm_id = params.get("alarm_id", "")
+            view_id = self.output.view.id() if self.output.view else "no-view"
+            print(f"[Claude] ⏰ ALARM WAKE received by session: name='{self.name}', view_id={view_id}")
+            print(f"[Claude] Alarm ID: {alarm_id}")
+            print(f"[Claude] Wake prompt: {wake_prompt}")
+            print(f"[Claude] Session state: initialized={self.initialized}, working={self.working}, client={self.client is not None}")
+
+            # If session is still working, queue the wake query for when it becomes idle
+            if self.working:
+                print(f"[Claude] ⚠ Session is busy, deferring alarm wake until idle")
+
+                def start_wake_query():
+                    if not self.working:
+                        print(f"[Claude] ✓ Session now idle, starting deferred alarm wake query")
+                        try:
+                            self.query(wake_prompt)
+                        except Exception as e:
+                            print(f"[Claude] ✗ ERROR starting deferred wake query: {e}")
+                    else:
+                        # Still working, try again later
+                        sublime.set_timeout(start_wake_query, 500)
+
+                sublime.set_timeout(start_wake_query, 500)
+                return
+
+            # Session is idle, start wake query immediately
+            try:
+                self.query(wake_prompt)
+                print(f"[Claude] ✓ Alarm wake query started successfully")
+            except Exception as e:
+                print(f"[Claude] ✗ ERROR starting alarm wake query: {e}")
+                import traceback
+                traceback.print_exc()
             return
 
         if method != "message":

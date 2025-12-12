@@ -261,6 +261,37 @@ Use **Claude: View Blackboard...** to view/edit entries. Data persists across se
 - `spawn_session(prompt, name?)` - Start a new Claude session with a prompt
 - `list_sessions()` - List active sessions in current window
 
+### Alarm System (Event-Driven Waiting)
+
+Instead of polling for subsession completion, sessions can set alarms to "sleep" and wake when events occur. This enables efficient async coordination.
+
+**Usage Pattern:**
+```python
+# Spawn a subsession
+result = spawn_session("Run all tests", name="test-runner")
+subsession_id = str(result["view_id"])
+
+# Set alarm to wake when subsession completes (via MCP tool)
+set_alarm(
+    event_type="subsession_complete",
+    event_params={"subsession_id": subsession_id},
+    wake_prompt="Tests completed. Summarize results from test-runner."
+)
+# Main session ends query (goes idle), alarm monitors in background
+# When subsession completes, alarm fires and injects wake_prompt
+```
+
+**Event Types:**
+- `subsession_complete` - Wake when subsession finishes: `{subsession_id: str}`
+- `time_elapsed` - Wake after N seconds: `{seconds: int}`
+- `agent_complete` - Same as subsession_complete: `{agent_id: str}`
+
+**MCP Tools:**
+- `set_alarm(event_type, event_params, wake_prompt, alarm_id=None)`
+- `cancel_alarm(alarm_id)`
+
+Subsessions automatically notify the bridge when they complete. The alarm fires by injecting the wake_prompt into the main session as a new query.
+
 ## Subagents
 
 ### Built-in Agents
