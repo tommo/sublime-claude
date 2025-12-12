@@ -108,15 +108,17 @@ class Bridge:
         if cwd and os.path.isdir(cwd):
             os.chdir(cwd)
 
-        # Load MCP servers and agents from project settings
+        # Load MCP servers, agents, and plugins from project settings
         mcp_servers = self._load_mcp_servers(cwd)
         agents = self._load_agents(cwd)
+        plugins = self._load_plugins(cwd)
 
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"initialize: params={params}\n")
             f.write(f"  resume_id={resume_id}, fork={fork_session}, cwd={cwd}, actual_cwd={os.getcwd()}\n")
             f.write(f"  mcp_servers={list(mcp_servers.keys()) if mcp_servers else None}\n")
             f.write(f"  agents={list(agents.keys()) if agents else None}\n")
+            f.write(f"  plugins={plugins}\n")
 
         options_dict = {
             "allowed_tools": params.get("allowed_tools", []),
@@ -143,6 +145,10 @@ class Bridge:
         # Add agents if found
         if agents:
             options_dict["agents"] = agents
+
+        # Add plugins if found
+        if plugins:
+            options_dict["plugins"] = plugins
 
         self.options = ClaudeAgentOptions(**options_dict)
 
@@ -283,6 +289,114 @@ Be concise. Focus on what matters to the user.""",
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  loaded agents: {list(agents.keys())}\n")
         return agents
+
+    def _load_plugins(self, cwd: str) -> list:
+        """Load plugin configurations from project settings."""
+        settings = self._load_project_settings(cwd)
+
+        # Manual plugins from "plugins" key
+        manual_plugins = settings.get("plugins", [])
+
+        # Auto-installed plugins from marketplaces
+        auto_plugins = self._load_marketplace_plugins(settings, cwd)
+
+        # Combine both
+        all_plugins = manual_plugins + auto_plugins
+
+        # Resolve relative paths to absolute
+        if all_plugins and cwd:
+            resolved_plugins = []
+            for plugin in all_plugins:
+                if plugin.get("type") == "local":
+                    path = plugin.get("path", "")
+                    # Convert relative paths to absolute
+                    if path and not os.path.isabs(path):
+                        path = os.path.join(cwd, path)
+                    resolved_plugins.append({"type": "local", "path": path})
+                else:
+                    resolved_plugins.append(plugin)
+            all_plugins = resolved_plugins
+
+        if all_plugins:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  loaded plugins: {[p.get('path') for p in all_plugins]}\n")
+        return all_plugins
+
+    def _load_marketplace_plugins(self, settings: dict, cwd: str) -> list:
+        """Load and auto-install plugins from configured marketplaces."""
+        import subprocess
+        from pathlib import Path
+
+        marketplaces = settings.get("extraKnownMarketplaces", {})
+        enabled_plugins = settings.get("enabledPlugins", {})
+
+        if not enabled_plugins:
+            return []
+
+        # Plugin cache directory
+        cache_dir = Path.home() / ".claude" / "plugins"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        plugins = []
+
+        for plugin_name, plugin_config in enabled_plugins.items():
+            if not plugin_config.get("enabled", True):
+                continue
+
+            marketplace_name = plugin_config.get("marketplace")
+            if not marketplace_name or marketplace_name not in marketplaces:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  plugin {plugin_name}: marketplace '{marketplace_name}' not found\n")
+                continue
+
+            marketplace = marketplaces[marketplace_name]
+            source = marketplace.get("source", {})
+            source_type = source.get("source", "")
+
+            # Determine plugin path
+            plugin_dir = cache_dir / marketplace_name / plugin_name
+
+            # Download if not exists
+            if not plugin_dir.exists():
+                try:
+                    if source_type == "github":
+                        repo = source.get("repo", "")
+                        if repo:
+                            # Clone the entire marketplace repo, then find the plugin
+                            marketplace_dir = cache_dir / marketplace_name
+                            if not marketplace_dir.exists():
+                                url = f"https://github.com/{repo}.git"
+                                with open("/tmp/claude_bridge.log", "a") as f:
+                                    f.write(f"  cloning marketplace: {url}\n")
+                                subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
+                                             check=True, capture_output=True)
+
+                            # Plugin should be in a subdirectory
+                            plugin_dir = marketplace_dir / plugin_name
+
+                    elif source_type == "git":
+                        url = source.get("url", "")
+                        if url:
+                            with open("/tmp/claude_bridge.log", "a") as f:
+                                f.write(f"  cloning plugin from: {url}\n")
+                            subprocess.run(["git", "clone", "--depth", "1", url, str(plugin_dir)],
+                                         check=True, capture_output=True)
+
+                except Exception as e:
+                    with open("/tmp/claude_bridge.log", "a") as f:
+                        f.write(f"  error installing {plugin_name}: {e}\n")
+                    continue
+
+            # Add to plugins list if exists
+            if plugin_dir.exists() and (plugin_dir / ".claude-plugin" / "plugin.json").exists():
+                plugins.append({"type": "local", "path": str(plugin_dir)})
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  loaded marketplace plugin: {plugin_name} from {plugin_dir}\n")
+            else:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  plugin {plugin_name} not found at {plugin_dir}\n")
+
+        return plugins
 
     async def can_use_tool(self, tool_name: str, tool_input: dict, context=None):
         """Handle permission request - ask Sublime for approval."""
