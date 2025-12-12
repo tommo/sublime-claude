@@ -1052,3 +1052,139 @@ class ClaudeQuickPromptCommand(sublime_plugin.TextCommand):
         prompt = QUICK_PROMPTS.get(key)
         if prompt and s.initialized and not s.working:
             s.query(prompt)
+
+class ClaudeCodeManageAutoAllowedToolsCommand(sublime_plugin.WindowCommand):
+    """Manage auto-allowed MCP tools for the current project."""
+
+    def run(self):
+        """Show quick panel to manage auto-allowed tools."""
+        import os
+        import json
+
+        # Get project settings path
+        folders = self.window.folders()
+        if not folders:
+            sublime.error_message("No project folder open")
+            return
+
+        project_dir = folders[0]
+        settings_dir = os.path.join(project_dir, ".claude")
+        settings_path = os.path.join(settings_dir, "settings.json")
+
+        # Load current settings
+        settings = {}
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r") as f:
+                    settings = json.load(f)
+            except Exception as e:
+                print(f"[Claude] Error loading settings: {e}")
+
+        auto_allowed = settings.get("autoAllowedMcpTools", [])
+
+        # Build options
+        options = []
+        options.append(("add", None, "➕ Add new pattern", "Add a new MCP tool pattern to auto-allow"))
+
+        # Show current patterns
+        for i, pattern in enumerate(auto_allowed):
+            options.append(("remove", i, f"❌ Remove: {pattern}", "Click to remove this pattern"))
+
+        if not auto_allowed:
+            options.append(("info", None, "ℹ️  No patterns configured", "Add patterns to auto-allow MCP tools"))
+
+        # Show quick panel
+        items = [[opt[2], opt[3]] for opt in options]
+
+        def on_select(idx):
+            if idx < 0:
+                return
+
+            action, data, _, _ = options[idx]
+
+            if action == "add":
+                self.show_add_pattern_input(settings_path, settings, auto_allowed)
+            elif action == "remove":
+                self.remove_pattern(settings_path, settings, auto_allowed, data)
+
+        self.window.show_quick_panel(items, on_select)
+
+    def show_add_pattern_input(self, settings_path, settings, auto_allowed):
+        """Show input panel to add a new pattern."""
+        # Build common patterns list
+        common_patterns = [
+            "mcp__*__*",  # All MCP tools
+            "mcp__plugin_*",  # All plugin MCP tools
+            "Bash",  # Bash tool
+            "Read",  # Read tool
+            "Write",  # Write tool
+        ]
+
+        # Show quick panel with common patterns + custom option
+        items = []
+        items.append(["✏️ Enter custom pattern", "Type your own pattern"])
+        for pattern in common_patterns:
+            items.append([f"Add: {pattern}", "Common pattern"])
+
+        def on_select_pattern(idx):
+            if idx < 0:
+                return
+
+            if idx == 0:
+                # Custom pattern
+                self.window.show_input_panel(
+                    "Enter MCP tool pattern (supports wildcards like mcp__*__):",
+                    "",
+                    lambda pattern: self.add_pattern(settings_path, settings, auto_allowed, pattern),
+                    None,
+                    None
+                )
+            else:
+                # Use common pattern
+                pattern = common_patterns[idx - 1]
+                self.add_pattern(settings_path, settings, auto_allowed, pattern)
+
+        self.window.show_quick_panel(items, on_select_pattern)
+
+    def add_pattern(self, settings_path, settings, auto_allowed, pattern):
+        """Add a pattern to auto-allowed tools."""
+        import os
+        import json
+
+        if not pattern or not pattern.strip():
+            return
+
+        pattern = pattern.strip()
+
+        if pattern in auto_allowed:
+            sublime.status_message(f"Pattern already exists: {pattern}")
+            return
+
+        # Add pattern
+        auto_allowed.append(pattern)
+        settings["autoAllowedMcpTools"] = auto_allowed
+
+        # Save settings
+        os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+        try:
+            with open(settings_path, "w") as f:
+                json.dump(settings, f, indent=2)
+            sublime.status_message(f"Added auto-allow pattern: {pattern}")
+        except Exception as e:
+            sublime.error_message(f"Failed to save settings: {e}")
+
+    def remove_pattern(self, settings_path, settings, auto_allowed, index):
+        """Remove a pattern from auto-allowed tools."""
+        import json
+
+        if 0 <= index < len(auto_allowed):
+            pattern = auto_allowed.pop(index)
+            settings["autoAllowedMcpTools"] = auto_allowed
+
+            # Save settings
+            try:
+                with open(settings_path, "w") as f:
+                    json.dump(settings, f, indent=2)
+                sublime.status_message(f"Removed auto-allow pattern: {pattern}")
+            except Exception as e:
+                sublime.error_message(f"Failed to save settings: {e}")

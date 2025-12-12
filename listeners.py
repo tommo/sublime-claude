@@ -193,40 +193,68 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not s or not s.output.is_input_mode():
             return None
 
-        # Allow these commands always
-        if command_name in ("copy", "select_all", "undo", "redo", "claude_submit_input"):
+        # Commands that are always safe (read-only, navigation, selection)
+        safe_commands = {
+            "copy", "select_all", "find_all_under",
+            "drag_select", "context_menu",
+            "move", "move_to", "scroll_lines",
+            "claude_submit_input", "claude_code_interrupt"
+        }
+
+        if command_name in safe_commands:
             return None
 
-        # For insert/delete commands, check if cursor is in input region
+        # All other commands are potentially destructive - check if cursor is in input region
+        input_start = s.output._input_start
         sel = self.view.sel()
-        if sel:
-            for region in sel:
-                if not s.output.is_in_input_region(region.begin()):
-                    # Block edit outside input region
-                    return ("noop", {})
+
+        # Check ALL regions in the selection
+        for region in sel:
+            # Block if either start or end of selection is outside input region
+            if region.begin() < input_start or region.end() < input_start:
+                print(f"[Claude] BLOCKING {command_name} at position {region.begin()}, input_start={input_start}")
+                return ("noop", {})
 
         return None
 
     def on_selection_modified(self):
-        """Keep cursor within input region when in input mode."""
+        """Dynamically toggle read_only based on cursor position to protect conversation history."""
         s = get_session_for_view(self.view)
-        if not s or not s.output.is_input_mode():
+        if not s:
             return
 
-        # Check if cursor is before input start
-        input_start = s.output._input_start
+        # Only manage read_only state when in input mode
+        if not s.output.is_input_mode():
+            return
+
+        # CRITICAL BUG FIX: Sublime Text requires at least one region in sel()
+        # for mouse clicks to work. If sel is completely empty, restore a cursor.
         sel = self.view.sel()
-        needs_fix = False
+        if len(sel) == 0:
+            cursor_pos = self.view.size() if self.view.size() > 0 else 0
+            self.view.sel().add(sublime.Region(cursor_pos, cursor_pos))
+            return
+
+        # Check if ALL cursors/selections are in the input region
+        input_start = s.output._input_start
+        all_in_input_region = True
 
         for region in sel:
-            if region.begin() < input_start or region.end() < input_start:
-                needs_fix = True
+            # If any part of any selection is before input_start, not safe to edit
+            if region.begin() < input_start:
+                all_in_input_region = False
                 break
 
-        if needs_fix:
-            # Move cursor to input start
-            self.view.sel().clear()
-            self.view.sel().add(sublime.Region(input_start, input_start))
+        # Toggle read_only based on whether we're in the input region
+        # This prevents typing/pasting/any modification outside input area
+        if all_in_input_region:
+            # Safe to edit - in input region
+            if self.view.is_read_only():
+                self.view.set_read_only(False)
+        else:
+            # Not safe - in conversation history
+            if not self.view.is_read_only():
+                self.view.set_read_only(True)
 
     def on_modified(self):
         """Track modifications for draft saving and @ autocomplete."""

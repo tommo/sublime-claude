@@ -68,6 +68,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Clear Output | `Cmd+Ctrl+Alt+C` | Clear output view |
 | Interrupt | `Cmd+Shift+Escape` | Stop current query |
 | Permission Mode... | - | Change permission settings |
+| Manage Auto-Allowed Tools... | - | Configure tools that skip permission prompts |
 
 ### Inline Input Mode
 
@@ -131,7 +132,27 @@ When in `default` mode, tool actions show an inline prompt:
 - **Y** - Allow this action
 - **N** - Deny (marks tool as error)
 - **S** - Allow same tool for 30 seconds
-- **A** - Always allow this tool (session)
+- **A** - Always allow this tool (saves to project settings)
+
+### Auto-Allowed Tools
+
+Automatically allow specific tools without permission prompts. Configure via:
+
+**Command:** `Claude: Manage Auto-Allowed Tools...` - UI to add/remove patterns
+
+**Settings:** Add to project `.claude/settings.json` or user `~/.claude/settings.json`:
+```json
+{
+  "autoAllowedMcpTools": [
+    "mcp__*__*",        // All MCP tools
+    "mcp__plugin_*",    // All plugin MCP tools
+    "Read",             // Specific tool
+    "Bash"
+  ]
+}
+```
+
+Supports wildcards (`*`) for pattern matching. User-level settings apply to all projects, project settings override.
 
 ## Context
 

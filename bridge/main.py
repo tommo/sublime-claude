@@ -189,31 +189,70 @@ class Bridge:
         })
 
     def _load_project_settings(self, cwd: str) -> dict:
-        """Load project settings from .claude/settings.json or .mcp.json."""
+        """Load and merge user-level and project settings.
+
+        User settings from ~/.claude/settings.json are loaded first,
+        then project settings override them.
+        """
+        from pathlib import Path
+
+        # Start with user-level settings
+        user_settings = {}
+        user_settings_path = Path.home() / ".claude" / "settings.json"
+        if user_settings_path.exists():
+            try:
+                with open(user_settings_path, "r") as f:
+                    user_settings = json.load(f)
+                    with open("/tmp/claude_bridge.log", "a") as f:
+                        f.write(f"  loaded user settings from {user_settings_path}\n")
+            except Exception as e:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  error loading {user_settings_path}: {e}\n")
+
         if not cwd:
-            return {}
+            return user_settings
+
+        # Load project settings
+        project_settings = {}
 
         # Try .claude/settings.json first
         settings_path = os.path.join(cwd, ".claude", "settings.json")
         if os.path.exists(settings_path):
             try:
                 with open(settings_path, "r") as f:
-                    return json.load(f)
+                    project_settings = json.load(f)
             except Exception as e:
                 with open("/tmp/claude_bridge.log", "a") as f:
                     f.write(f"  error loading {settings_path}: {e}\n")
 
         # Try .mcp.json (MCP servers only)
-        mcp_path = os.path.join(cwd, ".mcp.json")
-        if os.path.exists(mcp_path):
-            try:
-                with open(mcp_path, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  error loading {mcp_path}: {e}\n")
+        if not project_settings:
+            mcp_path = os.path.join(cwd, ".mcp.json")
+            if os.path.exists(mcp_path):
+                try:
+                    with open(mcp_path, "r") as f:
+                        project_settings = json.load(f)
+                except Exception as e:
+                    with open("/tmp/claude_bridge.log", "a") as f:
+                        f.write(f"  error loading {mcp_path}: {e}\n")
 
-        return {}
+        # Merge settings: project overrides user
+        merged = self._merge_settings(user_settings, project_settings)
+        return merged
+
+    def _merge_settings(self, user: dict, project: dict) -> dict:
+        """Deep merge project settings into user settings."""
+        result = user.copy()
+
+        for key, value in project.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                # Deep merge dictionaries
+                result[key] = {**result[key], **value}
+            else:
+                # Project value overrides user value
+                result[key] = value
+
+        return result
 
     def _load_mcp_servers(self, cwd: str) -> dict:
         """Load MCP server config from project settings, plus built-in sublime server."""
@@ -339,11 +378,25 @@ Be concise. Focus on what matters to the user.""",
 
         plugins = []
 
-        for plugin_name, plugin_config in enabled_plugins.items():
-            if not plugin_config.get("enabled", True):
-                continue
+        for plugin_key, plugin_config in enabled_plugins.items():
+            # Parse plugin format: either "plugin@marketplace" or old object format
+            if "@" in plugin_key:
+                # New format: "plugin@marketplace": true|false|array
+                plugin_name, marketplace_name = plugin_key.split("@", 1)
+                # Check if enabled (can be bool, array, or object)
+                if isinstance(plugin_config, bool) and not plugin_config:
+                    continue
+            else:
+                # Old format: "plugin": {enabled: true, marketplace: "name"}
+                plugin_name = plugin_key
+                if isinstance(plugin_config, dict):
+                    if not plugin_config.get("enabled", True):
+                        continue
+                    marketplace_name = plugin_config.get("marketplace")
+                else:
+                    # Skip if not a dict in old format
+                    continue
 
-            marketplace_name = plugin_config.get("marketplace")
             if not marketplace_name or marketplace_name not in marketplaces:
                 with open("/tmp/claude_bridge.log", "a") as f:
                     f.write(f"  plugin {plugin_name}: marketplace '{marketplace_name}' not found\n")
@@ -353,48 +406,79 @@ Be concise. Focus on what matters to the user.""",
             source = marketplace.get("source", {})
             source_type = source.get("source", "")
 
-            # Determine plugin path
-            plugin_dir = cache_dir / marketplace_name / plugin_name
+            # Clone marketplace if not exists
+            marketplace_dir = cache_dir / marketplace_name
 
-            # Download if not exists
-            if not plugin_dir.exists():
-                try:
+            try:
+                if not marketplace_dir.exists():
                     if source_type == "github":
                         repo = source.get("repo", "")
                         if repo:
-                            # Clone the entire marketplace repo, then find the plugin
-                            marketplace_dir = cache_dir / marketplace_name
-                            if not marketplace_dir.exists():
-                                url = f"https://github.com/{repo}.git"
-                                with open("/tmp/claude_bridge.log", "a") as f:
-                                    f.write(f"  cloning marketplace: {url}\n")
-                                subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
-                                             check=True, capture_output=True)
-
-                            # Plugin should be in a subdirectory
-                            plugin_dir = marketplace_dir / plugin_name
+                            url = f"https://github.com/{repo}.git"
+                            with open("/tmp/claude_bridge.log", "a") as f:
+                                f.write(f"  cloning marketplace: {url}\n")
+                            subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
+                                         check=True, capture_output=True)
 
                     elif source_type == "git":
                         url = source.get("url", "")
                         if url:
                             with open("/tmp/claude_bridge.log", "a") as f:
-                                f.write(f"  cloning plugin from: {url}\n")
-                            subprocess.run(["git", "clone", "--depth", "1", url, str(plugin_dir)],
+                                f.write(f"  cloning from git: {url}\n")
+                            subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
                                          check=True, capture_output=True)
 
+            except Exception as e:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"  error cloning {marketplace_name}: {e}\n")
+                continue
+
+            # Determine plugin location
+            # First check if there's a marketplace.json
+            marketplace_json_path = marketplace_dir / ".claude-plugin" / "marketplace.json"
+            plugin_dir = None
+
+            if marketplace_json_path.exists():
+                # Read marketplace.json to find plugin location
+                try:
+                    with open(marketplace_json_path, "r") as f:
+                        marketplace_data = json.load(f)
+                        plugins_list = marketplace_data.get("plugins", [])
+                        # Find the plugin in the marketplace
+                        for p in plugins_list:
+                            if p.get("name") == plugin_name or p.get("id") == plugin_name:
+                                # Plugin found in marketplace
+                                plugin_path = p.get("path", plugin_name)
+                                plugin_dir = marketplace_dir / plugin_path
+                                break
+                        if not plugin_dir:
+                            with open("/tmp/claude_bridge.log", "a") as f:
+                                f.write(f"  plugin {plugin_name} not in marketplace.json\n")
                 except Exception as e:
                     with open("/tmp/claude_bridge.log", "a") as f:
-                        f.write(f"  error installing {plugin_name}: {e}\n")
-                    continue
+                        f.write(f"  error reading marketplace.json: {e}\n")
 
-            # Add to plugins list if exists
-            if plugin_dir.exists() and (plugin_dir / ".claude-plugin" / "plugin.json").exists():
+            # Fallback: try common plugin locations if marketplace.json not found or plugin not listed
+            if not plugin_dir or not plugin_dir.exists():
+                # Case 1: The marketplace repo itself is the plugin
+                if (marketplace_dir / ".claude-plugin" / "plugin.json").exists():
+                    plugin_dir = marketplace_dir
+                # Case 2: Plugin in subdirectory (for backward compatibility with subdir field)
+                elif "subdir" in source:
+                    base_dir = marketplace_dir / source["subdir"]
+                    plugin_dir = base_dir / plugin_name
+                # Case 3: Plugin directly in marketplace directory
+                else:
+                    plugin_dir = marketplace_dir / plugin_name
+
+            # Add to plugins list if valid
+            if plugin_dir and plugin_dir.exists() and (plugin_dir / ".claude-plugin" / "plugin.json").exists():
                 plugins.append({"type": "local", "path": str(plugin_dir)})
                 with open("/tmp/claude_bridge.log", "a") as f:
                     f.write(f"  loaded marketplace plugin: {plugin_name} from {plugin_dir}\n")
             else:
                 with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  plugin {plugin_name} not found at {plugin_dir}\n")
+                    f.write(f"  plugin {plugin_name} not found (checked {plugin_dir})\n")
 
         return plugins
 
@@ -403,6 +487,18 @@ Be concise. Focus on what matters to the user.""",
         # Auto-allow built-in sublime MCP tools
         if tool_name.startswith("mcp__sublime__"):
             return PermissionResultAllow(updated_input=tool_input)
+
+        # Check auto-allowed tools from settings
+        settings = self._load_project_settings(self.cwd)
+        auto_allowed = settings.get("autoAllowedMcpTools", [])
+
+        # Check if tool matches any auto-allow pattern
+        import fnmatch
+        for pattern in auto_allowed:
+            if fnmatch.fnmatch(tool_name, pattern):
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"can_use_tool: auto-allowed {tool_name} (matched pattern: {pattern})\n")
+                return PermissionResultAllow(updated_input=tool_input)
 
         self.permission_id += 1
         pid = self.permission_id

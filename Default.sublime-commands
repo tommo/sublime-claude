@@ -88,6 +88,10 @@
         "command": "claude_code_add_mcp"
     },
     {
+        "caption": "Claude: Manage Auto-Allowed Tools...",
+        "command": "claude_code_manage_auto_allowed_tools"
+    },
+    {
         "caption": "Claude: View Blackboard...",
         "command": "claude_code_blackboard"
     },

@@ -118,6 +118,15 @@ class OutputView:
             self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
+
+        # Initialize cursor position to enable mouse selection
+        # CRITICAL: Sublime requires a valid cursor for mouse interaction
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(0, 0))
+
+        # Ensure view can receive mouse events
+        self.view.settings().set("is_widget", False)
+
         if focus:
             self.window.focus_view(self.view)
 
@@ -253,8 +262,16 @@ class OutputView:
 
         # Build input area (context + marker)
         self._input_area_start = self.view.size()
-        prefix = "\n" if self.view.size() > 0 else ""
-        self.view.run_command("append", {"characters": prefix})
+
+        # Add newline prefix only if view has content AND doesn't already end with newline
+        prefix = ""
+        if self.view.size() > 0:
+            last_char = self.view.substr(self.view.size() - 1)
+            if last_char != "\n":
+                prefix = "\n"
+
+        if prefix:
+            self.view.run_command("append", {"characters": prefix})
         self._input_area_start = self.view.size()
 
         # Add context line if any
@@ -358,6 +375,10 @@ class OutputView:
         self.view.set_read_only(True)
         # Also clear any pending regions that might be stale
         self._pending_context_region = (0, 0)
+
+        # Re-enter input mode after reset to restore a clean, working state
+        # Use a timeout to ensure view state is fully reset before re-entering
+        sublime.set_timeout(self.enter_input_mode, 10)
 
     def is_in_input_region(self, point: int) -> bool:
         """Check if a point is within the editable input region."""
@@ -847,9 +868,10 @@ class OutputView:
         """Respond to a permission request with given callback."""
         import time
 
-        # Handle "allow all" - remember for this session
+        # Handle "allow all" - save to project settings and remember for this session
         if response == PERM_ALLOW_ALL:
             self.auto_allow_tools.add(tool)
+            self._save_auto_allowed_tool(tool)
             response = PERM_ALLOW
 
         # Handle "allow 30s" - set timed auto-allow
@@ -870,6 +892,47 @@ class OutputView:
 
         # Process next queued permission if any
         self._process_permission_queue()
+
+    def _save_auto_allowed_tool(self, tool: str) -> None:
+        """Save a tool to the auto-allowed list in project settings."""
+        import os
+        import json
+
+        # Get project directory
+        folders = self.window.folders()
+        if not folders:
+            print(f"[Claude] Cannot save auto-allowed tool: no project folder")
+            return
+
+        project_dir = folders[0]
+        settings_dir = os.path.join(project_dir, ".claude")
+        settings_path = os.path.join(settings_dir, "settings.json")
+
+        # Load current settings
+        settings = {}
+        if os.path.exists(settings_path):
+            try:
+                with open(settings_path, "r") as f:
+                    settings = json.load(f)
+            except Exception as e:
+                print(f"[Claude] Error loading settings: {e}")
+                return
+
+        # Add tool to auto-allowed list
+        auto_allowed = settings.get("autoAllowedMcpTools", [])
+        if tool not in auto_allowed:
+            auto_allowed.append(tool)
+            settings["autoAllowedMcpTools"] = auto_allowed
+
+            # Save settings
+            os.makedirs(settings_dir, exist_ok=True)
+            try:
+                with open(settings_path, "w") as f:
+                    json.dump(settings, f, indent=2)
+                print(f"[Claude] Saved auto-allowed tool: {tool}")
+                sublime.status_message(f"Auto-allowed: {tool}")
+            except Exception as e:
+                print(f"[Claude] Failed to save settings: {e}")
 
     def _move_cursor_to_end(self) -> None:
         """Move cursor to end of view."""
@@ -1051,7 +1114,11 @@ class OutputView:
         detail = ""
         tool_input = tool.tool_input or {}
 
-        if tool.name == "Bash" and "command" in tool_input:
+        if tool.name == "Skill" and "skill" in tool_input:
+            # Show the actual skill name instead of just "Skill"
+            skill_name = tool_input["skill"]
+            detail = f": {skill_name}"
+        elif tool.name == "Bash" and "command" in tool_input:
             cmd = tool_input["command"]
             if len(cmd) > 60:
                 cmd = cmd[:60] + "..."

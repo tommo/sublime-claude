@@ -314,6 +314,33 @@ Use Sublime's tracked regions (`add_regions`/`get_regions`) for UI elements. Sto
 - [ ] Click to expand/collapse tool sections
 - [ ] MCP tool parameters (pass args to saved tools)
 
+## Recent Changes (2025-12-12)
+
+### New Features
+- **User-level settings**: Bridge now loads from `~/.claude/settings.json` and merges with project settings. User settings apply globally, project settings override.
+- **Marketplace.json support**: Plugin system now reads `.claude-plugin/marketplace.json` to find plugin locations, compatible with official Claude Code plugin format.
+- **Plugin format**: Supports official `"plugin@marketplace": true` format in `enabledPlugins` (backward compatible with old object format).
+- **Auto-allowed MCP tools**: Automatically allow tools without permission prompts
+  - Settings: `autoAllowedMcpTools` array with patterns (e.g., `"mcp__*__*"`, `"Bash"`)
+  - Command: `Claude: Manage Auto-Allowed Tools...` to add/remove patterns via quick panel
+  - Permission dialog: Press `[A] Always` to save tool to auto-allow list in project settings
+  - Bridge checks patterns with `fnmatch` before prompting
+  ```json
+  {
+    "autoAllowedMcpTools": [
+      "mcp__plugin_*",
+      "Read",
+      "Bash"
+    ]
+  }
+  ```
+
+### Bug Fixes
+- **Mouse selection**: Fixed issue where dragging to select text would make view unresponsive. Dynamic `read_only` toggling based on cursor position now allows selection everywhere while protecting conversation history from edits.
+- **Input mode protection**: Conversation history is now truly read-only when in input mode. Typing, pasting, or any modification outside the input area is blocked via dynamic `read_only` state.
+- **Reset input mode**: Fixed command to properly re-enter input mode after cleanup, not leave view in unusable state.
+- **Orphaned view reconnection**: Fixed blank lines being added each time an orphaned view is reconnected after restart. Now checks if content already ends with newline before adding separator.
+
 ## Recent Changes (2025-12-11)
 
 ### New Features
