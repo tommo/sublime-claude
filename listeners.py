@@ -210,8 +210,21 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         # Check ALL regions in the selection
         for region in sel:
-            # Block if either start or end of selection is outside input region
+            # If typing outside input region, refocus to input area
             if region.begin() < input_start or region.end() < input_start:
+                # For insert commands (typing), move cursor to end of input and allow the command
+                if command_name == "insert" and args and "characters" in args:
+                    print(f"[Claude] Refocusing to input area (was at {region.begin()}, input_start={input_start})")
+                    # Move cursor to end of input area
+                    input_end = self.view.size()
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(input_end, input_end))
+                    # Show the cursor
+                    self.view.show(input_end)
+                    # Let the insert command proceed at new position
+                    return None
+
+                # For other commands, block them
                 print(f"[Claude] BLOCKING {command_name} at position {region.begin()}, input_start={input_start}")
                 return ("noop", {})
 
@@ -245,22 +258,72 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 all_in_input_region = False
                 break
 
-        # Toggle read_only based on whether we're in the input region
-        # This prevents typing/pasting/any modification outside input area
-        if all_in_input_region:
-            # Safe to edit - in input region
-            if self.view.is_read_only():
-                self.view.set_read_only(False)
-        else:
-            # Not safe - in conversation history
-            if not self.view.is_read_only():
-                self.view.set_read_only(True)
+        # Keep view editable - we handle protection via on_modified (Terminus approach)
+        # This allows typing anywhere, then we redirect it to input area
+        if self.view.is_read_only():
+            self.view.set_read_only(False)
+
+    def on_query_context(self, key, operator, operand, match_all):
+        """Provide context for key bindings."""
+        if key == "claude_outside_input_area":
+            s = get_session_for_view(self.view)
+            if not s or not s.output.is_input_mode():
+                return False
+
+            input_start = s.output._input_start
+            sel = self.view.sel()
+
+            # Check if cursor is outside input area
+            for region in sel:
+                if region.begin() < input_start:
+                    return True
+            return False
+
+        return None
 
     def on_modified(self):
-        """Track modifications for draft saving and @ autocomplete."""
+        """Track modifications and redirect typing from history to input area."""
         s = get_session_for_view(self.view)
         if not s or not s.output.is_input_mode():
             return
+
+        # Check what command just ran (Terminus trick)
+        command, args, _ = self.view.command_history(0)
+
+        # Handle insert command - check if typing happened outside input area
+        if command == "insert" and "characters" in args and len(self.view.sel()) == 1:
+            input_start = s.output._input_start
+            current_cursor = self.view.sel()[0].end()
+
+            # If the insert happened before input area, redirect it
+            chars = args["characters"]
+            insert_pos = max(current_cursor - len(chars), 0)
+
+            if insert_pos < input_start:
+                # Undo the insert
+                self.view.run_command("soft_undo")
+
+                # Move cursor to end of input area
+                input_end = self.view.size()
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(input_end, input_end))
+
+                # Re-insert at correct position
+                self.view.run_command("insert", {"characters": chars})
+
+                # Show cursor
+                self.view.show(self.view.size())
+                return
+
+        # Block other commands that happened outside input area
+        elif command and not command.startswith("claude"):
+            input_start = s.output._input_start
+            if len(self.view.sel()) > 0:
+                for region in self.view.sel():
+                    if region.begin() < input_start:
+                        # Unwanted edit in history - undo it
+                        self.view.run_command("soft_undo")
+                        return
 
         # Save draft
         input_text = s.output.get_input_text()
