@@ -425,6 +425,15 @@ class Session:
             self._handle_permission_request(params)
             return
 
+        if method == "queued_inject":
+            # Injected prompt was queued because query completed too fast
+            # Auto-submit it now
+            message = params.get("message", "")
+            if message:
+                print(f"[Claude] Auto-submitting queued inject: {message[:60]}...")
+                self.query(message)
+            return
+
         if method == "alarm_wake":
             # Alarm fired - start a new query with the wake prompt
             wake_prompt = params.get("wake_prompt", "")

@@ -70,6 +70,9 @@ class Bridge:
         self.query_id: int | None = None  # Track active query for inject_message
         self.cwd: str | None = None  # Current working directory (set by initialize)
 
+        # Queue for injected prompts that arrive when query completes
+        self.pending_injects: list[str] = []
+
         # Alarm system for efficient event-driven waiting
         self.alarms: dict[str, dict] = {}  # alarm_id → {event_type, params, wake_prompt}
         self.alarm_tasks: dict[str, asyncio.Task] = {}  # alarm_id → monitoring task
@@ -603,6 +606,14 @@ Be concise. Focus on what matters to the user.""",
             send_result(id, {"status": "interrupted"})
         finally:
             self.query_id = None
+            # Process any pending injects that arrived during query
+            if self.pending_injects:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"query ended with {len(self.pending_injects)} pending injects\n")
+                # Send notification to Sublime to submit the queued prompts
+                for inject in self.pending_injects:
+                    send_notification("queued_inject", {"message": inject})
+                self.pending_injects.clear()
 
     async def emit_message(self, message: Any) -> None:
         """Emit a message notification."""
@@ -727,16 +738,27 @@ Be concise. Focus on what matters to the user.""",
             send_error(id, -32602, "Missing message parameter")
             return
 
-        if not self.query_id:
-            send_error(id, -32002, "No active query to inject into")
-            return
-
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"inject_message: {message[:60]}...\n")
 
-        # Send as a new query - Claude will see it as a follow-up user message
-        await self.client.query(message)
-        send_result(id, {"status": "ok"})
+        # If no active query, queue the message to be sent when next query starts
+        if not self.query_id:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  no active query, queuing inject\n")
+            self.pending_injects.append(message)
+            send_result(id, {"status": "queued"})
+            return
+
+        # Try to inject immediately
+        try:
+            await self.client.query(message)
+            send_result(id, {"status": "ok"})
+        except Exception as e:
+            # If injection fails (e.g., query completed), queue it
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  inject failed: {e}, queuing\n")
+            self.pending_injects.append(message)
+            send_result(id, {"status": "queued"})
 
     async def get_history(self, id: int) -> None:
         """Get conversation history from the SDK."""
