@@ -939,7 +939,8 @@ Be concise. Focus on what matters to the user.""",
     async def run(self) -> None:
         """Main loop - read JSON-RPC from stdin."""
         loop = asyncio.get_event_loop()
-        reader = asyncio.StreamReader()
+        # Increase buffer limit to 100MB to handle large tool results (e.g., images)
+        reader = asyncio.StreamReader(limit=100 * 1024 * 1024)
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 

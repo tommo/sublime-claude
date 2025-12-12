@@ -106,7 +106,7 @@ class OutputView:
         self.view = self.window.new_file()
         self.view.set_name("Claude")
         self.view.set_scratch(True)
-        self.view.set_read_only(False)  # Keep editable - protection via on_modified
+        self.view.set_read_only(True)
         self.view.settings().set("claude_output", True)
         self.view.settings().set("word_wrap", True)
         self.view.settings().set("gutter", True)
@@ -156,15 +156,11 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return 0
 
-        # Keep view editable (Terminus approach) - protection handled by on_modified
+        self.view.set_read_only(False)
         if pos is None:
             pos = self.view.size()
-
-        # Temporarily make editable if needed
-        if self.view.is_read_only():
-            self.view.set_read_only(False)
-
         self.view.run_command("claude_insert", {"pos": pos, "text": text})
+        self.view.set_read_only(True)
         return pos + len(text)
 
     def _replace(self, start: int, end: int, text: str) -> int:
@@ -172,12 +168,9 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return end
 
-        # Keep view editable (Terminus approach) - protection handled by on_modified
-        # Temporarily make editable if needed
-        if self.view.is_read_only():
-            self.view.set_read_only(False)
-
+        self.view.set_read_only(False)
         self.view.run_command("claude_replace", {"start": start, "end": end, "text": text})
+        self.view.set_read_only(True)
         return start + len(text)
 
     def _scroll_to_end(self, force: bool = False) -> None:
@@ -527,7 +520,6 @@ class OutputView:
             ]
 
         self._render_current()
-        self._scroll_to_end()
 
     def tool_done(self, name: str, result: str = None) -> None:
         """Mark most recent pending tool with this name as done."""
@@ -569,7 +561,6 @@ class OutputView:
 
         self.current.events.append(content)
         self._render_current()
-        self._scroll_to_end()
 
     def meta(self, duration: float, cost: float = None) -> None:
         """Set completion meta - marks conversation as done."""
@@ -579,7 +570,6 @@ class OutputView:
         self.current.duration = duration
         self.current.working = False
         self._render_current()
-        self._scroll_to_end()
 
     def interrupted(self) -> None:
         """Show interrupted indicator."""
@@ -597,7 +587,6 @@ class OutputView:
         # Append interrupted text
         self.current.events.append("\n\n*[interrupted]*\n")
         self._render_current()
-        self._scroll_to_end()
 
     def clear(self) -> None:
         """Clear all output (can undo with Cmd+Z)."""
@@ -1059,17 +1048,12 @@ class OutputView:
         # Events in time order (text chunks and tools interleaved)
         if self.current.events:
             lines.append("\n")
-
-            # Check if there are any pending tools - if so, skip text (it's just planning commentary)
-            has_pending_tools = any(isinstance(e, ToolCall) and e.status == PENDING for e in self.current.events)
-
             for event in self.current.events:
                 if isinstance(event, str):
-                    # Skip text chunks if tools are still pending (agent planning commentary)
-                    if not has_pending_tools:
-                        lines.append(event)
-                        if not event.endswith("\n"):
-                            lines.append("\n")
+                    # Text chunk
+                    lines.append(event)
+                    if not event.endswith("\n"):
+                        lines.append("\n")
                 elif isinstance(event, ToolCall):
                     # Tool call
                     symbol = self.SYMBOLS[event.status]
@@ -1119,7 +1103,9 @@ class OutputView:
         if self.pending_permission and self.pending_permission.callback:
             self._remove_permission_block()
             self._render_permission()
-            self._scroll_to_end()
+
+        # Scroll after render completes
+        self._scroll_to_end()
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string."""
