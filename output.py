@@ -156,11 +156,10 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return 0
 
-        self.view.set_read_only(False)
+        # Keep view editable (Terminus approach) - protection handled by on_modified
         if pos is None:
             pos = self.view.size()
         self.view.run_command("claude_insert", {"pos": pos, "text": text})
-        self.view.set_read_only(True)
         return pos + len(text)
 
     def _replace(self, start: int, end: int, text: str) -> int:
@@ -168,9 +167,8 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return end
 
-        self.view.set_read_only(False)
+        # Keep view editable (Terminus approach) - protection handled by on_modified
         self.view.run_command("claude_replace", {"start": start, "end": end, "text": text})
-        self.view.set_read_only(True)
         return start + len(text)
 
     def _scroll_to_end(self, force: bool = False) -> None:

@@ -284,11 +284,15 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
     def on_modified(self):
         """Track modifications and redirect typing from history to input area."""
         s = get_session_for_view(self.view)
-        if not s or not s.output.is_input_mode():
+        if not s:
             return
 
         # Check what command just ran (Terminus trick)
         command, args, _ = self.view.command_history(0)
+
+        # Don't redirect during input mode setup
+        if not s.output.is_input_mode():
+            return
 
         # Handle insert command - check if typing happened outside input area
         if command == "insert" and "characters" in args and len(self.view.sel()) == 1:
