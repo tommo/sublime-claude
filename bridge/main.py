@@ -154,6 +154,7 @@ class Bridge:
             "resume": resume_id,
             "fork_session": fork_session,
             "setting_sources": ["project"],
+            "max_buffer_size": 100 * 1024 * 1024,  # 100MB for large images/files
         }
 
         # Profile config: model and betas
@@ -938,11 +939,22 @@ Be concise. Focus on what matters to the user.""",
 
     async def run(self) -> None:
         """Main loop - read JSON-RPC from stdin."""
+        # Immediate startup log
+        sys.stderr.write("=== BRIDGE STARTING WITH 1GB BUFFER ===\n")
+        sys.stderr.flush()
+
         loop = asyncio.get_event_loop()
-        # Increase buffer limit to 100MB to handle large tool results (e.g., images)
-        reader = asyncio.StreamReader(limit=100 * 1024 * 1024)
-        protocol = asyncio.StreamReaderProtocol(reader)
+        # Increase buffer limit to 1GB to handle large tool results (e.g., images)
+        buffer_limit = 1024 * 1024 * 1024
+        reader = asyncio.StreamReader(limit=buffer_limit, loop=loop)
+        protocol = asyncio.StreamReaderProtocol(reader, loop=loop)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+        # Log to verify this code is running
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write("Bridge started with 1GB buffer limit\n")
+        sys.stderr.write(f"=== StreamReader limit set to {reader._limit} bytes ===\n")
+        sys.stderr.flush()
 
         while self.running:
             try:
@@ -953,10 +965,30 @@ Be concise. Focus on what matters to the user.""",
                 # Don't await - handle requests concurrently so permission responses
                 # can be processed while a query is running
                 asyncio.create_task(self.handle_request(req))
+            except asyncio.LimitOverrunError as e:
+                send_error(None, -32000, f"Message too large: {e}")
+                sys.stderr.write(f"!!! LIMIT OVERRUN ERROR: {e} !!!\n")
+                sys.stderr.write(f"!!! Reader limit: {reader._limit} !!!\n")
+                sys.stderr.write(f"!!! Error type: {type(e).__name__} !!!\n")
+                sys.stderr.flush()
+                # Try to consume the rest of the line to recover
+                try:
+                    await reader.readuntil(b'\n')
+                except:
+                    pass
             except json.JSONDecodeError as e:
                 send_error(None, -32700, f"Parse error: {e}")
+                sys.stderr.write(f"Fatal error in message reader: Failed to decode JSON: {e}\n")
+                sys.stderr.flush()
             except Exception as e:
                 send_error(None, -32000, f"Internal error: {e}")
+                sys.stderr.write(f"!!! EXCEPTION TYPE: {type(e).__module__}.{type(e).__name__} !!!\n")
+                sys.stderr.write(f"!!! EXCEPTION MESSAGE: {e} !!!\n")
+                sys.stderr.write(f"!!! READER LIMIT: {reader._limit} !!!\n")
+                sys.stderr.write(f"Fatal error in message reader: {e}\n")
+                sys.stderr.flush()
+                import traceback
+                traceback.print_exc(file=sys.stderr)
 
 
 async def main():

@@ -1118,8 +1118,6 @@ class OutputView:
             detail = f": {skill_name}"
         elif tool.name == "Bash" and "command" in tool_input:
             cmd = tool_input["command"]
-            if len(cmd) > 60:
-                cmd = cmd[:60] + "..."
             detail = f": {cmd}"
             # Show output for completed Bash commands
             if tool.result and tool.status in (DONE, ERROR):
