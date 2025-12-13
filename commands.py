@@ -585,7 +585,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         if not in_output_view and current_file:
             import os
             filename = os.path.basename(current_file)
-            items.append([f"📋 New with ctx:{filename}", "Create session with this file as context"])
+            items.append([f"📎 New with ctx:{filename}", "Create session with this file as context"])
             actions.append(("new_with_file", current_file))
 
         if active_session and not in_output_view:
@@ -625,7 +625,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         for name, config in profiles.items():
             desc = config.get("description", f"{config.get('model', 'default')} model")
-            items.append([f"📋 {name}", desc])
+            items.append([f"😶 {name}", desc])
             actions.append(("profile", config))
 
         for name, config in checkpoints.items():

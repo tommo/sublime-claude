@@ -186,6 +186,7 @@ class Session:
         """Add a file to pending context."""
         name = os.path.basename(path)
         self.pending_context.append(ContextItem("file", name, f"File: {path}\n```\n{content}\n```"))
+        # print(f"[Claude] add_context_file: added {name}, pending_context={[c.name for c in self.pending_context]}")
         self._update_context_display()
 
     def add_context_selection(self, path: str, content: str) -> None:
@@ -589,6 +590,8 @@ class Session:
         # Show spinner in status bar only (not title - causes cursor flicker)
         status = self.current_tool or "thinking..."
         self._status(f"{s} {status}")
+        # Animate spinner in output view
+        self.output.advance_spinner()
         sublime.set_timeout(self._animate, 100)
 
     def _handle_permission_request(self, params: dict) -> None:
