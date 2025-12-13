@@ -1124,6 +1124,9 @@ class OutputView:
                 detail += self._format_bash_result(tool.result)
         elif tool.name == "Read" and "file_path" in tool_input:
             detail = f": {tool_input['file_path']}"
+            # Show line count for completed Read
+            if tool.result and tool.status == DONE:
+                detail += self._format_read_result(tool.result)
         elif tool.name == "Edit" and "file_path" in tool_input:
             detail = f": {tool_input['file_path']}"
             # Show diff for Edit tool
@@ -1205,6 +1208,13 @@ class OutputView:
         if files:
             return f" → {len(lines)} matches in {len(files)} files"
         return f" → {len(lines)} matches"
+
+    def _format_read_result(self, result: str) -> str:
+        """Format Read result as line count."""
+        if not result or not result.strip():
+            return " → 0 lines"
+        lines = result.strip().split("\n")
+        return f" → {len(lines)} lines"
 
     def _format_mcp_result(self, result: str) -> str:
         """Format generic MCP tool result."""
