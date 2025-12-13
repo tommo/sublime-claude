@@ -57,6 +57,7 @@ class Conversation:
     working: bool = True  # True while processing, False when done
     duration: float = 0.0
     region: tuple = (0, 0)
+    context_names: List[str] = field(default_factory=list)  # Context files used
 
     @property
     def tools(self) -> List[ToolCall]:
@@ -525,7 +526,7 @@ class OutputView:
                 prev_todos = self.current.todos
 
         # Start new
-        self.current = Conversation(prompt=text, todos=prev_todos)
+        self.current = Conversation(prompt=text, todos=prev_todos, context_names=context_names or [])
         self._update_title()  # Show working indicator
 
         # Render prompt with optional context indicator
@@ -539,11 +540,14 @@ class OutputView:
             indented = text
         if context_names:
             context_str = ", ".join(context_names)
-            line = f"{prefix}◎ {indented}  📎 {context_str} ▶\n"
+            line = f"{prefix}◎ {indented} ▶\n  📎 {context_str}\n"
+            # print(f"[Claude] prompt: writing with context: {repr(line)}")
         else:
             line = f"{prefix}◎ {indented} ▶\n"
+            # print(f"[Claude] prompt: writing without context: {repr(line)}")
         end = self._write(line)
         self.current.region = (start, end)
+        # print(f"[Claude] prompt: wrote prompt at region ({start}, {end}), view_size={self.view.size()}")
         self._scroll_to_end()
 
     def tool(self, name: str, tool_input: dict = None) -> None:
@@ -1038,7 +1042,7 @@ class OutputView:
             return True
         return False
 
-    def _render_current(self) -> None:
+    def _render_current(self, auto_scroll: bool = True) -> None:
         """Re-render current conversation in place (debounced)."""
         if not self.current or not self.view:
             return
@@ -1047,13 +1051,14 @@ class OutputView:
         if self._render_pending:
             return
         self._render_pending = True
+        self._auto_scroll = auto_scroll  # Store for _do_render
         sublime.set_timeout(self._do_render, 10)
 
     def advance_spinner(self) -> None:
         """Advance spinner animation frame and re-render if working."""
         if self.current and self.current.working:
             self._spinner_frame += 1
-            self._render_current()
+            self._render_current(auto_scroll=False)  # Don't scroll during spinner updates
 
     def _do_render(self) -> None:
         """Actually perform the render."""
@@ -1094,7 +1099,13 @@ class OutputView:
             indented_prompt = prompt_lines[0] + "\n" + "\n".join("  " + l for l in prompt_lines[1:])
         else:
             indented_prompt = self.current.prompt
-        lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
+        # Include context indicator if present
+        if self.current.context_names:
+            context_str = ", ".join(self.current.context_names)
+            lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
+            lines.append(f"  📎 {context_str}\n")
+        else:
+            lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
 
         # Events in time order (text chunks and tools interleaved)
         if self.current.events:
@@ -1156,8 +1167,9 @@ class OutputView:
             self._remove_permission_block()
             self._render_permission()
 
-        # Scroll after render completes
-        self._scroll_to_end()
+        # Scroll after render completes (only if auto_scroll is enabled)
+        if getattr(self, '_auto_scroll', True):
+            self._scroll_to_end()
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string."""

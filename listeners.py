@@ -213,16 +213,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         for region in sel:
             # If typing outside input region, refocus to input area
             if region.begin() < input_start or region.end() < input_start:
-                # For insert commands (typing), move cursor to end of input and allow the command
-                if command_name == "insert" and args and "characters" in args:
-                    print(f"[Claude] Refocusing to input area (was at {region.begin()}, input_start={input_start})")
+                # For insert/paste commands, move cursor to end of input and allow the command
+                if command_name in ("insert", "paste") or (command_name == "insert" and args and "characters" in args):
+                    print(f"[Claude] Refocusing to input area for {command_name} (was at {region.begin()}, input_start={input_start})")
                     # Move cursor to end of input area
                     input_end = self.view.size()
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(input_end, input_end))
                     # Show the cursor
                     self.view.show(input_end)
-                    # Let the insert command proceed at new position
+                    # Let the command proceed at new position
                     return None
 
                 # For other commands, block them

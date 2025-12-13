@@ -556,6 +556,7 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
 class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
     """Switch between active sessions in this window."""
     def run(self) -> None:
+        import os
         from .core import create_session
 
         # Get all sessions in this window
@@ -583,7 +584,6 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         # Add "New Session with This File" option when in a non-session file
         if not in_output_view and current_file:
-            import os
             filename = os.path.basename(current_file)
             items.append([f"📎 New with ctx:{filename}", "Create session with this file as context"])
             actions.append(("new_with_file", current_file))
