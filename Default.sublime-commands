@@ -92,10 +92,6 @@
         "command": "claude_code_manage_auto_allowed_tools"
     },
     {
-        "caption": "Claude: View Blackboard...",
-        "command": "claude_code_blackboard"
-    },
-    {
         "caption": "Claude: Reset Input Mode",
         "command": "claude_code_reset_input"
     },

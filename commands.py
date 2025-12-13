@@ -4,14 +4,21 @@ import sublime_plugin
 
 from .core import get_active_session, get_session_for_view, create_session
 from .session import Session, load_saved_sessions
+from .prompt_builder import PromptBuilder
 
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
     """Start a new session. Shows profile picker if profiles are configured."""
     def run(self, profile: str = None) -> None:
-        from .mcp_server import _load_profiles_and_checkpoints
+        from .settings import load_profiles_and_checkpoints
+        import os
 
-        profiles, checkpoints = _load_profiles_and_checkpoints()
+        # Get project profiles path
+        project_path = None
+        if self.window.folders():
+            project_path = os.path.join(self.window.folders()[0], ".claude", "profiles.json")
+
+        profiles, checkpoints = load_profiles_and_checkpoints(project_path)
 
         # If profile specified directly, use it
         if profile:
@@ -125,7 +132,7 @@ class ClaudeCodeQuerySelectionCommand(sublime_plugin.TextCommand):
         s = get_active_session(window)
         if not s:
             s = create_session(window)
-        q = f"{prompt}\n\nFrom `{fname}`:\n```\n{selection}\n```"
+        q = PromptBuilder.selection_query(prompt, fname, selection)
         s.output.show()
         s.output._move_cursor_to_end()
         if s.initialized:
@@ -161,7 +168,7 @@ class ClaudeCodeQueryFileCommand(sublime_plugin.WindowCommand):
         s = get_active_session(self.window)
         if not s:
             return
-        q = f"{prompt}\n\nFile: `{fname}`\n```\n{content}\n```"
+        q = PromptBuilder.file_query(prompt, fname, content)
         s.output.show()
         s.output._move_cursor_to_end()
         if s.initialized:
@@ -277,6 +284,14 @@ class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
         s = get_active_session(self.window)
         if s:
             s.output.clear()
+
+
+class ClaudeCodeCompactCommand(sublime_plugin.WindowCommand):
+    """Manually trigger conversation compaction/summarization."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if s:
+            s.query("/compact")
 
 
 class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
@@ -599,8 +614,14 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             actions.append(("restart", active_session))
 
         # Add profiles and checkpoints
-        from .mcp_server import _load_profiles_and_checkpoints
-        profiles, checkpoints = _load_profiles_and_checkpoints()
+        from .settings import load_profiles_and_checkpoints
+
+        # Get project profiles path
+        project_path = None
+        if self.window.folders():
+            project_path = os.path.join(self.window.folders()[0], ".claude", "profiles.json")
+
+        profiles, checkpoints = load_profiles_and_checkpoints(project_path)
 
         for name, config in profiles.items():
             desc = config.get("description", f"{config.get('model', 'default')} model")
@@ -827,78 +848,6 @@ return {
 
         sublime.status_message(f"MCP config added to {claude_dir}")
         self.window.open_file(settings_path)
-
-
-class ClaudeCodeBlackboardCommand(sublime_plugin.WindowCommand):
-    """View and edit the shared blackboard."""
-    def run(self) -> None:
-        from . import mcp_server
-
-        bb = mcp_server._blackboard
-        if not bb:
-            sublime.status_message("Blackboard is empty")
-            return
-
-        items = []
-        keys = list(bb.keys())
-        for key in keys:
-            entry = bb[key]
-            value = entry["value"]
-            if isinstance(value, str):
-                preview = value[:80].replace("\n", "↵")
-            else:
-                preview = str(value)[:80]
-            items.append([key, preview])
-
-        def on_select(idx):
-            if idx >= 0:
-                key = keys[idx]
-                self._show_entry(key)
-
-        self.window.show_quick_panel(items, on_select)
-
-    def _show_entry(self, key: str) -> None:
-        import json
-        from . import mcp_server
-
-        entry = mcp_server._blackboard.get(key, {})
-        value = entry.get("value", "")
-
-        view = self.window.new_file()
-        view.set_name(f"Blackboard: {key}")
-        view.set_scratch(True)
-        view.settings().set("blackboard_key", key)
-
-        content = value if isinstance(value, str) else json.dumps(value, indent=2)
-        view.run_command("insert", {"characters": content})
-
-        sublime.status_message("Edit and save (Cmd+S) to update blackboard, or close to discard")
-
-
-class ClaudeCodeBlackboardSaveCommand(sublime_plugin.TextCommand):
-    """Save edited blackboard entry."""
-    def run(self, edit) -> None:
-        import json
-
-        key = self.view.settings().get("blackboard_key")
-        if not key:
-            return
-
-        from . import mcp_server
-
-        content = self.view.substr(sublime.Region(0, self.view.size()))
-
-        try:
-            value = json.loads(content)
-        except:
-            value = content
-
-        mcp_server._blackboard[key] = {
-            "value": value,
-            "timestamp": __import__("time").time(),
-        }
-        sublime.status_message(f"Blackboard '{key}' updated")
-        self.view.set_scratch(True)
 
 
 class ClaudeCodeTogglePermissionModeCommand(sublime_plugin.WindowCommand):

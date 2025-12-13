@@ -4,6 +4,7 @@ import sublime_plugin
 
 from .core import get_session_for_view, get_active_session
 from .session import Session
+from .context_parser import ContextParser, ContextMenuItem, ContextMenuHandler
 
 
 class ClaudeCodeEventListener(sublime_plugin.EventListener):
@@ -337,11 +338,10 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         sel = self.view.sel()
         if sel and len(sel) == 1:
             cursor = sel[0].end()
-            # Check if char before cursor is @
-            if cursor > 0:
-                char_before = self.view.substr(cursor - 1)
-                if char_before == "@":
-                    self._show_context_popup(s, cursor)
+            content = self.view.substr(sublime.Region(0, self.view.size()))
+            trigger = ContextParser.check_trigger(content, cursor)
+            if trigger:
+                self._show_context_popup(s, cursor)
 
     def _show_context_popup(self, session: Session, cursor: int) -> None:
         """Show @ context autocomplete via quick panel."""
@@ -356,39 +356,43 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             "text": ""
         })
 
-        # Build menu items: browse, clear, then open files
-        items = []  # (action, data, [title, description])
-
-        # Browse option
-        items.append(("browse", None, ["Browse...", "Choose file from project"]))
-
-        # Clear context (only show if there's pending context)
-        if session.pending_context:
-            count = len(session.pending_context)
-            items.append(("clear", None, ["Clear context", f"{count} pending item{'s' if count > 1 else ''}"]))
-
-        # Open files in this window
+        # Build list of open files
+        import os
+        open_files = []
         for v in window.views():
             if v.file_name() and not v.settings().get("claude_output"):
-                import os
                 name = os.path.basename(v.file_name())
                 path = v.file_name()
-                items.append(("file", v, [name, path]))
+                open_files.append((name, path))
+
+        # Use context parser to build menu
+        has_pending = bool(session.pending_context)
+        pending_count = len(session.pending_context) if has_pending else 0
+        menu_items = ContextParser.build_menu(open_files, has_pending, pending_count)
+
+        # Create handler for menu selection
+        def on_browse():
+            self._show_file_picker(session)
+
+        def on_clear():
+            session.clear_context()
+            sublime.status_message("Context cleared")
+
+        def on_add_file(path, _content):
+            # Find the view for this path and read content
+            for v in window.views():
+                if v.file_name() == path:
+                    content = v.substr(sublime.Region(0, v.size()))
+                    session.add_context_file(path, content)
+                    break
+
+        handler = ContextMenuHandler(on_browse, on_clear, on_add_file)
 
         def on_select(idx):
-            if idx >= 0:
-                action, data, _ = items[idx]
-                if action == "browse":
-                    self._show_file_picker(session)
-                elif action == "clear":
-                    session.clear_context()
-                    sublime.status_message("Context cleared")
-                elif action == "file" and data:
-                    content = data.substr(sublime.Region(0, data.size()))
-                    session.add_context_file(data.file_name(), content)
+            handler.handle_selection(menu_items, idx)
 
         window.show_quick_panel(
-            [item[2] for item in items],
+            ContextParser.format_menu_items(menu_items),
             on_select,
             placeholder="Add context..."
         )

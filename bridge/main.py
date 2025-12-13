@@ -8,7 +8,17 @@ import json
 import os
 import sys
 from dataclasses import asdict, is_dataclass
+from pathlib import Path
 from typing import Any
+
+# Import shared utilities
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from settings import load_project_settings
+from logger import get_bridge_logger, ContextLogger
+from constants import BRIDGE_BUFFER_SIZE
+
+# Initialize logger
+_logger = get_bridge_logger()
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -131,14 +141,13 @@ class Bridge:
         mcp_servers = self._load_mcp_servers(cwd)
         agents = self._load_agents(cwd)
         plugins = self._load_plugins(cwd)
-        settings = self._load_project_settings(cwd)
+        settings = load_project_settings(cwd)
 
-        with open("/tmp/claude_bridge.log", "a") as f:
-            f.write(f"initialize: params={params}\n")
-            f.write(f"  resume_id={resume_id}, fork={fork_session}, cwd={cwd}, actual_cwd={os.getcwd()}\n")
-            f.write(f"  mcp_servers={list(mcp_servers.keys()) if mcp_servers else None}\n")
-            f.write(f"  agents={list(agents.keys()) if agents else None}\n")
-            f.write(f"  plugins={plugins}\n")
+        _logger.info(f"initialize: params={params}")
+        _logger.info(f"  resume_id={resume_id}, fork={fork_session}, cwd={cwd}, actual_cwd={os.getcwd()}")
+        _logger.info(f"  mcp_servers={list(mcp_servers.keys()) if mcp_servers else None}")
+        _logger.info(f"  agents={list(agents.keys()) if agents else None}")
+        _logger.info(f"  plugins={plugins}")
 
         # Build system prompt with project addon
         system_prompt = params.get("system_prompt", "")
@@ -217,75 +226,10 @@ class Bridge:
             "agents": list(agents.keys()) if agents else [],
         })
 
-    def _load_project_settings(self, cwd: str) -> dict:
-        """Load and merge user-level and project settings.
-
-        User settings from ~/.claude/settings.json are loaded first,
-        then project settings override them.
-        """
-        from pathlib import Path
-
-        # Start with user-level settings
-        user_settings = {}
-        user_settings_path = Path.home() / ".claude" / "settings.json"
-        if user_settings_path.exists():
-            try:
-                with open(user_settings_path, "r") as f:
-                    user_settings = json.load(f)
-                    with open("/tmp/claude_bridge.log", "a") as f:
-                        f.write(f"  loaded user settings from {user_settings_path}\n")
-            except Exception as e:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  error loading {user_settings_path}: {e}\n")
-
-        if not cwd:
-            return user_settings
-
-        # Load project settings
-        project_settings = {}
-
-        # Try .claude/settings.json first
-        settings_path = os.path.join(cwd, ".claude", "settings.json")
-        if os.path.exists(settings_path):
-            try:
-                with open(settings_path, "r") as f:
-                    project_settings = json.load(f)
-            except Exception as e:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  error loading {settings_path}: {e}\n")
-
-        # Try .mcp.json (MCP servers only)
-        if not project_settings:
-            mcp_path = os.path.join(cwd, ".mcp.json")
-            if os.path.exists(mcp_path):
-                try:
-                    with open(mcp_path, "r") as f:
-                        project_settings = json.load(f)
-                except Exception as e:
-                    with open("/tmp/claude_bridge.log", "a") as f:
-                        f.write(f"  error loading {mcp_path}: {e}\n")
-
-        # Merge settings: project overrides user
-        merged = self._merge_settings(user_settings, project_settings)
-        return merged
-
-    def _merge_settings(self, user: dict, project: dict) -> dict:
-        """Deep merge project settings into user settings."""
-        result = user.copy()
-
-        for key, value in project.items():
-            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-                # Deep merge dictionaries
-                result[key] = {**result[key], **value}
-            else:
-                # Project value overrides user value
-                result[key] = value
-
-        return result
 
     def _load_mcp_servers(self, cwd: str) -> dict:
         """Load MCP server config from project settings, plus built-in sublime server."""
-        settings = self._load_project_settings(cwd)
+        settings = load_project_settings(cwd)
         servers = settings.get("mcpServers", {})
 
         # Always include the built-in sublime MCP server
@@ -307,38 +251,12 @@ class Bridge:
 
     def _load_agents(self, cwd: str) -> dict:
         """Load subagent definitions from project settings, plus built-in agents."""
-        settings = self._load_project_settings(cwd)
+        settings = load_project_settings(cwd)
         project_agents = settings.get("agents", {})
 
         # Built-in agents (can be overridden by project settings)
-        builtin = {
-            "planner": {
-                "description": "Use at the START of complex tasks to create an implementation plan. Saves plan to blackboard.",
-                "prompt": """You are a planning specialist. Create clear implementation plans.
-
-When planning:
-1. Break down the task into concrete steps
-2. Identify files that need changes
-3. Note any risks or dependencies
-4. Save plan using bb_write tool with key "plan"
-
-Keep plans concise and actionable. Output the plan, then save it.""",
-                "tools": ["Read", "Glob", "Grep", "bb_write", "bb_read"],
-                "model": "haiku"
-            },
-            "reporter": {
-                "description": "Use AFTER completing significant work to update the walkthrough/progress report.",
-                "prompt": """You are a progress reporter. Update the walkthrough for the user.
-
-1. Use bb_read with key "walkthrough" to get current state
-2. Update with: what was completed, current status, next steps
-3. Use bb_write with key "walkthrough" to save (markdown format)
-
-Be concise. Focus on what matters to the user.""",
-                "tools": ["bb_write", "bb_read", "bb_list"],
-                "model": "haiku"
-            },
-        }
+        # NOTE: Removed blackboard-based agents (planner, reporter) - use custom agents if needed
+        builtin = {}
 
         # Merge: project agents override built-ins
         merged = {**builtin, **project_agents}
@@ -360,7 +278,7 @@ Be concise. Focus on what matters to the user.""",
 
     def _load_plugins(self, cwd: str) -> list:
         """Load plugin configurations from project settings."""
-        settings = self._load_project_settings(cwd)
+        settings = load_project_settings(cwd)
 
         # Manual plugins from "plugins" key
         manual_plugins = settings.get("plugins", [])
@@ -518,7 +436,7 @@ Be concise. Focus on what matters to the user.""",
             return PermissionResultAllow(updated_input=tool_input)
 
         # Check auto-allowed tools from settings
-        settings = self._load_project_settings(self.cwd)
+        settings = load_project_settings(self.cwd)
         auto_allowed = settings.get("autoAllowedMcpTools", [])
 
         # Check if tool matches any auto-allow pattern

@@ -8,11 +8,11 @@ import time
 import sublime
 import sublime_plugin
 
+from .settings import load_profiles_and_checkpoints
+
 SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
-USER_PROFILES_PATH = os.path.expanduser("~/.claude-sublime/profiles.json")
 
 _server = None
-_blackboard: dict = {}  # Shared blackboard across sessions
 
 
 def _get_project_profiles_path() -> str:
@@ -21,35 +21,6 @@ def _get_project_profiles_path() -> str:
     if window and window.folders():
         return os.path.join(window.folders()[0], ".claude", "profiles.json")
     return ""
-
-
-def _load_profiles_and_checkpoints() -> tuple:
-    """Load profiles and checkpoints with cascade: user < project."""
-    profiles = {}
-    checkpoints = {}
-
-    # Load user-level
-    if os.path.exists(USER_PROFILES_PATH):
-        try:
-            with open(USER_PROFILES_PATH, "r") as f:
-                data = json.load(f)
-                profiles.update(data.get("profiles", {}))
-                checkpoints.update(data.get("checkpoints", {}))
-        except Exception as e:
-            print(f"[Claude MCP] Error loading user profiles: {e}")
-
-    # Load project-level (overrides user)
-    project_path = _get_project_profiles_path()
-    if project_path and os.path.exists(project_path):
-        try:
-            with open(project_path, "r") as f:
-                data = json.load(f)
-                profiles.update(data.get("profiles", {}))
-                checkpoints.update(data.get("checkpoints", {}))
-        except Exception as e:
-            print(f"[Claude MCP] Error loading project profiles: {e}")
-
-    return profiles, checkpoints
 
 
 def _save_checkpoint(name: str, session_id: str, description: str, to_project: bool = True) -> bool:
@@ -407,12 +378,6 @@ class MCPSocketServer:
             "read_view": self._read_view,
             "terminus_run": self._terminus_run,
             "list_tools": self._list_tools,
-            # Blackboard
-            "bb_write": self._bb_write,
-            "bb_read": self._bb_read,
-            "bb_delete": self._bb_delete,
-            "bb_list": self._bb_list,
-            "bb_clear": self._bb_clear,
             # Session tools
             "list_profiles": self._list_profiles,
             "spawn_session": self._spawn_session,
@@ -808,68 +773,19 @@ class MCPSocketServer:
 
         return result
 
-    # ─── Blackboard ───────────────────────────────────────────────────────
-
-    def _bb_write(self, key: str, value) -> dict:
-        """Write a value to the shared blackboard."""
-        global _blackboard
-        _blackboard[key] = {
-            "value": value,
-            "timestamp": time.time(),
-        }
-        return {"key": key, "written": True}
-
-    def _bb_read(self, key: str) -> dict:
-        """Read a value from the blackboard."""
-        if key in _blackboard:
-            entry = _blackboard[key]
-            return {"key": key, "value": entry["value"], "timestamp": entry["timestamp"]}
-        return {"key": key, "value": None, "error": "Key not found"}
-
-    def _bb_delete(self, key: str) -> dict:
-        """Delete a key from the blackboard."""
-        global _blackboard
-        if key in _blackboard:
-            del _blackboard[key]
-            return {"key": key, "deleted": True}
-        return {"key": key, "deleted": False, "error": "Key not found"}
-
-    def _bb_list(self) -> list:
-        """List all keys in the blackboard with previews."""
-        result = []
-        for key, entry in _blackboard.items():
-            value = entry["value"]
-            # Preview: truncate long values
-            if isinstance(value, str):
-                preview = value[:100] + "..." if len(value) > 100 else value
-            else:
-                preview = str(value)[:100]
-            result.append({
-                "key": key,
-                "preview": preview,
-                "timestamp": entry["timestamp"],
-            })
-        return result
-
-    def _bb_clear(self) -> dict:
-        """Clear all blackboard entries."""
-        global _blackboard
-        count = len(_blackboard)
-        _blackboard = {}
-        return {"cleared": count}
-
     # ─── Session Spawn ────────────────────────────────────────────────────
 
     def _list_profiles(self) -> dict:
         """List available profiles and checkpoints."""
-        profiles, checkpoints = _load_profiles_and_checkpoints()
+        project_path = _get_project_profiles_path()
+        profiles, checkpoints = load_profiles_and_checkpoints(project_path)
 
         result = {
             "profiles": [],
             "checkpoints": [],
             "paths": {
-                "user": USER_PROFILES_PATH,
-                "project": _get_project_profiles_path() or "(no project)",
+                "user": "~/.claude-sublime/profiles.json",
+                "project": project_path or "(no project)",
             }
         }
 
@@ -899,7 +815,8 @@ class MCPSocketServer:
         if not window:
             return {"error": "No window"}
 
-        profiles, checkpoints = _load_profiles_and_checkpoints()
+        project_path = _get_project_profiles_path()
+        profiles, checkpoints = load_profiles_and_checkpoints(project_path)
         profile_config = None
         resume_id = None
         fork = False

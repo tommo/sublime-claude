@@ -36,8 +36,6 @@ from .commands import (
     ClaudeCodeForkCommand,
     ClaudeCodeForkFromCommand,
     ClaudeCodeAddMcpCommand,
-    ClaudeCodeBlackboardCommand,
-    ClaudeCodeBlackboardSaveCommand,
     ClaudeCodeTogglePermissionModeCommand,
     ClaudeSubmitInputCommand,
     ClaudeEnterInputModeCommand,

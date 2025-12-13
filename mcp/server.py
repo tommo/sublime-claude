@@ -9,9 +9,16 @@ import socket
 import sys
 from typing import Any
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tool_router import create_sublime_router, parse_tool_call
+
 SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES_GUIDE = os.path.join(PLUGIN_DIR, "docs", "profiles.md")
+
+# Initialize tool router
+_router = create_sublime_router()
 
 
 def send_to_sublime(code: str = "", tool: str = None) -> dict:
@@ -125,59 +132,6 @@ def handle_request(request: dict) -> dict:
                             "grep": {"type": "string", "description": "Filter lines matching regex pattern (case-sensitive)"},
                             "grep_i": {"type": "string", "description": "Filter lines matching regex pattern (case-insensitive)"}
                         }
-                    }
-                },
-                # ─── Blackboard Tools ─────────────────────────────────────
-                # Shared scratchpad for persistent artifacts across sessions.
-                # Common patterns:
-                #   bb_write("plan", {steps: [...], status: "in_progress"})
-                #   bb_write("walkthrough", "## Progress\n- Done X\n- Working on Y")
-                #   bb_write("decisions", [{what: "...", why: "..."}])
-                #   bb_write("commands", {build: "pil load:app", test: "nim check ..."})
-                {
-                    "name": "bb_write",
-                    "description": """Write to shared blackboard. Persists across sessions and context loss.
-
-Use for:
-- plan: Implementation steps, architecture decisions
-- walkthrough: Progress report for user (markdown)
-- decisions: Key choices made and rationale
-- commands: Project-specific commands that work
-- context: Important details that might be forgotten""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Key (e.g. 'plan', 'walkthrough', 'commands')"},
-                            "value": {"description": "Value (string, object, or array)"}
-                        },
-                        "required": ["key", "value"]
-                    }
-                },
-                {
-                    "name": "bb_read",
-                    "description": "Read from blackboard. Use after context loss to restore important state.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Key to read"}
-                        },
-                        "required": ["key"]
-                    }
-                },
-                {
-                    "name": "bb_list",
-                    "description": "List all blackboard keys. Check this after context loss to see what's saved.",
-                    "inputSchema": {"type": "object", "properties": {}}
-                },
-                {
-                    "name": "bb_delete",
-                    "description": "Delete a blackboard key when no longer needed.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "description": "Key to delete"}
-                        },
-                        "required": ["key"]
                     }
                 },
                 # ─── Session Tools ────────────────────────────────────────
@@ -409,120 +363,25 @@ Example usage:
         })
 
     elif method == "tools/call":
-        tool_name = params.get("name")
-        args = params.get("arguments", {})
+        try:
+            tool_name, args = parse_tool_call(method, params)
 
-        # Route to appropriate handler
-        if tool_name == "sublime_eval":
-            code = args.get("code", "")
-            result = send_to_sublime(code=code)
-        elif tool_name == "sublime_tool":
-            name = args.get("name", "")
-            result = send_to_sublime(tool=name)
-        elif tool_name == "list_tools":
-            result = send_to_sublime(code="return list_tools()")
-        # Editor tools
-        elif tool_name == "get_window_summary":
-            result = send_to_sublime(code="return get_window_summary()")
-        elif tool_name == "find_file":
-            query = args.get("query", "")
-            pattern = args.get("pattern")
-            limit = args.get("limit", 20)
-            result = send_to_sublime(code=f"return find_file({query!r}, {pattern!r}, {limit})")
-        elif tool_name == "get_symbols":
-            query = args.get("query", "")
-            file_path = args.get("file_path")
-            limit = args.get("limit", 10)
-            result = send_to_sublime(code=f"return get_symbols({query!r}, {file_path!r}, {limit})")
-        elif tool_name == "goto_symbol":
-            query = args.get("query", "")
-            result = send_to_sublime(code=f"return goto_symbol({query!r})")
-        elif tool_name == "read_view":
-            file_path = args.get("file_path")
-            view_name = args.get("view_name")
-            head = args.get("head")
-            tail = args.get("tail")
-            grep = args.get("grep")
-            grep_i = args.get("grep_i")
-            result = send_to_sublime(code=f"return read_view({file_path!r}, {view_name!r}, {head}, {tail}, {grep!r}, {grep_i!r})")
-        # Blackboard tools
-        elif tool_name == "bb_write":
-            key = args.get("key", "")
-            value = args.get("value")
-            result = send_to_sublime(code=f"return bb_write({key!r}, {json.dumps(value)})")
-        elif tool_name == "bb_read":
-            key = args.get("key", "")
-            result = send_to_sublime(code=f"return bb_read({key!r})")
-        elif tool_name == "bb_list":
-            result = send_to_sublime(code="return bb_list()")
-        elif tool_name == "bb_delete":
-            key = args.get("key", "")
-            result = send_to_sublime(code=f"return bb_delete({key!r})")
-        # Session tools
-        elif tool_name == "list_profiles":
-            result = send_to_sublime(code="return list_profiles()")
-        elif tool_name == "spawn_session":
-            prompt = args.get("prompt", "")
-            name = args.get("name")
-            profile = args.get("profile")
-            checkpoint = args.get("checkpoint")
-            wait = args.get("wait_for_completion", False)
-            result = send_to_sublime(code=f"return spawn_session({prompt!r}, {name!r}, {profile!r}, {checkpoint!r}, {wait})")
-        elif tool_name == "send_to_session":
-            view_id = args.get("view_id")
-            prompt = args.get("prompt", "")
-            result = send_to_sublime(code=f"return send_to_session({view_id}, {prompt!r})")
-        elif tool_name == "list_sessions":
-            result = send_to_sublime(code="return list_sessions()")
-        elif tool_name == "read_session_output":
-            view_id = args.get("view_id")
-            lines = args.get("lines")
-            if lines:
-                result = send_to_sublime(code=f"return read_session_output({view_id}, {lines})")
+            # Route the tool call to get executable code
+            if tool_name == "sublime_eval":
+                # Special case: code is passed directly
+                code = args.get("code", "")
+                result = send_to_sublime(code=code)
+            elif tool_name == "sublime_tool":
+                # Special case: execute saved tool
+                name = args.get("name", "")
+                result = send_to_sublime(tool=name)
             else:
-                result = send_to_sublime(code=f"return read_session_output({view_id})")
-        elif tool_name == "list_profile_docs":
-            result = send_to_sublime(code="return list_profile_docs()")
-        elif tool_name == "read_profile_doc":
-            path = args.get("path", "")
-            result = send_to_sublime(code=f"return read_profile_doc({path!r})")
-        # Terminal tools (uses Terminus plugin)
-        elif tool_name == "terminal_list":
-            result = send_to_sublime(code="return terminus_list()")
-        elif tool_name == "terminal_run":
-            command = args.get("command", "")
-            # Ensure command ends with newline to execute
-            if not command.endswith("\n"):
-                command += "\n"
-            target_id = args.get("target_id")
-            tag = args.get("tag")
-            wait = args.get("wait", 0)
-            result = send_to_sublime(code=f"return terminus_run({command!r}, tag={tag!r}, wait={wait}, target_id={target_id!r})")
-        elif tool_name == "terminal_read":
-            target_id = args.get("target_id")
-            tag = args.get("tag")
-            lines = args.get("lines", 100)
-            result = send_to_sublime(code=f"return terminus_read(tag={tag!r}, lines={lines}, target_id={target_id!r})")
-        elif tool_name == "terminal_close":
-            target_id = args.get("target_id")
-            tag = args.get("tag")
-            result = send_to_sublime(code=f"return terminus_close(tag={tag!r}, target_id={target_id!r})")
-        # User interaction
-        elif tool_name == "ask_user":
-            question = args.get("question", "")
-            options = args.get("options", [])
-            result = send_to_sublime(code=f"return ask_user({question!r}, {options!r})")
-        elif tool_name == "set_alarm":
-            event_type = args.get("event_type")
-            event_params = args.get("event_params", {})
-            wake_prompt = args.get("wake_prompt")
-            alarm_id = args.get("alarm_id")
-            result = send_to_sublime(code=f"return set_alarm({event_type!r}, {event_params!r}, {wake_prompt!r}, {alarm_id!r})")
-        elif tool_name == "cancel_alarm":
-            alarm_id = args.get("alarm_id")
-            result = send_to_sublime(code=f"return cancel_alarm({alarm_id!r})")
-        else:
-            return make_response(id, error=f"Unknown tool: {tool_name}")
+                # Use router for all other tools
+                code = _router.route(tool_name, args)
+                result = send_to_sublime(code=code)
+
+        except ValueError as e:
+            return make_response(id, error=str(e))
 
         if result.get("error"):
             return make_response(id, {

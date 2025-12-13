@@ -239,23 +239,6 @@ return [{"file": s["file"], "line": s["row"]} for s in symbols]
 
 Add a docstring at the top - it's shown when calling `list_tools()`.
 
-### Blackboard
-
-Cross-session shared scratchpad for persistent artifacts:
-
-- `bb_write(key, value)` - Store a value
-- `bb_read(key)` - Read a value
-- `bb_list()` - List all keys
-- `bb_delete(key)` - Delete a key
-
-**Common keys:**
-- `plan` - Implementation steps, architecture decisions
-- `walkthrough` - Progress report for user (markdown)
-- `decisions` - Key choices made and rationale
-- `commands` - Project-specific commands that work
-
-Use **Claude: View Blackboard...** to view/edit entries. Data persists across sessions and survives context loss.
-
 ### Session Spawning
 
 - `spawn_session(prompt, name?)` - Start a new Claude session with a prompt
@@ -293,17 +276,6 @@ set_alarm(
 Subsessions automatically notify the bridge when they complete. The alarm fires by injecting the wake_prompt into the main session as a new query.
 
 ## Subagents
-
-### Built-in Agents
-
-Two agents are included by default:
-
-| Agent | When | Purpose |
-|-------|------|---------|
-| `planner` | Start of complex tasks | Creates implementation plan, saves to `bb_write("plan", ...)` |
-| `reporter` | After significant work | Updates progress in `bb_write("walkthrough", ...)` |
-
-Both use `haiku` for speed/cost.
 
 ### Custom Agents
 
@@ -356,16 +328,29 @@ bridge process using Python 3.10+ which runs the Claude Agent SDK.
 
 ```
 sublime-claude/
-├── claude_code.py      # Plugin entry point (imports)
-├── core.py             # Session management, plugin lifecycle
-├── commands.py         # All plugin commands
-├── listeners.py        # Event listeners
-├── session.py          # Session class
-├── rpc.py              # JSON-RPC client
-├── output.py           # Output view rendering
-└── bridge/
-    └── main.py         # Python 3.10+ bridge (claude-agent-sdk)
+├── claude_code.py         # Plugin entry point
+├── core.py                # Session lifecycle
+├── commands.py            # Plugin commands
+├── session.py             # Session class
+├── output.py              # Output rendering
+├── listeners.py           # Event handlers
+├── rpc.py                 # JSON-RPC client
+├── mcp_server.py          # MCP socket server
+├── bridge/main.py         # Python 3.10+ bridge
+├── mcp/server.py          # MCP protocol server
+│
+└── Core Utilities (2024-12):
+    ├── constants.py       # Config & magic strings
+    ├── logger.py          # Unified logging
+    ├── error_handler.py   # Error handling
+    ├── session_state.py   # State machine
+    ├── settings.py        # Settings loader
+    ├── prompt_builder.py  # Prompt utilities
+    ├── tool_router.py     # Tool dispatch
+    └── context_parser.py  # Context menus
 ```
+
+**Recent Improvements:** Refactored Dec 2024 - removed ~400 lines of duplication, added self-contained utility modules, improved performance with O(1) tool routing. See `NOTES.md` for details.
 
 ## License
 

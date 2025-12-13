@@ -4,13 +4,48 @@
 
 ```
 sublime-claude/
-├── claude_code.py     # Plugin commands, plugin_loaded hook
-├── session.py         # Session management, bridge communication
-├── rpc.py             # JSON-RPC client
-├── output.py          # Structured output view with region tracking
+├── claude_code.py         # Plugin entry point, command registry
+├── session.py             # Session management, bridge communication
+├── rpc.py                 # JSON-RPC client
+├── output.py              # Structured output view with region tracking
 ├── bridge/
-│   └── main.py        # Python 3.10+ bridge using claude-agent-sdk
+│   └── main.py            # Python 3.10+ bridge using claude-agent-sdk
+├── mcp/
+│   └── server.py          # MCP protocol server (stdio)
+├── mcp_server.py          # MCP socket server (Sublime context)
+│
+├── Core Utilities (Refactored 2024-12):
+├── constants.py           # Centralized config values & magic strings
+├── logger.py              # Unified logging (bridge & plugin)
+├── error_handler.py       # Reusable error handling patterns
+├── session_state.py       # Session state machine
+├── settings.py            # Shared settings loader
+├── prompt_builder.py      # Prompt construction utilities
+├── tool_router.py         # MCP tool routing (O(1) dispatch)
+└── context_parser.py      # @ trigger handling & context menus
 ```
+
+## Recent Refactoring (Dec 2024)
+
+### Code Quality Improvements
+
+**Extracted Self-Contained Modules:**
+- **constants.py** (107 lines) - Centralized all magic strings, paths, config values
+- **logger.py** (136 lines) - Unified logging; replaced 10+ duplicate file write blocks
+- **error_handler.py** (199 lines) - Reusable decorators & helpers for JSON/file/Sublime errors
+- **session_state.py** (204 lines) - Explicit state machine (UNINITIALIZED → READY → WORKING)
+- **prompt_builder.py** (82 lines) - Fluent API for prompt construction
+- **tool_router.py** (162 lines) - Registry-based tool dispatch; replaced 100+ line if/elif chain
+- **context_parser.py** (186 lines) - @ trigger detection & context menu logic
+
+**Key Wins:**
+- Removed ~400 lines of duplicated code
+- Faster tool routing (O(n) → O(1) dictionary lookup)
+- Removed blackboard functionality (simplified architecture)
+- Consistent error handling patterns
+- Better separation of concerns
+
+**Performance:** Noticeably faster due to optimized tool routing and reduced I/O overhead.
 
 ## Key Findings
 
