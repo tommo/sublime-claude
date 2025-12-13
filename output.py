@@ -1210,6 +1210,22 @@ class OutputView:
             # Show match count for completed Grep
             if tool.result and tool.status == DONE:
                 detail += self._format_grep_result(tool.result)
+        elif tool.name == "WebSearch" and "query" in tool_input:
+            detail = f": {tool_input['query']}"
+        elif tool.name == "WebFetch" and "url" in tool_input:
+            detail = f": {tool_input['url']}"
+        elif tool.name == "Task" and "subagent_type" in tool_input:
+            # Show agent type and description for Task launches
+            subagent = tool_input["subagent_type"]
+            desc = tool_input.get("description", "")
+            detail = f": {subagent}" + (f" - {desc}" if desc else "")
+        elif tool.name == "NotebookEdit" and "notebook_path" in tool_input:
+            detail = f": {tool_input['notebook_path']}"
+        elif tool.name == "TodoWrite" and "todos" in tool_input:
+            # Show todo count for TodoWrite
+            todos = tool_input["todos"]
+            count = len(todos) if isinstance(todos, list) else "?"
+            detail = f": {count} task{'s' if count != 1 else ''}"
         elif tool.name in ("ask_user", "mcp__sublime__ask_user") and "question" in tool_input:
             question = tool_input["question"]
             detail = f": {question}"
