@@ -184,10 +184,10 @@ class RemoteNotificationHub:
             wake_prompt += f"\n```json\n{json.dumps(data, indent=2)}\n```"
 
         # Send the notification through the backend
-        # The backend's send_notification will inject it into the Sublime session
+        # The backend's _send_notification callback will inject it into the Sublime session
         try:
-            if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, 'send_notification'):
-                self.hub.backend.send_notification(
+            if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, '_send_notification'):
+                self.hub.backend._send_notification(
                     "notification",
                     {
                         "notification_id": notification_id,
@@ -198,7 +198,7 @@ class RemoteNotificationHub:
                 )
                 logger.info(f"Injected wake_prompt for {notification_id}")
             else:
-                logger.warning("Backend doesn't support send_notification")
+                logger.warning("Backend doesn't support _send_notification")
         except Exception as e:
             logger.error(f"Failed to inject wake_prompt: {e}")
 
