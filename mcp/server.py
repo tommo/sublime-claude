@@ -381,16 +381,24 @@ use the new notalone tools: watch_ticket, subscribe_channel, broadcast_message."
                     "description": """Watch a ticket for state changes using notalone. Wakes this session when the ticket enters one of the specified states.
 
 Powered by the notalone notification protocol - coordinate with other agents and systems!
-Requires integration with a kanban system (e.g. VibeKanban MCP server).
 
-Example:
+LOCAL vs REMOTE:
+- Without remote_url: Watches locally (ticket must be in same system)
+- With remote_url: Registers with remote system via RPC (e.g., VibeKanban)
+
+Examples:
+  # Local watch
+  watch_ticket(ticket_id=123, states=["done"], wake_prompt="Ticket done!")
+
+  # Remote watch (cross-system)
   watch_ticket(
-      ticket_id=123,
+      ticket_id=75,
       states=["done", "blocked"],
-      wake_prompt="Ticket #123 status changed! Check the new state."
+      wake_prompt="Ticket #75 changed!",
+      remote_url="http://localhost:5050/notalone/register"
   )
 
-You're notalone - the system will wake you when the ticket changes!""",
+You're notalone - even across systems!""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -406,6 +414,10 @@ You're notalone - the system will wake you when the ticket changes!""",
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when ticket enters watched state"
+                            },
+                            "remote_url": {
+                                "type": "string",
+                                "description": "Optional: URL of remote notalone registration endpoint (e.g., http://localhost:5050/notalone/register). If provided, registers with remote system via RPC."
                             },
                             "session_id": {
                                 "type": "integer",

@@ -879,7 +879,7 @@ class Bridge:
         })
 
     async def watch_ticket(self, id: int, params: dict) -> None:
-        """Watch a ticket for state changes using notalone."""
+        """Watch a ticket for state changes using notalone (local or remote)."""
         if not self.notification_hub:
             send_error(id, -32000, "Notification system not initialized")
             return
@@ -887,23 +887,43 @@ class Bridge:
         ticket_id = params.get("ticket_id")
         states = params.get("states", [])
         wake_prompt = params.get("wake_prompt")
+        remote_url = params.get("remote_url")
 
         if not all([ticket_id is not None, states, wake_prompt]):
             send_error(id, -32602, "Missing required parameters")
             return
 
-        result = await self.notification_hub.watch_ticket(
-            ticket_id=ticket_id,
-            states=states,
-            wake_prompt=wake_prompt
-        )
+        # Choose local or remote based on remote_url parameter
+        if remote_url:
+            # Remote watch via RPC
+            notification_id = await self.notification_hub.watch_ticket_remote(
+                remote_url=remote_url,
+                ticket_id=ticket_id,
+                states=states,
+                wake_prompt=wake_prompt
+            )
 
-        send_result(id, {
-            "notification_id": result.notification_id,
-            "status": result.status,
-            "ticket_id": ticket_id,
-            "states": states
-        })
+            send_result(id, {
+                "notification_id": notification_id,
+                "status": "registered_remote",
+                "remote_url": remote_url,
+                "ticket_id": ticket_id,
+                "states": states
+            })
+        else:
+            # Local watch
+            result = await self.notification_hub.watch_ticket(
+                ticket_id=ticket_id,
+                states=states,
+                wake_prompt=wake_prompt
+            )
+
+            send_result(id, {
+                "notification_id": result.notification_id,
+                "status": result.status,
+                "ticket_id": ticket_id,
+                "states": states
+            })
 
     async def subscribe_channel(self, id: int, params: dict) -> None:
         """Subscribe to a notification channel using notalone."""
