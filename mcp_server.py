@@ -1306,7 +1306,13 @@ class MCPSocketServer:
             return None, {
                 "error": "No Claude session found in current context",
                 "hint": "Call from within a Claude session, or specify session_id parameter",
-                "available_sessions": available
+                "available_sessions": available,
+                "debug": {
+                    "claude_executing_view": window.settings().get("claude_executing_view"),
+                    "active_view_id": view_id,
+                    "active_view_file": view.file_name() if view else None,
+                    "window_id": window.id()
+                }
             }
 
         return sublime._claude_sessions[view_id], None
