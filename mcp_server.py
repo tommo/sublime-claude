@@ -1296,6 +1296,7 @@ class MCPSocketServer:
 
         # Try executing view first, fall back to active view
         view_id = window.settings().get("claude_executing_view")
+        view = None
         if not view_id:
             view = window.active_view()
             view_id = view.id() if view else None
@@ -1303,6 +1304,10 @@ class MCPSocketServer:
         if not view_id or view_id not in sublime._claude_sessions:
             # Provide helpful error with list of available sessions
             available = list(sublime._claude_sessions.keys())
+            # Get view for debug info if we don't have it yet
+            if not view:
+                view = window.active_view()
+
             return None, {
                 "error": "No Claude session found in current context",
                 "hint": "Call from within a Claude session, or specify session_id parameter",
