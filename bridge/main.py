@@ -21,6 +21,7 @@ from constants import BRIDGE_BUFFER_SIZE
 from notalone.hub import NotificationHub
 from notalone.backends.sublime import SublimeNotificationBackend
 from notalone.types import NotificationType, NotificationParams, Notification
+from notalone.rpc.integration import RemoteNotificationHub
 
 # Initialize logger
 _logger = get_bridge_logger()
@@ -90,7 +91,7 @@ class Bridge:
 
         # Notification system (notalone)
         self.notification_backend: SublimeNotificationBackend | None = None
-        self.notification_hub: NotificationHub | None = None
+        self.notification_hub: RemoteNotificationHub | None = None
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -145,14 +146,21 @@ class Bridge:
         cwd = params.get("cwd")
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
 
-        # Initialize notification system
+        # Initialize notification system with RPC support
         self.notification_backend = SublimeNotificationBackend(
             send_notification=send_notification,
             session_id=resume_id or "new-session"
         )
-        self.notification_hub = NotificationHub(self.notification_backend)
+        local_hub = NotificationHub(self.notification_backend)
+        self.notification_hub = RemoteNotificationHub(
+            hub=local_hub,
+            session_id=resume_id or "new-session",
+            rpc_host="localhost",
+            rpc_port=0  # Auto-assign port
+        )
         await self.notification_hub.start()
-        _logger.info("Notification system (notalone) initialized")
+        callback_url = self.notification_hub.server.get_callback_url()
+        _logger.info(f"Notification system (notalone) initialized with RPC at {callback_url}")
 
         # Change to project directory so SDK finds CLAUDE.md etc.
         if cwd and os.path.isdir(cwd):
