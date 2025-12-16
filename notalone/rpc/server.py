@@ -7,6 +7,11 @@ from typing import Callable, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+# JSON-RPC 2.0 error codes
+JSONRPC_AUTH_ERROR = -32005
+JSONRPC_METHOD_NOT_FOUND = -32601
+JSONRPC_SERVER_ERROR = -32000
+
 
 class NotificationServer:
     """Server for receiving notalone notification callbacks."""
@@ -90,33 +95,39 @@ class NotificationServer:
         provided_token = params.get("auth_token")
         return provided_token == self.auth_token
 
-    async def _handle_notify(self, request: web.Request) -> web.Response:
-        """Handle notalone.notify RPC call."""
+    def _error_response(self, code: int, message: str, request_id: Any, status: int = 500) -> web.Response:
+        """Create a JSON-RPC error response."""
+        return web.json_response({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": code,
+                "message": message
+            },
+            "id": request_id
+        }, status=status)
+
+    async def _handle_rpc_call(self, request: web.Request, method_name: str) -> web.Response:
+        """Generic handler for JSON-RPC calls."""
         try:
             data = await request.json()
             params = data.get("params", {})
 
             if not self._check_auth(params):
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32005,
-                        "message": "Authentication failed"
-                    },
-                    "id": data.get("id")
-                }, status=403)
+                return self._error_response(
+                    JSONRPC_AUTH_ERROR,
+                    "Authentication failed",
+                    data.get("id"),
+                    403
+                )
 
-            # Call registered handler
-            handler = self._handlers.get("notalone.notify")
+            handler = self._handlers.get(method_name)
             if not handler:
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32601,
-                        "message": "Method not found"
-                    },
-                    "id": data.get("id")
-                }, status=404)
+                return self._error_response(
+                    JSONRPC_METHOD_NOT_FOUND,
+                    "Method not found",
+                    data.get("id"),
+                    404
+                )
 
             result = await handler(params)
 
@@ -127,150 +138,26 @@ class NotificationServer:
             })
 
         except Exception as e:
-            logger.error(f"Error handling notify: {e}")
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                },
-                "id": data.get("id") if "data" in locals() else None
-            }, status=500)
+            logger.error(f"Error handling {method_name}: {e}")
+            return self._error_response(
+                JSONRPC_SERVER_ERROR,
+                str(e),
+                data.get("id") if "data" in locals() else None,
+                500
+            )
+
+    async def _handle_notify(self, request: web.Request) -> web.Response:
+        """Handle notalone.notify RPC call."""
+        return await self._handle_rpc_call(request, "notalone.notify")
 
     async def _handle_register(self, request: web.Request) -> web.Response:
         """Handle notalone.register RPC call."""
-        try:
-            data = await request.json()
-            params = data.get("params", {})
-
-            if not self._check_auth(params):
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32005,
-                        "message": "Authentication failed"
-                    },
-                    "id": data.get("id")
-                }, status=403)
-
-            handler = self._handlers.get("notalone.register")
-            if not handler:
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32601,
-                        "message": "Method not found"
-                    },
-                    "id": data.get("id")
-                }, status=404)
-
-            result = await handler(params)
-
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "result": result,
-                "id": data.get("id")
-            })
-
-        except Exception as e:
-            logger.error(f"Error handling register: {e}")
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                },
-                "id": data.get("id") if "data" in locals() else None
-            }, status=500)
+        return await self._handle_rpc_call(request, "notalone.register")
 
     async def _handle_unregister(self, request: web.Request) -> web.Response:
         """Handle notalone.unregister RPC call."""
-        try:
-            data = await request.json()
-            params = data.get("params", {})
-
-            if not self._check_auth(params):
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32005,
-                        "message": "Authentication failed"
-                    },
-                    "id": data.get("id")
-                }, status=403)
-
-            handler = self._handlers.get("notalone.unregister")
-            if not handler:
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32601,
-                        "message": "Method not found"
-                    },
-                    "id": data.get("id")
-                }, status=404)
-
-            result = await handler(params)
-
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "result": result,
-                "id": data.get("id")
-            })
-
-        except Exception as e:
-            logger.error(f"Error handling unregister: {e}")
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                },
-                "id": data.get("id") if "data" in locals() else None
-            }, status=500)
+        return await self._handle_rpc_call(request, "notalone.unregister")
 
     async def _handle_list(self, request: web.Request) -> web.Response:
         """Handle notalone.list RPC call."""
-        try:
-            data = await request.json()
-            params = data.get("params", {})
-
-            if not self._check_auth(params):
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32005,
-                        "message": "Authentication failed"
-                    },
-                    "id": data.get("id")
-                }, status=403)
-
-            handler = self._handlers.get("notalone.list")
-            if not handler:
-                return web.json_response({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": -32601,
-                        "message": "Method not found"
-                    },
-                    "id": data.get("id")
-                }, status=404)
-
-            result = await handler(params)
-
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "result": result,
-                "id": data.get("id")
-            })
-
-        except Exception as e:
-            logger.error(f"Error handling list: {e}")
-            return web.json_response({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32000,
-                    "message": str(e)
-                },
-                "id": data.get("id") if "data" in locals() else None
-            }, status=500)
+        return await self._handle_rpc_call(request, "notalone.list")

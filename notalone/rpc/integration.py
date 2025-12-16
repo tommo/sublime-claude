@@ -28,7 +28,8 @@ class RemoteNotificationHub:
         session_id: Optional[str] = None,
         rpc_host: str = "localhost",
         rpc_port: int = 0,
-        auth_token: Optional[str] = None
+        auth_token: Optional[str] = None,
+        heartbeat_interval: int = 30
     ):
         """
         Initialize remote notification support.
@@ -39,9 +40,11 @@ class RemoteNotificationHub:
             rpc_host: Host for RPC callback server
             rpc_port: Port for RPC callback server (0 = auto-assign)
             auth_token: Optional auth token
+            heartbeat_interval: Seconds between heartbeats (default: 30)
         """
         self.hub = hub
         self.session_id = session_id or str(uuid.uuid4())
+        self.heartbeat_interval = heartbeat_interval
 
         # RPC components
         self.server = NotificationServer(rpc_host, rpc_port, auth_token)
@@ -49,6 +52,14 @@ class RemoteNotificationHub:
 
         # Track remote registrations: notification_id -> remote_url
         self._remote_registrations: Dict[str, str] = {}
+
+        # Heartbeat task
+        self._heartbeat_task: Optional[asyncio.Task] = None
+
+    @property
+    def instance_id(self) -> str:
+        """Get full instance ID in format 'sublime.{session_id}'."""
+        return f"sublime.{self.session_id}"
 
     async def start(self):
         """Start hub and RPC server/client."""
@@ -59,11 +70,55 @@ class RemoteNotificationHub:
         # Register RPC handlers
         self.server.register_handler("notalone.notify", self._handle_remote_notification)
 
+        # Register with central notalone registry
+        callback_url = self.server.get_callback_url()
+
+        try:
+            from notalone.registry import NotaloneRegistry
+
+            registry = NotaloneRegistry()
+
+            # Clean up stale instances on startup
+            removed = registry.cleanup_stale_instances(max_age_minutes=60)
+            if removed > 0:
+                logger.info(f"Cleaned up {removed} stale instance(s) from registry")
+
+            # Register this instance
+            registry.register(
+                instance_id=self.instance_id,
+                instance_type="sublime",
+                callback_endpoint=callback_url
+            )
+            logger.info(f"Registered {self.instance_id} in central registry")
+
+            # Start heartbeat task
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+        except Exception as e:
+            logger.warning(f"Failed to register in central registry: {e}")
+
         logger.info(f"RemoteNotificationHub started (session: {self.session_id})")
-        logger.info(f"Callback endpoint: {self.server.get_callback_url()}")
+        logger.info(f"Callback endpoint: {callback_url}")
 
     async def stop(self):
         """Stop hub and RPC components."""
+        # Cancel heartbeat task
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        # Unregister from central registry
+        try:
+            from notalone.registry import NotaloneRegistry
+            registry = NotaloneRegistry()
+            registry.unregister(self.instance_id)
+            logger.info(f"Unregistered {self.instance_id} from central registry")
+        except Exception as e:
+            logger.warning(f"Failed to unregister from central registry: {e}")
+
         await self.client.stop()
         await self.server.stop()
         await self.hub.stop()
@@ -154,6 +209,23 @@ class RemoteNotificationHub:
 
         logger.info(f"Unregistered remote notification: {notification_id}")
 
+    async def _heartbeat_loop(self):
+        """Background task that periodically sends heartbeats to the registry."""
+        try:
+            from notalone.registry import NotaloneRegistry
+            registry = NotaloneRegistry()
+
+            while True:
+                await asyncio.sleep(self.heartbeat_interval)
+                try:
+                    registry.heartbeat(self.instance_id)
+                    logger.debug(f"Sent heartbeat for {self.instance_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send heartbeat: {e}")
+        except asyncio.CancelledError:
+            logger.info("Heartbeat task cancelled")
+            raise
+
     async def _handle_remote_notification(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle incoming notification from remote system.
@@ -164,24 +236,21 @@ class RemoteNotificationHub:
         session_id = params.get("session_id")
         event_type = params.get("event_type")
         data = params.get("data")
+        wake_prompt = params.get("wake_prompt")
 
         logger.info(f"Received remote notification: {notification_id} ({event_type})")
 
         # Verify it's for this session
-        if session_id != self.session_id:
-            logger.warning(f"Notification for different session: {session_id}")
+        if session_id != self.instance_id:
+            logger.warning(f"Notification for different session: {session_id} (expected {self.instance_id})")
             return {"status": "ignored", "reason": "wrong_session"}
 
-        # Look up the registration to get the wake_prompt
-        if notification_id not in self._remote_registrations:
-            logger.warning(f"Unknown notification_id: {notification_id}")
-            return {"status": "ignored", "reason": "unknown_notification"}
-
-        # Format wake prompt with event data
-        wake_prompt = f"🔔 Remote notification: {event_type}"
-        if data:
-            import json
-            wake_prompt += f"\n```json\n{json.dumps(data, indent=2)}\n```"
+        # Use wake_prompt from payload if provided, otherwise use default
+        if not wake_prompt:
+            wake_prompt = f"🔔 Remote notification: {event_type}"
+            if data:
+                import json
+                wake_prompt += f"\n```json\n{json.dumps(data, indent=2)}\n```"
 
         # Send the notification through the backend
         # The backend's _send_notification callback will inject it into the Sublime session

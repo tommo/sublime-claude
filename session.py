@@ -92,6 +92,7 @@ class Session:
             "cwd": self._cwd(),
             "allowed_tools": allowed_tools,
             "permission_mode": permission_mode,
+            "view_id": str(self.output.view.id()) if self.output and self.output.view else None,
         }
         if self.resume_id:
             init_params["resume"] = self.resume_id

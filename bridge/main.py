@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -144,17 +145,21 @@ class Bridge:
         resume_id = params.get("resume")
         fork_session = params.get("fork_session", False)
         cwd = params.get("cwd")
+        view_id = params.get("view_id")
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
+
+        # Use resume_id if resuming, otherwise use view_id as local session identifier
+        session_id = resume_id or view_id or str(uuid.uuid4())
 
         # Initialize notification system with RPC support
         self.notification_backend = SublimeNotificationBackend(
             send_notification=send_notification,
-            session_id=resume_id or "new-session"
+            session_id=session_id
         )
         local_hub = NotificationHub(self.notification_backend)
         self.notification_hub = RemoteNotificationHub(
             hub=local_hub,
-            session_id=resume_id or "new-session",
+            session_id=session_id,
             rpc_host="localhost",
             rpc_port=0  # Auto-assign port
         )

@@ -129,7 +129,8 @@ class NotificationClient:
         notification_id: str,
         session_id: str,
         event_type: str,
-        data: Dict[str, Any]
+        data: Dict[str, Any],
+        wake_prompt: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Send a notification to a callback endpoint.
@@ -140,6 +141,7 @@ class NotificationClient:
             session_id: Target session ID
             event_type: Type of event (ticket_update, channel_message, etc.)
             data: Event data
+            wake_prompt: Optional custom wake prompt
 
         Returns:
             Response dict with status
@@ -147,15 +149,19 @@ class NotificationClient:
         if not self._session:
             raise RuntimeError("Client not started - call start() first")
 
+        params = {
+            "notification_id": notification_id,
+            "session_id": session_id,
+            "event_type": event_type,
+            "data": data
+        }
+        if wake_prompt:
+            params["wake_prompt"] = wake_prompt
+
         payload = {
             "jsonrpc": "2.0",
             "method": "notalone.notify",
-            "params": {
-                "notification_id": notification_id,
-                "session_id": session_id,
-                "event_type": event_type,
-                "data": data
-            }
+            "params": params
         }
 
         logger.info(f"Sending notification {notification_id} to {callback_url}")
