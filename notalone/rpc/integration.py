@@ -172,17 +172,35 @@ class RemoteNotificationHub:
             logger.warning(f"Notification for different session: {session_id}")
             return {"status": "ignored", "reason": "wrong_session"}
 
-        # Trigger the local notification through the hub
-        # The wake_prompt was stored with the registration
-        # For now, we'll format a generic wake prompt with the data
-        wake_prompt = f"Notification {notification_id}: {event_type}"
-        if data:
-            wake_prompt += f"\nData: {data}"
+        # Look up the registration to get the wake_prompt
+        if notification_id not in self._remote_registrations:
+            logger.warning(f"Unknown notification_id: {notification_id}")
+            return {"status": "ignored", "reason": "unknown_notification"}
 
-        # Inject the wake_prompt into the session
-        # This depends on the backend implementation
-        # For now, just log it
-        logger.info(f"Would inject wake_prompt: {wake_prompt}")
+        # Format wake prompt with event data
+        wake_prompt = f"🔔 Remote notification: {event_type}"
+        if data:
+            import json
+            wake_prompt += f"\n```json\n{json.dumps(data, indent=2)}\n```"
+
+        # Send the notification through the backend
+        # The backend's send_notification will inject it into the Sublime session
+        try:
+            if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, 'send_notification'):
+                self.hub.backend.send_notification(
+                    "notification",
+                    {
+                        "notification_id": notification_id,
+                        "event_type": event_type,
+                        "wake_prompt": wake_prompt,
+                        "data": data
+                    }
+                )
+                logger.info(f"Injected wake_prompt for {notification_id}")
+            else:
+                logger.warning("Backend doesn't support send_notification")
+        except Exception as e:
+            logger.error(f"Failed to inject wake_prompt: {e}")
 
         return {"status": "delivered"}
 
