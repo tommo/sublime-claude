@@ -62,10 +62,10 @@ class NotificationServer:
 
         # Get actual port if auto-assigned
         if self.port == 0:
-            for site in self._runner.sites:
-                if isinstance(site, web.TCPSite):
-                    self.port = site._port
-                    break
+            # Access the actual server socket to get the assigned port
+            if self._site and self._site._server:
+                sock = self._site._server.sockets[0]
+                self.port = sock.getsockname()[1]
 
         logger.info(f"NotificationServer listening on {self.host}:{self.port}")
 
