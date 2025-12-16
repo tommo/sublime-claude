@@ -485,13 +485,13 @@ class Session:
                 self.query(message)
             return
 
-        if method == "alarm_wake":
-            # Alarm fired - start a new query with the wake prompt
+        if method in ("alarm_wake", "notification_wake"):
+            # Notification fired - start a new query with the wake prompt
             wake_prompt = params.get("wake_prompt", "")
-            alarm_id = params.get("alarm_id", "")
+            notification_id = params.get("notification_id") or params.get("alarm_id", "")
             view_id = self.output.view.id() if self.output.view else "no-view"
-            print(f"[Claude] ⏰ ALARM WAKE received by session: name='{self.name}', view_id={view_id}")
-            print(f"[Claude] Alarm ID: {alarm_id}")
+            print(f"[Claude] 🔔 NOTIFICATION WAKE received by session: name='{self.name}', view_id={view_id}")
+            print(f"[Claude] Notification ID: {notification_id}")
             print(f"[Claude] Wake prompt: {wake_prompt}")
             print(f"[Claude] Session state: initialized={self.initialized}, working={self.working}, client={self.client is not None}")
 

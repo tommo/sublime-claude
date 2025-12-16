@@ -266,9 +266,8 @@ class SublimeNotificationBackend(NotificationBackend):
         logger.info(f"[Sublime] FIRING notification {notification.id}")
 
         # Send wake notification to Sublime session
-        # This matches the existing alarm_wake notification format
-        self._send_notification("alarm_wake", {
-            "alarm_id": notification.id,
+        self._send_notification("notification_wake", {
+            "notification_id": notification.id,
             "event_type": notification.notification_type.value,
             "wake_prompt": notification.wake_prompt,
         })

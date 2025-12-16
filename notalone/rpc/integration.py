@@ -188,7 +188,7 @@ class RemoteNotificationHub:
         try:
             if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, '_send_notification'):
                 self.hub.backend._send_notification(
-                    "notification",
+                    "notification_wake",
                     {
                         "notification_id": notification_id,
                         "event_type": event_type,
