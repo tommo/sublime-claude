@@ -429,8 +429,8 @@ class Session:
             return
         self.client.send("list_notifications", {}, callback)
 
-    def watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, remote_url: str = None, callback=None) -> None:
-        """Watch a ticket for state changes (local or remote)."""
+    def watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, callback=None) -> None:
+        """Watch a ticket for state changes in kanban (always remote)."""
         if not self.client:
             return
 
@@ -439,9 +439,6 @@ class Session:
             "states": states,
             "wake_prompt": wake_prompt,
         }
-        if remote_url:
-            params["remote_url"] = remote_url
-
         self.client.send("watch_ticket", params, callback)
 
     def subscribe_channel(self, channel: str, wake_prompt: str, callback=None) -> None:

@@ -1393,8 +1393,8 @@ class MCPSocketServer:
 
         return result
 
-    def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, remote_url: str = None, session_id: int = None) -> dict:
-        """Watch a ticket for state changes (local or remote)."""
+    def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, session_id: int = None) -> dict:
+        """Watch a ticket for state changes in kanban (always remote)."""
         session, error = self._get_session_for_tool(session_id)
         if error:
             return error
@@ -1408,15 +1408,13 @@ class MCPSocketServer:
             ticket_id=ticket_id,
             states=states,
             wake_prompt=wake_prompt,
-            remote_url=remote_url,
             callback=on_result
         )
 
         return {
-            "status": "watching_remote" if remote_url else "watching",
+            "status": "watching",
             "ticket_id": ticket_id,
-            "states": states,
-            "remote_url": remote_url
+            "states": states
         }
 
     def _watch_ticket_remote(self, remote_url: str, ticket_id: int, states: list, wake_prompt: str, session_id: int = None) -> dict:

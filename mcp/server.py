@@ -378,33 +378,25 @@ use the new notalone tools: watch_ticket, subscribe_channel, broadcast_message."
                 },
                 {
                     "name": "watch_ticket",
-                    "description": """Watch a ticket for state changes using notalone. Wakes this session when the ticket enters one of the specified states.
+                    "description": """Watch a ticket for state changes in the kanban system. Wakes this session when the ticket enters one of the specified states.
 
-Powered by the notalone notification protocol - coordinate with other agents and systems!
+Automatically registers with the configured kanban server (set via kanban_base_url in settings).
+Tickets live in the kanban system, so this always uses remote notification via the notalone RPC protocol.
 
-LOCAL vs REMOTE:
-- Without remote_url: Watches locally (ticket must be in same system)
-- With remote_url: Registers with remote system via RPC (e.g., VibeKanban)
-
-Examples:
-  # Local watch
-  watch_ticket(ticket_id=123, states=["done"], wake_prompt="Ticket done!")
-
-  # Remote watch (cross-system)
+Example:
   watch_ticket(
       ticket_id=75,
       states=["done", "blocked"],
-      wake_prompt="Ticket #75 changed!",
-      remote_url="http://localhost:5050/notalone/register"
+      wake_prompt="🎉 Ticket #75 changed state!"
   )
 
-You're notalone - even across systems!""",
+You're notalone - the kanban system will notify you when the ticket changes!""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "ticket_id": {
                                 "type": "integer",
-                                "description": "Ticket ID to watch"
+                                "description": "Ticket ID to watch in the kanban system"
                             },
                             "states": {
                                 "type": "array",
@@ -414,10 +406,6 @@ You're notalone - even across systems!""",
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when ticket enters watched state"
-                            },
-                            "remote_url": {
-                                "type": "string",
-                                "description": "Optional: URL of remote notalone registration endpoint (e.g., http://localhost:5050/notalone/register). If provided, registers with remote system via RPC."
                             },
                             "session_id": {
                                 "type": "integer",

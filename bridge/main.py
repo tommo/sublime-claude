@@ -172,6 +172,10 @@ class Bridge:
         plugins = self._load_plugins(cwd)
         settings = load_project_settings(cwd)
 
+        # Load kanban base URL for notalone remote notifications
+        self.kanban_base_url = settings.get("kanban_base_url", "http://localhost:5050")
+        _logger.info(f"Kanban base URL: {self.kanban_base_url}")
+
         _logger.info(f"initialize: params={params}")
         _logger.info(f"  resume_id={resume_id}, fork={fork_session}, cwd={cwd}, actual_cwd={os.getcwd()}")
         _logger.info(f"  mcp_servers={list(mcp_servers.keys()) if mcp_servers else None}")
@@ -879,7 +883,7 @@ class Bridge:
         })
 
     async def watch_ticket(self, id: int, params: dict) -> None:
-        """Watch a ticket for state changes using notalone (local or remote)."""
+        """Watch a ticket for state changes using notalone (always remote to kanban)."""
         if not self.notification_hub:
             send_error(id, -32000, "Notification system not initialized")
             return
@@ -887,43 +891,28 @@ class Bridge:
         ticket_id = params.get("ticket_id")
         states = params.get("states", [])
         wake_prompt = params.get("wake_prompt")
-        remote_url = params.get("remote_url")
 
         if not all([ticket_id is not None, states, wake_prompt]):
             send_error(id, -32602, "Missing required parameters")
             return
 
-        # Choose local or remote based on remote_url parameter
-        if remote_url:
-            # Remote watch via RPC
-            notification_id = await self.notification_hub.watch_ticket_remote(
-                remote_url=remote_url,
-                ticket_id=ticket_id,
-                states=states,
-                wake_prompt=wake_prompt
-            )
+        # Tickets always live in kanban - use remote registration
+        remote_url = f"{self.kanban_base_url}/notalone/register"
 
-            send_result(id, {
-                "notification_id": notification_id,
-                "status": "registered_remote",
-                "remote_url": remote_url,
-                "ticket_id": ticket_id,
-                "states": states
-            })
-        else:
-            # Local watch
-            result = await self.notification_hub.watch_ticket(
-                ticket_id=ticket_id,
-                states=states,
-                wake_prompt=wake_prompt
-            )
+        notification_id = await self.notification_hub.watch_ticket_remote(
+            remote_url=remote_url,
+            ticket_id=ticket_id,
+            states=states,
+            wake_prompt=wake_prompt
+        )
 
-            send_result(id, {
-                "notification_id": result.notification_id,
-                "status": result.status,
-                "ticket_id": ticket_id,
-                "states": states
-            })
+        send_result(id, {
+            "notification_id": notification_id,
+            "status": "registered_remote",
+            "kanban_url": self.kanban_base_url,
+            "ticket_id": ticket_id,
+            "states": states
+        })
 
     async def subscribe_channel(self, id: int, params: dict) -> None:
         """Subscribe to a notification channel using notalone."""

@@ -144,7 +144,7 @@ def create_sublime_router() -> ToolRouter:
 
     router.register("watch_ticket", lambda args:
         f"return watch_ticket({args.get('ticket_id')}, {args.get('states', [])!r}, "
-        f"{args.get('wake_prompt')!r}, remote_url={args.get('remote_url')!r}, session_id={args.get('session_id')})")
+        f"{args.get('wake_prompt')!r}, session_id={args.get('session_id')})")
 
     router.register("subscribe_channel", lambda args:
         f"return subscribe_channel({args.get('channel')!r}, {args.get('wake_prompt')!r}, "
