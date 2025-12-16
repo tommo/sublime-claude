@@ -366,7 +366,15 @@ use the new notalone tools: watch_ticket, subscribe_channel, broadcast_message."
                 {
                     "name": "list_notifications",
                     "description": "List all active notalone notifications for this session. Shows timers, subsession waits, ticket watches, and channel subscriptions. Part of the notalone notification protocol - you're not alone, notify all as one!",
-                    "inputSchema": {"type": "object", "properties": {}}
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
+                            }
+                        }
+                    }
                 },
                 {
                     "name": "watch_ticket",
@@ -398,6 +406,10 @@ You're notalone - the system will wake you when the ticket changes!""",
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when ticket enters watched state"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
                             }
                         },
                         "required": ["ticket_id", "states", "wake_prompt"]
@@ -427,6 +439,10 @@ Now you'll wake when other agents broadcast to 'build-updates' - notify all as o
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when message received"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
                             }
                         },
                         "required": ["channel", "wake_prompt"]
@@ -461,6 +477,10 @@ All agents subscribed to 'build-updates' will wake - you're notalone!""",
                             "data": {
                                 "type": "object",
                                 "description": "Optional: additional data payload"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
                             }
                         },
                         "required": ["message"]

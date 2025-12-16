@@ -1271,12 +1271,25 @@ class MCPSocketServer:
 
     # ─── Session Helpers ──────────────────────────────────────────────────
 
-    def _get_session_for_tool(self):
+    def _get_session_for_tool(self, session_id: int = None):
         """Get the Claude session for tool execution.
 
-        Tries executing view first (for internal tool calls), then falls back
-        to active view (for external MCP calls). Returns (session, error_dict).
+        Args:
+            session_id: Optional specific session to use. If not provided:
+                1. Tries executing view (for internal tool calls)
+                2. Falls back to active view (for external MCP calls)
+                3. If no session found, returns helpful error
+
+        Returns:
+            Tuple of (session, error_dict)
         """
+        # If session_id provided, use it directly
+        if session_id is not None:
+            if session_id not in sublime._claude_sessions:
+                return None, {"error": f"Session not found: {session_id}"}
+            return sublime._claude_sessions[session_id], None
+
+        # Try to find session from context
         window = sublime.active_window()
         if not window:
             return None, {"error": "No active window"}
@@ -1288,13 +1301,19 @@ class MCPSocketServer:
             view_id = view.id() if view else None
 
         if not view_id or view_id not in sublime._claude_sessions:
-            return None, {"error": "No Claude session found"}
+            # Provide helpful error with list of available sessions
+            available = list(sublime._claude_sessions.keys())
+            return None, {
+                "error": "No Claude session found in current context",
+                "hint": "Call from within a Claude session, or specify session_id parameter",
+                "available_sessions": available
+            }
 
         return sublime._claude_sessions[view_id], None
 
     # ─── Alarm Tools ──────────────────────────────────────────────────────
 
-    def _set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: str = None) -> dict:
+    def _set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: str = None, session_id: int = None) -> dict:
         """Set an alarm to wake current session when an event occurs.
 
         Instead of polling, the session sleeps and wakes when the event fires.
@@ -1311,7 +1330,7 @@ class MCPSocketServer:
         Returns:
             {alarm_id: str, status: "set", event_type: str}
         """
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
@@ -1336,7 +1355,7 @@ class MCPSocketServer:
             "note": "Alarm will fire asynchronously when event occurs"
         }
 
-    def _cancel_alarm(self, alarm_id: str) -> dict:
+    def _cancel_alarm(self, alarm_id: str, session_id: int = None) -> dict:
         """Cancel a pending alarm.
 
         Args:
@@ -1345,7 +1364,7 @@ class MCPSocketServer:
         Returns:
             {alarm_id: str, status: "cancelled"}
         """
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
@@ -1364,9 +1383,9 @@ class MCPSocketServer:
 
     # ─── Notification Tools (notalone API) ────────────────────────────────
 
-    def _list_notifications(self) -> dict:
+    def _list_notifications(self, session_id: int = None) -> dict:
         """List active notifications for current session."""
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
@@ -1379,9 +1398,9 @@ class MCPSocketServer:
 
         return result
 
-    def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str) -> dict:
+    def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, session_id: int = None) -> dict:
         """Watch a ticket for state changes."""
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
@@ -1403,9 +1422,9 @@ class MCPSocketServer:
             "states": states
         }
 
-    def _subscribe_channel(self, channel: str, wake_prompt: str) -> dict:
+    def _subscribe_channel(self, channel: str, wake_prompt: str, session_id: int = None) -> dict:
         """Subscribe to a notification channel."""
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
@@ -1425,9 +1444,9 @@ class MCPSocketServer:
             "channel": channel
         }
 
-    def _broadcast_message(self, message: str, channel: str = None, data: dict = None) -> dict:
+    def _broadcast_message(self, message: str, channel: str = None, data: dict = None, session_id: int = None) -> dict:
         """Broadcast a message to channel subscribers."""
-        session, error = self._get_session_for_tool()
+        session, error = self._get_session_for_tool(session_id)
         if error:
             return error
 
