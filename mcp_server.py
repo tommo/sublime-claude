@@ -1363,11 +1363,16 @@ class MCPSocketServer:
         if not window:
             return {"error": "No active window"}
 
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
+        # Try executing view first, fall back to active view
+        view_id = window.settings().get("claude_executing_view")
+        if not view_id:
+            view = window.active_view()
+            view_id = view.id() if view else None
 
-        session = sublime._claude_sessions[executing_view_id]
+        if not view_id or view_id not in sublime._claude_sessions:
+            return {"error": "No Claude session found"}
+
+        session = sublime._claude_sessions[view_id]
 
         result = {"pending": True, "notifications": []}
 
@@ -1384,11 +1389,16 @@ class MCPSocketServer:
         if not window:
             return {"error": "No active window"}
 
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
+        # Try executing view first, fall back to active view
+        view_id = window.settings().get("claude_executing_view")
+        if not view_id:
+            view = window.active_view()
+            view_id = view.id() if view else None
 
-        session = sublime._claude_sessions[executing_view_id]
+        if not view_id or view_id not in sublime._claude_sessions:
+            return {"error": "No Claude session found"}
+
+        session = sublime._claude_sessions[view_id]
 
         result = {"pending": True}
 
@@ -1414,11 +1424,16 @@ class MCPSocketServer:
         if not window:
             return {"error": "No active window"}
 
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
+        # Try executing view first, fall back to active view
+        view_id = window.settings().get("claude_executing_view")
+        if not view_id:
+            view = window.active_view()
+            view_id = view.id() if view else None
 
-        session = sublime._claude_sessions[executing_view_id]
+        if not view_id or view_id not in sublime._claude_sessions:
+            return {"error": "No Claude session found"}
+
+        session = sublime._claude_sessions[view_id]
 
         result = {"pending": True}
 
@@ -1442,11 +1457,16 @@ class MCPSocketServer:
         if not window:
             return {"error": "No active window"}
 
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
+        # Try executing view first, fall back to active view
+        view_id = window.settings().get("claude_executing_view")
+        if not view_id:
+            view = window.active_view()
+            view_id = view.id() if view else None
 
-        session = sublime._claude_sessions[executing_view_id]
+        if not view_id or view_id not in sublime._claude_sessions:
+            return {"error": "No Claude session found"}
+
+        session = sublime._claude_sessions[view_id]
 
         result = {"pending": True}
 
