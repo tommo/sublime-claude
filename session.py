@@ -421,6 +421,52 @@ class Session:
 
         self.client.send("cancel_alarm", {"alarm_id": alarm_id}, callback)
 
+    # ─── Notification Tools (notalone API) ────────────────────────────────
+
+    def list_notifications(self, callback=None) -> None:
+        """List active notifications for this session."""
+        if not self.client:
+            return
+        self.client.send("list_notifications", {}, callback)
+
+    def watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, callback=None) -> None:
+        """Watch a ticket for state changes."""
+        if not self.client:
+            return
+
+        params = {
+            "ticket_id": ticket_id,
+            "states": states,
+            "wake_prompt": wake_prompt,
+        }
+        self.client.send("watch_ticket", params, callback)
+
+    def subscribe_channel(self, channel: str, wake_prompt: str, callback=None) -> None:
+        """Subscribe to a notification channel."""
+        if not self.client:
+            return
+
+        params = {
+            "channel": channel,
+            "wake_prompt": wake_prompt,
+        }
+        self.client.send("subscribe_channel", params, callback)
+
+    def broadcast_message(self, message: str, channel: str = None, data: dict = None, callback=None) -> None:
+        """Broadcast a message to channel subscribers."""
+        if not self.client:
+            return
+
+        params = {
+            "message": message,
+        }
+        if channel:
+            params["channel"] = channel
+        if data:
+            params["data"] = data
+
+        self.client.send("broadcast_message", params, callback)
+
     def _on_notification(self, method: str, params: dict) -> None:
         if method == "permission_request":
             self._handle_permission_request(params)

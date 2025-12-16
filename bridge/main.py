@@ -120,6 +120,14 @@ class Bridge:
                 await self.set_alarm(id, params)
             elif method == "cancel_alarm":
                 await self.cancel_alarm(id, params)
+            elif method == "list_notifications":
+                await self.list_notifications(id, params)
+            elif method == "watch_ticket":
+                await self.watch_ticket(id, params)
+            elif method == "subscribe_channel":
+                await self.subscribe_channel(id, params)
+            elif method == "broadcast_message":
+                await self.broadcast_message(id, params)
             elif method == "subsession_complete":
                 # Notification: no response needed
                 subsession_id = params.get("subsession_id")
@@ -839,6 +847,108 @@ class Bridge:
             send_error(id, -32602, f"Alarm not found: {alarm_id}")
         else:
             send_result(id, {"alarm_id": alarm_id, "status": result.status})
+
+    # ─── Notification Tools (notalone API) ────────────────────────────────
+
+    async def list_notifications(self, id: int, params: dict) -> None:
+        """List active notifications using notalone."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
+
+        notifications = await self.notification_backend.list_notifications()
+        send_result(id, {
+            "notifications": [
+                {
+                    "id": n.id,
+                    "type": n.notification_type.value,
+                    "wake_prompt": n.wake_prompt,
+                    "params": n.params.__dict__ if n.params else {},
+                    "fired": n.fired,
+                }
+                for n in notifications
+            ]
+        })
+
+    async def watch_ticket(self, id: int, params: dict) -> None:
+        """Watch a ticket for state changes using notalone."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
+
+        ticket_id = params.get("ticket_id")
+        states = params.get("states", [])
+        wake_prompt = params.get("wake_prompt")
+
+        if not all([ticket_id is not None, states, wake_prompt]):
+            send_error(id, -32602, "Missing required parameters")
+            return
+
+        result = await self.notification_hub.watch_ticket(
+            ticket_id=ticket_id,
+            states=states,
+            wake_prompt=wake_prompt
+        )
+
+        send_result(id, {
+            "notification_id": result.notification_id,
+            "status": result.status,
+            "ticket_id": ticket_id,
+            "states": states
+        })
+
+    async def subscribe_channel(self, id: int, params: dict) -> None:
+        """Subscribe to a notification channel using notalone."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
+
+        channel = params.get("channel")
+        wake_prompt = params.get("wake_prompt")
+
+        if not all([channel, wake_prompt]):
+            send_error(id, -32602, "Missing required parameters")
+            return
+
+        result = await self.notification_hub.subscribe(
+            session_id=self._session_id,
+            channel=channel,
+            wake_prompt=wake_prompt
+        )
+
+        send_result(id, {
+            "notification_id": result.notification_id,
+            "status": result.status,
+            "channel": channel
+        })
+
+    async def broadcast_message(self, id: int, params: dict) -> None:
+        """Broadcast a message to channel subscribers using notalone."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
+
+        message = params.get("message")
+        channel = params.get("channel")
+        data = params.get("data", {})
+
+        if not message:
+            send_error(id, -32602, "Missing required parameter: message")
+            return
+
+        count = await self.notification_hub.broadcast(
+            message=message,
+            channel=channel,
+            data=data,
+            sender_session_id=self._session_id
+        )
+
+        send_result(id, {
+            "status": "broadcast_sent",
+            "channel": channel or "global",
+            "recipients": count,
+            "message": message
+        })
 
     async def _monitor_time_alarm(self, alarm_id: str) -> None:
         """Monitor time-based alarm - sleep then fire."""

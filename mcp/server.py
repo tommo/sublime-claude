@@ -359,6 +359,100 @@ Example usage:
                         },
                         "required": ["alarm_id"]
                     }
+                },
+                {
+                    "name": "list_notifications",
+                    "description": "List all active notifications for this session. Shows timers, subsession waits, and channel subscriptions.",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "watch_ticket",
+                    "description": """Watch a ticket for state changes. Wakes this session when the ticket enters one of the specified states.
+
+Requires integration with a kanban system (e.g. VibeKanban MCP server).
+
+Example:
+  watch_ticket(
+      ticket_id=123,
+      states=["done", "blocked"],
+      wake_prompt="Ticket #123 status changed! Check the new state."
+  )""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "ticket_id": {
+                                "type": "integer",
+                                "description": "Ticket ID to watch"
+                            },
+                            "states": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "List of states to watch for (e.g. ['done', 'blocked'])"
+                            },
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when ticket enters watched state"
+                            }
+                        },
+                        "required": ["ticket_id", "states", "wake_prompt"]
+                    }
+                },
+                {
+                    "name": "subscribe_channel",
+                    "description": """Subscribe to a notification channel. Wakes this session when messages are broadcast to the channel.
+
+Use for inter-session communication and coordination.
+
+Example:
+  subscribe_channel(
+      channel="build-updates",
+      wake_prompt="Build status update received"
+  )""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {
+                                "type": "string",
+                                "description": "Channel name to subscribe to"
+                            },
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when message received"
+                            }
+                        },
+                        "required": ["channel", "wake_prompt"]
+                    }
+                },
+                {
+                    "name": "broadcast_message",
+                    "description": """Broadcast a message to all subscribers of a channel (or globally to all sessions if no channel specified).
+
+Use to notify other sessions about events or state changes.
+
+Example:
+  broadcast_message(
+      channel="build-updates",
+      message="Build completed successfully",
+      data={"status": "success", "duration": "2m15s"}
+  )""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Message to broadcast"
+                            },
+                            "channel": {
+                                "type": "string",
+                                "description": "Optional: channel name (omit for global broadcast)"
+                            },
+                            "data": {
+                                "type": "object",
+                                "description": "Optional: additional data payload"
+                            }
+                        },
+                        "required": ["message"]
+                    }
                 }
             ]
         })

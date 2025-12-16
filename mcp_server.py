@@ -394,6 +394,11 @@ class MCPSocketServer:
             # Alarm tools
             "set_alarm": self._set_alarm,
             "cancel_alarm": self._cancel_alarm,
+            # Notification tools (notalone API)
+            "list_notifications": self._list_notifications,
+            "watch_ticket": self._watch_ticket,
+            "subscribe_channel": self._subscribe_channel,
+            "broadcast_message": self._broadcast_message,
         }
 
         # Handle return statements
@@ -1348,4 +1353,115 @@ class MCPSocketServer:
         return {
             "status": "cancel_requested",
             "alarm_id": alarm_id
+        }
+
+    # ─── Notification Tools (notalone API) ────────────────────────────────
+
+    def _list_notifications(self) -> dict:
+        """List active notifications for current session."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        result = {"pending": True, "notifications": []}
+
+        def on_result(list_result):
+            result.update(list_result)
+
+        session.list_notifications(callback=on_result)
+
+        return result
+
+    def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str) -> dict:
+        """Watch a ticket for state changes."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        result = {"pending": True}
+
+        def on_result(watch_result):
+            result.update(watch_result)
+
+        session.watch_ticket(
+            ticket_id=ticket_id,
+            states=states,
+            wake_prompt=wake_prompt,
+            callback=on_result
+        )
+
+        return {
+            "status": "watching",
+            "ticket_id": ticket_id,
+            "states": states
+        }
+
+    def _subscribe_channel(self, channel: str, wake_prompt: str) -> dict:
+        """Subscribe to a notification channel."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        result = {"pending": True}
+
+        def on_result(sub_result):
+            result.update(sub_result)
+
+        session.subscribe_channel(
+            channel=channel,
+            wake_prompt=wake_prompt,
+            callback=on_result
+        )
+
+        return {
+            "status": "subscribed",
+            "channel": channel
+        }
+
+    def _broadcast_message(self, message: str, channel: str = None, data: dict = None) -> dict:
+        """Broadcast a message to channel subscribers."""
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No active window"}
+
+        executing_view_id = window.settings().get("claude_executing_view")
+        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
+            return {"error": "No executing Claude session"}
+
+        session = sublime._claude_sessions[executing_view_id]
+
+        result = {"pending": True}
+
+        def on_result(broadcast_result):
+            result.update(broadcast_result)
+
+        session.broadcast_message(
+            message=message,
+            channel=channel,
+            data=data or {},
+            callback=on_result
+        )
+
+        return {
+            "status": "broadcast_sent",
+            "channel": channel or "global",
+            "message": message
         }

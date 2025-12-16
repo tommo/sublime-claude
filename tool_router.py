@@ -130,13 +130,27 @@ def create_sublime_router() -> ToolRouter:
     router.register("ask_user", lambda args:
         f"return ask_user({args.get('question', '')!r}, {args.get('options', [])!r})")
 
-    # Alarm tools
+    # Alarm tools (legacy API - still supported)
     router.register("set_alarm", lambda args:
         f"return set_alarm({args.get('event_type')!r}, {args.get('event_params', {})!r}, "
         f"{args.get('wake_prompt')!r}, {args.get('alarm_id')!r})")
 
     router.register("cancel_alarm", lambda args:
         f"return cancel_alarm({args.get('alarm_id')!r})")
+
+    # Notification tools (notalone API)
+    router.register("list_notifications", simple_call_handler("list_notifications"))
+
+    router.register("watch_ticket", lambda args:
+        f"return watch_ticket({args.get('ticket_id')}, {args.get('states', [])!r}, "
+        f"{args.get('wake_prompt')!r})")
+
+    router.register("subscribe_channel", lambda args:
+        f"return subscribe_channel({args.get('channel')!r}, {args.get('wake_prompt')!r})")
+
+    router.register("broadcast_message", lambda args:
+        f"return broadcast_message({args.get('message')!r}, {args.get('channel')!r}, "
+        f"{args.get('data', {})!r})")
 
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))
