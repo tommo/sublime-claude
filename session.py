@@ -431,6 +431,10 @@ class Session:
             # Auto-submit it now
             message = params.get("message", "")
             if message:
+                # Set working=True immediately to prevent input mode race condition
+                # (notification handler runs on background thread, but _on_done schedules
+                # input mode entry on main thread with 100ms delay)
+                self.working = True
                 print(f"[Claude] Auto-submitting queued inject: {message[:60]}...")
                 self.query(message)
             return

@@ -150,6 +150,7 @@ def handle_request(request: dict) -> dict:
                             "name": {"type": "string", "description": "Optional: name for the session"},
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
                             "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
+                            "fork_current": {"type": "boolean", "description": "Optional: fork from the current session (preserves conversation history). Default: false"},
                             "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },
                         "required": ["prompt"]

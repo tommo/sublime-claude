@@ -807,9 +807,9 @@ class MCPSocketServer:
 
         return result
 
-    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, wait_for_completion: bool = False) -> dict:
+    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, fork_current: bool = False, wait_for_completion: bool = False) -> dict:
         """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag."""
-        from .core import create_session
+        from .core import create_session, get_active_session
 
         window = sublime.active_window()
         if not window:
@@ -827,7 +827,16 @@ class MCPSocketServer:
                 return {"error": f"Profile '{profile}' not found"}
             profile_config = profiles[profile]
 
-        # Load checkpoint if specified
+        # Fork from current session if requested
+        if fork_current:
+            current_session = get_active_session(window)
+            if current_session and current_session.session_id:
+                resume_id = current_session.session_id
+                fork = True
+            else:
+                return {"error": "Cannot fork: current session has no session_id"}
+
+        # Load checkpoint if specified (overrides fork_current)
         if checkpoint:
             if checkpoint not in checkpoints:
                 return {"error": f"Checkpoint '{checkpoint}' not found"}

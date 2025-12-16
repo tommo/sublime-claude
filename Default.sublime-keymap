@@ -12,10 +12,6 @@
         "command": "claude_code_interrupt"
     },
     {
-        "keys": ["super+alt+c"],
-        "command": "claude_code_toggle"
-    },
-    {
         "keys": ["super+ctrl+alt+c"],
         "command": "claude_code_clear"
     },

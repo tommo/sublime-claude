@@ -429,11 +429,56 @@ class Bridge:
 
         return plugins
 
+    def _validate_bash_command(self, command: str) -> tuple[bool, str]:
+        """Validate bash command for dangerous patterns.
+
+        Returns: (is_safe, warning_message)
+        """
+        import re
+
+        # Check for rm -rf with potentially dangerous paths
+        rm_pattern = r'\brm\s+(-[rf]{1,2}\s+|-[a-z]*[rf][a-z]*\s+)'
+        if re.search(rm_pattern, command):
+            # Extract the path being deleted
+            # Match: rm -rf <path> or rm -f -r <path>, etc.
+            path_match = re.search(rm_pattern + r'([^\s;&|]+)', command)
+            if path_match:
+                path = path_match.group(2)
+
+                # Dangerous: relative paths that could delete parent dirs
+                if '..' in path:
+                    return False, f"Dangerous rm command with parent directory reference: {path}"
+
+                # Dangerous: deleting from root or home
+                if path.startswith('/') and path.count('/') <= 3:
+                    return False, f"Dangerous rm command targeting high-level directory: {path}"
+
+                # Dangerous: wildcards in critical locations
+                if '*' in path and path.count('/') <= 4:
+                    return False, f"Dangerous rm command with wildcards in shallow path: {path}"
+
+                # Check for deletion of entire project directories
+                critical_dirs = ['node', 'src', 'lib', 'app', 'dist', 'build']
+                path_parts = path.rstrip('/').split('/')
+                if path_parts and path_parts[-1] in critical_dirs and '/' not in path:
+                    return False, f"Dangerous: attempting to delete entire '{path_parts[-1]}' directory"
+
+        return True, ""
+
     async def can_use_tool(self, tool_name: str, tool_input: dict, context=None):
         """Handle permission request - ask Sublime for approval."""
         # Auto-allow built-in sublime MCP tools
         if tool_name.startswith("mcp__sublime__"):
             return PermissionResultAllow(updated_input=tool_input)
+
+        # Validate Bash commands for dangerous patterns
+        if tool_name == "Bash" and "command" in tool_input:
+            is_safe, warning = self._validate_bash_command(tool_input["command"])
+            if not is_safe:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"BLOCKED dangerous Bash command: {warning}\n")
+                    f.write(f"  Command: {tool_input['command']}\n")
+                return PermissionResultDeny(message=f"Blocked dangerous command: {warning}")
 
         # Check auto-allowed tools from settings
         settings = load_project_settings(self.cwd)

@@ -823,6 +823,19 @@ class OutputView:
         # Track button positions relative to block start
         text_before_buttons = "".join(lines)
 
+        # Check if this is a dangerous command that shouldn't have "Always allow"
+        hide_always = False
+        if tool == "Bash" and "command" in tool_input:
+            cmd = tool_input["command"]
+            # Hide "Always" for dangerous commands: rm, git checkout, git reset
+            dangerous_patterns = [
+                'rm ', 'rm\t',
+                'git checkout', 'git reset',
+                'git clean', 'git stash drop'
+            ]
+            if any(pattern in cmd for pattern in dangerous_patterns):
+                hide_always = True
+
         # Buttons
         btn_y = "[Y] Allow"
         btn_n = "[N] Deny"
@@ -834,8 +847,11 @@ class OutputView:
         lines.append(btn_n)
         lines.append("  ")
         lines.append(btn_s)
-        lines.append("  ")
-        lines.append(btn_a)
+        if not hide_always:
+            lines.append("  ")
+            lines.append(btn_a)
+        else:
+            lines.append("  (Always disabled for safety)")
         lines.append("\n")
 
         text = "".join(lines)
@@ -862,7 +878,8 @@ class OutputView:
         btn_start += len(btn_n) + 2
         perm.button_regions[PERM_ALLOW_SESSION] = (btn_start, btn_start + len(btn_s))
         btn_start += len(btn_s) + 2
-        perm.button_regions[PERM_ALLOW_ALL] = (btn_start, btn_start + len(btn_a))
+        if not hide_always:
+            perm.button_regions[PERM_ALLOW_ALL] = (btn_start, btn_start + len(btn_a))
 
         # Add regions for highlighting
         self._add_button_regions()
@@ -1428,9 +1445,9 @@ class ClaudeUndoClearCommand(sublime_plugin.TextCommand):
     """Undo clear - restore saved content."""
     def run(self, edit):
         # Get the OutputView instance from claude_code module
-        from . import claude_code
+        from .core import get_active_session
         window = self.view.window()
         if window:
-            session = claude_code.get_session(window)
+            session = get_active_session(window)
             if session:
                 session.output.undo_clear()

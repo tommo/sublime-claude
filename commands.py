@@ -291,6 +291,44 @@ class ClaudeCodeCompactCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
         if s:
+            # Gather pre-compact prompts from multiple sources
+            from .hooks import get_project_hook_prompt, combine_hook_prompts
+
+            prompts = []
+
+            # 1. Project-level hook file (.claude/hooks/pre-compact)
+            cwd = self.window.folders()[0] if self.window.folders() else None
+            if cwd:
+                project_prompt = get_project_hook_prompt("pre-compact", cwd)
+                if project_prompt:
+                    prompts.append(project_prompt)
+
+            # 2. Project-level settings (.claude/settings.json)
+            if cwd:
+                from .settings import load_project_settings
+                project_settings = load_project_settings(cwd)
+                if project_settings and "pre_compact_prompt" in project_settings:
+                    settings_prompt = project_settings["pre_compact_prompt"]
+                    if settings_prompt:
+                        prompts.append(settings_prompt)
+
+            # 3. Profile-level pre-compact prompt
+            if s.profile and "pre_compact_prompt" in s.profile:
+                profile_prompt = s.profile["pre_compact_prompt"]
+                if profile_prompt:
+                    prompts.append(profile_prompt)
+
+            # Combine and inject if we have any prompts
+            combined = combine_hook_prompts(prompts)
+            if combined:
+                # Inject combined prompt before compaction
+                s.queue_prompt(combined)
+                # Wait a bit for the inject to be processed, then compact
+                import sublime
+                sublime.set_timeout(lambda: s.query("/compact"), 500)
+                return
+
+            # No prompts - just compact
             s.query("/compact")
 
 
@@ -610,7 +648,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         # Add "Restart Session" option when in a session window
         if in_output_view and active_session:
-            items.append(["Restart Session", "Restart current session, keep output"])
+            items.append(["🔄 Restart Session", "Restart current session, keep output"])
             actions.append(("restart", active_session))
 
         # Add profiles and checkpoints
@@ -637,6 +675,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         items.append(["🆕 New Session", "Start fresh with default settings"])
         actions.append(("new", None))
 
+        # Add "Fork Session" option when in a session window
+        if in_output_view and active_session:
+            items.append(["🍴 Fork Session", "Create new session with copy of history"])
+            actions.append(("fork", active_session))
+
         def on_select(idx):
             if idx >= 0:
                 action, data = actions[idx]
@@ -661,6 +704,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                     session_id = data.get("session_id")
                     if session_id:
                         create_session(self.window, resume_id=session_id, fork=True)
+                elif action == "fork" and data:
+                    # Fork the current session
+                    if data.session_id:
+                        create_session(self.window, resume_id=data.session_id, fork=True)
                 elif action == "focus" and data:
                     data.output.show()
 

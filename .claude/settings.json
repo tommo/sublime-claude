@@ -27,5 +27,11 @@
       "enabled": true,
       "marketplace": "official-plugins"
     }
+  },
+  "mcpServers": {
+    "vibekanban": {
+      "command": "/Volumes/prj/ai/vibekanban/.venv/bin/python3",
+      "args": ["/Volumes/prj/ai/vibekanban/mcp/kanban.py"]
+    }
   }
 }
