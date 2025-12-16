@@ -1275,10 +1275,8 @@ class MCPSocketServer:
         """Get the Claude session for tool execution.
 
         Args:
-            session_id: Optional specific session to use. If not provided:
-                1. Tries executing view (for internal tool calls)
-                2. Falls back to active view (for external MCP calls)
-                3. If no session found, returns helpful error
+            session_id: Optional specific session to use. If not provided,
+                        uses claude_executing_view (set during internal tool execution).
 
         Returns:
             Tuple of (session, error_dict)
@@ -1289,35 +1287,21 @@ class MCPSocketServer:
                 return None, {"error": f"Session not found: {session_id}"}
             return sublime._claude_sessions[session_id], None
 
-        # Try to find session from context
+        # Try to find session from execution context
         window = sublime.active_window()
         if not window:
             return None, {"error": "No active window"}
 
-        # Try executing view first, fall back to active view
+        # Only trust claude_executing_view (set during internal tool execution)
         view_id = window.settings().get("claude_executing_view")
-        view = None
-        if not view_id:
-            view = window.active_view()
-            view_id = view.id() if view else None
 
         if not view_id or view_id not in sublime._claude_sessions:
-            # Provide helpful error with list of available sessions
+            # No reliable session context - require explicit session_id
             available = list(sublime._claude_sessions.keys())
-            # Get view for debug info if we don't have it yet
-            if not view:
-                view = window.active_view()
-
             return None, {
-                "error": "No Claude session found in current context",
-                "hint": "Call from within a Claude session, or specify session_id parameter",
-                "available_sessions": available,
-                "debug": {
-                    "claude_executing_view": window.settings().get("claude_executing_view"),
-                    "active_view_id": view_id,
-                    "active_view_file": view.file_name() if view else None,
-                    "window_id": window.id()
-                }
+                "error": "No session context available",
+                "hint": "Specify session_id parameter explicitly. Get available sessions with list_sessions()",
+                "available_sessions": available
             }
 
         return sublime._claude_sessions[view_id], None
