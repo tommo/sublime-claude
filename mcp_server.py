@@ -1269,6 +1269,29 @@ class MCPSocketServer:
             "tag": tag_val,
         }
 
+    # ─── Session Helpers ──────────────────────────────────────────────────
+
+    def _get_session_for_tool(self):
+        """Get the Claude session for tool execution.
+
+        Tries executing view first (for internal tool calls), then falls back
+        to active view (for external MCP calls). Returns (session, error_dict).
+        """
+        window = sublime.active_window()
+        if not window:
+            return None, {"error": "No active window"}
+
+        # Try executing view first, fall back to active view
+        view_id = window.settings().get("claude_executing_view")
+        if not view_id:
+            view = window.active_view()
+            view_id = view.id() if view else None
+
+        if not view_id or view_id not in sublime._claude_sessions:
+            return None, {"error": "No Claude session found"}
+
+        return sublime._claude_sessions[view_id], None
+
     # ─── Alarm Tools ──────────────────────────────────────────────────────
 
     def _set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: str = None) -> dict:
@@ -1288,18 +1311,9 @@ class MCPSocketServer:
         Returns:
             {alarm_id: str, status: "set", event_type: str}
         """
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Get executing session (not UI-active session)
-        # When main session spawns subsession, subsession becomes UI-active
-        # but alarm should be set in the session that called set_alarm
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
-
-        session = sublime._claude_sessions[executing_view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         # Set alarm on the session
         result = {"pending": True}
@@ -1331,16 +1345,9 @@ class MCPSocketServer:
         Returns:
             {alarm_id: str, status: "cancelled"}
         """
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Get executing session (not UI-active session)
-        executing_view_id = window.settings().get("claude_executing_view")
-        if not executing_view_id or executing_view_id not in sublime._claude_sessions:
-            return {"error": "No executing Claude session"}
-
-        session = sublime._claude_sessions[executing_view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         # Cancel alarm
         result = {"pending": True}
@@ -1359,20 +1366,9 @@ class MCPSocketServer:
 
     def _list_notifications(self) -> dict:
         """List active notifications for current session."""
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Try executing view first, fall back to active view
-        view_id = window.settings().get("claude_executing_view")
-        if not view_id:
-            view = window.active_view()
-            view_id = view.id() if view else None
-
-        if not view_id or view_id not in sublime._claude_sessions:
-            return {"error": "No Claude session found"}
-
-        session = sublime._claude_sessions[view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         result = {"pending": True, "notifications": []}
 
@@ -1385,20 +1381,9 @@ class MCPSocketServer:
 
     def _watch_ticket(self, ticket_id: int, states: list, wake_prompt: str) -> dict:
         """Watch a ticket for state changes."""
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Try executing view first, fall back to active view
-        view_id = window.settings().get("claude_executing_view")
-        if not view_id:
-            view = window.active_view()
-            view_id = view.id() if view else None
-
-        if not view_id or view_id not in sublime._claude_sessions:
-            return {"error": "No Claude session found"}
-
-        session = sublime._claude_sessions[view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         result = {"pending": True}
 
@@ -1420,20 +1405,9 @@ class MCPSocketServer:
 
     def _subscribe_channel(self, channel: str, wake_prompt: str) -> dict:
         """Subscribe to a notification channel."""
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Try executing view first, fall back to active view
-        view_id = window.settings().get("claude_executing_view")
-        if not view_id:
-            view = window.active_view()
-            view_id = view.id() if view else None
-
-        if not view_id or view_id not in sublime._claude_sessions:
-            return {"error": "No Claude session found"}
-
-        session = sublime._claude_sessions[view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         result = {"pending": True}
 
@@ -1453,20 +1427,9 @@ class MCPSocketServer:
 
     def _broadcast_message(self, message: str, channel: str = None, data: dict = None) -> dict:
         """Broadcast a message to channel subscribers."""
-        window = sublime.active_window()
-        if not window:
-            return {"error": "No active window"}
-
-        # Try executing view first, fall back to active view
-        view_id = window.settings().get("claude_executing_view")
-        if not view_id:
-            view = window.active_view()
-            view_id = view.id() if view else None
-
-        if not view_id or view_id not in sublime._claude_sessions:
-            return {"error": "No Claude session found"}
-
-        session = sublime._claude_sessions[view_id]
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
 
         result = {"pending": True}
 
