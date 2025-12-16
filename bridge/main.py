@@ -17,6 +17,11 @@ from settings import load_project_settings
 from logger import get_bridge_logger, ContextLogger
 from constants import BRIDGE_BUFFER_SIZE
 
+# Import notalone notification system
+from notalone.hub import NotificationHub
+from notalone.backends.sublime import SublimeNotificationBackend
+from notalone.types import NotificationType, NotificationParams, Notification
+
 # Initialize logger
 _logger = get_bridge_logger()
 
@@ -83,10 +88,9 @@ class Bridge:
         # Queue for injected prompts that arrive when query completes
         self.pending_injects: list[str] = []
 
-        # Alarm system for efficient event-driven waiting
-        self.alarms: dict[str, dict] = {}  # alarm_id → {event_type, params, wake_prompt}
-        self.alarm_tasks: dict[str, asyncio.Task] = {}  # alarm_id → monitoring task
-        self.subsession_events: dict[str, asyncio.Event] = {}  # subsession_id → completion event
+        # Notification system (notalone)
+        self.notification_backend: SublimeNotificationBackend | None = None
+        self.notification_hub: NotificationHub | None = None
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -120,7 +124,7 @@ class Bridge:
                 # Notification: no response needed
                 subsession_id = params.get("subsession_id")
                 if subsession_id:
-                    self.signal_subsession_complete(subsession_id)
+                    await self.signal_subsession_complete(subsession_id)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -132,6 +136,15 @@ class Bridge:
         fork_session = params.get("fork_session", False)
         cwd = params.get("cwd")
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
+
+        # Initialize notification system
+        self.notification_backend = SublimeNotificationBackend(
+            send_notification=send_notification,
+            session_id=resume_id or "new-session"
+        )
+        self.notification_hub = NotificationHub(self.notification_backend)
+        await self.notification_hub.start()
+        _logger.info("Notification system (notalone) initialized")
 
         # Change to project directory so SDK finds CLAUDE.md etc.
         if cwd and os.path.isdir(cwd):
@@ -754,22 +767,10 @@ class Bridge:
             send_error(id, -32000, f"Failed to get history: {str(e)}")
 
     async def set_alarm(self, id: int, params: dict) -> None:
-        """Set an alarm to inject prompt when event occurs.
-
-        Instead of polling for events, session can sleep and wake when event fires.
-        The alarm "wakes" the session by injecting the specified wake_prompt.
-
-        Args:
-            event_type: "agent_complete", "time_elapsed", "subsession_complete"
-            event_params: Event-specific parameters
-                - agent_complete: {agent_id: str}
-                - time_elapsed: {seconds: int}
-                - subsession_complete: {subsession_id: str}
-            wake_prompt: Prompt to inject when alarm fires
-            alarm_id: Optional alarm identifier (generated if not provided)
-        """
-        import uuid
-        import time
+        """Set an alarm using notalone notification system."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
 
         event_type = params.get("event_type")
         if not event_type:
@@ -782,55 +783,62 @@ class Bridge:
             return
 
         event_params = params.get("event_params", {})
-        alarm_id = params.get("alarm_id") or str(uuid.uuid4())
+        alarm_id = params.get("alarm_id")
 
-        # Store alarm
-        self.alarms[alarm_id] = {
-            "event_type": event_type,
-            "event_params": event_params,
-            "wake_prompt": wake_prompt,
-            "created_at": time.time()
-        }
-
-        # Start monitoring task based on event type
+        # Map event_type to NotificationType
         if event_type == "time_elapsed":
-            task = asyncio.create_task(self._monitor_time_alarm(alarm_id))
-            self.alarm_tasks[alarm_id] = task
+            ntype = NotificationType.TIMER
+            nparams = NotificationParams(seconds=event_params.get("seconds", 0))
         elif event_type in ("agent_complete", "subsession_complete"):
-            task = asyncio.create_task(self._monitor_subsession_alarm(alarm_id))
-            self.alarm_tasks[alarm_id] = task
+            ntype = NotificationType.SUBSESSION_COMPLETE
+            nparams = NotificationParams(
+                subsession_id=event_params.get("subsession_id"),
+                agent_id=event_params.get("agent_id")
+            )
         else:
             send_error(id, -32602, f"Unknown event_type: {event_type}")
-            del self.alarms[alarm_id]
             return
 
-        with open("/tmp/claude_bridge.log", "a") as f:
-            f.write(f"[Alarm] Set alarm {alarm_id}: {event_type} → {wake_prompt[:50]}...\n")
+        # Create notification
+        notification = Notification(
+            notification_type=ntype,
+            params=nparams,
+            wake_prompt=wake_prompt
+        )
+        if alarm_id:
+            notification.id = alarm_id
+
+        # Set notification
+        result = await self.notification_backend.set_notification(
+            notification,
+            callback=lambda n: None  # Callback handled by backend's send_notification
+        )
+
+        _logger.info(f"Set alarm {result.notification_id}: {event_type}")
 
         send_result(id, {
-            "alarm_id": alarm_id,
-            "status": "set",
+            "alarm_id": result.notification_id,
+            "status": result.status,
             "event_type": event_type
         })
 
     async def cancel_alarm(self, id: int, params: dict) -> None:
-        """Cancel a pending alarm."""
+        """Cancel a pending alarm using notalone."""
+        if not self.notification_hub:
+            send_error(id, -32000, "Notification system not initialized")
+            return
+
         alarm_id = params.get("alarm_id")
         if not alarm_id:
             send_error(id, -32602, "Missing required parameter: alarm_id")
             return
 
-        # Cancel monitoring task
-        if alarm_id in self.alarm_tasks:
-            self.alarm_tasks[alarm_id].cancel()
-            del self.alarm_tasks[alarm_id]
+        result = await self.notification_backend.cancel_notification(alarm_id)
 
-        # Remove alarm
-        if alarm_id in self.alarms:
-            del self.alarms[alarm_id]
-            send_result(id, {"alarm_id": alarm_id, "status": "cancelled"})
-        else:
+        if result.status == "not_found":
             send_error(id, -32602, f"Alarm not found: {alarm_id}")
+        else:
+            send_result(id, {"alarm_id": alarm_id, "status": result.status})
 
     async def _monitor_time_alarm(self, alarm_id: str) -> None:
         """Monitor time-based alarm - sleep then fire."""
@@ -908,17 +916,22 @@ class Bridge:
             "wake_prompt": wake_prompt
         })
 
-    def signal_subsession_complete(self, subsession_id: str) -> None:
-        """Signal that a subsession has completed (call this from subsession code)."""
-        if subsession_id in self.subsession_events:
-            self.subsession_events[subsession_id].set()
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"[Alarm] Subsession {subsession_id} completed - event signaled\n")
+    async def signal_subsession_complete(self, subsession_id: str) -> None:
+        """Signal that a subsession has completed using notalone."""
+        if self.notification_backend:
+            count = await self.notification_backend.signal_session_complete(subsession_id)
+            _logger.info(f"Subsession {subsession_id} completed - triggered {count} notifications")
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""
         if self.client:
             await self.client.disconnect()
+
+        # Stop notification system
+        if self.notification_hub:
+            await self.notification_hub.stop()
+            _logger.info("Notification system stopped")
+
         send_result(id, {"status": "shutdown"})
         self.running = False
 
