@@ -303,7 +303,7 @@ User can always type a custom response.""",
                 # ─── Alarm Tools ─────────────────────────────────────────────
                 {
                     "name": "set_alarm",
-                    "description": """Set an alarm to wake this session when an event occurs.
+                    "description": """Set an alarm to wake this session when an event occurs (powered by notalone).
 
 Instead of polling for subsession completion, sessions can sleep and wake when events fire.
 The alarm fires by injecting the wake_prompt into this session as a new query.
@@ -321,7 +321,10 @@ Example usage:
       wake_prompt="Tests done! Summarize results from tester session."
   )
   # This query ends, alarm monitors in background
-  # When subsession completes, alarm fires and wakes this session""",
+  # When subsession completes, alarm fires and wakes this session
+
+Note: This is the legacy API. For advanced features like ticket watching and channel pub/sub,
+use the new notalone tools: watch_ticket, subscribe_channel, broadcast_message.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -348,7 +351,7 @@ Example usage:
                 },
                 {
                     "name": "cancel_alarm",
-                    "description": "Cancel a pending alarm by its ID. Returns confirmation when cancelled.",
+                    "description": "Cancel a pending alarm by its ID (notalone). Returns confirmation when cancelled.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -362,13 +365,14 @@ Example usage:
                 },
                 {
                     "name": "list_notifications",
-                    "description": "List all active notifications for this session. Shows timers, subsession waits, and channel subscriptions.",
+                    "description": "List all active notalone notifications for this session. Shows timers, subsession waits, ticket watches, and channel subscriptions. Part of the notalone notification protocol - you're not alone, notify all as one!",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
                     "name": "watch_ticket",
-                    "description": """Watch a ticket for state changes. Wakes this session when the ticket enters one of the specified states.
+                    "description": """Watch a ticket for state changes using notalone. Wakes this session when the ticket enters one of the specified states.
 
+Powered by the notalone notification protocol - coordinate with other agents and systems!
 Requires integration with a kanban system (e.g. VibeKanban MCP server).
 
 Example:
@@ -376,7 +380,9 @@ Example:
       ticket_id=123,
       states=["done", "blocked"],
       wake_prompt="Ticket #123 status changed! Check the new state."
-  )""",
+  )
+
+You're notalone - the system will wake you when the ticket changes!""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -399,15 +405,18 @@ Example:
                 },
                 {
                     "name": "subscribe_channel",
-                    "description": """Subscribe to a notification channel. Wakes this session when messages are broadcast to the channel.
+                    "description": """Subscribe to a notalone channel. Wakes this session when messages are broadcast to the channel.
 
-Use for inter-session communication and coordination.
+Powered by notalone - the unified notification protocol for AI agents.
+Use for inter-session communication and coordination. You're notalone!
 
 Example:
   subscribe_channel(
       channel="build-updates",
       wake_prompt="Build status update received"
-  )""",
+  )
+
+Now you'll wake when other agents broadcast to 'build-updates' - notify all as one!""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -425,16 +434,19 @@ Example:
                 },
                 {
                     "name": "broadcast_message",
-                    "description": """Broadcast a message to all subscribers of a channel (or globally to all sessions if no channel specified).
+                    "description": """Broadcast a message via notalone to all subscribers of a channel (or globally to all sessions).
 
-Use to notify other sessions about events or state changes.
+Powered by notalone - notify all as one! Use to coordinate with other agents and sessions.
+Messages wake subscribed sessions with their wake_prompt + your message.
 
 Example:
   broadcast_message(
       channel="build-updates",
       message="Build completed successfully",
       data={"status": "success", "duration": "2m15s"}
-  )""",
+  )
+
+All agents subscribed to 'build-updates' will wake - you're notalone!""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
