@@ -330,6 +330,10 @@ Returns notification_id that can be used with unregister_notification() to cance
                             "notification_id": {
                                 "type": "string",
                                 "description": "Optional: custom notification ID (auto-generated if omitted)"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         },
                         "required": ["seconds", "wake_prompt"]
@@ -355,6 +359,10 @@ The parent session will wake up and can read your output.""",
                             "result_summary": {
                                 "type": "string",
                                 "description": "Optional: Brief summary of what was accomplished"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         }
                     }
@@ -388,6 +396,10 @@ Returns notification_id that can be used with unregister_notification() to cance
                             "notification_id": {
                                 "type": "string",
                                 "description": "Optional: custom notification ID (auto-generated if omitted)"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         },
                         "required": ["subsession_id", "wake_prompt"]
@@ -401,7 +413,12 @@ Shows timers, ticket watches, channel subscriptions, and subsession waits.
 All managed through notalone - not alone, list all!""",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {}
+                        "properties": {
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: session view ID (omit to list all sessions)"
+                            }
+                        }
                     }
                 },
                 {
@@ -419,6 +436,10 @@ Example:
                             "notification_id": {
                                 "type": "string",
                                 "description": "Notification ID to cancel (from set_timer, watch_ticket, etc.)"
+                            },
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         },
                         "required": ["notification_id"]
