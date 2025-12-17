@@ -815,6 +815,7 @@ class MCPSocketServer:
     def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, fork_current: bool = False, wait_for_completion: bool = False) -> dict:
         """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag."""
         from .core import create_session, get_active_session
+        import uuid
 
         window = sublime.active_window()
         if not window:
@@ -848,8 +849,21 @@ class MCPSocketServer:
             resume_id = checkpoints[checkpoint].get("session_id")
             fork = True
 
-        # Create new session
-        session = create_session(window, resume_id=resume_id, fork=fork, profile=profile_config)
+        # Generate unique subsession ID for notalone completion tracking
+        subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
+
+        # Get parent view ID for context
+        current_session = get_active_session(window)
+        parent_view_id = current_session.output.view.id() if current_session and current_session.output.view else None
+
+        # Prepare initial context for subsession
+        initial_context = {
+            "subsession_id": subsession_id,
+            "parent_view_id": parent_view_id,
+        }
+
+        # Create new session with initial context
+        session = create_session(window, resume_id=resume_id, fork=fork, profile=profile_config, initial_context=initial_context)
         if name:
             session.name = name
             session.output.set_name(name)
@@ -865,6 +879,7 @@ class MCPSocketServer:
             "spawned": True,
             "name": name or "(unnamed)",
             "view_id": view_id,
+            "subsession_id": subsession_id,  # Return subsession_id for parent to track
             "profile": profile,
             "checkpoint": checkpoint,
         }

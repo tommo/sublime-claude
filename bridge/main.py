@@ -10,7 +10,7 @@ import sys
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Import shared utilities
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -194,6 +194,56 @@ class Bridge:
             system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  injected system_prompt_addon: {len(addon)} chars\n")
+
+        # Add unified notification guide to system prompt
+        notification_guide = """
+
+## Notification System (Notalone)
+
+You have access to a unified notification system for all wake-up scenarios.
+Uses notalone protocol: register/unregister/list.
+
+**register_notification(notification_type, params, wake_prompt)**
+- notification_type: 'timer', 'subsession_complete', 'agent_complete', 'ticket_update', 'channel'
+- params: Dict with type-specific parameters
+- wake_prompt: Message to inject when notification fires
+- Returns: {'notification_id': str, 'status': str}
+
+**Examples:**
+
+# Timer (wake me up in 30 minutes)
+register_notification('timer', {'seconds': 1800}, 'Timer completed!')
+
+# Subsession completion (I'm done, wake parent)
+register_notification('subsession_complete', {'subsession_id': 'subsession-abc123'}, 'Subsession completed')
+
+# Remote ticket watch (wake me when ticket #123 is done)
+register_notification('ticket_update', {'ticket_id': 123, 'states': ['done']}, 'Ticket is done!')
+
+# Channel subscription (wake me on channel messages)
+register_notification('channel', {'channel': 'project-updates'}, 'New project update!')
+
+**Other tools:**
+- unregister_notification(notification_id) - Unregister any notification
+- list_notifications() - See all active notifications
+"""
+        system_prompt = (system_prompt + notification_guide) if system_prompt else notification_guide
+
+        # If this is a subsession, add specific guidance
+        subsession_id = params.get("subsession_id")
+        if subsession_id:
+            subsession_guide = f"""
+
+IMPORTANT: You are a subsession with ID: {subsession_id}
+When you complete your task, you MUST call:
+
+register_notification('subsession_complete', {{'subsession_id': '{subsession_id}'}}, 'Task completed successfully')
+
+This notifies your parent session that you're done.
+"""
+            system_prompt += subsession_guide
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  added subsession guidance for {subsession_id}\n")
 
         options_dict = {
             "allowed_tools": params.get("allowed_tools", []),
@@ -1053,6 +1103,171 @@ class Bridge:
         if self.notification_backend:
             count = await self.notification_backend.signal_session_complete(subsession_id)
             _logger.info(f"Subsession {subsession_id} completed - triggered {count} notifications")
+
+    # ─── Unified Notification Interface (Notalone) ───────────────────────
+    # These methods provide a unified API for all notification types,
+    # called by tool_router to enable direct bridge access for subsessions
+    # Uses notalone protocol terminology: register/unregister/list
+
+    async def register_notification(
+        self,
+        notification_type: str,
+        params: dict,
+        wake_prompt: str,
+        notification_id: Optional[str] = None
+    ) -> dict:
+        """
+        Unified notification interface - maps to notalone types.
+
+        notification_type can be:
+        - 'timer' → TIMER
+        - 'subsession_complete' → SUBSESSION_COMPLETE
+        - 'agent_complete' → AGENT_COMPLETE (alias for subsession_complete)
+        - 'ticket_update' → TICKET_UPDATE (remote)
+        - 'channel' → CHANNEL (remote)
+        """
+        from notalone.types import NotificationType, NotificationParams, Notification
+
+        # Map string types to NotificationType enum
+        type_map = {
+            'timer': NotificationType.TIMER,
+            'subsession_complete': NotificationType.SUBSESSION_COMPLETE,
+            'agent_complete': NotificationType.AGENT_COMPLETE,
+            'ticket_update': NotificationType.TICKET_UPDATE,
+            'channel': NotificationType.CHANNEL,
+        }
+
+        ntype = type_map.get(notification_type)
+        if not ntype:
+            return {"error": f"Unknown notification_type: {notification_type}"}
+
+        # Create notification params
+        nparams = NotificationParams(**params)
+
+        # Create notification
+        notification = Notification(
+            notification_type=ntype,
+            params=nparams,
+            wake_prompt=wake_prompt,
+            source_session_id=self._session_id
+        )
+        if notification_id:
+            notification.id = notification_id
+
+        # Set via appropriate backend method based on type
+        if not self.notification_hub:
+            return {"error": "Notification system not initialized"}
+
+        try:
+            if ntype == NotificationType.TIMER:
+                # Local timer
+                result = await self.notification_hub.set_timer(
+                    seconds=params.get('seconds', 0),
+                    wake_prompt=wake_prompt,
+                    repeat=params.get('repeat', False)
+                )
+                return {
+                    "notification_id": result.notification_id,
+                    "status": result.status
+                }
+
+            elif ntype in (NotificationType.SUBSESSION_COMPLETE, NotificationType.AGENT_COMPLETE):
+                # Subsession completion wait
+                subsession_id = params.get('subsession_id') or params.get('agent_id')
+                if not subsession_id:
+                    return {"error": "Missing subsession_id or agent_id in params"}
+
+                result = await self.notification_hub.wait_for_session(
+                    session_id=subsession_id,
+                    wake_prompt=wake_prompt
+                )
+                return {
+                    "notification_id": result.notification_id,
+                    "status": result.status,
+                    "subsession_id": subsession_id
+                }
+
+            elif ntype == NotificationType.TICKET_UPDATE:
+                # Remote ticket watch
+                ticket_id = params.get('ticket_id')
+                states = params.get('states', [])
+                if not ticket_id or not states:
+                    return {"error": "Missing ticket_id or states in params"}
+
+                remote_url = f"{self.kanban_base_url}/notalone/register"
+                notification_id = await self.notification_hub.watch_ticket_remote(
+                    remote_url=remote_url,
+                    ticket_id=ticket_id,
+                    states=states,
+                    wake_prompt=wake_prompt
+                )
+                return {
+                    "notification_id": notification_id,
+                    "status": "registered_remote",
+                    "ticket_id": ticket_id
+                }
+
+            elif ntype == NotificationType.CHANNEL:
+                # Channel subscription
+                channel = params.get('channel')
+                if not channel:
+                    return {"error": "Missing channel in params"}
+
+                result = await self.notification_hub.subscribe(
+                    session_id=self._session_id,
+                    channel=channel,
+                    wake_prompt=wake_prompt
+                )
+                return {
+                    "notification_id": result.notification_id,
+                    "status": result.status,
+                    "channel": channel
+                }
+
+            else:
+                return {"error": f"Unsupported notification type: {notification_type}"}
+
+        except Exception as e:
+            _logger.error(f"Error setting notification: {e}")
+            return {"error": str(e)}
+
+    async def unregister_notification(self, notification_id: str) -> dict:
+        """Unregister any notification by ID (notalone protocol)."""
+        if not self.notification_hub:
+            return {"error": "Notification system not initialized"}
+
+        try:
+            result = await self.notification_hub.cancel_notification(notification_id)
+            return {
+                "notification_id": notification_id,
+                "status": result.status if hasattr(result, 'status') else "cancelled"
+            }
+        except Exception as e:
+            _logger.error(f"Error cancelling notification: {e}")
+            return {"error": str(e)}
+
+    async def list_notifications(self, session_id: Optional[str] = None) -> list:
+        """List active notifications."""
+        if not self.notification_hub:
+            return []
+
+        try:
+            notifications = await self.notification_hub.list_notifications(session_id)
+            return [
+                {
+                    "notification_id": n.id,
+                    "notification_type": n.notification_type.value,
+                    "params": n.params.to_dict() if hasattr(n.params, 'to_dict') else {},
+                    "wake_prompt": n.wake_prompt,
+                    "source_session_id": n.source_session_id,
+                    "fired": n.fired,
+                    "cancelled": n.cancelled
+                }
+                for n in notifications
+            ]
+        except Exception as e:
+            _logger.error(f"Error listing notifications: {e}")
+            return []
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""

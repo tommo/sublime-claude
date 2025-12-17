@@ -42,7 +42,7 @@ class ContextItem:
 
 
 class Session:
-    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[Dict] = None):
+    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[Dict] = None, initial_context: Optional[Dict] = None):
         self.window = window
         self.client: Optional[JsonRpcClient] = None
         self.output = OutputView(window)
@@ -57,6 +57,7 @@ class Session:
         self.resume_id: Optional[str] = resume_id  # ID to resume from
         self.fork: bool = fork  # Fork from resume_id instead of continuing it
         self.profile: Optional[Dict] = profile  # Profile config (model, betas, system_prompt, preload_docs)
+        self.initial_context: Optional[Dict] = initial_context  # Initial context (subsession_id, parent_view_id, etc.)
         self.name: Optional[str] = None
         self.total_cost: float = 0.0
         self.query_count: int = 0
@@ -68,6 +69,14 @@ class Session:
         self.draft_prompt: str = ""
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
+
+        # Extract subsession_id and parent_view_id if provided
+        if initial_context:
+            self.subsession_id = initial_context.get("subsession_id")
+            self.parent_view_id = initial_context.get("parent_view_id")
+        else:
+            self.subsession_id = None
+            self.parent_view_id = None
 
     def start(self) -> None:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -87,7 +96,7 @@ class Session:
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}")
+        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, subsession_id={getattr(self, 'subsession_id', None)}")
         init_params = {
             "cwd": self._cwd(),
             "allowed_tools": allowed_tools,
@@ -98,6 +107,9 @@ class Session:
             init_params["resume"] = self.resume_id
             if self.fork:
                 init_params["fork_session"] = True
+        # Pass subsession_id if this is a subsession
+        if hasattr(self, 'subsession_id') and self.subsession_id:
+            init_params["subsession_id"] = self.subsession_id
         # Apply profile config
         if self.profile:
             if self.profile.get("model"):

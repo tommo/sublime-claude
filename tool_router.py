@@ -130,12 +130,22 @@ def create_sublime_router() -> ToolRouter:
     router.register("ask_user", lambda args:
         f"return ask_user({args.get('question', '')!r}, {args.get('options', [])!r})")
 
-    # ─── Notification Tools ───────────────────────────────────────────────
-    # Removed duplicate notification tools - now provided by dedicated MCP servers:
-    # - list_notifications, unsubscribe → notalone MCP server (generic)
-    # - watch_kanban (includes watch_ticket functionality) → vibekanban MCP server
-    # - set_alarm, cancel_alarm → legacy API, superseded by notalone
-    # - subscribe_channel, broadcast_message → unused pub/sub functionality
+    # ─── Unified Notification System (Notalone) ───────────────────────────
+    # Expose bridge's notalone backend for all wake-up scenarios:
+    # timers, subsession completion, remote watches
+    # Uses notalone protocol terminology: register/unregister/list
+    router.register("register_notification", lambda args:
+        f"return register_notification("
+        f"notification_type={args.get('notification_type')!r}, "
+        f"params={args.get('params', {})!r}, "
+        f"wake_prompt={args.get('wake_prompt')!r}, "
+        f"notification_id={args.get('notification_id')})")
+
+    router.register("unregister_notification", lambda args:
+        f"return unregister_notification({args.get('notification_id')!r})")
+
+    router.register("list_notifications", lambda args:
+        f"return list_notifications(session_id={args.get('session_id')})")
 
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))

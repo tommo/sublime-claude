@@ -300,82 +300,10 @@ User can always type a custom response.""",
                         "required": ["question"]
                     }
                 },
-                # ─── Alarm Tools ─────────────────────────────────────────────
-                {
-                    "name": "set_alarm",
-                    "description": """Set an alarm to wake this session when an event occurs (powered by notalone).
-
-Instead of polling for subsession completion, sessions can sleep and wake when events fire.
-The alarm fires by injecting the wake_prompt into this session as a new query.
-
-Event types:
-- subsession_complete: Wake when a subsession finishes (requires subsession_id)
-- time_elapsed: Wake after N seconds (requires seconds)
-- agent_complete: Same as subsession_complete (requires agent_id)
-
-Example usage:
-  result = spawn_session("Run tests", name="tester")
-  set_alarm(
-      event_type="subsession_complete",
-      event_params={"subsession_id": str(result["view_id"])},
-      wake_prompt="Tests done! Summarize results from tester session."
-  )
-  # This query ends, alarm monitors in background
-  # When subsession completes, alarm fires and wakes this session
-
-Note: This is the legacy API. For advanced features like ticket watching and channel pub/sub,
-use the new notalone tools: watch_ticket, subscribe_channel, broadcast_message.""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "event_type": {
-                                "type": "string",
-                                "enum": ["subsession_complete", "time_elapsed", "agent_complete"],
-                                "description": "Type of event to wait for"
-                            },
-                            "event_params": {
-                                "type": "object",
-                                "description": "Event-specific params: {subsession_id: str} | {seconds: int} | {agent_id: str}"
-                            },
-                            "wake_prompt": {
-                                "type": "string",
-                                "description": "Prompt to inject when alarm fires (wakes this session)"
-                            },
-                            "alarm_id": {
-                                "type": "string",
-                                "description": "Optional alarm identifier (auto-generated if omitted)"
-                            }
-                        },
-                        "required": ["event_type", "event_params", "wake_prompt"]
-                    }
-                },
-                {
-                    "name": "cancel_alarm",
-                    "description": "Cancel a pending alarm by its ID (notalone). Returns confirmation when cancelled.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "alarm_id": {
-                                "type": "string",
-                                "description": "Alarm identifier from set_alarm response"
-                            }
-                        },
-                        "required": ["alarm_id"]
-                    }
-                },
-                {
-                    "name": "list_notifications",
-                    "description": "List all active notalone notifications for this session. Shows timers, subsession waits, ticket watches, and channel subscriptions. Part of the notalone notification protocol - you're not alone, notify all as one!",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
-                            }
-                        }
-                    }
-                },
+                # ─── Remote Notification Tools (Notalone) ───────────────────
+                # Note: Local notification tools (timers, subsession completion) are
+                # now provided via tool_router for direct bridge access.
+                # MCP server only exposes remote notification tools.
                 {
                     "name": "watch_ticket",
                     "description": """Watch a ticket for state changes in the kanban system. Wakes this session when the ticket enters one of the specified states.
