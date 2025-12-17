@@ -300,10 +300,72 @@ User can always type a custom response.""",
                         "required": ["question"]
                     }
                 },
-                # ─── Remote Notification Tools (Notalone) ───────────────────
-                # Note: Local notification tools (timers, subsession completion) are
-                # now provided via tool_router for direct bridge access.
-                # MCP server only exposes remote notification tools.
+                # ─── Notification Tools (Notalone) ──────────────────────────
+                # Local notifications (timers) and cross-system notifications
+                # All powered by notalone - the unified notification protocol
+                {
+                    "name": "set_timer",
+                    "description": """Set a timer to wake this session after specified seconds.
+
+Uses notalone for reliable notification delivery. Timer runs in bridge process.
+
+Example:
+  set_timer(
+      seconds=300,
+      wake_prompt="⏰ 5 minutes elapsed! Time to check the build."
+  )
+
+Returns notification_id that can be used with unregister_notification() to cancel.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "seconds": {
+                                "type": "integer",
+                                "description": "Number of seconds until notification fires"
+                            },
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when timer fires"
+                            },
+                            "notification_id": {
+                                "type": "string",
+                                "description": "Optional: custom notification ID (auto-generated if omitted)"
+                            }
+                        },
+                        "required": ["seconds", "wake_prompt"]
+                    }
+                },
+                {
+                    "name": "list_notifications",
+                    "description": """List all active notifications for this session (or all sessions).
+
+Shows timers, ticket watches, channel subscriptions, and subsession waits.
+All managed through notalone - not alone, list all!""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "unregister_notification",
+                    "description": """Cancel any notification by its notification_id.
+
+Works with ALL notification types: timers, ticket watches, channel subscriptions.
+Pure notalone operation - unregister from anywhere!
+
+Example:
+  unregister_notification(notification_id="ntf-abc123")""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "notification_id": {
+                                "type": "string",
+                                "description": "Notification ID to cancel (from set_timer, watch_ticket, etc.)"
+                            }
+                        },
+                        "required": ["notification_id"]
+                    }
+                },
                 {
                     "name": "watch_ticket",
                     "description": """Watch a ticket for state changes in the kanban system. Wakes this session when the ticket enters one of the specified states.

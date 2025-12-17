@@ -147,6 +147,14 @@ def create_sublime_router() -> ToolRouter:
     router.register("list_notifications", lambda args:
         f"return list_notifications(session_id={args.get('session_id')})")
 
+    # Convenience shortcuts for common notification types
+    router.register("set_timer", lambda args:
+        f"return register_notification("
+        f"'timer', "
+        f"{{'seconds': {args.get('seconds')}}}, "
+        f"{args.get('wake_prompt')!r}, "
+        f"{args.get('notification_id')})")
+
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))
     router.register("sublime_tool", lambda args: args.get("name", ""))
