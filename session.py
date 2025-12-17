@@ -219,7 +219,14 @@ class Session:
         parts.append(prompt)
         return "\n\n".join(parts)
 
-    def query(self, prompt: str) -> None:
+    def query(self, prompt: str, display_prompt: str = None) -> None:
+        """
+        Start a new query.
+
+        Args:
+            prompt: The full prompt to send to the agent
+            display_prompt: Optional shorter prompt to display in the UI (defaults to prompt)
+        """
         if not self.client or not self.initialized:
             sublime.error_message("Claude not initialized")
             return
@@ -241,7 +248,10 @@ class Session:
         self.pending_context = []  # Clear after use
         self._update_context_display()
 
-        print(f"[Claude] >>> {prompt[:60]}...")
+        # Use display_prompt for UI if provided, otherwise use full prompt
+        ui_prompt = display_prompt if display_prompt else prompt
+
+        print(f"[Claude] >>> {ui_prompt[:60]}...")
         self.output.show()
 
         # Check if bridge is alive before sending
@@ -252,9 +262,9 @@ class Session:
 
         # Auto-name session from first prompt if not already named
         if not self.name:
-            self._set_name(prompt[:30].strip() + ("..." if len(prompt) > 30 else ""))
+            self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
         print(f"[Claude] query() - calling output.prompt()")
-        self.output.prompt(prompt, context_names)
+        self.output.prompt(ui_prompt, context_names)
         print(f"[Claude] query() - calling _animate()")
         self._animate()
         print(f"[Claude] query() - sending RPC query request")
@@ -375,98 +385,12 @@ class Session:
             self.client.send("shutdown", {}, lambda _: self.client.stop())
         self._clear_status()
 
-    def set_alarm(self, event_type: str, event_params: dict, wake_prompt: str, alarm_id: Optional[str] = None, callback=None) -> None:
-        """Set an alarm to wake this session when an event occurs.
-
-        Instead of polling for events, the session sleeps and wakes when the event fires.
-        The alarm "wakes" the session by injecting the wake_prompt.
-
-        Args:
-            event_type: "agent_complete", "time_elapsed", "subsession_complete"
-            event_params: Event-specific parameters
-                - agent_complete: {agent_id: str}
-                - time_elapsed: {seconds: int}
-                - subsession_complete: {subsession_id: str}
-            wake_prompt: Prompt to inject when alarm fires
-            alarm_id: Optional alarm identifier (generated if not provided)
-            callback: Optional callback for result
-
-        Returns (via callback):
-            {alarm_id: str, status: "set", event_type: str}
-        """
-        if not self.client:
-            return
-
-        params = {
-            "event_type": event_type,
-            "event_params": event_params,
-            "wake_prompt": wake_prompt,
-        }
-        if alarm_id:
-            params["alarm_id"] = alarm_id
-
-        self.client.send("set_alarm", params, callback)
-
-    def cancel_alarm(self, alarm_id: str, callback=None) -> None:
-        """Cancel a pending alarm.
-
-        Args:
-            alarm_id: Alarm identifier returned by set_alarm
-            callback: Optional callback for result
-
-        Returns (via callback):
-            {alarm_id: str, status: "cancelled"}
-        """
-        if not self.client:
-            return
-
-        self.client.send("cancel_alarm", {"alarm_id": alarm_id}, callback)
-
-    # ─── Notification Tools (notalone API) ────────────────────────────────
-
-    def list_notifications(self, callback=None) -> None:
-        """List active notifications for this session."""
-        if not self.client:
-            return
-        self.client.send("list_notifications", {}, callback)
-
-    def watch_ticket(self, ticket_id: int, states: list, wake_prompt: str, callback=None) -> None:
-        """Watch a ticket for state changes in kanban (always remote)."""
-        if not self.client:
-            return
-
-        params = {
-            "ticket_id": ticket_id,
-            "states": states,
-            "wake_prompt": wake_prompt,
-        }
-        self.client.send("watch_ticket", params, callback)
-
-    def subscribe_channel(self, channel: str, wake_prompt: str, callback=None) -> None:
-        """Subscribe to a notification channel."""
-        if not self.client:
-            return
-
-        params = {
-            "channel": channel,
-            "wake_prompt": wake_prompt,
-        }
-        self.client.send("subscribe_channel", params, callback)
-
-    def broadcast_message(self, message: str, channel: str = None, data: dict = None, callback=None) -> None:
-        """Broadcast a message to channel subscribers."""
-        if not self.client:
-            return
-
-        params = {
-            "message": message,
-        }
-        if channel:
-            params["channel"] = channel
-        if data:
-            params["data"] = data
-
-        self.client.send("broadcast_message", params, callback)
+    # ─── Notification Tools ───────────────────────────────────────────────
+    # Removed duplicate notification tools - now provided by dedicated MCP servers:
+    # - list_notifications, unsubscribe → notalone MCP server (generic)
+    # - watch_kanban (includes watch_ticket functionality) → vibekanban MCP server
+    # - set_alarm, cancel_alarm → legacy API, superseded by notalone
+    # - subscribe_channel, broadcast_message → unused pub/sub functionality
 
     def _on_notification(self, method: str, params: dict) -> None:
         if method == "permission_request":
@@ -489,22 +413,25 @@ class Session:
         if method in ("alarm_wake", "notification_wake"):
             # Notification fired - start a new query with the wake prompt
             wake_prompt = params.get("wake_prompt", "")
+            display_message = params.get("display_message", "")  # User-friendly message
             notification_id = params.get("notification_id") or params.get("alarm_id", "")
             view_id = self.output.view.id() if self.output.view else "no-view"
-            print(f"[Claude] 🔔 NOTIFICATION WAKE received by session: name='{self.name}', view_id={view_id}")
+
+            # Use display_message for user if available, otherwise fall back to wake_prompt
+            user_message = display_message if display_message else wake_prompt
+
+            print(f"[Claude] {user_message}")
             print(f"[Claude] Notification ID: {notification_id}")
-            print(f"[Claude] Wake prompt: {wake_prompt}")
             print(f"[Claude] Session state: initialized={self.initialized}, working={self.working}, client={self.client is not None}")
 
             # If session is still working, queue the wake query for when it becomes idle
             if self.working:
-                print(f"[Claude] ⚠ Session is busy, deferring alarm wake until idle")
+                print(f"[Claude] Session is busy, will start when idle...")
 
                 def start_wake_query():
                     if not self.working:
-                        print(f"[Claude] ✓ Session now idle, starting deferred alarm wake query")
                         try:
-                            self.query(wake_prompt)
+                            self.query(wake_prompt, display_prompt=user_message)
                         except Exception as e:
                             print(f"[Claude] ✗ ERROR starting deferred wake query: {e}")
                     else:
@@ -516,10 +443,9 @@ class Session:
 
             # Session is idle, start wake query immediately
             try:
-                self.query(wake_prompt)
-                print(f"[Claude] ✓ Alarm wake query started successfully")
+                self.query(wake_prompt, display_prompt=user_message)
             except Exception as e:
-                print(f"[Claude] ✗ ERROR starting alarm wake query: {e}")
+                print(f"[Claude] ✗ ERROR starting wake query: {e}")
                 import traceback
                 traceback.print_exc()
             return

@@ -265,11 +265,20 @@ class SublimeNotificationBackend(NotificationBackend):
 
         logger.info(f"[Sublime] FIRING notification {notification.id}")
 
+        # Generate display message for user (concise, not verbose)
+        display_message = f"🔔 {notification.notification_type.value}"
+        if notification.wake_prompt:
+            # Use first line of wake_prompt for display
+            first_line = notification.wake_prompt.split("\n")[0]
+            if first_line and first_line != notification.wake_prompt:
+                display_message = first_line
+
         # Send wake notification to Sublime session
         self._send_notification("notification_wake", {
             "notification_id": notification.id,
             "event_type": notification.notification_type.value,
-            "wake_prompt": notification.wake_prompt,
+            "wake_prompt": notification.wake_prompt,  # For agent
+            "display_message": display_message,  # For user UI
         })
 
         # Call the registered callback

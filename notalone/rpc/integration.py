@@ -252,6 +252,16 @@ class RemoteNotificationHub:
                 import json
                 wake_prompt += f"\n```json\n{json.dumps(data, indent=2)}\n```"
 
+        # Generate user-friendly display message (generic, not verbose)
+        # Extract source system from notification_reason if available
+        display_message = "🔔 Notification"
+        if data and data.get("notification_reason"):
+            # Use first line of notification_reason for display
+            reason = data["notification_reason"].split("\n")[0]
+            display_message = f"🔔 {reason}"
+        elif event_type:
+            display_message = f"🔔 {event_type}"
+
         # Send the notification through the backend
         # The backend's _send_notification callback will inject it into the Sublime session
         try:
@@ -261,7 +271,8 @@ class RemoteNotificationHub:
                     {
                         "notification_id": notification_id,
                         "event_type": event_type,
-                        "wake_prompt": wake_prompt,
+                        "wake_prompt": wake_prompt,  # For agent
+                        "display_message": display_message,  # For user UI
                         "data": data
                     }
                 )
