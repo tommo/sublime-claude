@@ -399,6 +399,9 @@ class MCPSocketServer:
             "watch_ticket": self._watch_ticket,
             "subscribe_channel": self._subscribe_channel,
             "broadcast_message": self._broadcast_message,
+            # Unified notification API (for tool_router)
+            "register_notification": self._register_notification,
+            "signal_subsession_complete": self._signal_subsession_complete,
         }
 
         # Handle return statements
@@ -1502,4 +1505,68 @@ class MCPSocketServer:
             "status": "broadcast_sent",
             "channel": channel or "global",
             "message": message
+        }
+
+    def _register_notification(self, notification_type: str, params: dict, wake_prompt: str, notification_id: str = None, session_id: int = None) -> dict:
+        """Register a notification using notalone API.
+
+        Args:
+            notification_type: 'timer', 'subsession_complete', 'ticket_update', 'channel'
+            params: Type-specific parameters (e.g., {'seconds': 30} for timer)
+            wake_prompt: Prompt to inject when notification fires
+            notification_id: Optional custom notification ID
+            session_id: Optional session ID (uses current session if not provided)
+
+        Returns:
+            {notification_id: str, status: "set"}
+        """
+        session, error = self._get_session_for_tool(session_id)
+        if error:
+            return error
+
+        result = {"pending": True}
+
+        def on_result(notif_result):
+            result.update(notif_result)
+
+        session.register_notification(
+            notification_type=notification_type,
+            params=params,
+            wake_prompt=wake_prompt,
+            notification_id=notification_id,
+            callback=on_result
+        )
+
+        return {
+            "status": "notification_registered",
+            "notification_type": notification_type
+        }
+
+    def _signal_subsession_complete(self, result_summary: str = None, session_id: int = None) -> dict:
+        """Signal that this subsession has completed.
+
+        Args:
+            result_summary: Optional summary of what was accomplished
+            session_id: Optional session ID (uses current session if not provided)
+
+        Returns:
+            {status: "signaled", subsession_id: str, notifications_triggered: int}
+        """
+        session, error = self._get_session_for_tool(session_id)
+        if error:
+            return error
+
+        result = {"pending": True}
+
+        def on_result(signal_result):
+            result.update(signal_result)
+
+        session.signal_subsession_complete(
+            result_summary=result_summary,
+            callback=on_result
+        )
+
+        return {
+            "status": "signal_sent",
+            "result_summary": result_summary
         }

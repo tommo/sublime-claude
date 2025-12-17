@@ -609,3 +609,50 @@ class Session:
 
         # Show permission UI in output view
         self.output.permission_request(pid, tool, tool_input, on_response)
+
+    # ─── Unified Notification API (notalone) ──────────────────────────────────
+
+    def register_notification(
+        self,
+        notification_type: str,
+        params: dict,
+        wake_prompt: str,
+        notification_id: Optional[str] = None,
+        callback: Optional[callable] = None
+    ) -> None:
+        """Register a notification using notalone protocol.
+
+        Args:
+            notification_type: 'timer', 'subsession_complete', 'ticket_update', 'channel'
+            params: Type-specific parameters
+            wake_prompt: Prompt to inject when notification fires
+            notification_id: Optional custom notification ID
+            callback: Optional callback for result
+        """
+        if not self.client:
+            return
+
+        self.client.send("register_notification", {
+            "notification_type": notification_type,
+            "params": params,
+            "wake_prompt": wake_prompt,
+            "notification_id": notification_id
+        }, callback)
+
+    def signal_subsession_complete(
+        self,
+        result_summary: Optional[str] = None,
+        callback: Optional[callable] = None
+    ) -> None:
+        """Signal that this subsession has completed.
+
+        Args:
+            result_summary: Optional summary of what was accomplished
+            callback: Optional callback for result
+        """
+        if not self.client:
+            return
+
+        self.client.send("signal_subsession_complete", {
+            "result_summary": result_summary
+        }, callback)

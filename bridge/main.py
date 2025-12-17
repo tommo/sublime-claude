@@ -130,6 +130,20 @@ class Bridge:
                 await self.subscribe_channel(id, params)
             elif method == "broadcast_message":
                 await self.broadcast_message(id, params)
+            elif method == "register_notification":
+                result = await self.register_notification(
+                    notification_type=params.get("notification_type"),
+                    params=params.get("params", {}),
+                    wake_prompt=params.get("wake_prompt"),
+                    notification_id=params.get("notification_id")
+                )
+                send_result(id, result)
+            elif method == "signal_subsession_complete":
+                result = await self.signal_subsession_complete(
+                    subsession_id=None,  # Will use self._subsession_id
+                    result_summary=params.get("result_summary")
+                )
+                send_result(id, result)
             elif method == "subsession_complete":
                 # Notification: no response needed
                 subsession_id = params.get("subsession_id")
