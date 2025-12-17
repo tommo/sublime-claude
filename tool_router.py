@@ -155,6 +155,16 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('wake_prompt')!r}, "
         f"{args.get('notification_id')})")
 
+    router.register("wait_for_subsession", lambda args:
+        f"return register_notification("
+        f"'subsession_complete', "
+        f"{{'subsession_id': {args.get('subsession_id')!r}}}, "
+        f"{args.get('wake_prompt')!r}, "
+        f"{args.get('notification_id')})")
+
+    router.register("signal_complete", lambda args:
+        f"return signal_subsession_complete({args.get('result_summary')!r})")
+
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))
     router.register("sublime_tool", lambda args: args.get("name", ""))

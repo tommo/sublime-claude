@@ -336,6 +336,64 @@ Returns notification_id that can be used with unregister_notification() to cance
                     }
                 },
                 {
+                    "name": "signal_complete",
+                    "description": """Signal that this subsession has completed its work.
+
+ONLY use this if you are a subsession (spawned via spawn_session).
+Notifies the parent session that spawned you. Parent must be waiting via wait_for_subsession().
+
+Your subsession_id is automatically available in your context.
+This is a fire-and-forget notification - you can continue working after signaling.
+
+Example (from within a subsession):
+  signal_complete(result_summary="Architecture design complete. See output above.")
+
+The parent session will wake up and can read your output.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "result_summary": {
+                                "type": "string",
+                                "description": "Optional: Brief summary of what was accomplished"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "wait_for_subsession",
+                    "description": """Wait for a subsession to complete. Wakes this session when the subsession finishes.
+
+Use this after spawning a subsession with spawn_session() to be notified when it completes.
+The spawned subsession must signal completion using signal_complete().
+
+Example:
+  result = spawn_session(prompt="Design the solution", name="architect")
+  wait_for_subsession(
+      subsession_id=result['subsession_id'],
+      wake_prompt="🎉 Architect subsession completed! Review the design."
+  )
+
+Returns notification_id that can be used with unregister_notification() to cancel the wait.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "subsession_id": {
+                                "type": "string",
+                                "description": "Subsession ID from spawn_session() result"
+                            },
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when subsession completes"
+                            },
+                            "notification_id": {
+                                "type": "string",
+                                "description": "Optional: custom notification ID (auto-generated if omitted)"
+                            }
+                        },
+                        "required": ["subsession_id", "wake_prompt"]
+                    }
+                },
+                {
                     "name": "list_notifications",
                     "description": """List all active notifications for this session (or all sessions).
 

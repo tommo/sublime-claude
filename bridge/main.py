@@ -229,17 +229,18 @@ register_notification('channel', {'channel': 'project-updates'}, 'New project up
 """
         system_prompt = (system_prompt + notification_guide) if system_prompt else notification_guide
 
-        # If this is a subsession, add specific guidance
+        # If this is a subsession, store subsession_id and add specific guidance
         subsession_id = params.get("subsession_id")
+        self._subsession_id = subsession_id  # Store for signal_complete tool
         if subsession_id:
             subsession_guide = f"""
 
 IMPORTANT: You are a subsession with ID: {subsession_id}
-When you complete your task, you MUST call:
+When you complete your task, call signal_complete() to notify your parent:
 
-register_notification('subsession_complete', {{'subsession_id': '{subsession_id}'}}, 'Task completed successfully')
+signal_complete(result_summary="Brief summary of what was accomplished")
 
-This notifies your parent session that you're done.
+This uses notalone to wake your parent session. You can continue working after signaling.
 """
             system_prompt += subsession_guide
             with open("/tmp/claude_bridge.log", "a") as f:
@@ -1098,11 +1099,30 @@ This notifies your parent session that you're done.
             "wake_prompt": wake_prompt
         })
 
-    async def signal_subsession_complete(self, subsession_id: str) -> None:
-        """Signal that a subsession has completed using notalone."""
+    async def signal_subsession_complete(self, subsession_id: str = None, result_summary: str = None) -> dict:
+        """Signal that a subsession has completed using notalone.
+
+        Args:
+            subsession_id: Optional subsession ID. If None, uses self._subsession_id
+            result_summary: Optional summary of what was accomplished
+        """
+        if subsession_id is None:
+            subsession_id = getattr(self, '_subsession_id', None)
+
+        if not subsession_id:
+            return {"error": "Not a subsession - no subsession_id available"}
+
         if self.notification_backend:
             count = await self.notification_backend.signal_session_complete(subsession_id)
             _logger.info(f"Subsession {subsession_id} completed - triggered {count} notifications")
+            return {
+                "status": "signaled",
+                "subsession_id": subsession_id,
+                "notifications_triggered": count,
+                "result_summary": result_summary
+            }
+
+        return {"error": "Notification backend not initialized"}
 
     # ─── Unified Notification Interface (Notalone) ───────────────────────
     # These methods provide a unified API for all notification types,
