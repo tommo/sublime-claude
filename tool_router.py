@@ -130,29 +130,12 @@ def create_sublime_router() -> ToolRouter:
     router.register("ask_user", lambda args:
         f"return ask_user({args.get('question', '')!r}, {args.get('options', [])!r})")
 
-    # Alarm tools (legacy API - still supported)
-    router.register("set_alarm", lambda args:
-        f"return set_alarm({args.get('event_type')!r}, {args.get('event_params', {})!r}, "
-        f"{args.get('wake_prompt')!r}, {args.get('alarm_id')!r})")
-
-    router.register("cancel_alarm", lambda args:
-        f"return cancel_alarm({args.get('alarm_id')!r})")
-
-    # Notification tools (notalone API)
-    router.register("list_notifications", lambda args:
-        f"return list_notifications(session_id={args.get('session_id')})")
-
-    router.register("watch_ticket", lambda args:
-        f"return watch_ticket({args.get('ticket_id')}, {args.get('states', [])!r}, "
-        f"{args.get('wake_prompt')!r}, session_id={args.get('session_id')})")
-
-    router.register("subscribe_channel", lambda args:
-        f"return subscribe_channel({args.get('channel')!r}, {args.get('wake_prompt')!r}, "
-        f"session_id={args.get('session_id')})")
-
-    router.register("broadcast_message", lambda args:
-        f"return broadcast_message({args.get('message')!r}, {args.get('channel')!r}, "
-        f"{args.get('data', {})!r}, session_id={args.get('session_id')})")
+    # ─── Notification Tools ───────────────────────────────────────────────
+    # Removed duplicate notification tools - now provided by dedicated MCP servers:
+    # - list_notifications, unsubscribe → notalone MCP server (generic)
+    # - watch_kanban (includes watch_ticket functionality) → vibekanban MCP server
+    # - set_alarm, cancel_alarm → legacy API, superseded by notalone
+    # - subscribe_channel, broadcast_message → unused pub/sub functionality
 
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))
