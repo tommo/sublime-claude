@@ -81,6 +81,10 @@ class SublimeNotificationBackend(NotificationBackend):
         # Registered sessions for broadcast
         self._registered_sessions: Set[str] = set()
 
+        # Agent processing state tracking (for batching optimization)
+        self._agent_processing = False
+        self._last_wake_time: Optional[datetime] = None
+
     @property
     def name(self) -> str:
         return "sublime"
@@ -273,6 +277,10 @@ class SublimeNotificationBackend(NotificationBackend):
             if first_line and first_line != notification.wake_prompt:
                 display_message = first_line
 
+        # Mark agent as processing (for batching optimization)
+        self._agent_processing = True
+        self._last_wake_time = datetime.utcnow()
+
         # Send wake notification to Sublime session
         self._send_notification("notification_wake", {
             "notification_id": notification.id,
@@ -294,6 +302,41 @@ class SublimeNotificationBackend(NotificationBackend):
             self._tasks.pop(notification.id, None)
             self._notifications.pop(notification.id, None)
             self._callbacks.pop(notification.id, None)
+
+    # =========================================================================
+    # Agent State Tracking (for batching optimization)
+    # =========================================================================
+
+    def is_processing(self) -> bool:
+        """
+        Check if the agent is currently processing a message.
+
+        Returns True if agent is busy, False if idle.
+        Used by batching system to avoid interrupting agent during processing.
+        """
+        if not self._agent_processing:
+            return False
+
+        # Auto-reset after 5 minutes (safety timeout)
+        if self._last_wake_time:
+            elapsed = (datetime.utcnow() - self._last_wake_time).total_seconds()
+            if elapsed > 300:  # 5 minutes
+                logger.debug("[Sublime] Agent processing timeout - marking as idle")
+                self._agent_processing = False
+                return False
+
+        return True
+
+    def mark_agent_idle(self) -> None:
+        """Mark agent as idle (finished processing)."""
+        self._agent_processing = False
+        logger.debug("[Sublime] Agent marked as idle")
+
+    def mark_agent_busy(self) -> None:
+        """Mark agent as busy (started processing)."""
+        self._agent_processing = True
+        self._last_wake_time = datetime.utcnow()
+        logger.debug("[Sublime] Agent marked as busy")
 
     # =========================================================================
     # Session Completion Signaling (maps to signal_subsession_complete)

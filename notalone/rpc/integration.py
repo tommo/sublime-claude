@@ -29,7 +29,8 @@ class RemoteNotificationHub:
         rpc_host: str = "localhost",
         rpc_port: int = 0,
         auth_token: Optional[str] = None,
-        heartbeat_interval: int = 30
+        heartbeat_interval: int = 30,
+        batch_delay: float = 1.5
     ):
         """
         Initialize remote notification support.
@@ -41,10 +42,12 @@ class RemoteNotificationHub:
             rpc_port: Port for RPC callback server (0 = auto-assign)
             auth_token: Optional auth token
             heartbeat_interval: Seconds between heartbeats (default: 30)
+            batch_delay: Seconds to wait before flushing notification batch (default: 1.5)
         """
         self.hub = hub
         self.session_id = session_id or str(uuid.uuid4())
         self.heartbeat_interval = heartbeat_interval
+        self.batch_delay = batch_delay
 
         # RPC components
         self.server = NotificationServer(rpc_host, rpc_port, auth_token)
@@ -52,6 +55,11 @@ class RemoteNotificationHub:
 
         # Track remote registrations: notification_id -> remote_url
         self._remote_registrations: Dict[str, str] = {}
+
+        # Notification batching
+        self._notification_batch: list = []
+        self._batch_flush_task: Optional[asyncio.Task] = None
+        self._batch_lock = asyncio.Lock()
 
         # Heartbeat task
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -102,6 +110,19 @@ class RemoteNotificationHub:
 
     async def stop(self):
         """Stop hub and RPC components."""
+        # Flush any pending notifications before stopping
+        if self._batch_flush_task:
+            self._batch_flush_task.cancel()
+            try:
+                await self._batch_flush_task
+            except asyncio.CancelledError:
+                pass
+
+        # Flush remaining batch
+        async with self._batch_lock:
+            if self._notification_batch:
+                await self._flush_batch()
+
         # Cancel heartbeat task
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
@@ -226,11 +247,97 @@ class RemoteNotificationHub:
             logger.info("Heartbeat task cancelled")
             raise
 
+    async def _schedule_batch_flush(self):
+        """Schedule a batch flush after batch_delay seconds."""
+        try:
+            await asyncio.sleep(self.batch_delay)
+            async with self._batch_lock:
+                if self._notification_batch:
+                    # Check if agent is busy before flushing
+                    if self._is_agent_busy():
+                        # Agent is busy, reschedule flush
+                        logger.debug(f"Agent busy, rescheduling flush ({len(self._notification_batch)} pending)")
+                        self._batch_flush_task = asyncio.create_task(self._schedule_batch_flush())
+                    else:
+                        # Agent is idle, flush now
+                        await self._flush_batch()
+                        self._batch_flush_task = None
+                else:
+                    self._batch_flush_task = None
+        except asyncio.CancelledError:
+            logger.debug("Batch flush task cancelled")
+            raise
+
+    def _is_agent_busy(self) -> bool:
+        """Check if the agent is currently processing a message."""
+        # Check if backend has agent state tracking
+        if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, 'is_processing'):
+            return self.hub.backend.is_processing()
+
+        # Fallback: assume agent is idle if we can't determine state
+        return False
+
+    async def _flush_batch(self):
+        """Flush the current notification batch to the agent."""
+        if not self._notification_batch:
+            return
+
+        count = len(self._notification_batch)
+        logger.info(f"Flushing {count} batched notification(s)")
+
+        # Build combined wake prompt
+        if count == 1:
+            # Single notification - use original format
+            notification = self._notification_batch[0]
+            wake_prompt = notification["wake_prompt"]
+            display_message = notification["display_message"]
+        else:
+            # Multiple notifications - batch format
+            import json
+            parts = [f"You have {count} new notifications:\n"]
+
+            for i, notification in enumerate(self._notification_batch, 1):
+                # Extract reason from wake_prompt (first line before Data:)
+                wake_text = notification["wake_prompt"]
+                reason = wake_text.split("\n")[0] if wake_text else f"Notification {i}"
+
+                parts.append(f"\n{i}. {reason}")
+
+                # Include data if present
+                if notification.get("data"):
+                    parts.append(f"```json\n{json.dumps(notification['data'], indent=2, default=str)}\n```")
+
+            wake_prompt = "\n".join(parts)
+            display_message = f"🔔 {count} notifications"
+
+        # Send combined notification
+        try:
+            if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, '_send_notification'):
+                self.hub.backend._send_notification(
+                    "notification_wake",
+                    {
+                        "notification_id": "batch",
+                        "event_type": "batch",
+                        "wake_prompt": wake_prompt,
+                        "display_message": display_message,
+                        "count": count
+                    }
+                )
+                logger.info(f"Injected batched wake_prompt ({count} notifications)")
+            else:
+                logger.warning("Backend doesn't support _send_notification")
+        except Exception as e:
+            logger.error(f"Failed to inject batched wake_prompt: {e}")
+
+        # Clear the batch
+        self._notification_batch.clear()
+
     async def _handle_remote_notification(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """
         Handle incoming notification from remote system.
 
         Called by RPC server when remote system sends notification.
+        Batches notifications for efficient agent processing.
         """
         notification_id = params.get("notification_id")
         session_id = params.get("session_id")
@@ -262,27 +369,24 @@ class RemoteNotificationHub:
         elif event_type:
             display_message = f"🔔 {event_type}"
 
-        # Send the notification through the backend
-        # The backend's _send_notification callback will inject it into the Sublime session
-        try:
-            if hasattr(self.hub, 'backend') and hasattr(self.hub.backend, '_send_notification'):
-                self.hub.backend._send_notification(
-                    "notification_wake",
-                    {
-                        "notification_id": notification_id,
-                        "event_type": event_type,
-                        "wake_prompt": wake_prompt,  # For agent
-                        "display_message": display_message,  # For user UI
-                        "data": data
-                    }
-                )
-                logger.info(f"Injected wake_prompt for {notification_id}")
-            else:
-                logger.warning("Backend doesn't support _send_notification")
-        except Exception as e:
-            logger.error(f"Failed to inject wake_prompt: {e}")
+        # Add to batch instead of immediately sending
+        async with self._batch_lock:
+            self._notification_batch.append({
+                "notification_id": notification_id,
+                "event_type": event_type,
+                "wake_prompt": wake_prompt,
+                "display_message": display_message,
+                "data": data
+            })
 
-        return {"status": "delivered"}
+            # If this is the first notification in a new batch, schedule flush
+            if len(self._notification_batch) == 1 and not self._batch_flush_task:
+                self._batch_flush_task = asyncio.create_task(self._schedule_batch_flush())
+                logger.debug(f"Started batch timer ({self.batch_delay}s)")
+
+            logger.info(f"Added to batch ({len(self._notification_batch)} pending)")
+
+        return {"status": "batched"}
 
     # =========================================================================
     # Delegate local notification methods to hub
