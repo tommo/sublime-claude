@@ -329,8 +329,8 @@ class Session:
         # Clear any stale permission UI (query finished, no more permissions expected)
         self.output.clear_all_permissions()
 
-        # Notify ALL bridges that this subsession completed (for alarm system)
-        # Other sessions may be waiting on this subsession via alarms
+        # Notify ALL bridges that this subsession completed (for notalone notification system)
+        # Other sessions may be waiting on this subsession via notifications
         # Each session has its own bridge, so we need to broadcast to all
         if self.output.view:
             view_id = str(self.output.view.id())
@@ -411,11 +411,9 @@ class Session:
         self._clear_status()
 
     # ─── Notification Tools ───────────────────────────────────────────────
-    # Removed duplicate notification tools - now provided by dedicated MCP servers:
-    # - list_notifications, unsubscribe → notalone MCP server (generic)
-    # - watch_kanban (includes watch_ticket functionality) → vibekanban MCP server
-    # - set_alarm, cancel_alarm → legacy API, superseded by notalone
-    # - subscribe_channel, broadcast_message → unused pub/sub functionality
+    # Notification tools are provided by dedicated MCP servers:
+    # - notalone MCP server: timers, session completion, list/unregister
+    # - vibekanban MCP server: watch_kanban for ticket state changes
 
     def _on_notification(self, method: str, params: dict) -> None:
         if method == "permission_request":
@@ -435,11 +433,11 @@ class Session:
                 self.query(message)
             return
 
-        if method in ("alarm_wake", "notification_wake"):
+        if method == "notification_wake":
             # Notification fired - start a new query with the wake prompt
             wake_prompt = params.get("wake_prompt", "")
             display_message = params.get("display_message", "")  # User-friendly message
-            notification_id = params.get("notification_id") or params.get("alarm_id", "")
+            notification_id = params.get("notification_id", "")
             view_id = self.output.view.id() if self.output.view else "no-view"
 
             # Use display_message for user if available, otherwise fall back to wake_prompt
