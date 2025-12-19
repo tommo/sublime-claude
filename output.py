@@ -641,6 +641,9 @@ class OutputView:
         """Clear all output (can undo with Cmd+Z)."""
         # Remember if we were in input mode
         was_input_mode = self._input_mode
+        # Check if agent is currently working (before we clear state)
+        was_working = self.current and self.current.working
+
         if self._input_mode:
             self.exit_input_mode(keep_text=False)
         if self.view and self.view.is_valid():
@@ -663,6 +666,15 @@ class OutputView:
         # Clean up any tracked permission region
         if self.view:
             self.view.erase_regions("claude_permission_block")
+
+        # If agent was working, create a stub conversation to receive further output
+        # This prevents output from being silently discarded after clear
+        if was_working:
+            self.current = Conversation(prompt="(continued)", working=True)
+            self.current.region = (0, 0)  # Will be set on first render
+            self._update_title()  # Show working indicator
+            return  # Don't enter input mode while working
+
         # Re-enter input mode if we were in it
         if was_input_mode:
             self.enter_input_mode()

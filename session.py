@@ -96,7 +96,8 @@ class Session:
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, subsession_id={getattr(self, 'subsession_id', None)}")
+        default_model = settings.get("default_model")
+        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
         init_params = {
             "cwd": self._cwd(),
             "allowed_tools": allowed_tools,
@@ -110,7 +111,7 @@ class Session:
         # Pass subsession_id if this is a subsession
         if hasattr(self, 'subsession_id') and self.subsession_id:
             init_params["subsession_id"] = self.subsession_id
-        # Apply profile config
+        # Apply profile config or default model
         if self.profile:
             if self.profile.get("model"):
                 init_params["model"] = self.profile["model"]
@@ -123,6 +124,10 @@ class Session:
                 system_prompt = system_prompt + docs_info if system_prompt else docs_info.strip()
             if system_prompt:
                 init_params["system_prompt"] = system_prompt
+        else:
+            # No profile - use default_model setting if available
+            if default_model:
+                init_params["model"] = default_model
         self.client.send("initialize", init_params, self._on_init)
 
     def _cwd(self) -> str:
@@ -131,7 +136,11 @@ class Session:
         view = self.window.active_view()
         if view and view.file_name():
             return os.path.dirname(view.file_name())
-        return os.getcwd()
+        # Fallback: use ~/.claude/scratch for sessions without a project
+        # This ensures consistent cwd for session resume
+        scratch_dir = os.path.expanduser("~/.claude/scratch")
+        os.makedirs(scratch_dir, exist_ok=True)
+        return scratch_dir
 
     def _on_init(self, result: dict) -> None:
         if "error" in result:
@@ -299,7 +308,11 @@ class Session:
 
         status = result.get("status", "")
         if "error" in result:
+            error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
             self._status("error")
+            print(f"[Claude] query error: {error_msg}")
+            # Show error to user
+            self.output.text(f"\n\n*Error: {error_msg}*\n")
             # Mark conversation as done on error
             if self.output.current:
                 self.output.current.working = False

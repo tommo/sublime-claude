@@ -206,8 +206,6 @@ class Bridge:
         addon = settings.get("system_prompt_addon")
         if addon:
             system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  injected system_prompt_addon: {len(addon)} chars\n")
 
         # Add unified notification guide to system prompt
         notification_guide = """
@@ -257,8 +255,6 @@ signal_complete(result_summary="Brief summary of what was accomplished")
 This uses notalone to wake your parent session. You can continue working after signaling.
 """
             system_prompt += subsession_guide
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  added subsession guidance for {subsession_id}\n")
 
         options_dict = {
             "allowed_tools": params.get("allowed_tools", []),
@@ -270,14 +266,14 @@ This uses notalone to wake your parent session. You can continue working after s
             "fork_session": fork_session,
             "setting_sources": ["project"],
             "max_buffer_size": 100 * 1024 * 1024,  # 100MB for large images/files
+            "cli_path": "claude",
         }
 
         # Profile config: model and betas
         if params.get("model"):
             options_dict["model"] = params["model"]
         if params.get("betas"):
-            # betas must be passed via env var ANTHROPIC_BETAS
-            options_dict["env"] = {"ANTHROPIC_BETAS": ",".join(params["betas"])}
+            options_dict["betas"] = params["betas"]
 
         # Add MCP servers if found
         if mcp_servers:
@@ -292,18 +288,12 @@ This uses notalone to wake your parent session. You can continue working after s
             options_dict["plugins"] = plugins
 
         self.options = ClaudeAgentOptions(**options_dict)
-
-        with open("/tmp/claude_bridge.log", "a") as f:
-            f.write(f"  options.resume={self.options.resume}, options.fork_session={self.options.fork_session}\n")
-
         self.client = ClaudeSDKClient(options=self.options)
 
         try:
             await self.client.connect()
         except Exception as e:
             error_msg = str(e)
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  connect error: {error_msg}\n")
 
             # If session not found or command failed during resume, retry without resume
             # The SDK wraps the actual error, so we check for common patterns
@@ -312,9 +302,6 @@ This uses notalone to wake your parent session. You can continue working after s
                 ("Command failed" in error_msg and resume_id)
             )
             if is_session_error and resume_id:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  retrying without resume (stale session)\n")
-
                 options_dict["resume"] = None
                 options_dict["fork_session"] = False
                 self.options = ClaudeAgentOptions(**options_dict)
@@ -670,6 +657,20 @@ This uses notalone to wake your parent session. You can continue working after s
             await self.current_task
         except asyncio.CancelledError:
             send_result(id, {"status": "interrupted"})
+        except Exception as e:
+            error_msg = str(e)
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"query error: {error_msg}\n")
+            # Check for session-related errors
+            is_session_error = (
+                "No conversation found" in error_msg or
+                "Command failed" in error_msg or
+                "exit code" in error_msg
+            )
+            if is_session_error:
+                send_error(id, -32003, f"Session error: {error_msg}. Try restarting the session.")
+            else:
+                send_error(id, -32000, f"Query failed: {error_msg}")
         finally:
             self.query_id = None
             # Process any pending injects that arrived during query
@@ -1151,7 +1152,10 @@ This uses notalone to wake your parent session. You can continue working after s
         notification_id: Optional[str] = None
     ) -> dict:
         """
-        Unified notification interface - maps to notalone types.
+        Universal notification interface using notalone protocol.
+
+        ALL notifications (local and cross-system) go through the same RPC path.
+        This ensures semantic correctness - one code path, one implementation.
 
         notification_type can be:
         - 'timer' → TIMER
@@ -1161,6 +1165,8 @@ This uses notalone to wake your parent session. You can continue working after s
         - 'channel' → CHANNEL (remote)
         """
         from notalone.types import NotificationType, NotificationParams, Notification
+        from notalone.registry import NotaloneRegistry
+        from notalone.rpc.client import NotificationClient
 
         # Map string types to NotificationType enum
         type_map = {
@@ -1175,26 +1181,14 @@ This uses notalone to wake your parent session. You can continue working after s
         if not ntype:
             return {"error": f"Unknown notification_type: {notification_type}"}
 
-        # Create notification params
-        nparams = NotificationParams(**params)
-
-        # Create notification
-        notification = Notification(
-            notification_type=ntype,
-            params=nparams,
-            wake_prompt=wake_prompt,
-            source_session_id=self._session_id
-        )
-        if notification_id:
-            notification.id = notification_id
-
-        # Set via appropriate backend method based on type
+        # Use local notification backend for local notifications
+        # (Hybrid approach: local = direct, cross-system = RPC)
         if not self.notification_hub:
             return {"error": "Notification system not initialized"}
 
         try:
             if ntype == NotificationType.TIMER:
-                # Local timer
+                # Local timer - call backend directly
                 result = await self.notification_hub.set_timer(
                     seconds=params.get('seconds', 0),
                     wake_prompt=wake_prompt,
@@ -1202,11 +1196,12 @@ This uses notalone to wake your parent session. You can continue working after s
                 )
                 return {
                     "notification_id": result.notification_id,
-                    "status": result.status
+                    "status": "set",
+                    "notification_type": notification_type
                 }
 
             elif ntype in (NotificationType.SUBSESSION_COMPLETE, NotificationType.AGENT_COMPLETE):
-                # Subsession completion wait
+                # Subsession completion wait - call backend directly
                 subsession_id = params.get('subsession_id') or params.get('agent_id')
                 if not subsession_id:
                     return {"error": "Missing subsession_id or agent_id in params"}
@@ -1217,27 +1212,29 @@ This uses notalone to wake your parent session. You can continue working after s
                 )
                 return {
                     "notification_id": result.notification_id,
-                    "status": result.status,
+                    "status": "set",
+                    "notification_type": notification_type,
                     "subsession_id": subsession_id
                 }
 
             elif ntype == NotificationType.TICKET_UPDATE:
-                # Remote ticket watch
+                # Remote ticket watch - use RPC
                 ticket_id = params.get('ticket_id')
                 states = params.get('states', [])
-                if not ticket_id or not states:
-                    return {"error": "Missing ticket_id or states in params"}
+                if not ticket_id:
+                    return {"error": "Missing ticket_id in params"}
 
                 remote_url = f"{self.kanban_base_url}/notalone/register"
                 notification_id = await self.notification_hub.watch_ticket_remote(
                     remote_url=remote_url,
                     ticket_id=ticket_id,
-                    states=states,
+                    states=states or ['done'],  # Default to watching 'done' state
                     wake_prompt=wake_prompt
                 )
                 return {
                     "notification_id": notification_id,
                     "status": "registered_remote",
+                    "notification_type": notification_type,
                     "ticket_id": ticket_id
                 }
 
@@ -1254,7 +1251,8 @@ This uses notalone to wake your parent session. You can continue working after s
                 )
                 return {
                     "notification_id": result.notification_id,
-                    "status": result.status,
+                    "status": "subscribed",
+                    "notification_type": notification_type,
                     "channel": channel
                 }
 
@@ -1262,8 +1260,8 @@ This uses notalone to wake your parent session. You can continue working after s
                 return {"error": f"Unsupported notification type: {notification_type}"}
 
         except Exception as e:
-            _logger.error(f"Error setting notification: {e}")
-            return {"error": str(e)}
+            logger.error(f"Error registering notification: {e}", exc_info=True)
+            return {"error": f"Registration failed: {str(e)}"}
 
     async def unregister_notification(self, notification_id: str) -> dict:
         """Unregister any notification by ID (notalone protocol)."""
