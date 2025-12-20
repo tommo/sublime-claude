@@ -545,6 +545,10 @@ This uses notalone to wake your parent session. You can continue working after s
 
     async def can_use_tool(self, tool_name: str, tool_input: dict, context=None):
         """Handle permission request - ask Sublime for approval."""
+        # Handle AskUserQuestion - show UI and collect answers
+        if tool_name == "AskUserQuestion":
+            return await self._handle_ask_user_question(tool_input)
+
         # Auto-allow built-in sublime MCP tools
         if tool_name.startswith("mcp__sublime__"):
             return PermissionResultAllow(updated_input=tool_input)
@@ -615,6 +619,57 @@ This uses notalone to wake your parent session. You can continue working after s
         else:
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  -> WARNING: pid {pid} not found in pending!\n")
+
+        send_result(id, {"status": "ok"})
+
+    async def _handle_ask_user_question(self, tool_input: dict):
+        """Handle AskUserQuestion tool - show UI and collect answers."""
+        questions = tool_input.get("questions", [])
+        if not questions:
+            return PermissionResultAllow(updated_input=tool_input)
+
+        self.permission_id += 1
+        qid = self.permission_id
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"AskUserQuestion: qid={qid}, questions={len(questions)}\n")
+
+        future = asyncio.get_event_loop().create_future()
+        self.pending_questions[qid] = future
+
+        send_notification("question_request", {
+            "id": qid,
+            "questions": questions,
+        })
+
+        try:
+            answers = await asyncio.wait_for(future, timeout=300)
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"AskUserQuestion response: qid={qid}, answers={answers}\n")
+
+            if answers is None:
+                return PermissionResultDeny(message="User cancelled")
+
+            updated_input = {"questions": questions, "answers": answers}
+            return PermissionResultAllow(updated_input=updated_input)
+        except asyncio.TimeoutError:
+            return PermissionResultDeny(message="Question timed out")
+        finally:
+            self.pending_questions.pop(qid, None)
+
+    async def handle_question_response(self, id: int, params: dict) -> None:
+        """Handle question response from Sublime."""
+        qid = params.get("id")
+        answers = params.get("answers")
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"question_response: qid={qid}, answers={answers}\n")
+
+        if qid in self.pending_questions:
+            self.pending_questions[qid].set_result(answers)
+        else:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  -> WARNING: qid {qid} not found!\n")
 
         send_result(id, {"status": "ok"})
 
