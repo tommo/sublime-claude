@@ -18,11 +18,22 @@ from settings import load_project_settings
 from logger import get_bridge_logger, ContextLogger
 from constants import BRIDGE_BUFFER_SIZE
 
-# Import notalone notification system
+# Import notalone notification system (central lib)
 from notalone.hub import NotificationHub
-from notalone.backends.sublime import SublimeNotificationBackend
 from notalone.types import NotificationType, NotificationParams, Notification
 from notalone.rpc.integration import RemoteNotificationHub
+# Import project-specific backend (local)
+from notalone_backends.sublime import SublimeNotificationBackend
+
+
+class SublimeNotificationHub(RemoteNotificationHub):
+    """Sublime-specific notification hub with correct instance_id prefix."""
+
+    @property
+    def instance_id(self) -> str:
+        """Return sublime-prefixed instance ID."""
+        return f"sublime.{self.session_id}"
+
 
 # Initialize logger
 _logger = get_bridge_logger()
@@ -159,7 +170,7 @@ class Bridge:
             session_id=session_id
         )
         local_hub = NotificationHub(self.notification_backend)
-        self.notification_hub = RemoteNotificationHub(
+        self.notification_hub = SublimeNotificationHub(
             hub=local_hub,
             session_id=session_id,
             rpc_host="localhost",
@@ -196,9 +207,13 @@ class Bridge:
             system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
 
         # Add unified notification guide to system prompt
-        notification_guide = """
+        session_id_info = f"sublime.{session_id}"
+        notification_guide = f"""
 
 ## Notification System (Notalone)
+
+Your session ID is: **{session_id_info}**
+Use this when calling watch_kanban or other remote notification tools.
 
 You have access to a unified notification system for all wake-up scenarios.
 Uses notalone protocol: register/unregister/list.
@@ -207,21 +222,21 @@ Uses notalone protocol: register/unregister/list.
 - notification_type: 'timer', 'subsession_complete', 'agent_complete', 'ticket_update', 'channel'
 - params: Dict with type-specific parameters
 - wake_prompt: Message to inject when notification fires
-- Returns: {'notification_id': str, 'status': str}
+- Returns: {{'notification_id': str, 'status': str}}
 
 **Examples:**
 
 # Timer (wake me up in 30 minutes)
-register_notification('timer', {'seconds': 1800}, 'Timer completed!')
+register_notification('timer', {{'seconds': 1800}}, 'Timer completed!')
 
 # Subsession completion (I'm done, wake parent)
-register_notification('subsession_complete', {'subsession_id': 'subsession-abc123'}, 'Subsession completed')
+register_notification('subsession_complete', {{'subsession_id': 'subsession-abc123'}}, 'Subsession completed')
 
 # Remote ticket watch (wake me when ticket #123 is done)
-register_notification('ticket_update', {'ticket_id': 123, 'states': ['done']}, 'Ticket is done!')
+register_notification('ticket_update', {{'ticket_id': 123, 'states': ['done']}}, 'Ticket is done!')
 
 # Channel subscription (wake me on channel messages)
-register_notification('channel', {'channel': 'project-updates'}, 'New project update!')
+register_notification('channel', {{'channel': 'project-updates'}}, 'New project update!')
 
 **Other tools:**
 - unregister_notification(notification_id) - Unregister any notification
@@ -262,6 +277,13 @@ This uses notalone to wake your parent session. You can continue working after s
             options_dict["model"] = params["model"]
         if params.get("betas"):
             options_dict["betas"] = params["betas"]
+
+        # Sandbox settings from project config
+        sandbox = self._load_sandbox_settings(cwd)
+        if sandbox:
+            options_dict["sandbox"] = sandbox
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  sandbox enabled: {sandbox}\n")
 
         # Add MCP servers if found
         if mcp_servers:
@@ -326,6 +348,40 @@ This uses notalone to wake your parent session. You can continue working after s
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  loaded MCP servers: {list(servers.keys())}\n")
         return servers
+
+    def _load_sandbox_settings(self, cwd: str) -> dict:
+        """Load sandbox settings from project config."""
+        settings = load_project_settings(cwd)
+        sandbox_config = settings.get("sandbox", {})
+
+        if not sandbox_config.get("enabled"):
+            return None
+
+        sandbox = {
+            "enabled": True,
+            "auto_allow_bash_if_sandboxed": sandbox_config.get("autoAllowBashIfSandboxed", False),
+        }
+
+        # Excluded commands (bypass sandbox)
+        if "excludedCommands" in sandbox_config:
+            sandbox["excluded_commands"] = sandbox_config["excludedCommands"]
+
+        # Allow model to request unsandboxed execution
+        if sandbox_config.get("allowUnsandboxedCommands"):
+            sandbox["allow_unsandboxed_commands"] = True
+
+        # Network settings
+        network = sandbox_config.get("network", {})
+        if network:
+            sandbox["network"] = {}
+            if network.get("allowLocalBinding"):
+                sandbox["network"]["allow_local_binding"] = True
+            if network.get("allowUnixSockets"):
+                sandbox["network"]["allow_unix_sockets"] = network["allowUnixSockets"]
+            if network.get("allowAllUnixSockets"):
+                sandbox["network"]["allow_all_unix_sockets"] = True
+
+        return sandbox
 
     def _load_agents(self, cwd: str) -> dict:
         """Load subagent definitions from project settings, plus built-in agents."""

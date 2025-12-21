@@ -9,11 +9,11 @@ import logging
 from typing import Callable, Optional, Dict, Any, List, Set
 from datetime import datetime
 
-from ..types import (
+from notalone.types import (
     Notification, NotificationResult, NotificationType,
     NotificationParams
 )
-from ..backend import NotificationBackend, NotificationCallback
+from notalone.backend import NotificationBackend, NotificationCallback
 
 logger = logging.getLogger(__name__)
 

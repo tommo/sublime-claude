@@ -13,7 +13,7 @@ async def test_notalone_imports():
     """Test that notalone modules can be imported."""
     try:
         from notalone.hub import NotificationHub
-        from notalone.backends.sublime import SublimeNotificationBackend
+        from notalone_backends.sublime import SublimeNotificationBackend
         from notalone.types import NotificationType, NotificationParams, Notification
         print("✓ Notalone modules imported successfully")
         return True
@@ -25,7 +25,7 @@ async def test_notalone_imports():
 async def test_sublime_backend_initializes():
     """Test that SublimeNotificationBackend can be initialized."""
     from notalone.hub import NotificationHub
-    from notalone.backends.sublime import SublimeNotificationBackend
+    from notalone_backends.sublime import SublimeNotificationBackend
 
     # Create a mock send_notification function
     def mock_send_notification(method: str, params: dict):
@@ -65,7 +65,7 @@ async def test_notification_types():
 async def test_timer_notification():
     """Test setting a timer notification."""
     from notalone.hub import NotificationHub
-    from notalone.backends.sublime import SublimeNotificationBackend
+    from notalone_backends.sublime import SublimeNotificationBackend
     from notalone.types import NotificationType
 
     notifications_sent = []
@@ -105,7 +105,7 @@ async def test_timer_notification():
 async def test_session_complete_signal():
     """Test signaling session complete."""
     from notalone.hub import NotificationHub
-    from notalone.backends.sublime import SublimeNotificationBackend
+    from notalone_backends.sublime import SublimeNotificationBackend
 
     notifications_sent = []
 
