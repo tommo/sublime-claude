@@ -442,14 +442,17 @@ class Session:
             wake_prompt = params.get("wake_prompt", "")
             display_message = params.get("display_message", "")  # User-friendly message
             notification_id = params.get("notification_id", "")
-            view_id = self.output.view.id() if self.output.view else "no-view"
 
-            # Use display_message for user if available, otherwise fall back to wake_prompt
-            user_message = display_message if display_message else wake_prompt
+            # Use display_message for user (concise), wake_prompt goes to agent (detailed)
+            # If no display_message, extract first line of wake_prompt
+            if display_message:
+                user_message = display_message
+            else:
+                # Extract first meaningful line for display
+                first_line = wake_prompt.split("\n")[0].strip() if wake_prompt else ""
+                user_message = first_line if first_line else "🔔 Notification received"
 
             print(f"[Claude] {user_message}")
-            print(f"[Claude] Notification ID: {notification_id}")
-            print(f"[Claude] Session state: initialized={self.initialized}, working={self.working}, client={self.client is not None}")
 
             # If session is still working, queue the wake query for when it becomes idle
             if self.working:
