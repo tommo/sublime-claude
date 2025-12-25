@@ -7,9 +7,9 @@ from typing import Dict, Tuple
 # Use absolute imports for bridge compatibility
 try:
     from .constants import (
-        USER_SETTINGS_DIR,
-        SETTINGS_FILE,
+        USER_SETTINGS_FILE,
         PROJECT_SETTINGS_DIR,
+        SETTINGS_FILE,
         MCP_CONFIG_FILE,
         USER_PROFILES_DIR,
         PROFILES_FILE
@@ -18,26 +18,24 @@ try:
 except ImportError:
     # Fallback for standalone bridge script
     from constants import (
-        USER_SETTINGS_DIR,
-        SETTINGS_FILE,
+        USER_SETTINGS_FILE,
         PROJECT_SETTINGS_DIR,
+        SETTINGS_FILE,
         MCP_CONFIG_FILE,
         USER_PROFILES_DIR,
         PROFILES_FILE
     )
     from error_handler import safe_json_load
 
-USER_SETTINGS_PATH = USER_SETTINGS_DIR / SETTINGS_FILE
-
 
 def load_project_settings(cwd: str = None) -> dict:
     """Load and merge user-level and project settings.
 
-    User settings from ~/.claude/settings.json are loaded first,
-    then project settings override them.
+    User settings from ~/.claude.json are loaded first,
+    then project settings (.claude/settings.json) override them.
     """
     # Start with user-level settings
-    user_settings = safe_json_load(str(USER_SETTINGS_PATH), default={})
+    user_settings = safe_json_load(str(USER_SETTINGS_FILE), default={})
 
     if not cwd:
         return user_settings

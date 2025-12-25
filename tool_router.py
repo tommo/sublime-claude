@@ -153,7 +153,8 @@ def create_sublime_router() -> ToolRouter:
         f"'timer', "
         f"{{'seconds': {args.get('seconds')}}}, "
         f"{args.get('wake_prompt')!r}, "
-        f"{args.get('notification_id')})")
+        f"{args.get('notification_id')}, "
+        f"{args.get('session_id')})")
 
     router.register("wait_for_subsession", lambda args:
         f"return register_notification("

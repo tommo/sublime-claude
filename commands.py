@@ -5,6 +5,7 @@ import sublime_plugin
 from .core import get_active_session, get_session_for_view, create_session
 from .session import Session, load_saved_sessions
 from .prompt_builder import PromptBuilder
+from .command_parser import CommandParser
 
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
@@ -954,6 +955,14 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if not text:
             return
 
+        # Check for slash commands
+        cmd = CommandParser.parse(text)
+        if cmd:
+            s.output.exit_input_mode(keep_text=False)
+            s.draft_prompt = ""
+            self._handle_command(s, cmd)
+            return
+
         s.output.exit_input_mode(keep_text=False)
         s.draft_prompt = ""
 
@@ -962,6 +971,39 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             s.queue_prompt(text)
         else:
             s.query(text)
+
+    def _handle_command(self, session, cmd):
+        """Handle a slash command."""
+        if cmd.name == "clear":
+            self._cmd_clear(session)
+        elif cmd.name == "compact":
+            self._cmd_compact(session)
+        elif cmd.name == "context":
+            self._cmd_context(session)
+        else:
+            # Unknown command - send as regular prompt to Claude
+            session.query(cmd.raw)
+
+    def _cmd_clear(self, session):
+        """Clear conversation history."""
+        session.output.clear()
+        sublime.status_message("Claude: conversation cleared")
+
+    def _cmd_compact(self, session):
+        """Send /compact to Claude for context summarization."""
+        session.query("/compact", display_prompt="/compact")
+
+    def _cmd_context(self, session):
+        """Show pending context items."""
+        if not session.pending_context:
+            session.output.text("\n*No pending context.*\n")
+        else:
+            lines = ["\n*Pending context:*"]
+            for item in session.pending_context:
+                lines.append(f"  📎 {item.name}")
+            lines.append("")
+            session.output.text("\n".join(lines))
+        session.output.enter_input_mode()
 
 
 class ClaudeEnterInputModeCommand(sublime_plugin.TextCommand):

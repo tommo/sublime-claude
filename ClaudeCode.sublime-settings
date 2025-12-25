@@ -3,6 +3,10 @@
     // Must have claude-agent-sdk installed: pip install claude-agent-sdk
     "python_path": "python3",
 
+    // Default model when no profile is selected
+    // Options: "opus", "sonnet", "haiku"
+    "default_model": "opus",
+
     // Tools Claude is allowed to use
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],

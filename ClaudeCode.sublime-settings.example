@@ -3,6 +3,11 @@
     // Must have claude-agent-sdk installed: pip install claude-agent-sdk
     "python_path": "python3",
 
+    // Default model when no profile is selected
+    // Options: "opus", "sonnet", "haiku"
+    // If not set, defaults to SDK default (sonnet)
+    "default_model": "opus",
+
     // Tools Claude is allowed to use without confirmation
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
@@ -13,5 +18,31 @@
     //   "acceptEdits"       - Auto-accept file edits
     //   "plan"              - Planning mode only
     //   "bypassPermissions" - Allow all tools (use with caution)
-    "permission_mode": "acceptEdits"
+    "permission_mode": "acceptEdits",
+
+    // Sandbox mode - restricts command execution for safety
+    // When enabled, bash commands run in isolated environment
+    "sandbox": {
+        // Enable sandbox mode
+        "enabled": false,
+
+        // Auto-approve bash commands when sandboxed (safe since restricted)
+        "autoAllowBashIfSandboxed": true,
+
+        // Commands that always bypass sandbox (e.g., docker needs host access)
+        "excludedCommands": ["docker", "podman"],
+
+        // Allow Claude to request running specific commands unsandboxed
+        // Falls back to permission system for approval
+        "allowUnsandboxedCommands": false,
+
+        // Network restrictions within sandbox
+        "network": {
+            // Allow binding to local ports (for dev servers)
+            "allowLocalBinding": true,
+
+            // Specific unix sockets to allow (e.g., docker socket)
+            "allowUnixSockets": ["/var/run/docker.sock"]
+        }
+    }
 }

@@ -9,6 +9,7 @@ PLUGIN_NAME = "ClaudeCode"
 # ─── User Directories ─────────────────────────────────────────────────────────
 USER_HOME = Path.home()
 USER_SETTINGS_DIR = USER_HOME / ".claude"
+USER_SETTINGS_FILE = USER_HOME / ".claude.json"  # User-level settings (MCP, etc.)
 USER_PROFILES_DIR = USER_HOME / ".claude-sublime"
 
 # ─── Project Directories ──────────────────────────────────────────────────────
