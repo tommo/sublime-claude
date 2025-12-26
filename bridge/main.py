@@ -18,21 +18,8 @@ from settings import load_project_settings
 from logger import get_bridge_logger, ContextLogger
 from constants import BRIDGE_BUFFER_SIZE
 
-# Import notalone notification system (central lib)
-from notalone.hub import NotificationHub
-from notalone.types import NotificationType, NotificationParams, Notification
-from notalone.rpc.integration import RemoteNotificationHub
-# Import project-specific backend (local)
-from notalone_backends.sublime import SublimeNotificationBackend
-
-
-class SublimeNotificationHub(RemoteNotificationHub):
-    """Sublime-specific notification hub with correct instance_id prefix."""
-
-    @property
-    def instance_id(self) -> str:
-        """Return sublime-prefixed instance ID."""
-        return f"sublime.{self.session_id}"
+# Import notalone2 client for daemon-based notifications
+from notalone2_client import Notalone2Client, set_timer, wait_for_subsession
 
 
 # Initialize logger
@@ -101,9 +88,8 @@ class Bridge:
         # Queue for injected prompts that arrive when query completes
         self.pending_injects: list[str] = []
 
-        # Notification system (notalone)
-        self.notification_backend: SublimeNotificationBackend | None = None
-        self.notification_hub: RemoteNotificationHub | None = None
+        # Notification system (notalone2)
+        self.notalone: Notalone2Client | None = None
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -148,6 +134,12 @@ class Bridge:
                 subsession_id = params.get("subsession_id")
                 if subsession_id:
                     await self.signal_subsession_complete(subsession_id)
+            elif method == "list_notifications":
+                result = await self.list_notifications()
+                send_result(id, result)
+            elif method == "discover_services":
+                result = await self.discover_services()
+                send_result(id, result)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -163,22 +155,18 @@ class Bridge:
 
         # Use resume_id if resuming, otherwise use view_id as local session identifier
         session_id = resume_id or view_id or str(uuid.uuid4())
+        self._session_id = session_id
 
-        # Initialize notification system with RPC support
-        self.notification_backend = SublimeNotificationBackend(
-            send_notification=send_notification,
-            session_id=session_id
+        # Initialize notalone2 client (connects to daemon)
+        self.notalone = Notalone2Client(
+            prefix="sublime",
+            session_id=str(session_id),
+            on_inject=self._on_notalone_inject
         )
-        local_hub = NotificationHub(self.notification_backend)
-        self.notification_hub = SublimeNotificationHub(
-            hub=local_hub,
-            session_id=session_id,
-            rpc_host="localhost",
-            rpc_port=0  # Auto-assign port
-        )
-        await self.notification_hub.start()
-        callback_url = self.notification_hub.server.get_callback_url()
-        _logger.info(f"Notification system (notalone) initialized with RPC at {callback_url}")
+        if await self.notalone.connect():
+            _logger.info(f"notalone2: connected as sublime.{session_id}")
+        else:
+            _logger.warning("notalone2: daemon not available, notifications disabled")
 
         # Change to project directory so SDK finds CLAUDE.md etc.
         if cwd and os.path.isdir(cwd):
@@ -206,41 +194,21 @@ class Bridge:
         if addon:
             system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
 
-        # Add unified notification guide to system prompt
+        # Add notification guide to system prompt
         session_id_info = f"sublime.{session_id}"
         notification_guide = f"""
 
-## Notification System (Notalone)
+## Notifications (notalone2)
 
-Your session ID is: **{session_id_info}**
-Use this when calling watch_kanban or other remote notification tools.
+Session ID: **{session_id_info}**
 
-You have access to a unified notification system for all wake-up scenarios.
-Uses notalone protocol: register/unregister/list.
+discover_services() - See available notification types
+register_notification(type, params, wake_prompt) - Subscribe to notifications
+list_notifications() - List active subscriptions
+unregister_notification(notification_id) - Cancel a subscription
 
-**register_notification(notification_type, params, wake_prompt)**
-- notification_type: 'timer', 'subsession_complete', 'agent_complete', 'ticket_update', 'channel'
-- params: Dict with type-specific parameters
-- wake_prompt: Message to inject when notification fires
-- Returns: {{'notification_id': str, 'status': str}}
-
-**Examples:**
-
-# Timer (wake me up in 30 minutes)
-register_notification('timer', {{'seconds': 1800}}, 'Timer completed!')
-
-# Subsession completion (I'm done, wake parent)
-register_notification('subsession_complete', {{'subsession_id': 'subsession-abc123'}}, 'Subsession completed')
-
-# Remote ticket watch (wake me when ticket #123 is done)
-register_notification('ticket_update', {{'ticket_id': 123, 'states': ['done']}}, 'Ticket is done!')
-
-# Channel subscription (wake me on channel messages)
-register_notification('channel', {{'channel': 'project-updates'}}, 'New project update!')
-
-**Other tools:**
-- unregister_notification(notification_id) - Unregister any notification
-- list_notifications() - See all active notifications
+Built-in types: timer, subsession
+Service types: discovered via discover_services()
 """
         system_prompt = (system_prompt + notification_guide) if system_prompt else notification_guide
 
@@ -250,12 +218,7 @@ register_notification('channel', {{'channel': 'project-updates'}}, 'New project 
         if subsession_id:
             subsession_guide = f"""
 
-IMPORTANT: You are a subsession with ID: {subsession_id}
-When you complete your task, call signal_complete() to notify your parent:
-
-signal_complete(result_summary="Brief summary of what was accomplished")
-
-This uses notalone to wake your parent session. You can continue working after signaling.
+You are subsession **{subsession_id}**. Call signal_complete() when done to wake parent.
 """
             system_prompt += subsession_guide
 
@@ -897,6 +860,27 @@ This uses notalone to wake your parent session. You can continue working after s
             f.write(f"cancel_pending: cancelled {count} requests\n")
         send_result(id, {"status": "ok", "cancelled": count})
 
+    def _on_notalone_inject(
+        self,
+        session_id: str,
+        wake_prompt: str,
+        context: Optional[dict]
+    ) -> None:
+        """Handle inject callback from notalone2 daemon."""
+        _logger.info(f"notalone2 inject: session={session_id}, prompt={wake_prompt[:50]}...")
+
+        # Send notification to Sublime for UI update
+        display_message = wake_prompt.split("\n")[0] if wake_prompt else "Notification"
+        send_notification("notification_wake", {
+            "session_id": session_id,
+            "wake_prompt": wake_prompt,
+            "display_message": display_message,
+            "context": context
+        })
+
+        # Queue the wake prompt for injection
+        self.pending_injects.append(wake_prompt)
+
     async def inject_message(self, id: int, params: dict) -> None:
         """Inject a user message into the current conversation."""
         message = params.get("message", "")
@@ -956,13 +940,11 @@ This uses notalone to wake your parent session. You can continue working after s
         except Exception as e:
             send_error(id, -32000, f"Failed to get history: {str(e)}")
 
-    # ─── Notification Tools (notalone API) ────────────────────────────────
-    # Note: Most notification functionality is now in dedicated MCP servers:
-    # - notalone: timers, session completion, list/unregister
-    # - vibekanban: watch_kanban for ticket state changes
+    # ─── Notification Tools (notalone2) ────────────────────────────────
+    # Uses notalone2 daemon for timer, subsession, and service notifications
 
     async def signal_subsession_complete(self, subsession_id: str = None, result_summary: str = None) -> dict:
-        """Signal that a subsession has completed using notalone.
+        """Signal that a subsession has completed.
 
         Args:
             subsession_id: Optional subsession ID. If None, uses self._subsession_id
@@ -974,22 +956,16 @@ This uses notalone to wake your parent session. You can continue working after s
         if not subsession_id:
             return {"error": "Not a subsession - no subsession_id available"}
 
-        if self.notification_backend:
-            count = await self.notification_backend.signal_session_complete(subsession_id)
-            _logger.info(f"Subsession {subsession_id} completed - triggered {count} notifications")
+        if self.notalone:
+            success = await self.notalone.signal_complete(subsession_id)
+            _logger.info(f"Subsession {subsession_id} completed - signaled: {success}")
             return {
-                "status": "signaled",
+                "status": "signaled" if success else "failed",
                 "subsession_id": subsession_id,
-                "notifications_triggered": count,
                 "result_summary": result_summary
             }
 
-        return {"error": "Notification backend not initialized"}
-
-    # ─── Unified Notification Interface (Notalone) ───────────────────────
-    # These methods provide a unified API for all notification types,
-    # called by tool_router to enable direct bridge access for subsessions
-    # Uses notalone protocol terminology: register/unregister/list
+        return {"error": "notalone2 not connected"}
 
     async def register_notification(
         self,
@@ -999,164 +975,84 @@ This uses notalone to wake your parent session. You can continue working after s
         notification_id: Optional[str] = None
     ) -> dict:
         """
-        Universal notification interface using notalone protocol.
+        Register a notification via notalone2 daemon.
 
-        ALL notifications (local and cross-system) go through the same RPC path.
-        This ensures semantic correctness - one code path, one implementation.
-
-        notification_type can be:
-        - 'timer' → TIMER
-        - 'subsession_complete' → SUBSESSION_COMPLETE
-        - 'agent_complete' → AGENT_COMPLETE (alias for subsession_complete)
-        - 'ticket_update' → TICKET_UPDATE (remote)
-        - 'channel' → CHANNEL (remote)
+        notification_type: 'timer', 'subsession'
+        params: Type-specific parameters
+        wake_prompt: Message to inject when notification fires
         """
-        from notalone.types import NotificationType, NotificationParams, Notification
-        from notalone.registry import NotaloneRegistry
-        from notalone.rpc.client import NotificationClient
-
-        # Map string types to NotificationType enum
-        type_map = {
-            'timer': NotificationType.TIMER,
-            'subsession_complete': NotificationType.SUBSESSION_COMPLETE,
-            'agent_complete': NotificationType.AGENT_COMPLETE,
-            'ticket_update': NotificationType.TICKET_UPDATE,
-            'channel': NotificationType.CHANNEL,
-        }
-
-        ntype = type_map.get(notification_type)
-        if not ntype:
-            return {"error": f"Unknown notification_type: {notification_type}"}
-
-        # Use local notification backend for local notifications
-        # (Hybrid approach: local = direct, cross-system = RPC)
-        if not self.notification_hub:
-            return {"error": "Notification system not initialized"}
+        if not self.notalone:
+            return {"error": "notalone2 not connected"}
 
         try:
-            if ntype == NotificationType.TIMER:
-                # Local timer - call backend directly
-                result = await self.notification_hub.set_timer(
-                    seconds=params.get('seconds', 0),
-                    wake_prompt=wake_prompt,
-                    repeat=params.get('repeat', False)
-                )
+            # Map old type names to notalone2 types
+            type_map = {
+                'timer': 'timer',
+                'subsession_complete': 'subsession',
+                'agent_complete': 'subsession',
+            }
+            ntype = type_map.get(notification_type, notification_type)
+
+            nid = await self.notalone.register(ntype, params, wake_prompt)
+            if nid:
                 return {
-                    "notification_id": result.notification_id,
-                    "status": "set",
+                    "notification_id": nid,
+                    "status": "registered",
                     "notification_type": notification_type
                 }
-
-            elif ntype in (NotificationType.SUBSESSION_COMPLETE, NotificationType.AGENT_COMPLETE):
-                # Subsession completion wait - call backend directly
-                subsession_id = params.get('subsession_id') or params.get('agent_id')
-                if not subsession_id:
-                    return {"error": "Missing subsession_id or agent_id in params"}
-
-                result = await self.notification_hub.wait_for_session(
-                    session_id=subsession_id,
-                    wake_prompt=wake_prompt
-                )
-                return {
-                    "notification_id": result.notification_id,
-                    "status": "set",
-                    "notification_type": notification_type,
-                    "subsession_id": subsession_id
-                }
-
-            elif ntype == NotificationType.TICKET_UPDATE:
-                # Remote ticket watch - use RPC
-                ticket_id = params.get('ticket_id')
-                states = params.get('states', [])
-                if not ticket_id:
-                    return {"error": "Missing ticket_id in params"}
-
-                remote_url = f"{self.kanban_base_url}/notalone/register"
-                notification_id = await self.notification_hub.watch_ticket_remote(
-                    remote_url=remote_url,
-                    ticket_id=ticket_id,
-                    states=states or ['done'],  # Default to watching 'done' state
-                    wake_prompt=wake_prompt
-                )
-                return {
-                    "notification_id": notification_id,
-                    "status": "registered_remote",
-                    "notification_type": notification_type,
-                    "ticket_id": ticket_id
-                }
-
-            elif ntype == NotificationType.CHANNEL:
-                # Channel subscription
-                channel = params.get('channel')
-                if not channel:
-                    return {"error": "Missing channel in params"}
-
-                result = await self.notification_hub.subscribe(
-                    session_id=self._session_id,
-                    channel=channel,
-                    wake_prompt=wake_prompt
-                )
-                return {
-                    "notification_id": result.notification_id,
-                    "status": "subscribed",
-                    "notification_type": notification_type,
-                    "channel": channel
-                }
-
             else:
-                return {"error": f"Unsupported notification type: {notification_type}"}
+                return {"error": "Registration failed"}
 
         except Exception as e:
-            logger.error(f"Error registering notification: {e}", exc_info=True)
+            _logger.error(f"Error registering notification: {e}")
             return {"error": f"Registration failed: {str(e)}"}
 
     async def unregister_notification(self, notification_id: str) -> dict:
-        """Unregister any notification by ID (notalone protocol)."""
-        if not self.notification_hub:
-            return {"error": "Notification system not initialized"}
+        """Unregister a notification by ID."""
+        if not self.notalone:
+            return {"error": "notalone2 not connected"}
 
         try:
-            result = await self.notification_hub.cancel_notification(notification_id)
+            success = await self.notalone.unregister(notification_id)
             return {
                 "notification_id": notification_id,
-                "status": result.status if hasattr(result, 'status') else "cancelled"
+                "status": "cancelled" if success else "failed"
             }
         except Exception as e:
             _logger.error(f"Error cancelling notification: {e}")
             return {"error": str(e)}
 
-    async def list_notifications(self, session_id: Optional[str] = None) -> list:
-        """List active notifications."""
-        if not self.notification_hub:
+    async def list_notifications(self) -> list:
+        """List active notifications for this session."""
+        if not self.notalone:
             return []
 
         try:
-            notifications = await self.notification_hub.list_notifications(session_id)
-            return [
-                {
-                    "notification_id": n.id,
-                    "notification_type": n.notification_type.value,
-                    "params": n.params.to_dict() if hasattr(n.params, 'to_dict') else {},
-                    "wake_prompt": n.wake_prompt,
-                    "source_session_id": n.source_session_id,
-                    "fired": n.fired,
-                    "cancelled": n.cancelled
-                }
-                for n in notifications
-            ]
+            return await self.notalone.list_notifications()
         except Exception as e:
             _logger.error(f"Error listing notifications: {e}")
             return []
+
+    async def discover_services(self) -> dict:
+        """Discover available notification services from daemon."""
+        if not self.notalone:
+            return {"error": "notalone2 not connected", "services": []}
+
+        try:
+            return await self.notalone.discover_services()
+        except Exception as e:
+            _logger.error(f"Error discovering services: {e}")
+            return {"error": str(e), "services": []}
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""
         if self.client:
             await self.client.disconnect()
 
-        # Stop notification system
-        if self.notification_hub:
-            await self.notification_hub.stop()
-            _logger.info("Notification system stopped")
+        # Disconnect from notalone2 daemon
+        if self.notalone:
+            await self.notalone.disconnect()
+            _logger.info("notalone2 disconnected")
 
         send_result(id, {"status": "shutdown"})
         self.running = False

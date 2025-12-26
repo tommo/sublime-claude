@@ -130,10 +130,8 @@ def create_sublime_router() -> ToolRouter:
     router.register("ask_user", lambda args:
         f"return ask_user({args.get('question', '')!r}, {args.get('options', [])!r})")
 
-    # ─── Unified Notification System (Notalone) ───────────────────────────
-    # Expose bridge's notalone backend for all wake-up scenarios:
-    # timers, subsession completion, remote watches
-    # Uses notalone protocol terminology: register/unregister/list
+    # ─── Notification System (notalone2) ───────────────────────────
+    # Uses notalone2 daemon for timers and subsession notifications
     router.register("register_notification", lambda args:
         f"return register_notification("
         f"notification_type={args.get('notification_type')!r}, "
@@ -145,7 +143,10 @@ def create_sublime_router() -> ToolRouter:
         f"return unregister_notification({args.get('notification_id')!r})")
 
     router.register("list_notifications", lambda args:
-        f"return list_notifications(session_id={args.get('session_id')})")
+        f"return list_notifications()")
+
+    router.register("discover_services", lambda args:
+        f"return discover_services()")
 
     # Convenience shortcuts for common notification types
     router.register("set_timer", lambda args:

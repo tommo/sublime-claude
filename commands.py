@@ -10,16 +10,24 @@ from .command_parser import CommandParser
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
     """Start a new session. Shows profile picker if profiles are configured."""
-    def run(self, profile: str = None) -> None:
-        from .settings import load_profiles_and_checkpoints
+    def run(self, profile: str = None, persona_id: int = None) -> None:
+        from .settings import load_profiles_and_checkpoints, load_project_settings
         import os
+
+        # If persona_id specified, acquire and start
+        if persona_id:
+            self._start_with_persona(persona_id)
+            return
 
         # Get project profiles path
         project_path = None
+        cwd = None
         if self.window.folders():
-            project_path = os.path.join(self.window.folders()[0], ".claude", "profiles.json")
+            cwd = self.window.folders()[0]
+            project_path = os.path.join(cwd, ".claude", "profiles.json")
 
         profiles, checkpoints = load_profiles_and_checkpoints(project_path)
+        settings = load_project_settings(cwd)
 
         # If profile specified directly, use it
         if profile:
@@ -30,6 +38,14 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         # Build options list
         options = []
 
+        # Default option (always available)
+        options.append(("default", None, "🆕 New Session", "Start fresh with default settings"))
+
+        # Personas - get URL from sublime settings
+        sublime_settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        persona_url = sublime_settings.get("persona_url", "http://localhost:5002/personas")
+        options.append(("persona", persona_url, "👤 From Persona...", "Acquire a persona identity"))
+
         # Profiles
         for name, config in profiles.items():
             desc = config.get("description", f"{config.get('model', 'default')} model")
@@ -39,9 +55,6 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         for name, config in checkpoints.items():
             desc = config.get("description", "Saved checkpoint")
             options.append(("checkpoint", name, f"📍 {name}", desc))
-
-        # Default option (always available)
-        options.insert(0, ("default", None, "🆕 New Session", "Start fresh with default settings"))
 
         if len(options) == 1:
             # Only default, just start
@@ -57,6 +70,8 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
             opt_type, opt_name, _, _ = options[idx]
             if opt_type == "default":
                 create_session(self.window)
+            elif opt_type == "persona":
+                self._show_persona_picker(opt_name)  # opt_name contains the URL
             elif opt_type == "profile":
                 profile_config = profiles.get(opt_name, {})
                 create_session(self.window, profile=profile_config)
@@ -69,6 +84,101 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
                     sublime.error_message(f"Checkpoint '{opt_name}' has no session_id")
 
         self.window.show_quick_panel(items, on_select)
+
+    def _show_persona_picker(self, persona_url: str) -> None:
+        """Show list of personas to pick from."""
+        from . import persona_client
+        import threading
+
+        def fetch_and_show():
+            personas = persona_client.list_personas(persona_url)
+            if not personas:
+                sublime.set_timeout(lambda: sublime.status_message("No personas available"), 0)
+                return
+
+            # Build options: unlocked first, then locked
+            unlocked = [p for p in personas if not p.get("is_locked")]
+            locked = [p for p in personas if p.get("is_locked")]
+
+            options = []
+            for p in unlocked:
+                tags = ", ".join(p.get("tags", [])) if p.get("tags") else ""
+                desc = p.get("notes", tags) or "No description"
+                options.append((p["id"], f"👤 {p['alias']}", desc[:60]))
+
+            for p in locked:
+                locked_by = p.get("locked_by_session", "unknown")
+                options.append((p["id"], f"🔒 {p['alias']}", f"Locked by {locked_by}"))
+
+            def show_panel():
+                items = [[opt[1], opt[2]] for opt in options]
+
+                def on_select(idx):
+                    if idx < 0:
+                        return
+                    persona_id = options[idx][0]
+                    self._start_with_persona(persona_id, persona_url)
+
+                self.window.show_quick_panel(items, on_select)
+
+            sublime.set_timeout(show_panel, 0)
+
+        threading.Thread(target=fetch_and_show, daemon=True).start()
+
+    def _start_with_persona(self, persona_id: int, persona_url: str = None) -> None:
+        """Acquire persona and start session."""
+        from . import persona_client
+        from .settings import load_project_settings
+        import threading
+        import os
+
+        if not persona_url:
+            cwd = self.window.folders()[0] if self.window.folders() else None
+            settings = load_project_settings(cwd)
+            persona_url = settings.get("persona_url")
+
+        if not persona_url:
+            sublime.error_message("persona_url not configured in settings")
+            return
+
+        def acquire_and_start():
+            # Generate session ID for locking
+            import uuid
+            session_id = f"sublime-{uuid.uuid4().hex[:8]}"
+
+            result = persona_client.acquire_persona(session_id, persona_id=persona_id, base_url=persona_url)
+
+            if "error" in result:
+                sublime.set_timeout(
+                    lambda: sublime.error_message(f"Failed to acquire persona: {result['error']}"),
+                    0
+                )
+                return
+
+            persona = result.get("persona", {})
+            ability = result.get("ability", {})
+            handoff_notes = result.get("handoff_notes")
+
+            # Build profile config from persona
+            profile_config = {
+                "model": ability.get("model", "sonnet"),
+                "system_prompt_addon": ability.get("system_prompt", ""),
+                "persona_id": persona_id,
+                "persona_session_id": session_id,
+                "persona_url": persona_url,
+                "description": f"Persona: {persona.get('alias', 'unknown')}"
+            }
+
+            def start():
+                s = create_session(self.window, profile=profile_config)
+                # Show handoff notes if present
+                if handoff_notes:
+                    s.output.text(f"\n*Handoff notes:* {handoff_notes}\n")
+                sublime.status_message(f"Acquired persona: {persona.get('alias', 'unknown')}")
+
+            sublime.set_timeout(start, 0)
+
+        threading.Thread(target=acquire_and_start, daemon=True).start()
 
 
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
@@ -672,6 +782,12 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             items.append([f"📍 {name}", desc])
             actions.append(("checkpoint", config))
 
+        # Add "From Persona" option
+        sublime_settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        persona_url = sublime_settings.get("persona_url", "http://localhost:5002/personas")
+        items.append(["👤 From Persona...", "Acquire a persona identity"])
+        actions.append(("persona", persona_url))
+
         # Add "New Session" option at end
         items.append(["🆕 New Session", "Start fresh with default settings"])
         actions.append(("new", None))
@@ -709,10 +825,96 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                     # Fork the current session
                     if data.session_id:
                         create_session(self.window, resume_id=data.session_id, fork=True)
+                elif action == "persona" and data:
+                    # Show persona picker
+                    self._show_persona_picker(data)
                 elif action == "focus" and data:
                     data.output.show()
 
         self.window.show_quick_panel(items, on_select)
+
+    def _show_persona_picker(self, persona_url: str) -> None:
+        """Show list of personas to pick from."""
+        from . import persona_client
+        from .core import create_session
+        import threading
+
+        def fetch_and_show():
+            personas = persona_client.list_personas(persona_url)
+            if not personas:
+                sublime.set_timeout(lambda: sublime.status_message("No personas available"), 0)
+                return
+
+            # Build options: unlocked first, then locked
+            unlocked = [p for p in personas if not p.get("is_locked")]
+            locked = [p for p in personas if p.get("is_locked")]
+
+            options = []
+            for p in unlocked:
+                tags = ", ".join(p.get("tags", [])) if p.get("tags") else ""
+                desc = p.get("notes", tags) or "No description"
+                options.append((p["id"], f"👤 {p['alias']}", desc[:60]))
+
+            for p in locked:
+                locked_by = p.get("locked_by_session", "unknown")
+                options.append((p["id"], f"🔒 {p['alias']}", f"Locked by {locked_by}"))
+
+            def show_panel():
+                items = [[opt[1], opt[2]] for opt in options]
+
+                def on_select(idx):
+                    if idx < 0:
+                        return
+                    persona_id = options[idx][0]
+                    self._start_with_persona(persona_id, persona_url)
+
+                self.window.show_quick_panel(items, on_select)
+
+            sublime.set_timeout(show_panel, 0)
+
+        threading.Thread(target=fetch_and_show, daemon=True).start()
+
+    def _start_with_persona(self, persona_id: int, persona_url: str) -> None:
+        """Acquire persona and start session."""
+        from . import persona_client
+        from .core import create_session
+        import threading
+        import uuid
+
+        def acquire_and_start():
+            session_id = f"sublime-{uuid.uuid4().hex[:8]}"
+
+            result = persona_client.acquire_persona(session_id, persona_id=persona_id, base_url=persona_url)
+
+            if "error" in result:
+                sublime.set_timeout(
+                    lambda: sublime.error_message(f"Failed to acquire persona: {result['error']}"),
+                    0
+                )
+                return
+
+            persona = result.get("persona", {})
+            ability = result.get("ability", {})
+            handoff_notes = result.get("handoff_notes")
+
+            profile_config = {
+                "model": ability.get("model", "sonnet"),
+                "system_prompt_addon": ability.get("system_prompt", ""),
+                "persona_id": persona_id,
+                "persona_session_id": session_id,
+                "persona_url": persona_url,
+                "description": f"Persona: {persona.get('alias', 'unknown')}"
+            }
+
+            def start():
+                s = create_session(self.window, profile=profile_config)
+                if handoff_notes:
+                    s.output.text(f"\n*Handoff notes:* {handoff_notes}\n")
+                sublime.status_message(f"Acquired persona: {persona.get('alias', 'unknown')}")
+
+            sublime.set_timeout(start, 0)
+
+        threading.Thread(target=acquire_and_start, daemon=True).start()
 
     def _show_restart_picker(self, session, profiles, checkpoints):
         """Show profile/checkpoint picker for restart."""

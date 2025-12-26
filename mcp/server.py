@@ -300,14 +300,13 @@ User can always type a custom response.""",
                         "required": ["question"]
                     }
                 },
-                # ─── Notification Tools (Notalone) ──────────────────────────
-                # Local notifications (timers) and cross-system notifications
-                # All powered by notalone - the unified notification protocol
+                # ─── Notification Tools (notalone2) ──────────────────────────
+                # Timer and subsession notifications via notalone2 daemon
                 {
                     "name": "set_timer",
                     "description": """Set a timer to wake this session after specified seconds.
 
-Uses notalone for reliable notification delivery. Timer runs in bridge process.
+Timer is managed by notalone2 daemon.
 
 Example:
   set_timer(
@@ -407,18 +406,27 @@ Returns notification_id that can be used with unregister_notification() to cance
                 },
                 {
                     "name": "list_notifications",
-                    "description": """List all active notifications for this session (or all sessions).
+                    "description": """List all active notifications for this session.
 
-Shows timers, ticket watches, channel subscriptions, and subsession waits.
-All managed through notalone - not alone, list all!""",
+Shows timers, subsession waits, and service subscriptions.
+Lists notifications registered with notalone2 daemon.""",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: session view ID (omit to list all sessions)"
-                            }
-                        }
+                        "properties": {}
+                    }
+                },
+                {
+                    "name": "discover_services",
+                    "description": """Discover available notification services from notalone2 daemon.
+
+Returns list of registered services and their notification types.
+Use this to see what kinds of notifications you can subscribe to.
+
+Built-in types: timer, subsession
+Service types: kanban.ticket_state, etc.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
                     }
                 },
                 {
@@ -426,7 +434,7 @@ All managed through notalone - not alone, list all!""",
                     "description": """Cancel any notification by its notification_id.
 
 Works with ALL notification types: timers, ticket watches, channel subscriptions.
-Pure notalone operation - unregister from anywhere!
+Unregisters from notalone2 daemon.
 
 Example:
   unregister_notification(notification_id="ntf-abc123")""",
@@ -450,16 +458,14 @@ Example:
                     "description": """Watch a ticket for state changes in the kanban system. Wakes this session when the ticket enters one of the specified states.
 
 Automatically registers with the configured kanban server (set via kanban_base_url in settings).
-Tickets live in the kanban system, so this always uses remote notification via the notalone RPC protocol.
+Tickets live in the kanban system, notification registered via notalone2 daemon.
 
 Example:
   watch_ticket(
       ticket_id=75,
       states=["done", "blocked"],
-      wake_prompt="🎉 Ticket #75 changed state!"
-  )
-
-You're notalone - the kanban system will notify you when the ticket changes!""",
+      wake_prompt="Ticket #75 changed state!"
+  )""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -486,18 +492,15 @@ You're notalone - the kanban system will notify you when the ticket changes!""",
                 },
                 {
                     "name": "subscribe_channel",
-                    "description": """Subscribe to a notalone channel. Wakes this session when messages are broadcast to the channel.
+                    "description": """Subscribe to a channel. Wakes this session when messages are broadcast to the channel.
 
-Powered by notalone - the unified notification protocol for AI agents.
-Use for inter-session communication and coordination. You're notalone!
+Use for inter-session communication and coordination via notalone2 daemon.
 
 Example:
   subscribe_channel(
       channel="build-updates",
       wake_prompt="Build status update received"
-  )
-
-Now you'll wake when other agents broadcast to 'build-updates' - notify all as one!""",
+  )""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -519,19 +522,16 @@ Now you'll wake when other agents broadcast to 'build-updates' - notify all as o
                 },
                 {
                     "name": "broadcast_message",
-                    "description": """Broadcast a message via notalone to all subscribers of a channel (or globally to all sessions).
+                    "description": """Broadcast a message to all subscribers of a channel (or globally to all sessions).
 
-Powered by notalone - notify all as one! Use to coordinate with other agents and sessions.
-Messages wake subscribed sessions with their wake_prompt + your message.
+Use to coordinate with other agents and sessions via notalone2 daemon.
 
 Example:
   broadcast_message(
       channel="build-updates",
       message="Build completed successfully",
       data={"status": "success", "duration": "2m15s"}
-  )
-
-All agents subscribed to 'build-updates' will wake - you're notalone!""",
+  )""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

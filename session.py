@@ -78,6 +78,16 @@ class Session:
             self.subsession_id = None
             self.parent_view_id = None
 
+        # Persona info (for release on close)
+        if profile:
+            self.persona_id = profile.get("persona_id")
+            self.persona_session_id = profile.get("persona_session_id")
+            self.persona_url = profile.get("persona_url")
+        else:
+            self.persona_id = None
+            self.persona_session_id = None
+            self.persona_url = None
+
     def start(self) -> None:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
         python_path = settings.get("python_path", "python3")
@@ -329,9 +339,8 @@ class Session:
         # Clear any stale permission UI (query finished, no more permissions expected)
         self.output.clear_all_permissions()
 
-        # Notify ALL bridges that this subsession completed (for notalone notification system)
+        # Notify ALL bridges that this subsession completed (for notalone2)
         # Other sessions may be waiting on this subsession via notifications
-        # Each session has its own bridge, so we need to broadcast to all
         if self.output.view:
             view_id = str(self.output.view.id())
             # Broadcast to all active sessions' bridges
@@ -406,13 +415,32 @@ class Session:
             self.working = False
 
     def stop(self) -> None:
+        # Release persona if acquired
+        if self.persona_session_id and self.persona_url:
+            self._release_persona()
+
         if self.client:
             self.client.send("shutdown", {}, lambda _: self.client.stop())
         self._clear_status()
 
+    def _release_persona(self) -> None:
+        """Release acquired persona."""
+        import threading
+        from . import persona_client
+
+        session_id = self.persona_session_id
+        persona_url = self.persona_url
+
+        def release():
+            result = persona_client.release_persona(session_id, base_url=persona_url)
+            if "error" not in result:
+                print(f"[Claude] Released persona for session {session_id}")
+
+        threading.Thread(target=release, daemon=True).start()
+
     # ─── Notification Tools ───────────────────────────────────────────────
     # Notification tools are provided by dedicated MCP servers:
-    # - notalone MCP server: timers, session completion, list/unregister
+    # - notalone2 daemon: timers, session completion, list/unregister
     # - vibekanban MCP server: watch_kanban for ticket state changes
 
     def _on_notification(self, method: str, params: dict) -> None:
@@ -692,7 +720,7 @@ class Session:
 
         sublime.set_timeout(ask_next, 0)
 
-    # ─── Unified Notification API (notalone) ──────────────────────────────────
+    # ─── Notification API (notalone2) ──────────────────────────────────
 
     def register_notification(
         self,
@@ -702,7 +730,7 @@ class Session:
         notification_id: Optional[str] = None,
         callback: Optional[callable] = None
     ) -> None:
-        """Register a notification using notalone protocol.
+        """Register a notification via notalone2 daemon.
 
         Args:
             notification_type: 'timer', 'subsession_complete', 'ticket_update', 'channel'

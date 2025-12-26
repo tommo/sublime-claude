@@ -13,7 +13,10 @@
 
     // Permission mode for tool execution
     // Options: "default", "acceptEdits", "plan", "bypassPermissions"
-    "permission_mode": "acceptEdits"
+    "permission_mode": "acceptEdits",
+
+    // Persona service URL for identity management
+    "persona_url": "http://localhost:5002/personas"
 
     // Profiles and checkpoints are stored in separate files:
     //   User-level:    ~/.claude-sublime/profiles.json

@@ -391,9 +391,11 @@ class MCPSocketServer:
             "terminus_send": self._terminus_send,
             "terminus_read": self._terminus_read,
             "terminus_close": self._terminus_close,
-            # Notification tools (notalone API)
+            # Notification tools (notalone2)
             "register_notification": self._register_notification,
             "signal_subsession_complete": self._signal_subsession_complete,
+            "list_notifications": self._list_notifications,
+            "discover_services": self._discover_services,
         }
 
         # Handle return statements
@@ -844,7 +846,7 @@ class MCPSocketServer:
             resume_id = checkpoints[checkpoint].get("session_id")
             fork = True
 
-        # Generate unique subsession ID for notalone completion tracking
+        # Generate unique subsession ID for notalone2 completion tracking
         subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
 
         # Get parent view ID for context
@@ -1316,13 +1318,11 @@ class MCPSocketServer:
 
         return sublime._claude_sessions[view_id], None
 
-    # ─── Notification Tools (notalone API) ────────────────────────────────
-    # Note: Most notification tools are now in dedicated MCP servers:
-    # - notalone: timers, session completion, list/unregister
-    # - vibekanban: watch_kanban for ticket state changes
+    # ─── Notification Tools (notalone2) ────────────────────────────────
+    # Uses notalone2 daemon for timer and subsession notifications
 
     def _register_notification(self, notification_type: str, params: dict, wake_prompt: str, notification_id: str = None, session_id: int = None) -> dict:
-        """Register a notification using notalone API.
+        """Register a notification via notalone2.
 
         Args:
             notification_type: 'timer', 'subsession_complete', 'ticket_update', 'channel'
@@ -1384,3 +1384,47 @@ class MCPSocketServer:
             "status": "signal_sent",
             "result_summary": result_summary
         }
+
+    def _list_notifications(self, session_id: int = None) -> list:
+        """List active notifications for this session."""
+        session, error = self._get_session_for_tool(session_id)
+        if error:
+            return []
+
+        result = []
+
+        def on_result(notifications):
+            result.extend(notifications if notifications else [])
+
+        if session.client:
+            session.client.send("list_notifications", {}, on_result)
+
+        return result
+
+    def _discover_services(self) -> dict:
+        """Discover available notification services from notalone2 daemon."""
+        # Query daemon directly - no session needed
+        import socket
+        import json
+        from pathlib import Path
+
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({"method": "services"}) + "\n").encode())
+
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            return json.loads(data.decode().strip())
+        except FileNotFoundError:
+            return {"error": "notalone2 daemon not running", "services": [], "builtin": ["timer", "subsession"]}
+        except Exception as e:
+            return {"error": str(e), "services": [], "builtin": ["timer", "subsession"]}
