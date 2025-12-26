@@ -162,7 +162,7 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
             # Build profile config from persona
             profile_config = {
                 "model": ability.get("model", "sonnet"),
-                "system_prompt_addon": ability.get("system_prompt", ""),
+                "system_prompt": ability.get("system_prompt", ""),
                 "persona_id": persona_id,
                 "persona_session_id": session_id,
                 "persona_url": persona_url,
@@ -899,7 +899,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
             profile_config = {
                 "model": ability.get("model", "sonnet"),
-                "system_prompt_addon": ability.get("system_prompt", ""),
+                "system_prompt": ability.get("system_prompt", ""),
                 "persona_id": persona_id,
                 "persona_session_id": session_id,
                 "persona_url": persona_url,
