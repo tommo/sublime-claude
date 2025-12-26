@@ -7,21 +7,27 @@ from .session import Session
 
 
 def plugin_loaded() -> None:
-    """Called when plugin is loaded. Start MCP server (orphaned views reconnect on focus)."""
+    """Called when plugin is loaded. Start MCP server and notalone client."""
     # Initialize session registry on sublime module (singleton)
     if not hasattr(sublime, '_claude_sessions'):
         sublime._claude_sessions = {}
 
-    # Lazy import to avoid circular import with mcp_server
+    # Start MCP server
     from . import mcp_server
     mcp_server.start()
 
+    # Start global notalone client (receives all injects for sublime.* sessions)
+    from . import notalone
+    notalone.start()
+
 
 def plugin_unloaded() -> None:
-    """Called when plugin is unloaded. Stop MCP server."""
-    # Lazy import to avoid circular import with mcp_server
+    """Called when plugin is unloaded. Stop MCP server and notalone client."""
     from . import mcp_server
     mcp_server.stop()
+
+    from . import notalone
+    notalone.stop()
 
 
 def get_session_for_view(view: sublime.View) -> Optional[Session]:

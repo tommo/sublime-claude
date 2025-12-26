@@ -148,21 +148,25 @@ def create_sublime_router() -> ToolRouter:
     router.register("discover_services", lambda args:
         f"return discover_services()")
 
+    # Generic subscribe - works with any service from discover_services()
+    router.register("subscribe", lambda args:
+        f"return register_notification("
+        f"notification_type={args.get('notification_type')!r}, "
+        f"params={args.get('params', {})!r}, "
+        f"wake_prompt={args.get('wake_prompt')!r})")
+
     # Convenience shortcuts for common notification types
     router.register("set_timer", lambda args:
         f"return register_notification("
         f"'timer', "
         f"{{'seconds': {args.get('seconds')}}}, "
-        f"{args.get('wake_prompt')!r}, "
-        f"{args.get('notification_id')}, "
-        f"{args.get('session_id')})")
+        f"{args.get('wake_prompt')!r})")
 
     router.register("wait_for_subsession", lambda args:
         f"return register_notification("
         f"'subsession_complete', "
         f"{{'subsession_id': {args.get('subsession_id')!r}}}, "
-        f"{args.get('wake_prompt')!r}, "
-        f"{args.get('notification_id')})")
+        f"{args.get('wake_prompt')!r})")
 
     router.register("signal_complete", lambda args:
         f"return signal_subsession_complete({args.get('result_summary')!r})")

@@ -302,37 +302,25 @@ User can always type a custom response.""",
                 },
                 # ─── Notification Tools (notalone2) ──────────────────────────
                 # Timer and subsession notifications via notalone2 daemon
+                # Session ID is embedded in bridge - no need to specify
                 {
                     "name": "set_timer",
                     "description": """Set a timer to wake this session after specified seconds.
 
-Timer is managed by notalone2 daemon.
-
 Example:
-  set_timer(
-      seconds=300,
-      wake_prompt="⏰ 5 minutes elapsed! Time to check the build."
-  )
+  set_timer(seconds=300, wake_prompt="⏰ 5 minutes elapsed!")
 
-Returns notification_id that can be used with unregister_notification() to cancel.""",
+Returns notification_id for cancellation via unregister_notification().""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "seconds": {
                                 "type": "integer",
-                                "description": "Number of seconds until notification fires"
+                                "description": "Seconds until notification fires"
                             },
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when timer fires"
-                            },
-                            "notification_id": {
-                                "type": "string",
-                                "description": "Optional: custom notification ID (auto-generated if omitted)"
-                            },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         },
                         "required": ["seconds", "wake_prompt"]
@@ -340,47 +328,34 @@ Returns notification_id that can be used with unregister_notification() to cance
                 },
                 {
                     "name": "signal_complete",
-                    "description": """Signal that this subsession has completed its work.
+                    "description": """Signal that this subsession has completed.
 
-ONLY use this if you are a subsession (spawned via spawn_session).
-Notifies the parent session that spawned you. Parent must be waiting via wait_for_subsession().
+ONLY for subsessions (spawned via spawn_session). Notifies parent session.
 
-Your subsession_id is automatically available in your context.
-This is a fire-and-forget notification - you can continue working after signaling.
-
-Example (from within a subsession):
-  signal_complete(result_summary="Architecture design complete. See output above.")
-
-The parent session will wake up and can read your output.""",
+Example:
+  signal_complete(result_summary="Task done. See output above.")""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "result_summary": {
                                 "type": "string",
-                                "description": "Optional: Brief summary of what was accomplished"
-                            },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: session view ID (defaults to current session)"
+                                "description": "Brief summary of what was accomplished"
                             }
                         }
                     }
                 },
                 {
                     "name": "wait_for_subsession",
-                    "description": """Wait for a subsession to complete. Wakes this session when the subsession finishes.
-
-Use this after spawning a subsession with spawn_session() to be notified when it completes.
-The spawned subsession must signal completion using signal_complete().
+                    "description": """Wait for a subsession to complete.
 
 Example:
-  result = spawn_session(prompt="Design the solution", name="architect")
+  result = spawn_session(prompt="Design solution", name="architect")
   wait_for_subsession(
       subsession_id=result['subsession_id'],
-      wake_prompt="🎉 Architect subsession completed! Review the design."
+      wake_prompt="Architect done! Review the design."
   )
 
-Returns notification_id that can be used with unregister_notification() to cancel the wait.""",
+Returns notification_id for cancellation.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -391,14 +366,6 @@ Returns notification_id that can be used with unregister_notification() to cance
                             "wake_prompt": {
                                 "type": "string",
                                 "description": "Prompt to inject when subsession completes"
-                            },
-                            "notification_id": {
-                                "type": "string",
-                                "description": "Optional: custom notification ID (auto-generated if omitted)"
-                            },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: session view ID (defaults to current session)"
                             }
                         },
                         "required": ["subsession_id", "wake_prompt"]
@@ -419,11 +386,22 @@ Lists notifications registered with notalone2 daemon.""",
                     "name": "discover_services",
                     "description": """Discover available notification services from notalone2 daemon.
 
-Returns list of registered services and their notification types.
-Use this to see what kinds of notifications you can subscribe to.
+Returns registered services with their notification types and required params.
+Use this first, then subscribe() to register for notifications.
 
 Built-in types: timer, subsession
-Service types: kanban.ticket_state, etc.""",
+Service types vary by connected services (e.g. jar-kanban.card_update)
+
+Example response:
+  {
+    "builtin": ["timer", "subsession"],
+    "services": {
+      "jar-kanban": {
+        "card_update": {"params": ["card_id"]},
+        "project_watch": {"params": ["project_slug"]}
+      }
+    }
+  }""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -431,10 +409,7 @@ Service types: kanban.ticket_state, etc.""",
                 },
                 {
                     "name": "unregister_notification",
-                    "description": """Cancel any notification by its notification_id.
-
-Works with ALL notification types: timers, ticket watches, channel subscriptions.
-Unregisters from notalone2 daemon.
+                    "description": """Cancel a notification by its notification_id.
 
 Example:
   unregister_notification(notification_id="ntf-abc123")""",
@@ -443,116 +418,40 @@ Example:
                         "properties": {
                             "notification_id": {
                                 "type": "string",
-                                "description": "Notification ID to cancel (from set_timer, watch_ticket, etc.)"
-                            },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: session view ID (defaults to current session)"
+                                "description": "Notification ID to cancel"
                             }
                         },
                         "required": ["notification_id"]
                     }
                 },
                 {
-                    "name": "watch_ticket",
-                    "description": """Watch a ticket for state changes in the kanban system. Wakes this session when the ticket enters one of the specified states.
-
-Automatically registers with the configured kanban server (set via kanban_base_url in settings).
-Tickets live in the kanban system, notification registered via notalone2 daemon.
+                    "name": "subscribe",
+                    "description": """Subscribe to a notification service discovered via discover_services().
 
 Example:
-  watch_ticket(
-      ticket_id=75,
-      states=["done", "blocked"],
-      wake_prompt="Ticket #75 changed state!"
+  services = discover_services()
+  subscribe(
+      notification_type="jar-kanban.card_update",
+      params={"card_id": "abc123"},
+      wake_prompt="Card updated!"
   )""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "ticket_id": {
-                                "type": "integer",
-                                "description": "Ticket ID to watch in the kanban system"
-                            },
-                            "states": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of states to watch for (e.g. ['done', 'blocked'])"
-                            },
-                            "wake_prompt": {
+                            "notification_type": {
                                 "type": "string",
-                                "description": "Prompt to inject when ticket enters watched state"
+                                "description": "Service type from discover_services()"
                             },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
-                            }
-                        },
-                        "required": ["ticket_id", "states", "wake_prompt"]
-                    }
-                },
-                {
-                    "name": "subscribe_channel",
-                    "description": """Subscribe to a channel. Wakes this session when messages are broadcast to the channel.
-
-Use for inter-session communication and coordination via notalone2 daemon.
-
-Example:
-  subscribe_channel(
-      channel="build-updates",
-      wake_prompt="Build status update received"
-  )""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "channel": {
-                                "type": "string",
-                                "description": "Channel name to subscribe to"
-                            },
-                            "wake_prompt": {
-                                "type": "string",
-                                "description": "Prompt to inject when message received"
-                            },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
-                            }
-                        },
-                        "required": ["channel", "wake_prompt"]
-                    }
-                },
-                {
-                    "name": "broadcast_message",
-                    "description": """Broadcast a message to all subscribers of a channel (or globally to all sessions).
-
-Use to coordinate with other agents and sessions via notalone2 daemon.
-
-Example:
-  broadcast_message(
-      channel="build-updates",
-      message="Build completed successfully",
-      data={"status": "success", "duration": "2m15s"}
-  )""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "message": {
-                                "type": "string",
-                                "description": "Message to broadcast"
-                            },
-                            "channel": {
-                                "type": "string",
-                                "description": "Optional: channel name (omit for global broadcast)"
-                            },
-                            "data": {
+                            "params": {
                                 "type": "object",
-                                "description": "Optional: additional data payload"
+                                "description": "Service-specific parameters"
                             },
-                            "session_id": {
-                                "type": "integer",
-                                "description": "Optional: specific session view_id (from list_sessions). If omitted, uses current session context."
+                            "wake_prompt": {
+                                "type": "string",
+                                "description": "Prompt to inject when notification fires"
                             }
                         },
-                        "required": ["message"]
+                        "required": ["notification_type", "params", "wake_prompt"]
                     }
                 }
             ]

@@ -19,7 +19,7 @@ from logger import get_bridge_logger, ContextLogger
 from constants import BRIDGE_BUFFER_SIZE
 
 # Import notalone2 client for daemon-based notifications
-from notalone2_client import Notalone2Client, set_timer, wait_for_subsession
+# notalone2 client removed - using global client in plugin instead
 
 
 # Initialize logger
@@ -89,7 +89,7 @@ class Bridge:
         self.pending_injects: list[str] = []
 
         # Notification system (notalone2)
-        self.notalone: Notalone2Client | None = None
+        # notalone handled by global client in plugin
 
     async def handle_request(self, req: dict) -> None:
         id = req.get("id")
@@ -157,16 +157,7 @@ class Bridge:
         session_id = resume_id or view_id or str(uuid.uuid4())
         self._session_id = session_id
 
-        # Initialize notalone2 client (connects to daemon)
-        self.notalone = Notalone2Client(
-            prefix="sublime",
-            session_id=str(session_id),
-            on_inject=self._on_notalone_inject
-        )
-        if await self.notalone.connect():
-            _logger.info(f"notalone2: connected as sublime.{session_id}")
-        else:
-            _logger.warning("notalone2: daemon not available, notifications disabled")
+        # notalone2 handled by global client in plugin (not per-bridge)
 
         # Change to project directory so SDK finds CLAUDE.md etc.
         if cwd and os.path.isdir(cwd):
@@ -860,26 +851,7 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
             f.write(f"cancel_pending: cancelled {count} requests\n")
         send_result(id, {"status": "ok", "cancelled": count})
 
-    def _on_notalone_inject(
-        self,
-        session_id: str,
-        wake_prompt: str,
-        context: Optional[dict]
-    ) -> None:
-        """Handle inject callback from notalone2 daemon."""
-        _logger.info(f"notalone2 inject: session={session_id}, prompt={wake_prompt[:50]}...")
-
-        # Send notification to Sublime for UI update
-        display_message = wake_prompt.split("\n")[0] if wake_prompt else "Notification"
-        send_notification("notification_wake", {
-            "session_id": session_id,
-            "wake_prompt": wake_prompt,
-            "display_message": display_message,
-            "context": context
-        })
-
-        # Queue the wake prompt for injection
-        self.pending_injects.append(wake_prompt)
+    # _on_notalone_inject removed - handled by global client in plugin
 
     async def inject_message(self, id: int, params: dict) -> None:
         """Inject a user message into the current conversation."""
@@ -940,119 +912,54 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
         except Exception as e:
             send_error(id, -32000, f"Failed to get history: {str(e)}")
 
-    # ─── Notification Tools (notalone2) ────────────────────────────────
-    # Uses notalone2 daemon for timer, subsession, and service notifications
+    # ─── Subsession signaling ────────────────────────────────────────────
+    # Notification registration handled by MCP tools directly to daemon
 
     async def signal_subsession_complete(self, subsession_id: str = None, result_summary: str = None) -> dict:
-        """Signal that a subsession has completed.
+        """Signal that a subsession has completed (direct socket to daemon)."""
+        import socket
+        from pathlib import Path
 
-        Args:
-            subsession_id: Optional subsession ID. If None, uses self._subsession_id
-            result_summary: Optional summary of what was accomplished
-        """
         if subsession_id is None:
             subsession_id = getattr(self, '_subsession_id', None)
 
         if not subsession_id:
             return {"error": "Not a subsession - no subsession_id available"}
 
-        if self.notalone:
-            success = await self.notalone.signal_complete(subsession_id)
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({
+                "method": "signal_complete",
+                "subsession_id": subsession_id
+            }) + "\n").encode())
+
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            resp = json.loads(data.decode().strip())
+            success = resp.get("ok", False)
             _logger.info(f"Subsession {subsession_id} completed - signaled: {success}")
             return {
                 "status": "signaled" if success else "failed",
                 "subsession_id": subsession_id,
                 "result_summary": result_summary
             }
-
-        return {"error": "notalone2 not connected"}
-
-    async def register_notification(
-        self,
-        notification_type: str,
-        params: dict,
-        wake_prompt: str,
-        notification_id: Optional[str] = None
-    ) -> dict:
-        """
-        Register a notification via notalone2 daemon.
-
-        notification_type: 'timer', 'subsession'
-        params: Type-specific parameters
-        wake_prompt: Message to inject when notification fires
-        """
-        if not self.notalone:
-            return {"error": "notalone2 not connected"}
-
-        try:
-            # Map old type names to notalone2 types
-            type_map = {
-                'timer': 'timer',
-                'subsession_complete': 'subsession',
-                'agent_complete': 'subsession',
-            }
-            ntype = type_map.get(notification_type, notification_type)
-
-            nid = await self.notalone.register(ntype, params, wake_prompt)
-            if nid:
-                return {
-                    "notification_id": nid,
-                    "status": "registered",
-                    "notification_type": notification_type
-                }
-            else:
-                return {"error": "Registration failed"}
-
         except Exception as e:
-            _logger.error(f"Error registering notification: {e}")
-            return {"error": f"Registration failed: {str(e)}"}
-
-    async def unregister_notification(self, notification_id: str) -> dict:
-        """Unregister a notification by ID."""
-        if not self.notalone:
-            return {"error": "notalone2 not connected"}
-
-        try:
-            success = await self.notalone.unregister(notification_id)
-            return {
-                "notification_id": notification_id,
-                "status": "cancelled" if success else "failed"
-            }
-        except Exception as e:
-            _logger.error(f"Error cancelling notification: {e}")
+            _logger.error(f"Error signaling subsession complete: {e}")
             return {"error": str(e)}
-
-    async def list_notifications(self) -> list:
-        """List active notifications for this session."""
-        if not self.notalone:
-            return []
-
-        try:
-            return await self.notalone.list_notifications()
-        except Exception as e:
-            _logger.error(f"Error listing notifications: {e}")
-            return []
-
-    async def discover_services(self) -> dict:
-        """Discover available notification services from daemon."""
-        if not self.notalone:
-            return {"error": "notalone2 not connected", "services": []}
-
-        try:
-            return await self.notalone.discover_services()
-        except Exception as e:
-            _logger.error(f"Error discovering services: {e}")
-            return {"error": str(e), "services": []}
 
     async def shutdown(self, id: int) -> None:
         """Shutdown the bridge."""
         if self.client:
             await self.client.disconnect()
-
-        # Disconnect from notalone2 daemon
-        if self.notalone:
-            await self.notalone.disconnect()
-            _logger.info("notalone2 disconnected")
 
         send_result(id, {"status": "shutdown"})
         self.running = False

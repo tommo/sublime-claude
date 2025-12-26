@@ -1296,7 +1296,11 @@ class MCPSocketServer:
         # If session_id provided, use it directly
         if session_id is not None:
             if session_id not in sublime._claude_sessions:
-                return None, {"error": f"Session not found: {session_id}"}
+                available = list(sublime._claude_sessions.keys())
+                return None, {
+                    "error": f"Session not found: {session_id}",
+                    "available_sessions": available
+                }
             return sublime._claude_sessions[session_id], None
 
         # Try to find session from execution context
@@ -1304,102 +1308,158 @@ class MCPSocketServer:
         if not window:
             return None, {"error": "No active window"}
 
-        # Only trust claude_executing_view (set during internal tool execution)
+        # Try claude_executing_view first (set during active query)
         view_id = window.settings().get("claude_executing_view")
 
+        # Fall back to claude_active_view (last active session)
         if not view_id or view_id not in sublime._claude_sessions:
-            # No reliable session context - require explicit session_id
+            view_id = window.settings().get("claude_active_view")
+
+        # Last resort: if only one session exists, use it
+        if not view_id or view_id not in sublime._claude_sessions:
             available = list(sublime._claude_sessions.keys())
-            return None, {
-                "error": "No session context available",
-                "hint": "Specify session_id parameter explicitly. Get available sessions with list_sessions()",
-                "available_sessions": available
-            }
+            if len(available) == 1:
+                view_id = available[0]
+            else:
+                return None, {
+                    "error": "No session context available",
+                    "hint": "Multiple sessions active. Focus the target session window.",
+                    "available_sessions": available
+                }
 
         return sublime._claude_sessions[view_id], None
 
     # ─── Notification Tools (notalone2) ────────────────────────────────
     # Uses notalone2 daemon for timer and subsession notifications
 
-    def _register_notification(self, notification_type: str, params: dict, wake_prompt: str, notification_id: str = None, session_id: int = None) -> dict:
-        """Register a notification via notalone2.
+    def _register_notification(self, notification_type: str, params: dict, wake_prompt: str) -> dict:
+        """Register a notification via notalone2 daemon (direct sync socket).
 
         Args:
-            notification_type: 'timer', 'subsession_complete', 'ticket_update', 'channel'
+            notification_type: 'timer', 'subsession_complete', or service type
             params: Type-specific parameters (e.g., {'seconds': 30} for timer)
             wake_prompt: Prompt to inject when notification fires
-            notification_id: Optional custom notification ID
-            session_id: Optional session ID (uses current session if not provided)
 
         Returns:
-            {notification_id: str, status: "set"}
+            {notification_id: str, status: "registered"}
         """
-        session, error = self._get_session_for_tool(session_id)
+        session, error = self._get_session_for_tool()
         if error:
             return error
 
-        result = {"pending": True}
+        # Get view_id for session_id
+        view_id = session.output.view.id() if session.output and session.output.view else None
+        if not view_id:
+            return {"error": "Session has no view"}
 
-        def on_result(notif_result):
-            result.update(notif_result)
+        # Direct sync socket call to daemon (like hive does)
+        import socket
+        from pathlib import Path
 
-        session.register_notification(
-            notification_type=notification_type,
-            params=params,
-            wake_prompt=wake_prompt,
-            notification_id=notification_id,
-            callback=on_result
-        )
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        session_id = f"sublime.{view_id}"
 
-        return {
-            "status": "notification_registered",
-            "notification_type": notification_type
-        }
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({
+                "method": "register",
+                "session_id": session_id,
+                "type": notification_type,
+                "params": params,
+                "wake_prompt": wake_prompt
+            }) + "\n").encode())
 
-    def _signal_subsession_complete(self, result_summary: str = None, session_id: int = None) -> dict:
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            resp = json.loads(data.decode().strip())
+
+            if resp.get("notification_id"):
+                return {
+                    "notification_id": resp["notification_id"],
+                    "status": "registered",
+                    "session_id": session_id
+                }
+            else:
+                return {"error": resp.get("error", "Registration failed")}
+
+        except FileNotFoundError:
+            return {"error": "notalone2 daemon not running"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _signal_subsession_complete(self, result_summary: str = None) -> dict:
         """Signal that this subsession has completed.
 
         Args:
             result_summary: Optional summary of what was accomplished
-            session_id: Optional session ID (uses current session if not provided)
 
         Returns:
-            {status: "signaled", subsession_id: str, notifications_triggered: int}
+            {status: "signaled", subsession_id: str}
         """
-        session, error = self._get_session_for_tool(session_id)
+        session, error = self._get_session_for_tool()
         if error:
             return error
 
-        result = {"pending": True}
+        if not session.client:
+            return {"error": "Session not connected"}
 
-        def on_result(signal_result):
-            result.update(signal_result)
-
-        session.signal_subsession_complete(
-            result_summary=result_summary,
-            callback=on_result
-        )
-
-        return {
-            "status": "signal_sent",
+        # Async - fire and forget for signaling
+        session.client.send("signal_subsession_complete", {
             "result_summary": result_summary
-        }
+        })
 
-    def _list_notifications(self, session_id: int = None) -> list:
-        """List active notifications for this session."""
-        session, error = self._get_session_for_tool(session_id)
+        return {"status": "signaled", "result_summary": result_summary}
+
+    def _list_notifications(self) -> dict:
+        """List active notifications for this session (direct sync socket)."""
+        session, error = self._get_session_for_tool()
         if error:
-            return []
+            return {"notifications": [], "error": str(error)}
 
-        result = []
+        # Get view_id for session_id
+        view_id = session.output.view.id() if session.output and session.output.view else None
+        if not view_id:
+            return {"notifications": [], "error": "Session has no view"}
 
-        def on_result(notifications):
-            result.extend(notifications if notifications else [])
+        # Direct sync socket call to daemon
+        import socket
+        from pathlib import Path
 
-        if session.client:
-            session.client.send("list_notifications", {}, on_result)
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        session_id = f"sublime.{view_id}"
 
-        return result
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({
+                "method": "list",
+                "session_id": session_id
+            }) + "\n").encode())
+
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            resp = json.loads(data.decode().strip())
+            return {"notifications": resp.get("notifications", [])}
+
+        except FileNotFoundError:
+            return {"notifications": [], "error": "notalone2 daemon not running"}
+        except Exception as e:
+            return {"notifications": [], "error": str(e)}
 
     def _discover_services(self) -> dict:
         """Discover available notification services from notalone2 daemon."""
