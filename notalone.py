@@ -25,6 +25,9 @@ class NotaloneClient:
     def __init__(self):
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Pending notifications per session (batch while busy)
+        self._pending: Dict[int, list] = {}  # view_id -> list of (wake_prompt, context)
+        self._pending_lock = threading.Lock()
 
     def start(self):
         """Start the pool connection in background thread."""
@@ -149,42 +152,59 @@ class NotaloneClient:
         logger.info(f"notalone: inject for view {view_id}: {wake_prompt[:50]}...")
         print(f"[Claude] notalone inject for view {view_id}: {wake_prompt[:50]}...")
 
-        # Find the session and inject
-        def do_inject():
-            if not hasattr(sublime, '_claude_sessions'):
-                logger.error("notalone: _claude_sessions not initialized")
-                return
+        # Queue the notification
+        with self._pending_lock:
+            if view_id not in self._pending:
+                self._pending[view_id] = []
+            self._pending[view_id].append((wake_prompt, context))
 
-            session = sublime._claude_sessions.get(view_id)
-            if not session:
-                logger.error(f"notalone: session not found for view {view_id}")
-                print(f"[Claude] notalone: session not found for view {view_id}, available: {list(sublime._claude_sessions.keys())}")
-                return
+        # Schedule processing on main thread
+        sublime.set_timeout(lambda: self._process_pending(view_id), 0)
 
-            # Inject the wake prompt
+    def _process_pending(self, view_id: int):
+        """Process pending notifications for a session (runs on main thread)."""
+        if not hasattr(sublime, '_claude_sessions'):
+            logger.error("notalone: _claude_sessions not initialized")
+            return
+
+        session = sublime._claude_sessions.get(view_id)
+        if not session:
+            logger.error(f"notalone: session not found for view {view_id}")
+            # Clear pending for non-existent session
+            with self._pending_lock:
+                self._pending.pop(view_id, None)
+            return
+
+        # If session is busy, try again later
+        if session.working:
+            sublime.set_timeout(lambda: self._process_pending(view_id), 500)
+            return
+
+        # Collect all pending notifications
+        with self._pending_lock:
+            pending = self._pending.pop(view_id, [])
+
+        if not pending:
+            return
+
+        # Batch into single wake prompt
+        if len(pending) == 1:
+            wake_prompt, context = pending[0]
             display_message = wake_prompt.split("\n")[0] if wake_prompt else "Notification"
-            print(f"[Claude] notalone: injecting to session {view_id}: {display_message}")
+        else:
+            # Combine multiple notifications
+            prompts = [p[0] for p in pending]
+            wake_prompt = f"📬 {len(pending)} notifications received:\n\n" + "\n\n---\n\n".join(prompts)
+            display_message = f"📬 {len(pending)} notifications"
+            print(f"[Claude] notalone: batching {len(pending)} notifications for view {view_id}")
 
-            try:
-                # If session is busy, queue it
-                if session.working:
-                    print(f"[Claude] notalone: session busy, queuing...")
+        print(f"[Claude] notalone: injecting to session {view_id}: {display_message}")
 
-                    def try_inject():
-                        if not session.working:
-                            session.query(wake_prompt, display_prompt=display_message)
-                        else:
-                            sublime.set_timeout(try_inject, 500)
-
-                    sublime.set_timeout(try_inject, 500)
-                else:
-                    session.query(wake_prompt, display_prompt=display_message)
-            except Exception as e:
-                logger.error(f"notalone: inject failed: {e}")
-                print(f"[Claude] notalone: inject failed: {e}")
-
-        # Schedule on main thread
-        sublime.set_timeout(do_inject, 0)
+        try:
+            session.query(wake_prompt, display_prompt=display_message)
+        except Exception as e:
+            logger.error(f"notalone: inject failed: {e}")
+            print(f"[Claude] notalone: inject failed: {e}")
 
 
 # Global client instance

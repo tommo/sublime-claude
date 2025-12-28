@@ -1388,7 +1388,24 @@ class MCPSocketServer:
                     "session_id": session_id
                 }
             else:
-                return {"error": resp.get("error", "Registration failed")}
+                error_msg = resp.get("error", "Registration failed")
+                # Fetch available services to help agent
+                try:
+                    services_resp = self._discover_services()
+                    available = services_resp.get("services", {})
+                    service_types = []
+                    for svc, types in available.items():
+                        for t in types:
+                            service_types.append(f"{svc}.{t}")
+                except:
+                    service_types = []
+
+                return {
+                    "error": error_msg,
+                    "hint": f"Invalid type '{notification_type}'. Use discover_services() or try one of these.",
+                    "builtin_types": ["timer", "subsession"],
+                    "service_types": service_types
+                }
 
         except FileNotFoundError:
             return {"error": "notalone2 daemon not running"}
