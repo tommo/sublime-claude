@@ -25,6 +25,9 @@ from constants import BRIDGE_BUFFER_SIZE
 # Initialize logger
 _logger = get_bridge_logger()
 
+# Set env var so child processes (bash commands) can detect they're running under Claude agent
+os.environ["CLAUDE_AGENT"] = "1"
+
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
@@ -517,6 +520,71 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
 
         return plugins
 
+    def _parse_permission_pattern(self, pattern: str) -> tuple[str, str | None]:
+        """Parse permission pattern into (tool_name, specifier).
+
+        Formats:
+            "Bash" -> ("Bash", None)
+            "Bash(git:*)" -> ("Bash", "git:*")
+            "Read(/src/**)" -> ("Read", "/src/**")
+        """
+        if '(' in pattern and pattern.endswith(')'):
+            paren_idx = pattern.index('(')
+            tool_name = pattern[:paren_idx]
+            specifier = pattern[paren_idx + 1:-1]
+            return tool_name, specifier
+        return pattern, None
+
+    def _match_permission_pattern(self, tool_name: str, tool_input: dict, pattern: str) -> bool:
+        """Check if tool use matches a permission pattern.
+
+        Supports:
+            - Simple tool match: "Bash" matches any Bash command
+            - Prefix match: "Bash(git:*)" matches commands starting with "git"
+            - Exact match: "Bash(git status)" matches exactly "git status"
+            - Glob match: "Read(/src/**/*.py)" matches files under /src/ ending in .py
+        """
+        import fnmatch
+
+        parsed_tool, specifier = self._parse_permission_pattern(pattern)
+
+        # Tool name must match (supports wildcards like mcp__*__)
+        if not fnmatch.fnmatch(tool_name, parsed_tool):
+            return False
+
+        # No specifier = match all uses of this tool
+        if specifier is None:
+            return True
+
+        # Get the value to match against based on tool type
+        match_value = None
+        if tool_name == "Bash":
+            match_value = tool_input.get("command", "")
+        elif tool_name in ("Read", "Write", "Edit"):
+            match_value = tool_input.get("file_path", "")
+        elif tool_name in ("Glob", "Grep"):
+            match_value = tool_input.get("pattern", "")
+        elif tool_name == "WebFetch":
+            match_value = tool_input.get("url", "")
+        else:
+            # For other tools, try common field names
+            match_value = tool_input.get("command") or tool_input.get("path") or tool_input.get("query", "")
+
+        if not match_value:
+            return False
+
+        # Handle prefix match with :* suffix (like Claude Code)
+        if specifier.endswith(":*"):
+            prefix = specifier[:-2]
+            return match_value.startswith(prefix)
+
+        # Handle glob/fnmatch patterns
+        if any(c in specifier for c in ['*', '?', '[']):
+            return fnmatch.fnmatch(match_value, specifier)
+
+        # Exact match
+        return match_value == specifier
+
     def _validate_bash_command(self, command: str) -> tuple[bool, str]:
         """Validate bash command for dangerous patterns.
 
@@ -576,10 +644,9 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
         settings = load_project_settings(self.cwd)
         auto_allowed = settings.get("autoAllowedMcpTools", [])
 
-        # Check if tool matches any auto-allow pattern
-        import fnmatch
+        # Check if tool matches any auto-allow pattern (supports fine-grained patterns)
         for pattern in auto_allowed:
-            if fnmatch.fnmatch(tool_name, pattern):
+            if self._match_permission_pattern(tool_name, tool_input, pattern):
                 with open("/tmp/claude_bridge.log", "a") as f:
                     f.write(f"can_use_tool: auto-allowed {tool_name} (matched pattern: {pattern})\n")
                 return PermissionResultAllow(updated_input=tool_input)
@@ -933,7 +1000,8 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
             sock.connect(socket_path)
             sock.sendall((json.dumps({
                 "method": "signal_complete",
-                "subsession_id": subsession_id
+                "subsession_id": subsession_id,
+                "result_summary": result_summary
             }) + "\n").encode())
 
             data = b""

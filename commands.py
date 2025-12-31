@@ -1364,12 +1364,20 @@ class ClaudeCodeManageAutoAllowedToolsCommand(sublime_plugin.WindowCommand):
     def show_add_pattern_input(self, settings_path, settings, auto_allowed):
         """Show input panel to add a new pattern."""
         # Build common patterns list
+        # Format: "Tool" or "Tool(specifier)" where specifier can be:
+        #   - exact match: "Bash(git status)"
+        #   - prefix match: "Bash(git:*)" matches commands starting with "git"
+        #   - glob pattern: "Read(/src/**/*.py)"
         common_patterns = [
             "mcp__*__*",  # All MCP tools
             "mcp__plugin_*",  # All plugin MCP tools
-            "Bash",  # Bash tool
-            "Read",  # Read tool
-            "Write",  # Write tool
+            "Bash(git:*)",  # Git commands only
+            "Bash(ls:*)",  # ls commands
+            "Bash(cat:*)",  # cat commands
+            "Bash(python:*)",  # python commands
+            "Bash(npm:*)",  # npm commands
+            "Read",  # All Read
+            "Write",  # All Write
         ]
 
         # Show quick panel with common patterns + custom option

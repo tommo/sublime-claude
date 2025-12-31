@@ -424,56 +424,39 @@ class MCPSocketServer:
         return [v.file_name() for v in window.views() if v.file_name()]
 
     def _get_window_summary(self) -> dict:
-        """Get summary of current window state."""
+        """Get summary of current window state (formatted for reduced context)."""
         window = sublime.active_window()
         if not window:
-            return {"success": False, "error": "No window"}
+            return {"error": "No window"}
 
-        # Get all open files
-        open_files = []
-        for view in window.views():
-            file_path = view.file_name()
-            if file_path:
-                open_files.append({
-                    "path": file_path,
-                    "is_dirty": view.is_dirty(),
-                    "size": view.size(),
-                })
+        # Build formatted output
+        lines = []
 
-        # Get active file with selection info
-        active_view = window.active_view()
-        active_file = None
-        if active_view and active_view.file_name():
-            active_file = {
-                "path": active_view.file_name(),
-                "line_count": active_view.rowcol(active_view.size())[0] + 1,
-                "selection": [
-                    {
-                        "start": active_view.rowcol(sel.begin()),
-                        "end": active_view.rowcol(sel.end()),
-                    }
-                    for sel in active_view.sel()
-                ],
-            }
-
-        # Get project folders
+        # Project folders
         folders = window.folders()
+        if folders:
+            lines.append(f"Project: {folders[0]}")
+            for f in folders[1:]:
+                lines.append(f"  + {f}")
 
-        # Get layout info
-        layout = window.layout()
-        num_groups = window.num_groups()
+        # Active file
+        active_view = window.active_view()
+        if active_view and active_view.file_name():
+            row, col = active_view.rowcol(active_view.sel()[0].begin()) if active_view.sel() else (0, 0)
+            lines.append(f"Active: {active_view.file_name()}:{row+1}:{col+1}")
 
-        return {
-            "success": True,
-            "open_files_count": len(open_files),
-            "open_files": open_files,
-            "active_file": active_file,
-            "project_folders": folders,
-            "layout": {
-                "groups": num_groups,
-                "cells": layout.get("cells", []),
-            },
-        }
+        # Open files (compact list)
+        open_files = [v.file_name() for v in window.views() if v.file_name()]
+        dirty_files = [v.file_name() for v in window.views() if v.file_name() and v.is_dirty()]
+
+        lines.append(f"Open files ({len(open_files)}):")
+        for f in open_files[:20]:  # Limit to 20 files
+            marker = " *" if f in dirty_files else ""
+            lines.append(f"  • {os.path.basename(f)}{marker}")
+        if len(open_files) > 20:
+            lines.append(f"  ... and {len(open_files) - 20} more")
+
+        return {"summary": "\n".join(lines), "open_count": len(open_files), "dirty_count": len(dirty_files)}
 
     def _find_file(self, query: str, pattern: str = None, limit: int = 20) -> list:
         """Fuzzy find files by name, optionally filtered by glob pattern."""
@@ -580,8 +563,9 @@ class MCPSocketServer:
         if not symbols:
             return {"success": False, "error": "No symbols provided"}
 
-        results = {}
-        counts = {}
+        # Collect and format results
+        lines = []
+        all_locations = []
 
         for sym in symbols:
             locations = window.lookup_symbol_in_index(sym)
@@ -590,25 +574,20 @@ class MCPSocketServer:
             if file_path:
                 locations = [loc for loc in locations if loc[0] == file_path]
 
-            counts[sym] = len(locations)
+            if not locations:
+                lines.append(f"'{sym}': not found")
+                continue
 
-            per_sym = []
+            lines.append(f"'{sym}' ({len(locations)} matches):")
             for loc in locations[:limit] if limit > 0 else locations:
                 fp, display_name, (row, col) = loc[0], loc[1], loc[2]
-                per_sym.append({
-                    "name": display_name,
-                    "file": fp,
-                    "row": row,
-                    "col": col,
-                })
-            results[sym] = per_sym
+                lines.append(f"  • {os.path.basename(fp)}:{row}:{col} - {display_name}")
+                all_locations.append({"symbol": sym, "file": fp, "row": row, "col": col})
 
-        return {
-            "success": True,
-            "results": results,
-            "counts": counts,
-            "limit": limit,
-        }
+            if len(locations) > limit:
+                lines.append(f"  ... and {len(locations) - limit} more")
+
+        return {"summary": "\n".join(lines), "locations": all_locations[:50]}
 
     def _list_tools(self) -> list:
         """List available saved tools."""
@@ -665,8 +644,12 @@ class MCPSocketServer:
         view = window.open_file(f"{path}:{row}:{col}", sublime.ENCODED_POSITION)
         return {"file": path, "name": name, "row": row, "col": col}
 
-    def _read_view(self, file_path: str = None, view_name: str = None, head: int = None, tail: int = None, grep: str = None, grep_i: str = None) -> dict:
-        """Read content from any view by file path or view name with head/tail/grep filtering."""
+    def _read_view(self, file_path: str = None, view_name: str = None, head: int = None, tail: int = None, grep: str = None, grep_i: str = None, max_chars: int = 50000) -> dict:
+        """Read content from any view by file path or view name with head/tail/grep filtering.
+
+        Args:
+            max_chars: Maximum characters to return (default 50000). Use -1 for unlimited.
+        """
         import os
         import re
         window = sublime.active_window()
@@ -751,11 +734,18 @@ class MCPSocketServer:
 
         content = '\n'.join(all_lines)
 
+        # Truncate if content exceeds max_chars
+        truncated = False
+        if max_chars > 0 and len(content) > max_chars:
+            content = content[:max_chars]
+            truncated = True
+
         result = {
             "content": content,
             "size": len(content),
             "line_count": len(all_lines),
             "original_line_count": original_line_count,
+            "truncated": truncated,
         }
 
         # Include identifier in response
@@ -778,36 +768,35 @@ class MCPSocketServer:
     # ─── Session Spawn ────────────────────────────────────────────────────
 
     def _list_profiles(self) -> dict:
-        """List available profiles and checkpoints."""
+        """List available profiles and checkpoints (formatted)."""
         project_path = _get_project_profiles_path()
         profiles, checkpoints = load_profiles_and_checkpoints(project_path)
 
-        result = {
-            "profiles": [],
-            "checkpoints": [],
-            "paths": {
-                "user": "~/.claude-sublime/profiles.json",
-                "project": project_path or "(no project)",
-            }
-        }
+        lines = []
+        profile_names = []
+        checkpoint_names = []
 
-        for name, config in profiles.items():
-            result["profiles"].append({
-                "name": name,
-                "model": config.get("model", "default"),
-                "description": config.get("description", ""),
-                "has_preload_docs": bool(config.get("preload_docs")),
-                "betas": config.get("betas", []),
-            })
+        if profiles:
+            lines.append("Profiles:")
+            for name, config in profiles.items():
+                model = config.get("model", "default")
+                desc = config.get("description", "")
+                desc_short = f" - {desc[:40]}..." if len(desc) > 40 else f" - {desc}" if desc else ""
+                lines.append(f"  • {name} ({model}){desc_short}")
+                profile_names.append(name)
 
-        for name, config in checkpoints.items():
-            result["checkpoints"].append({
-                "name": name,
-                "session_id": config.get("session_id", "")[:8] + "...",
-                "description": config.get("description", ""),
-            })
+        if checkpoints:
+            lines.append("Checkpoints:")
+            for name, config in checkpoints.items():
+                desc = config.get("description", "")
+                desc_short = f" - {desc[:40]}..." if len(desc) > 40 else f" - {desc}" if desc else ""
+                lines.append(f"  • {name}{desc_short}")
+                checkpoint_names.append(name)
 
-        return result
+        if not lines:
+            lines.append("No profiles or checkpoints configured")
+
+        return {"summary": "\n".join(lines), "profiles": profile_names, "checkpoints": checkpoint_names}
 
     def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, fork_current: bool = False, wait_for_completion: bool = False) -> dict:
         """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag."""
@@ -901,24 +890,29 @@ class MCPSocketServer:
             "name": session.name or "(unnamed)",
         }
 
-    def _list_sessions(self) -> list:
-        """List all active sessions across all windows."""
-
-        result = []
+    def _list_sessions(self) -> dict:
+        """List all active sessions across all windows (formatted)."""
+        sessions = []
+        lines = []
         for view_id, session in sublime._claude_sessions.items():
-            result.append({
-                "view_id": view_id,
-                "name": session.name or "(unnamed)",
-                "working": session.working,
-                "query_count": session.query_count,
-                "total_cost": session.total_cost,
-                "window_id": session.window.id() if session.window else None,
-            })
-        return result
+            status = "⏳" if session.working else "✓"
+            cost = f"${session.total_cost:.4f}" if session.total_cost else ""
+            name = session.name or "(unnamed)"
+            lines.append(f"{status} [{view_id}] {name} ({session.query_count} queries) {cost}")
+            sessions.append({"view_id": view_id, "name": name, "working": session.working})
 
-    def _read_session_output(self, view_id: int, lines: int = None) -> dict:
-        """Read conversation output from a session's view."""
+        if not lines:
+            return {"summary": "No active sessions", "sessions": []}
+        return {"summary": "\n".join(lines), "sessions": sessions, "count": len(sessions)}
 
+    def _read_session_output(self, view_id: int, lines: int = None, max_chars: int = 30000) -> dict:
+        """Read conversation output from a session's view.
+
+        Args:
+            lines: Limit to last N lines
+            max_chars: Maximum characters to return (default 30000). Use -1 for unlimited.
+                       Smart truncation preserves message boundaries.
+        """
         # Debug: log all session view_ids
         all_view_ids = list(sublime._claude_sessions.keys())
         print(f"[Claude] read_session_output: looking for {view_id}, _sessions={id(sublime._claude_sessions)}, available: {all_view_ids}")
@@ -943,12 +937,40 @@ class MCPSocketServer:
             if len(all_lines) > lines:
                 content = '\n'.join(all_lines[-lines:])
 
+        # Smart truncation: preserve message boundaries
+        truncated = False
+        skipped_messages = 0
+        if max_chars > 0 and len(content) > max_chars:
+            # Split by message separator (─── or blank lines between messages)
+            import re
+            # Messages are typically separated by horizontal lines or double newlines
+            message_pattern = r'\n(?=───|╭|▸|⚠|✓|✗|\n\n)'
+            parts = re.split(message_pattern, content)
+
+            # Keep messages from the end until we exceed max_chars
+            kept_parts = []
+            total_len = 0
+            for part in reversed(parts):
+                if total_len + len(part) > max_chars and kept_parts:
+                    skipped_messages += 1
+                    continue
+                kept_parts.insert(0, part)
+                total_len += len(part) + 1  # +1 for separator
+
+            content = '\n'.join(kept_parts)
+            truncated = True
+
+            # Add truncation notice at the beginning
+            if skipped_messages > 0:
+                content = f"[... {skipped_messages} earlier messages truncated ...]\n\n{content}"
+
         return {
             "view_id": view_id,
             "name": session.name or "(unnamed)",
             "working": session.working,
             "output": content,
             "line_count": content.count('\n') + 1 if content else 0,
+            "truncated": truncated,
         }
 
     def _list_profile_docs(self) -> dict:
@@ -1154,6 +1176,8 @@ class MCPSocketServer:
                     # Send the command after terminal is ready
                     ["terminus_send_string", {"string": text, "tag": tag}]
                 ],
+                # Set env var so scripts can detect they're running under Claude agent
+                "env": {"CLAUDE_AGENT": "1"},
             }
             if cwd:
                 open_args["cwd"] = cwd
@@ -1412,28 +1436,48 @@ class MCPSocketServer:
         except Exception as e:
             return {"error": str(e)}
 
-    def _signal_subsession_complete(self, result_summary: str = None) -> dict:
+    def _signal_subsession_complete(self, session_id: int = None, result_summary: str = None) -> dict:
         """Signal that this subsession has completed.
 
+        Directly injects result_summary into parent session's prompt queue.
+
         Args:
+            session_id: The subsession's view_id (required to identify caller)
             result_summary: Optional summary of what was accomplished
 
         Returns:
             {status: "signaled", subsession_id: str}
         """
-        session, error = self._get_session_for_tool()
-        if error:
-            return error
+        # Look up the calling session by session_id
+        if session_id is None:
+            return {"error": "session_id is required - pass your view_id from spawn result"}
 
-        if not session.client:
-            return {"error": "Session not connected"}
+        session = sublime._claude_sessions.get(session_id)
+        if not session:
+            available = list(sublime._claude_sessions.keys())
+            return {"error": f"Session {session_id} not found", "available": available}
 
-        # Async - fire and forget for signaling
-        session.client.send("signal_subsession_complete", {
-            "result_summary": result_summary
-        })
+        # Get parent_view_id from this subsession
+        parent_view_id = getattr(session, 'parent_view_id', None)
+        subsession_id = getattr(session, 'subsession_id', None)
 
-        return {"status": "signaled", "result_summary": result_summary}
+        if not parent_view_id:
+            return {"error": f"Session {session_id} is not a subsession - no parent_view_id"}
+
+        # Look up parent session directly in Sublime
+        parent_session = sublime._claude_sessions.get(parent_view_id)
+        if not parent_session:
+            return {"error": f"Parent session not found: {parent_view_id}"}
+
+        # Inject result into parent session's prompt
+        wake_prompt = f"✅ Subsession {subsession_id} completed"
+        if result_summary:
+            wake_prompt += f":\n{result_summary}"
+
+        # Queue the prompt for parent (will be processed when parent is idle)
+        parent_session.query(wake_prompt, display_prompt=f"📬 Subsession complete")
+
+        return {"status": "signaled", "subsession_id": subsession_id, "result_summary": result_summary}
 
     def _list_notifications(self) -> dict:
         """List active notifications for this session (direct sync socket)."""

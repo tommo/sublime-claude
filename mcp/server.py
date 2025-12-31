@@ -331,17 +331,23 @@ Returns notification_id for cancellation via unregister_notification().""",
                     "description": """Signal that this subsession has completed.
 
 ONLY for subsessions (spawned via spawn_session). Notifies parent session.
+The session_id is your view_id (shown in spawn result).
 
 Example:
-  signal_complete(result_summary="Task done. See output above.")""",
+  signal_complete(session_id=12345, result_summary="Task done. See output above.")""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "session_id": {
+                                "type": "integer",
+                                "description": "Your session's view_id (from spawn result)"
+                            },
                             "result_summary": {
                                 "type": "string",
                                 "description": "Brief summary of what was accomplished"
                             }
-                        }
+                        },
+                        "required": ["session_id"]
                     }
                 },
                 {

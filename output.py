@@ -938,14 +938,35 @@ class OutputView:
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
 
-    def _respond_permission_with_callback(self, response: str, callback, tool: str) -> None:
+    def _make_auto_allow_pattern(self, tool: str, tool_input: dict) -> str:
+        """Create a fine-grained auto-allow pattern from tool and input.
+
+        For Bash: extracts command prefix (first word) -> "Bash(git:*)"
+        For Read/Write/Edit: uses full tool name (paths vary too much)
+        For MCP tools: uses full tool name
+        """
+        if not tool_input:
+            return tool
+
+        if tool == "Bash":
+            command = tool_input.get("command", "")
+            if command:
+                # Extract first word as prefix (e.g., "git", "npm", "python")
+                first_word = command.split()[0] if command.split() else ""
+                if first_word:
+                    return f"Bash({first_word}:*)"
+        # For other tools, just use the tool name (file paths vary too much)
+        return tool
+
+    def _respond_permission_with_callback(self, response: str, callback, tool: str, tool_input: dict = None) -> None:
         """Respond to a permission request with given callback."""
         import time
 
         # Handle "allow all" - save to project settings and remember for this session
         if response == PERM_ALLOW_ALL:
-            self.auto_allow_tools.add(tool)
-            self._save_auto_allowed_tool(tool)
+            pattern = self._make_auto_allow_pattern(tool, tool_input)
+            self.auto_allow_tools.add(pattern)
+            self._save_auto_allowed_tool(pattern)
             response = PERM_ALLOW
 
         # Handle "allow 30s" - set timed auto-allow
@@ -1067,7 +1088,7 @@ class OutputView:
             # Mark as handled immediately
             callback = perm.callback
             perm.callback = None
-            self._respond_permission_with_callback(response, callback, perm.tool)
+            self._respond_permission_with_callback(response, callback, perm.tool, perm.tool_input)
             return True
         return False
 
