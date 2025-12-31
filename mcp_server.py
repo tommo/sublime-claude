@@ -838,8 +838,8 @@ class MCPSocketServer:
         # Generate unique subsession ID for notalone2 completion tracking
         subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
 
-        # Get parent view ID for context
-        current_session = get_active_session(window)
+        # Get parent session (the one calling spawn, not UI-active)
+        current_session, _ = self._get_session_for_tool()
         parent_view_id = current_session.output.view.id() if current_session and current_session.output.view else None
 
         # Prepare initial context for subsession
@@ -1467,17 +1467,35 @@ class MCPSocketServer:
         # Look up parent session directly in Sublime
         parent_session = sublime._claude_sessions.get(parent_view_id)
         if not parent_session:
-            return {"error": f"Parent session not found: {parent_view_id}"}
+            available = list(sublime._claude_sessions.keys())
+            return {"error": f"Parent session not found: {parent_view_id}", "available": available}
 
-        # Inject result into parent session's prompt
+        # Check if parent session is ready to receive
+        if not parent_session.client:
+            return {"error": f"Parent session {parent_view_id} has no client connection"}
+        if not parent_session.initialized:
+            return {"error": f"Parent session {parent_view_id} not initialized"}
+
+        # Build wake prompt
         wake_prompt = f"✅ Subsession {subsession_id} completed"
         if result_summary:
             wake_prompt += f":\n{result_summary}"
 
-        # Queue the prompt for parent (will be processed when parent is idle)
-        parent_session.query(wake_prompt, display_prompt=f"📬 Subsession complete")
+        print(f"[Claude] signal_complete: queuing for parent {parent_view_id}: {wake_prompt[:50]}...")
 
-        return {"status": "signaled", "subsession_id": subsession_id, "result_summary": result_summary}
+        # Queue injection with retry if parent is busy
+        def try_inject():
+            if not parent_session.working:
+                print(f"[Claude] signal_complete: injecting now to {parent_view_id}")
+                parent_session.query(wake_prompt, display_prompt=f"📬 Subsession complete")
+            else:
+                # Parent still busy, retry in 500ms
+                print(f"[Claude] signal_complete: parent {parent_view_id} busy, retrying...")
+                sublime.set_timeout(try_inject, 500)
+
+        sublime.set_timeout(try_inject, 0)
+
+        return {"status": "signaled", "subsession_id": subsession_id, "parent_view_id": parent_view_id, "result_summary": result_summary}
 
     def _list_notifications(self) -> dict:
         """List active notifications for this session (direct sync socket)."""

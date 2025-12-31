@@ -19,15 +19,21 @@ SOCKET_PATH = str(Path.home() / ".notalone" / "notalone.sock")
 POOL_PREFIX = "sublime"
 
 
+# Batching config
+MAX_BATCH_SIZE = 5  # Flush after this many notifications
+MAX_BATCH_AGE_SECS = 30  # Flush oldest batch after this many seconds
+
+
 class NotaloneClient:
     """Global client that receives all injects for sublime.* sessions."""
 
     def __init__(self):
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        # Pending notifications per session (batch while busy)
-        self._pending: Dict[int, list] = {}  # view_id -> list of (wake_prompt, context)
+        # Pending notifications per session: view_id -> list of (wake_prompt, context, timestamp)
+        self._pending: Dict[int, list] = {}
         self._pending_lock = threading.Lock()
+        self._flush_timer: Optional[int] = None  # sublime.set_timeout handle
 
     def start(self):
         """Start the pool connection in background thread."""
@@ -132,6 +138,8 @@ class NotaloneClient:
 
     def _handle_inject(self, inject: dict):
         """Handle an inject callback - route to correct session."""
+        import time
+
         session_id = inject.get("session_id", "")
         wake_prompt = inject.get("wake_prompt", "")
         context = inject.get("context")
@@ -152,17 +160,60 @@ class NotaloneClient:
         logger.info(f"notalone: inject for view {view_id}: {wake_prompt[:50]}...")
         print(f"[Claude] notalone inject for view {view_id}: {wake_prompt[:50]}...")
 
-        # Queue the notification
+        # Queue the notification with timestamp
         with self._pending_lock:
             if view_id not in self._pending:
                 self._pending[view_id] = []
-            self._pending[view_id].append((wake_prompt, context))
+            self._pending[view_id].append((wake_prompt, context, time.time()))
+
+            # Check if batch size reached - force immediate flush
+            if len(self._pending[view_id]) >= MAX_BATCH_SIZE:
+                print(f"[Claude] notalone: batch size {MAX_BATCH_SIZE} reached for view {view_id}, flushing")
+                sublime.set_timeout(lambda vid=view_id: self._flush_batch(vid), 0)
+                return
 
         # Schedule processing on main thread
         sublime.set_timeout(lambda: self._process_pending(view_id), 0)
 
-    def _process_pending(self, view_id: int):
-        """Process pending notifications for a session (runs on main thread)."""
+        # Start periodic flush timer if not running
+        self._ensure_flush_timer()
+
+    def _ensure_flush_timer(self):
+        """Ensure periodic flush timer is running."""
+        if self._flush_timer is not None:
+            return
+        # Check every 5 seconds for aged batches
+        self._flush_timer = sublime.set_timeout(self._periodic_flush, 5000)
+
+    def _periodic_flush(self):
+        """Periodically check for aged batches and flush them."""
+        import time
+        self._flush_timer = None
+
+        now = time.time()
+        view_ids_to_flush = []
+
+        with self._pending_lock:
+            for view_id, pending in self._pending.items():
+                if pending:
+                    oldest_ts = pending[0][2]  # timestamp of oldest notification
+                    if now - oldest_ts >= MAX_BATCH_AGE_SECS:
+                        view_ids_to_flush.append(view_id)
+
+            # Check if there are still pending notifications
+            has_pending = any(self._pending.values())
+
+        # Flush aged batches
+        for view_id in view_ids_to_flush:
+            print(f"[Claude] notalone: batch aged {MAX_BATCH_AGE_SECS}s for view {view_id}, flushing")
+            self._flush_batch(view_id)
+
+        # Reschedule if there are still pending notifications
+        if has_pending:
+            self._flush_timer = sublime.set_timeout(self._periodic_flush, 5000)
+
+    def _flush_batch(self, view_id: int):
+        """Force flush pending notifications for a session (inject even if busy)."""
         if not hasattr(sublime, '_claude_sessions'):
             logger.error("notalone: _claude_sessions not initialized")
             return
@@ -170,41 +221,63 @@ class NotaloneClient:
         session = sublime._claude_sessions.get(view_id)
         if not session:
             logger.error(f"notalone: session not found for view {view_id}")
-            # Clear pending for non-existent session
             with self._pending_lock:
                 self._pending.pop(view_id, None)
             return
 
-        # If session is busy, try again later
-        if session.working:
-            sublime.set_timeout(lambda: self._process_pending(view_id), 500)
-            return
-
-        # Collect all pending notifications
+        # Collect pending notifications
         with self._pending_lock:
             pending = self._pending.pop(view_id, [])
 
         if not pending:
             return
 
-        # Batch into single wake prompt
+        # Build wake prompt
         if len(pending) == 1:
-            wake_prompt, context = pending[0]
+            wake_prompt = pending[0][0]
             display_message = wake_prompt.split("\n")[0] if wake_prompt else "Notification"
         else:
-            # Combine multiple notifications
             prompts = [p[0] for p in pending]
-            wake_prompt = f"📬 {len(pending)} notifications received:\n\n" + "\n\n---\n\n".join(prompts)
+            wake_prompt = f"📬 {len(pending)} notifications:\n\n" + "\n\n---\n\n".join(prompts)
             display_message = f"📬 {len(pending)} notifications"
             print(f"[Claude] notalone: batching {len(pending)} notifications for view {view_id}")
 
-        print(f"[Claude] notalone: injecting to session {view_id}: {display_message}")
+        print(f"[Claude] notalone: flushing to session {view_id} (working={session.working}): {display_message}")
 
         try:
-            session.query(wake_prompt, display_prompt=display_message)
+            if session.working:
+                # Inject into running query
+                session.queue_prompt(wake_prompt)
+            else:
+                # Start new query
+                session.query(wake_prompt, display_prompt=display_message)
         except Exception as e:
-            logger.error(f"notalone: inject failed: {e}")
-            print(f"[Claude] notalone: inject failed: {e}")
+            logger.error(f"notalone: flush failed: {e}")
+            print(f"[Claude] notalone: flush failed: {e}")
+
+    def _process_pending(self, view_id: int):
+        """Process pending notifications for a session (runs on main thread).
+
+        Only processes if session is idle. If busy, relies on _flush_batch
+        which is triggered by batch size or time window.
+        """
+        if not hasattr(sublime, '_claude_sessions'):
+            logger.error("notalone: _claude_sessions not initialized")
+            return
+
+        session = sublime._claude_sessions.get(view_id)
+        if not session:
+            logger.error(f"notalone: session not found for view {view_id}")
+            with self._pending_lock:
+                self._pending.pop(view_id, None)
+            return
+
+        # If session is busy, let _flush_batch handle it (via timer or batch size)
+        if session.working:
+            return
+
+        # Session is idle - flush immediately
+        self._flush_batch(view_id)
 
 
 # Global client instance
