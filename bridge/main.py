@@ -155,6 +155,7 @@ class Bridge:
         cwd = params.get("cwd")
         view_id = params.get("view_id")
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
+        self._view_id = view_id  # Store for spawn_session to pass to subsessions
 
         # Use resume_id if resuming, otherwise use view_id as local session identifier
         session_id = resume_id or view_id or str(uuid.uuid4())
@@ -188,31 +189,24 @@ class Bridge:
         if addon:
             system_prompt = (system_prompt + "\n\n" + addon) if system_prompt else addon
 
-        # Add notification guide to system prompt
+        # Add session info to system prompt
         session_id_info = f"sublime.{session_id}"
-        notification_guide = f"""
+        view_id_info = view_id or session_id
+        session_guide = f"""
 
-## Notifications (notalone2)
+## Session Info
 
-Session ID: **{session_id_info}**
-
-discover_services() - See available notification types
-register_notification(type, params, wake_prompt) - Subscribe to notifications
-list_notifications() - List active subscriptions
-unregister_notification(notification_id) - Cancel a subscription
-
-Built-in types: timer, subsession
-Service types: discovered via discover_services()
+Session ID: {session_id_info}
+View ID: {view_id_info}
 """
-        system_prompt = (system_prompt + notification_guide) if system_prompt else notification_guide
+        system_prompt = (system_prompt + session_guide) if system_prompt else session_guide
 
         # If this is a subsession, store subsession_id and add specific guidance
         subsession_id = params.get("subsession_id")
         self._subsession_id = subsession_id  # Store for signal_complete tool
         if subsession_id:
             subsession_guide = f"""
-
-You are subsession **{subsession_id}**. Call signal_complete() when done to wake parent.
+You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id_info}, result_summary="...") when done.
 """
             system_prompt += subsession_guide
 
@@ -296,9 +290,11 @@ You are subsession **{subsession_id}**. Call signal_complete() when done to wake
         mcp_server_path = os.path.join(plugin_dir, "mcp", "server.py")
 
         if os.path.exists(mcp_server_path) and "sublime" not in servers:
+            # Pass view_id so MCP server can inject it into spawn_session calls
+            view_id_arg = f"--view-id={self._view_id}" if self._view_id else ""
             servers["sublime"] = {
                 "command": sys.executable,  # Use same python as bridge
-                "args": [mcp_server_path]
+                "args": [mcp_server_path, view_id_arg] if view_id_arg else [mcp_server_path]
             }
 
         if servers:

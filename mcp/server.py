@@ -17,16 +17,34 @@ SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES_GUIDE = os.path.join(PLUGIN_DIR, "docs", "profiles.md")
 
+# Parse --view-id from command line args (passed by bridge)
+CALLER_VIEW_ID = None
+for arg in sys.argv[1:]:
+    if arg.startswith("--view-id="):
+        try:
+            CALLER_VIEW_ID = int(arg.split("=", 1)[1])
+        except ValueError:
+            pass
+
 # Initialize tool router
 _router = create_sublime_router()
 
 
-def send_to_sublime(code: str = "", tool: str = None) -> dict:
-    """Send eval request to Sublime plugin via Unix socket."""
+def send_to_sublime(code: str = "", tool: str = None, view_id: int = None) -> dict:
+    """Send eval request to Sublime plugin via Unix socket.
+
+    Args:
+        code: Python code to execute
+        tool: Named tool to execute
+        view_id: Optional view_id to identify the calling session
+    """
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(SOCKET_PATH)
-        sock.sendall((json.dumps({"code": code, "tool": tool}) + "\n").encode())
+        msg = {"code": code, "tool": tool}
+        if view_id is not None:
+            msg["view_id"] = view_id
+        sock.sendall((json.dumps(msg) + "\n").encode())
 
         # Receive all data until newline (responses are newline-terminated)
         response_bytes = b""
@@ -467,19 +485,24 @@ Example:
         try:
             tool_name, args = parse_tool_call(method, params)
 
+            # Inject caller view_id for spawn_session (so subsession knows parent)
+            if tool_name == "spawn_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
+                args["_caller_view_id"] = CALLER_VIEW_ID
+
             # Route the tool call to get executable code
+            # Pass CALLER_VIEW_ID with every request so Sublime knows the session context
             if tool_name == "sublime_eval":
                 # Special case: code is passed directly
                 code = args.get("code", "")
-                result = send_to_sublime(code=code)
+                result = send_to_sublime(code=code, view_id=CALLER_VIEW_ID)
             elif tool_name == "sublime_tool":
                 # Special case: execute saved tool
                 name = args.get("name", "")
-                result = send_to_sublime(tool=name)
+                result = send_to_sublime(tool=name, view_id=CALLER_VIEW_ID)
             else:
                 # Use router for all other tools
                 code = _router.route(tool_name, args)
-                result = send_to_sublime(code=code)
+                result = send_to_sublime(code=code, view_id=CALLER_VIEW_ID)
 
         except ValueError as e:
             return make_response(id, error=str(e))

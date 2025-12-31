@@ -96,7 +96,8 @@ def create_sublime_router() -> ToolRouter:
 
     router.register("spawn_session", lambda args:
         f"return spawn_session({args.get('prompt', '')!r}, {args.get('name')!r}, "
-        f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('wait_for_completion', False)})")
+        f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('wait_for_completion', False)}, "
+        f"_caller_view_id={args.get('_caller_view_id')})")
 
     router.register("send_to_session", lambda args:
         f"return send_to_session({args.get('view_id')}, {args.get('prompt', '')!r})")
@@ -136,8 +137,7 @@ def create_sublime_router() -> ToolRouter:
         f"return register_notification("
         f"notification_type={args.get('notification_type')!r}, "
         f"params={args.get('params', {})!r}, "
-        f"wake_prompt={args.get('wake_prompt')!r}, "
-        f"notification_id={args.get('notification_id')})")
+        f"wake_prompt={args.get('wake_prompt')!r})")
 
     router.register("unregister_notification", lambda args:
         f"return unregister_notification({args.get('notification_id')!r})")

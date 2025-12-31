@@ -141,6 +141,7 @@ class MCPSocketServer:
             request = json.loads(data.strip())
             code = request.get("code", "")
             tool = request.get("tool")
+            view_id = request.get("view_id")  # Caller's view_id from mcp/server.py
 
             result = {"result": None, "error": None}
             done = threading.Event()
@@ -153,9 +154,9 @@ class MCPSocketServer:
                     if is_ask_user:
                         # Special handling: ask_user needs to NOT block main thread
                         # We'll call the method which will show UI and set done when complete
-                        result["result"] = self._eval_ask_user(code, done)
+                        result["result"] = self._eval_ask_user(code, done, caller_view_id=view_id)
                     else:
-                        result["result"] = self._eval(code, tool)
+                        result["result"] = self._eval(code, tool, caller_view_id=view_id)
                         done.set()
                 except Exception as e:
                     result["error"] = str(e)
@@ -278,8 +279,10 @@ class MCPSocketServer:
         finally:
             conn.close()
 
-    def _eval_ask_user(self, code: str, done_event: threading.Event):
+    def _eval_ask_user(self, code: str, done_event: threading.Event, caller_view_id: int = None):
         """Special eval for ask_user - handles async UI without blocking main thread."""
+        # Store caller_view_id for _get_session_for_tool to use
+        self._caller_view_id = caller_view_id
         # Parse the ask_user call to extract args
         # Expected format: return ask_user("question", ["opt1", "opt2"])
         import re
@@ -352,8 +355,17 @@ class MCPSocketServer:
         # The socket handler waits on done_event
         return result
 
-    def _eval(self, code: str, tool: str = None):
-        """Execute code in Sublime's context."""
+    def _eval(self, code: str, tool: str = None, caller_view_id: int = None):
+        """Execute code in Sublime's context.
+
+        Args:
+            code: Python code to execute
+            tool: Named tool to load and execute
+            caller_view_id: View ID of the calling session (from MCP server)
+        """
+        # Store caller_view_id for _get_session_for_tool to use
+        self._caller_view_id = caller_view_id
+
         # Load saved tool if specified
         if tool:
             window = sublime.active_window()
@@ -798,8 +810,13 @@ class MCPSocketServer:
 
         return {"summary": "\n".join(lines), "profiles": profile_names, "checkpoints": checkpoint_names}
 
-    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, fork_current: bool = False, wait_for_completion: bool = False) -> dict:
-        """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag."""
+    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, fork_current: bool = False, wait_for_completion: bool = False, _caller_view_id: int = None) -> dict:
+        """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag.
+
+        Args:
+            _caller_view_id: The view_id of the calling session. If provided, used as parent_view_id.
+                             This ensures subsession signals go to the correct parent.
+        """
         from .core import create_session, get_active_session
         import uuid
 
@@ -838,9 +855,13 @@ class MCPSocketServer:
         # Generate unique subsession ID for notalone2 completion tracking
         subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
 
-        # Get parent session (the one calling spawn, not UI-active)
-        current_session, _ = self._get_session_for_tool()
-        parent_view_id = current_session.output.view.id() if current_session and current_session.output.view else None
+        # Get parent view_id - prefer explicit _caller_view_id, fall back to inference
+        if _caller_view_id:
+            parent_view_id = _caller_view_id
+        else:
+            # Fall back to inferring from execution context (less reliable with multiple sessions)
+            current_session, _ = self._get_session_for_tool()
+            parent_view_id = current_session.output.view.id() if current_session and current_session.output.view else None
 
         # Prepare initial context for subsession
         initial_context = {
@@ -1332,8 +1353,12 @@ class MCPSocketServer:
         if not window:
             return None, {"error": "No active window"}
 
-        # Try claude_executing_view first (set during active query)
-        view_id = window.settings().get("claude_executing_view")
+        # First try caller_view_id from MCP request (most reliable for subsessions)
+        view_id = getattr(self, '_caller_view_id', None)
+
+        # Fall back to claude_executing_view (set during active query)
+        if not view_id or view_id not in sublime._claude_sessions:
+            view_id = window.settings().get("claude_executing_view")
 
         # Fall back to claude_active_view (last active session)
         if not view_id or view_id not in sublime._claude_sessions:
