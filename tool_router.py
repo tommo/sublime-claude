@@ -149,8 +149,9 @@ def create_sublime_router() -> ToolRouter:
         f"return discover_services()")
 
     # Generic subscribe - works with any service from discover_services()
+    # For channel services with HTTP endpoints, also POST to the endpoint
     router.register("subscribe", lambda args:
-        f"return register_notification("
+        f"return subscribe_to_service("
         f"notification_type={args.get('notification_type')!r}, "
         f"params={args.get('params', {})!r}, "
         f"wake_prompt={args.get('wake_prompt')!r})")

@@ -100,6 +100,8 @@ class NotaloneClient:
                                 msg = json.loads(line.decode())
                                 if "inject" in msg:
                                     self._handle_inject(msg["inject"])
+                                elif "channel" in msg:
+                                    self._handle_channel(msg["channel"])
                             except json.JSONDecodeError as e:
                                 logger.error(f"notalone: invalid JSON: {e}")
 
@@ -177,6 +179,119 @@ class NotaloneClient:
 
         # Start periodic flush timer if not running
         self._ensure_flush_timer()
+
+    def _handle_channel(self, channel_msg: dict):
+        """Handle a channel message - requires sync response."""
+        channel_id = channel_msg.get("channel_id", "")
+        session_id = channel_msg.get("session_id", "")
+        data = channel_msg.get("data", {})
+        interrupt = channel_msg.get("interrupt", True)  # Default: interrupt mode
+
+        logger.info(f"notalone: channel message for {session_id} (interrupt={interrupt})")
+
+        # Parse session_id: "sublime.{view_id}"
+        parts = session_id.split(".", 1)
+        if len(parts) != 2 or parts[0] != POOL_PREFIX:
+            self._send_channel_response(channel_id, {"error": "invalid session"})
+            return
+
+        try:
+            view_id = int(parts[1])
+        except ValueError:
+            self._send_channel_response(channel_id, {"error": "invalid view_id"})
+            return
+
+        # Queue on main thread with response callback
+        sublime.set_timeout(
+            lambda: self._process_channel(view_id, channel_id, data, interrupt), 0
+        )
+
+    def _process_channel(self, view_id: int, channel_id: str, data: dict, interrupt: bool = True, retries: int = 0):
+        """Process channel message on main thread.
+
+        Args:
+            view_id: Target session's view ID
+            channel_id: Channel identifier for response
+            data: Message data
+            interrupt: If True, interrupt current generation before sending
+            retries: Number of retry attempts (for waiting on busy session)
+        """
+        if not hasattr(sublime, '_claude_sessions'):
+            self._send_channel_response(channel_id, {"error": "sessions not initialized"})
+            return
+
+        session = sublime._claude_sessions.get(view_id)
+        if not session:
+            self._send_channel_response(channel_id, {"error": "session not found"})
+            return
+
+        # If session is busy, handle based on interrupt flag
+        if session.working:
+            if retries >= 25:  # 25 * 200ms = 5 seconds max wait
+                self._send_channel_response(channel_id, {"error": "session busy timeout"})
+                return
+            if interrupt and retries == 0:
+                print(f"[Claude] notalone: interrupting session {view_id} for channel message")
+                session.interrupt()
+            # Wait for session to become idle, then retry
+            sublime.set_timeout(
+                lambda: self._process_channel(view_id, channel_id, data, interrupt=False, retries=retries+1), 200
+            )
+            return
+
+        # Format data as user message
+        # Include hint for terse response (channel mode expects quick action commands)
+        screen = data.get("screen", "")
+        state = data.get("state", {})
+        msg = data.get("msg", "")
+
+        if screen:
+            user_msg = f"[CHANNEL - respond with action only, no explanation]\n\nGame Screen:\n```\n{screen}\n```"
+            if state:
+                user_msg += f"\n\nGame State: {json.dumps(state)}"
+        elif msg:
+            # Simple message
+            user_msg = f"[CHANNEL - respond briefly]\n\n{msg}"
+        else:
+            # Fallback to raw data
+            user_msg = f"[CHANNEL - respond briefly]\n\n{json.dumps(data)}"
+
+        logger.info(f"notalone: sending channel message to session {view_id}")
+
+        # Send to session and wait for response
+        def on_response(response_text: str):
+            print(f"[Claude] notalone: channel callback received: {len(response_text)} chars")
+            self._send_channel_response(channel_id, response_text)
+
+        print(f"[Claude] notalone: calling send_message_with_callback")
+        session.send_message_with_callback(user_msg, on_response, silent=False)
+
+    def _send_channel_response(self, channel_id: str, response):
+        """Send response back to daemon via new connection."""
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(SOCKET_PATH)
+
+            req = {
+                "method": "channel_respond",
+                "channel_id": channel_id,
+                "response": response
+            }
+            sock.sendall((json.dumps(req) + "\n").encode())
+
+            # Read ack
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            logger.info(f"notalone: sent channel response for {channel_id}")
+        except Exception as e:
+            logger.error(f"notalone: failed to send channel response: {e}")
 
     def _ensure_flush_timer(self):
         """Ensure periodic flush timer is running."""

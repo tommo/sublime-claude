@@ -1,7 +1,7 @@
 """Claude Code session management."""
 import json
 import os
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Callable
 
 import sublime
 
@@ -69,6 +69,8 @@ class Session:
         self.draft_prompt: str = ""
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
+        # Callback for channel mode responses
+        self._response_callback: Optional[Callable[[str], None]] = None
 
         # Extract subsession_id and parent_view_id if provided
         if initial_context:
@@ -250,13 +252,14 @@ class Session:
         parts.append(prompt)
         return "\n\n".join(parts)
 
-    def query(self, prompt: str, display_prompt: str = None) -> None:
+    def query(self, prompt: str, display_prompt: str = None, silent: bool = False) -> None:
         """
         Start a new query.
 
         Args:
             prompt: The full prompt to send to the agent
             display_prompt: Optional shorter prompt to display in the UI (defaults to prompt)
+            silent: If True, skip UI updates (for channel mode)
         """
         if not self.client or not self.initialized:
             sublime.error_message("Claude not initialized")
@@ -283,21 +286,23 @@ class Session:
         ui_prompt = display_prompt if display_prompt else prompt
 
         print(f"[Claude] >>> {ui_prompt[:60]}...")
-        self.output.show()
 
         # Check if bridge is alive before sending
         if not self.client.is_alive():
             self._status("error: bridge died")
-            self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
+            if not silent:
+                self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
             return
 
-        # Auto-name session from first prompt if not already named
-        if not self.name:
-            self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
-        print(f"[Claude] query() - calling output.prompt()")
-        self.output.prompt(ui_prompt, context_names)
-        print(f"[Claude] query() - calling _animate()")
-        self._animate()
+        if not silent:
+            self.output.show()
+            # Auto-name session from first prompt if not already named
+            if not self.name:
+                self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
+            print(f"[Claude] query() - calling output.prompt()")
+            self.output.prompt(ui_prompt, context_names)
+            print(f"[Claude] query() - calling _animate()")
+            self._animate()
         print(f"[Claude] query() - sending RPC query request")
         if not self.client.send("query", {"prompt": full_prompt}, self._on_done):
             self._status("error: bridge died")
@@ -305,6 +310,39 @@ class Session:
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
         else:
             print(f"[Claude] query() - RPC query sent successfully")
+
+    def send_message_with_callback(self, message: str, callback: Callable[[str], None], silent: bool = False, display_prompt: str = None) -> None:
+        """Send message and call callback with Claude's response.
+
+        Used by channel mode for sync request-response communication.
+
+        Args:
+            message: The message to send to Claude
+            callback: Function to call with the response text when complete
+            silent: If True, skip UI updates
+            display_prompt: Optional display text for UI (ignored if silent=True)
+        """
+        # Validate session state before setting callback
+        if not self.client or not self.initialized:
+            print(f"[Claude] send_message_with_callback: session not initialized")
+            callback("Error: session not initialized")
+            return
+        if not self.client.is_alive():
+            print(f"[Claude] send_message_with_callback: bridge not running")
+            callback("Error: bridge not running")
+            return
+
+        print(f"[Claude] send_message_with_callback: sending message")
+        self._response_callback = callback
+        ui_prompt = display_prompt if display_prompt else (message[:50] + "..." if len(message) > 50 else message)
+        self.query(message, display_prompt=ui_prompt, silent=silent)
+
+        # Check if query() failed (working is False if send failed)
+        if not self.working and self._response_callback:
+            print(f"[Claude] send_message_with_callback: query failed, calling callback with error")
+            cb = self._response_callback
+            self._response_callback = None
+            cb("Error: failed to send query")
 
     def _on_done(self, result: dict) -> None:
         self.working = False
@@ -338,6 +376,20 @@ class Session:
 
         # Clear any stale permission UI (query finished, no more permissions expected)
         self.output.clear_all_permissions()
+
+        # Call response callback if set (channel mode)
+        if self._response_callback:
+            callback = self._response_callback
+            self._response_callback = None  # Clear before calling
+            # Extract response text from current conversation
+            response_text = ""
+            if self.output.current:
+                response_text = "".join(self.output.current.text_chunks)
+            print(f"[Claude] _on_done: calling response callback with {len(response_text)} chars")
+            try:
+                callback(response_text)
+            except Exception as e:
+                print(f"[Claude] response callback error: {e}")
 
         # Notify ALL bridges that this subsession completed (for notalone2)
         # Other sessions may be waiting on this subsession via notifications
@@ -721,6 +773,67 @@ class Session:
         sublime.set_timeout(ask_next, 0)
 
     # ─── Notification API (notalone2) ──────────────────────────────────
+
+    def subscribe_to_service(
+        self,
+        notification_type: str,
+        params: dict,
+        wake_prompt: str
+    ) -> dict:
+        """Subscribe to a service - handles HTTP endpoints for channel services.
+
+        This is synchronous and returns a result dict.
+        """
+        import urllib.request
+        import json as json_mod
+        import socket as sock_mod
+
+        # First, get services list synchronously from notalone
+        try:
+            sock = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(os.path.expanduser("~/.notalone/notalone.sock"))
+            sock.sendall((json_mod.dumps({"method": "services"}) + "\n").encode())
+            response = sock.recv(65536).decode().strip()
+            sock.close()
+            services_data = json_mod.loads(response)
+            services = services_data.get("services", [])
+        except Exception as e:
+            print(f"[Claude] Failed to get services: {e}")
+            services = []
+
+        # Check if this is a channel service with an endpoint
+        endpoint = None
+        for svc in services:
+            if svc.get("type") == notification_type and svc.get("endpoint"):
+                endpoint = svc.get("endpoint")
+                break
+
+        # If it has an endpoint, POST to it first
+        if endpoint:
+            session_id = params.get("session_id", f"sublime.{self.view.id()}")
+            try:
+                req = urllib.request.Request(
+                    endpoint,
+                    data=json_mod.dumps({"session_id": session_id}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    result = resp.read().decode()
+                    print(f"[Claude] Subscribed to {notification_type}: {result}")
+            except Exception as e:
+                print(f"[Claude] Failed to subscribe to {notification_type}: {e}")
+                return {"error": str(e)}
+
+        # Now register with notalone daemon (simple version, no callback)
+        if self.client:
+            self.client.send("register_notification", {
+                "notification_type": notification_type,
+                "params": params,
+                "wake_prompt": wake_prompt
+            })
+        return {"ok": True, "notification_type": notification_type, "session_id": params.get("session_id", f"sublime.{self.view.id()}")}
 
     def register_notification(
         self,

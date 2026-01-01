@@ -405,6 +405,7 @@ class MCPSocketServer:
             "terminus_close": self._terminus_close,
             # Notification tools (notalone2)
             "register_notification": self._register_notification,
+            "subscribe_to_service": self._subscribe_to_service,
             "signal_subsession_complete": self._signal_subsession_complete,
             "list_notifications": self._list_notifications,
             "discover_services": self._discover_services,
@@ -1461,6 +1462,111 @@ class MCPSocketServer:
         except Exception as e:
             return {"error": str(e)}
 
+    def _subscribe_to_service(self, notification_type: str, params: dict, wake_prompt: str) -> dict:
+        """Subscribe to a service - handles HTTP endpoints for channel services.
+
+        For channel-type services with HTTP endpoints, POSTs to the endpoint first,
+        then registers with notalone daemon.
+        """
+        import socket
+        import urllib.request
+        from pathlib import Path
+
+        session, error = self._get_session_for_tool()
+        if error:
+            return error
+
+        view_id = session.output.view.id() if session.output and session.output.view else None
+        if not view_id:
+            return {"error": "Session has no view"}
+
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        session_id = f"sublime.{view_id}"
+
+        # Get services list to check if this is a channel service
+        services = []
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({"method": "services"}) + "\n").encode())
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            sock.close()
+            services_data = json.loads(data.decode().strip())
+            services = services_data.get("services", [])
+        except Exception as e:
+            print(f"[Claude MCP] Failed to get services: {e}")
+
+        # Check if this is a channel service with an endpoint
+        endpoint = None
+        mode = None
+        for svc in services:
+            if svc.get("type") == notification_type:
+                endpoint = svc.get("endpoint")
+                mode = svc.get("mode")
+                break
+
+        # Only POST to endpoint for channel-mode services (not notify-mode)
+        if endpoint and mode == "channel":
+            try:
+                # Include session_id in params for the endpoint
+                post_data = dict(params) if params else {}
+                post_data["session_id"] = session_id
+                req = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(post_data).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    result = resp.read().decode()
+                    print(f"[Claude MCP] Subscribed to {notification_type}: {result}")
+            except Exception as e:
+                print(f"[Claude MCP] Failed to POST to {notification_type}: {e}")
+                return {"error": f"Failed to subscribe to service endpoint: {e}"}
+
+        # Now register with notalone daemon
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({
+                "method": "register",
+                "session_id": session_id,
+                "type": notification_type,
+                "params": params,
+                "wake_prompt": wake_prompt
+            }) + "\n").encode())
+
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+
+            sock.close()
+            resp = json.loads(data.decode().strip())
+
+            if resp.get("notification_id"):
+                return {
+                    "notification_id": resp["notification_id"],
+                    "status": "registered",
+                    "session_id": session_id
+                }
+            else:
+                return {"error": resp.get("error", "Registration failed")}
+
+        except FileNotFoundError:
+            return {"error": "notalone2 daemon not running"}
+        except Exception as e:
+            return {"error": str(e)}
+
     def _signal_subsession_complete(self, session_id: int = None, result_summary: str = None) -> dict:
         """Signal that this subsession has completed.
 
@@ -1567,11 +1673,27 @@ class MCPSocketServer:
 
     def _discover_services(self) -> dict:
         """Discover available notification services from notalone2 daemon."""
-        # Query daemon directly - no session needed
         import socket
         import json
         from pathlib import Path
 
+        # Builtin types with descriptions
+        services = [
+            {
+                "type": "timer",
+                "mode": "builtin",
+                "description": "Wake after N seconds",
+                "params": {"seconds": "int"}
+            },
+            {
+                "type": "subsession",
+                "mode": "builtin",
+                "description": "Wake when subsession completes",
+                "params": {"subsession_id": "string"}
+            }
+        ]
+
+        # Query daemon for external services
         socket_path = str(Path.home() / ".notalone" / "notalone.sock")
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1587,8 +1709,39 @@ class MCPSocketServer:
                 data += chunk
 
             sock.close()
-            return json.loads(data.decode().strip())
+            resp = json.loads(data.decode().strip())
+
+            # Transform daemon response to flat list
+            daemon_services = resp.get("services", {})
+
+            # Handle both dict format and list format from daemon
+            if isinstance(daemon_services, dict):
+                # Format: {"service-name": {"type.name": {"mode": "...", "description": "..."}}}
+                for service_name, types in daemon_services.items():
+                    if not isinstance(types, dict):
+                        continue
+                    endpoint = types.get("_endpoint")
+                    for type_name, type_info in types.items():
+                        if type_name.startswith("_") or not isinstance(type_info, dict):
+                            continue
+                        entry = {
+                            "type": type_name,
+                            "mode": type_info.get("mode", "notify"),
+                            "description": type_info.get("description", ""),
+                            "service": service_name
+                        }
+                        if endpoint:
+                            entry["endpoint"] = endpoint
+                        services.append(entry)
+            elif isinstance(daemon_services, list):
+                # Already flat list format from daemon
+                for svc in daemon_services:
+                    if isinstance(svc, dict) and "type" in svc:
+                        services.append(svc)
+
+            return {"services": services}
+
         except FileNotFoundError:
-            return {"error": "notalone2 daemon not running", "services": [], "builtin": ["timer", "subsession"]}
+            return {"services": services, "error": "notalone2 daemon not running"}
         except Exception as e:
-            return {"error": str(e), "services": [], "builtin": ["timer", "subsession"]}
+            return {"services": services, "error": str(e)}
