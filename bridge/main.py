@@ -157,8 +157,13 @@ class Bridge:
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
         self._view_id = view_id  # Store for spawn_session to pass to subsessions
 
-        # Use resume_id if resuming, otherwise use view_id as local session identifier
-        session_id = resume_id or view_id or str(uuid.uuid4())
+        # Generate a proper UUID for Claude CLI (--session-id requires valid UUID format)
+        # view_id is Sublime's view ID (integer), not suitable for Claude's session_id
+        # For fresh sessions, generate new UUID; for resume, use existing resume_id
+        if resume_id:
+            session_id = resume_id
+        else:
+            session_id = str(uuid.uuid4())
         self._session_id = session_id
 
         # notalone2 handled by global client in plugin (not per-bridge)
@@ -248,6 +253,11 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if plugins:
             options_dict["plugins"] = plugins
 
+        # For fresh sessions (not resuming), specify session_id upfront via CLI arg
+        # This avoids waiting for first query to get session_id from ResultMessage
+        if not resume_id:
+            options_dict["extra_args"] = {"session-id": session_id}
+
         self.options = ClaudeAgentOptions(**options_dict)
         self.client = ClaudeSDKClient(options=self.options)
 
@@ -273,6 +283,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         send_result(id, {
             "status": "initialized",
+            "session_id": session_id,
             "mcp_servers": list(mcp_servers.keys()) if mcp_servers else [],
             "agents": list(agents.keys()) if agents else [],
         })

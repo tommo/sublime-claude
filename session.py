@@ -172,6 +172,10 @@ class Session:
             return
         self.initialized = True
         self._input_mode_entered = False  # Reset for fresh start after init
+        # Capture session_id from initialize response (set via --session-id CLI arg)
+        if result.get("session_id"):
+            self.session_id = result["session_id"]
+            print(f"[Claude] session_id={self.session_id}")
         # Show loaded MCP servers and agents
         mcp_servers = result.get("mcp_servers", [])
         agents = result.get("agents", [])
@@ -460,11 +464,22 @@ class Session:
             None   # on_cancel
         )
 
-    def interrupt(self) -> None:
+    def interrupt(self, break_channel: bool = True) -> None:
+        """Interrupt current query.
+
+        Args:
+            break_channel: If True, also breaks any active channel connection.
+                          Set to False when interrupt is from channel message.
+        """
         if self.client:
             self.client.send("interrupt", {})
             self._status("interrupting...")
             self.working = False
+
+        # Break any active channel connection (only for user-initiated interrupts)
+        if break_channel:
+            from . import notalone
+            notalone.interrupt_channel(self.view.id())
 
     def stop(self) -> None:
         # Release persona if acquired
