@@ -804,8 +804,9 @@ class OutputView:
         tool = perm.tool
         tool_input = perm.tool_input
 
-        # Format tool details
+        # Format tool details and display name
         detail = ""
+        display_tool = tool
         if tool == "Bash" and "command" in tool_input:
             cmd = tool_input["command"]
             if len(cmd) > 80:
@@ -817,6 +818,13 @@ class OutputView:
             detail = tool_input["pattern"]
         elif tool == "Grep" and "pattern" in tool_input:
             detail = tool_input["pattern"]
+        elif tool == "Skill" and "skill" in tool_input:
+            # Show skill name as the tool name for better clarity
+            skill_name = tool_input["skill"]
+            display_tool = f"Skill: {skill_name}"
+            # Show args if present
+            if "args" in tool_input and tool_input["args"]:
+                detail = tool_input["args"]
         else:
             # Generic: show first param
             for k, v in list(tool_input.items())[:1]:
@@ -825,7 +833,7 @@ class OutputView:
         # Build permission block
         lines = [
             "\n",
-            f"  ⚠ Allow {tool}",
+            f"  ⚠ Allow {display_tool}",
         ]
         if detail:
             lines.append(f": {detail}")
@@ -955,6 +963,10 @@ class OutputView:
                 first_word = command.split()[0] if command.split() else ""
                 if first_word:
                     return f"Bash({first_word}:*)"
+        elif tool == "Skill":
+            skill_name = tool_input.get("skill", "")
+            if skill_name:
+                return f"Skill({skill_name})"
         # For other tools, just use the tool name (file paths vary too much)
         return tool
 

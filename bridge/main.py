@@ -573,6 +573,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             match_value = tool_input.get("pattern", "")
         elif tool_name == "WebFetch":
             match_value = tool_input.get("url", "")
+        elif tool_name == "Skill":
+            match_value = tool_input.get("skill", "")
         else:
             # For other tools, try common field names
             match_value = tool_input.get("command") or tool_input.get("path") or tool_input.get("query", "")
