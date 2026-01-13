@@ -31,7 +31,6 @@ os.environ["CLAUDE_AGENT"] = "1"
 from claude_agent_sdk import (
     ClaudeSDKClient,
     ClaudeAgentOptions,
-    AgentDefinition,
     AssistantMessage,
     UserMessage,
     SystemMessage,
@@ -223,7 +222,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "can_use_tool": self.can_use_tool,
             "resume": resume_id,
             "fork_session": fork_session,
-            "setting_sources": ["project"],
+            "setting_sources": ["user", "project"],
             "max_buffer_size": 100 * 1024 * 1024,  # 100MB for large images/files
             "cli_path": "claude",
         }
@@ -290,17 +289,18 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
 
     def _load_mcp_servers(self, cwd: str) -> dict:
-        """Load MCP server config from project settings, plus built-in sublime server."""
-        settings = load_project_settings(cwd)
-        servers = settings.get("mcpServers", {})
+        """Return built-in sublime MCP server only.
+
+        Other MCP servers are loaded by SDK via setting_sources: ["user", "project"].
+        """
+        servers = {}
 
         # Always include the built-in sublime MCP server
-        # Find the mcp/server.py relative to this bridge script
         bridge_dir = os.path.dirname(os.path.abspath(__file__))
         plugin_dir = os.path.dirname(bridge_dir)
         mcp_server_path = os.path.join(plugin_dir, "mcp", "server.py")
 
-        if os.path.exists(mcp_server_path) and "sublime" not in servers:
+        if os.path.exists(mcp_server_path):
             # Pass view_id so MCP server can inject it into spawn_session calls
             view_id_arg = f"--view-id={self._view_id}" if self._view_id else ""
             servers["sublime"] = {
@@ -310,7 +310,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         if servers:
             with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  loaded MCP servers: {list(servers.keys())}\n")
+                f.write(f"  injected MCP servers: {list(servers.keys())}\n")
         return servers
 
     def _load_sandbox_settings(self, cwd: str) -> dict:
@@ -348,184 +348,16 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         return sandbox
 
     def _load_agents(self, cwd: str) -> dict:
-        """Load subagent definitions from project settings, plus built-in agents."""
-        settings = load_project_settings(cwd)
-        project_agents = settings.get("agents", {})
-
-        # Built-in agents (can be overridden by project settings)
-        # NOTE: Removed blackboard-based agents (planner, reporter) - use custom agents if needed
-        builtin = {}
-
-        # Merge: project agents override built-ins
-        merged = {**builtin, **project_agents}
-
-        # Convert dicts to AgentDefinition objects
-        agents = {}
-        for name, config in merged.items():
-            agents[name] = AgentDefinition(
-                description=config.get("description", ""),
-                prompt=config.get("prompt", ""),
-                tools=config.get("tools"),
-                model=config.get("model"),
-            )
-
-        if agents:
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  loaded agents: {list(agents.keys())}\n")
-        return agents
+        """Return empty dict - agents loaded by SDK via setting_sources."""
+        # SDK loads agents from ~/.claude/settings.json and .claude/settings.json
+        return {}
 
     def _load_plugins(self, cwd: str) -> list:
-        """Load plugin configurations from project settings."""
-        settings = load_project_settings(cwd)
+        """Return empty list - plugins loaded by SDK via setting_sources.
 
-        # Manual plugins from "plugins" key
-        manual_plugins = settings.get("plugins", [])
-
-        # Auto-installed plugins from marketplaces
-        auto_plugins = self._load_marketplace_plugins(settings, cwd)
-
-        # Combine both
-        all_plugins = manual_plugins + auto_plugins
-
-        # Resolve relative paths to absolute
-        if all_plugins and cwd:
-            resolved_plugins = []
-            for plugin in all_plugins:
-                if plugin.get("type") == "local":
-                    path = plugin.get("path", "")
-                    # Convert relative paths to absolute
-                    if path and not os.path.isabs(path):
-                        path = os.path.join(cwd, path)
-                    resolved_plugins.append({"type": "local", "path": path})
-                else:
-                    resolved_plugins.append(plugin)
-            all_plugins = resolved_plugins
-
-        if all_plugins:
-            with open("/tmp/claude_bridge.log", "a") as f:
-                f.write(f"  loaded plugins: {[p.get('path') for p in all_plugins]}\n")
-        return all_plugins
-
-    def _load_marketplace_plugins(self, settings: dict, cwd: str) -> list:
-        """Load and auto-install plugins from configured marketplaces."""
-        import subprocess
-        from pathlib import Path
-
-        marketplaces = settings.get("extraKnownMarketplaces", {})
-        enabled_plugins = settings.get("enabledPlugins", {})
-
-        if not enabled_plugins:
-            return []
-
-        # Plugin cache directory
-        cache_dir = Path.home() / ".claude" / "plugins"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-
-        plugins = []
-
-        for plugin_key, plugin_config in enabled_plugins.items():
-            # Parse plugin format: either "plugin@marketplace" or old object format
-            if "@" in plugin_key:
-                # New format: "plugin@marketplace": true|false|array
-                plugin_name, marketplace_name = plugin_key.split("@", 1)
-                # Check if enabled (can be bool, array, or object)
-                if isinstance(plugin_config, bool) and not plugin_config:
-                    continue
-            else:
-                # Old format: "plugin": {enabled: true, marketplace: "name"}
-                plugin_name = plugin_key
-                if isinstance(plugin_config, dict):
-                    if not plugin_config.get("enabled", True):
-                        continue
-                    marketplace_name = plugin_config.get("marketplace")
-                else:
-                    # Skip if not a dict in old format
-                    continue
-
-            if not marketplace_name or marketplace_name not in marketplaces:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  plugin {plugin_name}: marketplace '{marketplace_name}' not found\n")
-                continue
-
-            marketplace = marketplaces[marketplace_name]
-            source = marketplace.get("source", {})
-            source_type = source.get("source", "")
-
-            # Clone marketplace if not exists
-            marketplace_dir = cache_dir / marketplace_name
-
-            try:
-                if not marketplace_dir.exists():
-                    if source_type == "github":
-                        repo = source.get("repo", "")
-                        if repo:
-                            url = f"https://github.com/{repo}.git"
-                            with open("/tmp/claude_bridge.log", "a") as f:
-                                f.write(f"  cloning marketplace: {url}\n")
-                            subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
-                                         check=True, capture_output=True)
-
-                    elif source_type == "git":
-                        url = source.get("url", "")
-                        if url:
-                            with open("/tmp/claude_bridge.log", "a") as f:
-                                f.write(f"  cloning from git: {url}\n")
-                            subprocess.run(["git", "clone", "--depth", "1", url, str(marketplace_dir)],
-                                         check=True, capture_output=True)
-
-            except Exception as e:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  error cloning {marketplace_name}: {e}\n")
-                continue
-
-            # Determine plugin location
-            # First check if there's a marketplace.json
-            marketplace_json_path = marketplace_dir / ".claude-plugin" / "marketplace.json"
-            plugin_dir = None
-
-            if marketplace_json_path.exists():
-                # Read marketplace.json to find plugin location
-                try:
-                    with open(marketplace_json_path, "r") as f:
-                        marketplace_data = json.load(f)
-                        plugins_list = marketplace_data.get("plugins", [])
-                        # Find the plugin in the marketplace
-                        for p in plugins_list:
-                            if p.get("name") == plugin_name or p.get("id") == plugin_name:
-                                # Plugin found in marketplace
-                                plugin_path = p.get("path", plugin_name)
-                                plugin_dir = marketplace_dir / plugin_path
-                                break
-                        if not plugin_dir:
-                            with open("/tmp/claude_bridge.log", "a") as f:
-                                f.write(f"  plugin {plugin_name} not in marketplace.json\n")
-                except Exception as e:
-                    with open("/tmp/claude_bridge.log", "a") as f:
-                        f.write(f"  error reading marketplace.json: {e}\n")
-
-            # Fallback: try common plugin locations if marketplace.json not found or plugin not listed
-            if not plugin_dir or not plugin_dir.exists():
-                # Case 1: The marketplace repo itself is the plugin
-                if (marketplace_dir / ".claude-plugin" / "plugin.json").exists():
-                    plugin_dir = marketplace_dir
-                # Case 2: Plugin in subdirectory (for backward compatibility with subdir field)
-                elif "subdir" in source:
-                    base_dir = marketplace_dir / source["subdir"]
-                    plugin_dir = base_dir / plugin_name
-                # Case 3: Plugin directly in marketplace directory
-                else:
-                    plugin_dir = marketplace_dir / plugin_name
-
-            # Add to plugins list if valid
-            if plugin_dir and plugin_dir.exists() and (plugin_dir / ".claude-plugin" / "plugin.json").exists():
-                plugins.append({"type": "local", "path": str(plugin_dir)})
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  loaded marketplace plugin: {plugin_name} from {plugin_dir}\n")
-            else:
-                with open("/tmp/claude_bridge.log", "a") as f:
-                    f.write(f"  plugin {plugin_name} not found (checked {plugin_dir})\n")
-
-        return plugins
+        SDK loads plugins from ~/.claude/settings.json and .claude/settings.json.
+        """
+        return []
 
     def _parse_permission_pattern(self, pattern: str) -> tuple[str, str | None]:
         """Parse permission pattern into (tool_name, specifier).
