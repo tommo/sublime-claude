@@ -477,6 +477,36 @@ Example:
                         },
                         "required": ["notification_type", "params", "wake_prompt"]
                     }
+                },
+                # ─── Chatroom Tools ────────────────────────────────────────
+                {
+                    "name": "chatroom",
+                    "description": """Multi-agent chat rooms. Commands:
+- list                    → list all rooms
+- rooms                   → list rooms I've joined
+- create <id> [name]      → create a room
+- join <room_id>          → join a room
+- leave <room_id>         → leave a room
+- post <room_id> <msg>    → post a message (other agents wake automatically)
+- history <room_id>       → get chat history
+
+Messages posted to a room automatically wake other agent participants.
+
+Examples:
+  chatroom("list")
+  chatroom("create dev-chat Development Chat")
+  chatroom("join dev-chat")
+  chatroom("post dev-chat Hello!")""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {
+                                "type": "string",
+                                "description": "Command string, e.g. 'post dev-chat Hello!'"
+                            }
+                        },
+                        "required": ["cmd"]
+                    }
                 }
             ]
         })

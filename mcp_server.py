@@ -1745,3 +1745,89 @@ class MCPSocketServer:
             return {"services": services, "error": "notalone2 daemon not running"}
         except Exception as e:
             return {"services": services, "error": str(e)}
+
+
+# ============================================================================
+# Chatroom functions
+# ============================================================================
+
+def _chatroom_command(req: dict) -> dict:
+    """Send chatroom command to daemon."""
+    socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(socket_path)
+        sock.sendall((json.dumps(req) + "\n").encode())
+
+        data = b""
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+
+        sock.close()
+        return json.loads(data.decode().strip())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def chatroom_list() -> dict:
+    """List all chatrooms."""
+    return _chatroom_command({"method": "chatroom_list"})
+
+
+def chatroom_rooms_for_session(view_id: int) -> dict:
+    """List rooms a session has joined."""
+    return _chatroom_command({
+        "method": "chatroom_rooms_for_session",
+        "session_id": f"sublime.{view_id}"
+    })
+
+
+def chatroom_create(room_id: str = None, name: str = None, max_chars: int = 1000, prompt_hint: int = 500) -> dict:
+    """Create a new chatroom."""
+    req = {"method": "chatroom_create", "max_chars": max_chars, "prompt_hint": prompt_hint}
+    if room_id:
+        req["room_id"] = room_id
+    if name:
+        req["name"] = name
+    return _chatroom_command(req)
+
+
+def chatroom_join(view_id: int, room_id: str, role: str = "agent") -> dict:
+    """Join a chatroom."""
+    return _chatroom_command({
+        "method": "chatroom_join",
+        "room_id": room_id,
+        "session_id": f"sublime.{view_id}",
+        "role": role
+    })
+
+
+def chatroom_leave(view_id: int, room_id: str) -> dict:
+    """Leave a chatroom."""
+    return _chatroom_command({
+        "method": "chatroom_leave",
+        "room_id": room_id,
+        "session_id": f"sublime.{view_id}"
+    })
+
+
+def chatroom_post(view_id: int, room_id: str, content: str) -> dict:
+    """Post a message to a chatroom."""
+    return _chatroom_command({
+        "method": "chatroom_post",
+        "room_id": room_id,
+        "session_id": f"sublime.{view_id}",
+        "content": content
+    })
+
+
+def chatroom_history(room_id: str, limit: int = 50, before_id: int = 0) -> dict:
+    """Get chat history."""
+    req = {"method": "chatroom_history", "room_id": room_id, "limit": limit}
+    if before_id > 0:
+        req["before_id"] = before_id
+    return _chatroom_command(req)

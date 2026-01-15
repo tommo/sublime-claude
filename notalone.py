@@ -34,6 +34,9 @@ class NotaloneClient:
         self._pending: Dict[int, list] = {}
         self._pending_lock = threading.Lock()
         self._flush_timer: Optional[int] = None  # sublime.set_timeout handle
+        # Active channel requests: view_id -> channel_id
+        self._active_channels: Dict[int, str] = {}
+        self._channel_lock = threading.Lock()
 
     def start(self):
         """Start the pool connection in background thread."""
@@ -186,6 +189,7 @@ class NotaloneClient:
         session_id = channel_msg.get("session_id", "")
         data = channel_msg.get("data", {})
         interrupt = channel_msg.get("interrupt", True)  # Default: interrupt mode
+        rule_prompt = channel_msg.get("rule_prompt", "")  # Initial prompt from channel opener
 
         logger.info(f"notalone: channel message for {session_id} (interrupt={interrupt})")
 
@@ -203,10 +207,10 @@ class NotaloneClient:
 
         # Queue on main thread with response callback
         sublime.set_timeout(
-            lambda: self._process_channel(view_id, channel_id, data, interrupt), 0
+            lambda: self._process_channel(view_id, channel_id, data, interrupt, rule_prompt=rule_prompt), 0
         )
 
-    def _process_channel(self, view_id: int, channel_id: str, data: dict, interrupt: bool = True, retries: int = 0):
+    def _process_channel(self, view_id: int, channel_id: str, data: dict, interrupt: bool = True, retries: int = 0, rule_prompt: str = ""):
         """Process channel message on main thread.
 
         Args:
@@ -215,6 +219,7 @@ class NotaloneClient:
             data: Message data
             interrupt: If True, interrupt current generation before sending
             retries: Number of retry attempts (for waiting on busy session)
+            rule_prompt: Initial prompt to prepend (from channel opener)
         """
         if not hasattr(sublime, '_claude_sessions'):
             self._send_channel_response(channel_id, {"error": "sessions not initialized"})
@@ -232,39 +237,56 @@ class NotaloneClient:
                 return
             if interrupt and retries == 0:
                 print(f"[Claude] notalone: interrupting session {view_id} for channel message")
-                session.interrupt()
+                session.interrupt(break_channel=False)  # Don't break our own channel
             # Wait for session to become idle, then retry
             sublime.set_timeout(
-                lambda: self._process_channel(view_id, channel_id, data, interrupt=False, retries=retries+1), 200
+                lambda: self._process_channel(view_id, channel_id, data, interrupt=False, retries=retries+1, rule_prompt=rule_prompt), 200
             )
             return
 
         # Format data as user message
-        # Include hint for terse response (channel mode expects quick action commands)
         screen = data.get("screen", "")
         state = data.get("state", {})
         msg = data.get("msg", "")
 
+        # Use rule_prompt if provided, otherwise default hint
+        prefix = rule_prompt if rule_prompt else "[CHANNEL - respond with action only, no explanation]"
+
         if screen:
-            user_msg = f"[CHANNEL - respond with action only, no explanation]\n\nGame Screen:\n```\n{screen}\n```"
+            user_msg = f"{prefix}\n\nGame Screen:\n```\n{screen}\n```"
             if state:
                 user_msg += f"\n\nGame State: {json.dumps(state)}"
         elif msg:
-            # Simple message
-            user_msg = f"[CHANNEL - respond briefly]\n\n{msg}"
+            user_msg = f"{prefix}\n\n{msg}"
         else:
-            # Fallback to raw data
-            user_msg = f"[CHANNEL - respond briefly]\n\n{json.dumps(data)}"
+            user_msg = f"{prefix}\n\n{json.dumps(data)}"
 
         logger.info(f"notalone: sending channel message to session {view_id}")
 
+        # Track active channel for interrupt detection
+        with self._channel_lock:
+            self._active_channels[view_id] = channel_id
+
         # Send to session and wait for response
         def on_response(response_text: str):
-            print(f"[Claude] notalone: channel callback received: {len(response_text)} chars")
-            self._send_channel_response(channel_id, response_text)
+            # Clear active channel - only send if we were still active (not interrupted)
+            with self._channel_lock:
+                active_channel = self._active_channels.pop(view_id, None)
+            if active_channel:
+                print(f"[Claude] notalone: channel done: {len(response_text)}c")
+                self._send_channel_response(channel_id, response_text)
+            # else: already interrupted, response already sent
 
-        print(f"[Claude] notalone: calling send_message_with_callback")
         session.send_message_with_callback(user_msg, on_response, silent=False)
+
+    def interrupt_channel(self, view_id: int):
+        """Called when user interrupts a session - break any active channel."""
+        with self._channel_lock:
+            channel_id = self._active_channels.pop(view_id, None)
+
+        if channel_id:
+            print(f"[Claude] notalone: channel interrupted by user")
+            self._send_channel_response(channel_id, {"error": "interrupted"})
 
     def _send_channel_response(self, channel_id: str, response):
         """Send response back to daemon via new connection."""
@@ -413,3 +435,10 @@ def stop():
     if _client:
         _client.stop()
         _client = None
+
+
+def interrupt_channel(view_id: int):
+    """Interrupt any active channel for a session (called on user interrupt)."""
+    global _client
+    if _client:
+        _client.interrupt_channel(view_id)

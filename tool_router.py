@@ -176,6 +176,59 @@ def create_sublime_router() -> ToolRouter:
     router.register("sublime_eval", lambda args: args.get("code", ""))
     router.register("sublime_tool", lambda args: args.get("name", ""))
 
+    # ─── Chatroom ──────────────────────────────────────────────────────
+    # Parse command string and route to appropriate chatroom function
+    def chatroom_handler(args: Dict[str, Any]) -> str:
+        import shlex
+        cmd = args.get("cmd", "").strip()
+        if not cmd:
+            return "return {'error': 'Empty command'}"
+
+        try:
+            parts = shlex.split(cmd)
+        except ValueError as e:
+            return f"return {{'error': 'Parse error: {e}'}}"
+
+        if not parts:
+            return "return {'error': 'Empty command'}"
+
+        action = parts[0].lower()
+
+        if action == 'list':
+            return "return chatroom_list()"
+        elif action == 'rooms':
+            return "return chatroom_rooms_for_session(view.id())"
+        elif action == 'create':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: create <room_id> [name]'}"
+            room_id = parts[1]
+            name = ' '.join(parts[2:]) if len(parts) > 2 else room_id
+            return f"return chatroom_create(room_id={room_id!r}, name={name!r})"
+        elif action == 'join':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: join <room_id>'}"
+            return f"return chatroom_join(view.id(), {parts[1]!r})"
+        elif action == 'leave':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: leave <room_id>'}"
+            return f"return chatroom_leave(view.id(), {parts[1]!r})"
+        elif action == 'post':
+            if len(parts) < 3:
+                return "return {'error': 'Usage: post <room_id> <message>'}"
+            room_id = parts[1]
+            content = ' '.join(parts[2:])
+            return f"return chatroom_post(view.id(), {room_id!r}, {content!r})"
+        elif action == 'history':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: history <room_id> [limit]'}"
+            room_id = parts[1]
+            limit = int(parts[2]) if len(parts) > 2 else 50
+            return f"return chatroom_history({room_id!r}, {limit})"
+        else:
+            return f"return {{'error': 'Unknown command: {action}. Try: list, rooms, create, join, leave, post, history'}}"
+
+    router.register("chatroom", chatroom_handler)
+
     return router
 
 

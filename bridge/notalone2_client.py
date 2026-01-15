@@ -265,3 +265,67 @@ async def wait_for_subsession(
         {"subsession_id": subsession_id},
         wake_prompt
     )
+
+
+# ============================================================================
+# Chatroom functions
+# ============================================================================
+
+def chatroom_list() -> dict:
+    """List all chatrooms."""
+    return _sync_command({"method": "chatroom_list"})
+
+
+def chatroom_rooms_for_session(session_id: str) -> dict:
+    """List rooms a session has joined."""
+    return _sync_command({
+        "method": "chatroom_rooms_for_session",
+        "session_id": session_id
+    })
+
+
+def chatroom_create(room_id: str = None, name: str = None, max_chars: int = 1000, prompt_hint: int = 500) -> dict:
+    """Create a new chatroom."""
+    req = {"method": "chatroom_create", "max_chars": max_chars, "prompt_hint": prompt_hint}
+    if room_id:
+        req["room_id"] = room_id
+    if name:
+        req["name"] = name
+    return _sync_command(req)
+
+
+def chatroom_join(session_id: str, room_id: str, role: str = "agent") -> dict:
+    """Join a chatroom."""
+    return _sync_command({
+        "method": "chatroom_join",
+        "room_id": room_id,
+        "session_id": session_id,
+        "role": role
+    })
+
+
+def chatroom_leave(session_id: str, room_id: str) -> dict:
+    """Leave a chatroom."""
+    return _sync_command({
+        "method": "chatroom_leave",
+        "room_id": room_id,
+        "session_id": session_id
+    })
+
+
+def chatroom_post(session_id: str, room_id: str, content: str) -> dict:
+    """Post a message to a chatroom."""
+    return _sync_command({
+        "method": "chatroom_post",
+        "room_id": room_id,
+        "session_id": session_id,
+        "content": content
+    })
+
+
+def chatroom_history(room_id: str, limit: int = 50, before_id: int = 0) -> dict:
+    """Get chat history."""
+    req = {"method": "chatroom_history", "room_id": room_id, "limit": limit}
+    if before_id > 0:
+        req["before_id"] = before_id
+    return _sync_command(req)
