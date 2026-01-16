@@ -244,40 +244,54 @@ class NotaloneClient:
             )
             return
 
-        # Format data as user message
-        screen = data.get("screen", "")
-        state = data.get("state", {})
-        msg = data.get("msg", "")
+        # CLAIM the session immediately to prevent race condition
+        # (another timer callback could slip through the busy check before query() sets working=True)
+        session.working = True
 
-        # Use rule_prompt if provided, otherwise default hint
-        prefix = rule_prompt if rule_prompt else "[CHANNEL - respond with action only, no explanation]"
+        try:
+            # Format data as user message
+            screen = data.get("screen", "")
+            state = data.get("state", {})
+            msg = data.get("msg", "")
 
-        if screen:
-            user_msg = f"{prefix}\n\nGame Screen:\n```\n{screen}\n```"
-            if state:
-                user_msg += f"\n\nGame State: {json.dumps(state)}"
-        elif msg:
-            user_msg = f"{prefix}\n\n{msg}"
-        else:
-            user_msg = f"{prefix}\n\n{json.dumps(data)}"
+            # Use rule_prompt if provided, otherwise default hint
+            prefix = rule_prompt if rule_prompt else "[CHANNEL - respond with action only, no explanation]"
 
-        logger.info(f"notalone: sending channel message to session {view_id}")
+            if screen:
+                user_msg = f"{prefix}\n\nGame Screen:\n```\n{screen}\n```"
+                if state:
+                    user_msg += f"\n\nGame State: {json.dumps(state)}"
+            elif msg:
+                user_msg = f"{prefix}\n\n{msg}"
+            else:
+                user_msg = f"{prefix}\n\n{json.dumps(data)}"
 
-        # Track active channel for interrupt detection
-        with self._channel_lock:
-            self._active_channels[view_id] = channel_id
+            logger.info(f"notalone: sending channel message to session {view_id}")
 
-        # Send to session and wait for response
-        def on_response(response_text: str):
-            # Clear active channel - only send if we were still active (not interrupted)
+            # Track active channel for interrupt detection
             with self._channel_lock:
-                active_channel = self._active_channels.pop(view_id, None)
-            if active_channel:
-                print(f"[Claude] notalone: channel done: {len(response_text)}c")
-                self._send_channel_response(channel_id, response_text)
-            # else: already interrupted, response already sent
+                self._active_channels[view_id] = channel_id
 
-        session.send_message_with_callback(user_msg, on_response, silent=False)
+            # Send to session and wait for response
+            def on_response(response_text: str):
+                # Clear active channel - only send if we were still active (not interrupted)
+                with self._channel_lock:
+                    active_channel = self._active_channels.pop(view_id, None)
+                if active_channel:
+                    print(f"[Claude] notalone: channel done: {len(response_text)}c")
+                    self._send_channel_response(channel_id, response_text)
+                # else: already interrupted, response already sent
+
+            session.send_message_with_callback(user_msg, on_response, silent=False)
+            # If callback wasn't registered (early failure in send_message_with_callback),
+            # it already called our callback with error, but working is still True - reset it
+            if session._response_callback is None:
+                session.working = False
+        except Exception as e:
+            # Reset working on any failure to prevent stuck session
+            session.working = False
+            logger.error(f"notalone: channel processing error: {e}")
+            self._send_channel_response(channel_id, {"error": str(e)})
 
     def interrupt_channel(self, view_id: int):
         """Called when user interrupts a session - break any active channel."""

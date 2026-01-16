@@ -477,9 +477,9 @@ class Session:
             self.working = False
 
         # Break any active channel connection (only for user-initiated interrupts)
-        if break_channel:
+        if break_channel and self.output.view:
             from . import notalone
-            notalone.interrupt_channel(self.view.id())
+            notalone.interrupt_channel(self.output.view.id())
 
     def stop(self) -> None:
         # Release persona if acquired
