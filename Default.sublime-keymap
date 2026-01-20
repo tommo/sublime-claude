@@ -110,5 +110,65 @@
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
             { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
         ]
+    },
+    {
+        "keys": ["super+shift+o"],
+        "command": "claude_add_order",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        "keys": ["super+alt+o"],
+        "command": "claude_show_order_table"
+    },
+    {
+        "keys": ["enter"],
+        "command": "claude_order_goto",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["g"],
+        "command": "claude_order_goto",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["d"],
+        "command": "claude_order_delete",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["backspace"],
+        "command": "claude_order_delete",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["a"],
+        "command": "claude_add_plain_order",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["u"],
+        "command": "claude_order_undo",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+z"],
+        "command": "claude_order_undo",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
     }
 ]

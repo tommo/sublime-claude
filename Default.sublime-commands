@@ -110,5 +110,17 @@
     {
         "caption": "Claude: Show Usage",
         "command": "claude_code_usage"
+    },
+    {
+        "caption": "Claude: Add Order at Cursor",
+        "command": "claude_add_order"
+    },
+    {
+        "caption": "Claude: Add Order",
+        "command": "claude_add_plain_order"
+    },
+    {
+        "caption": "Claude: Show Order Table",
+        "command": "claude_show_order_table"
     }
 ]

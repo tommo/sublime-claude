@@ -456,3 +456,14 @@ def interrupt_channel(view_id: int):
     global _client
     if _client:
         _client.interrupt_channel(view_id)
+
+
+def inject_local(view_id: int, wake_prompt: str, context: dict = None):
+    """Inject a notification locally (bypasses daemon, uses same batching)."""
+    global _client
+    if _client:
+        _client._handle_inject({
+            "session_id": f"sublime.{view_id}",
+            "wake_prompt": wake_prompt,
+            "context": context
+        })

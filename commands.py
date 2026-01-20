@@ -1242,6 +1242,12 @@ class ClaudeReplaceCommand(sublime_plugin.TextCommand):
         self.view.replace(edit, sublime.Region(start, end), text)
 
 
+class ClaudeReplaceContentCommand(sublime_plugin.TextCommand):
+    """Replace entire view content."""
+    def run(self, edit, content):
+        self.view.replace(edit, sublime.Region(0, self.view.size()), content)
+
+
 class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
     """Insert newline in input mode (Shift+Enter)."""
     def run(self, edit):
@@ -1448,3 +1454,193 @@ class ClaudeCodeManageAutoAllowedToolsCommand(sublime_plugin.WindowCommand):
                 sublime.status_message(f"Removed auto-allow pattern: {pattern}")
             except Exception as e:
                 sublime.error_message(f"Failed to save settings: {e}")
+
+
+class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
+    """Add an order at current caret position to the order table."""
+
+    def run(self, edit):
+        import os
+        from .order_table import get_table, refresh_order_table
+
+        sel = self.view.sel()
+        if not sel:
+            return
+
+        point = sel[0].begin()
+        row, col = self.view.rowcol(point)
+        file_path = self.view.file_name()
+
+        if not file_path:
+            sublime.status_message("Cannot add order: file not saved")
+            return
+
+        basename = os.path.basename(file_path)
+        self.view.window().show_input_panel(
+            f"Order at {basename}:{row+1}:",
+            "",
+            lambda prompt: self._on_done(prompt, file_path, row, col),
+            None,
+            None
+        )
+
+    def _on_done(self, prompt, file_path, row, col):
+        from .order_table import get_table, show_order_table
+
+        if not prompt or not prompt.strip():
+            return
+
+        window = self.view.window()
+        table = get_table(window)
+        if not table:
+            sublime.status_message("No project folder")
+            return
+
+        order = table.add(prompt.strip(), file_path, row, col, view=self.view)
+        show_order_table(window)
+        sublime.status_message(f"Order added: {order.id}")
+
+
+class ClaudeAddPlainOrderCommand(sublime_plugin.WindowCommand):
+    """Add an order without file location."""
+
+    def run(self):
+        from .order_table import get_table, show_order_table
+
+        table = get_table(self.window)
+        if not table:
+            sublime.status_message("No project folder")
+            return
+
+        self.window.show_input_panel(
+            "Order:",
+            "",
+            lambda prompt: self._on_done(prompt),
+            None,
+            None
+        )
+
+    def _on_done(self, prompt):
+        from .order_table import get_table, show_order_table
+
+        if not prompt or not prompt.strip():
+            return
+
+        table = get_table(self.window)
+        if not table:
+            return
+
+        order = table.add(prompt.strip())
+        show_order_table(self.window)
+        sublime.status_message(f"Order added: {order.id}")
+
+
+class ClaudeShowOrderTableCommand(sublime_plugin.WindowCommand):
+    """Show the order table view."""
+
+    def run(self):
+        from .order_table import show_order_table
+        view = show_order_table(self.window)
+        if not view:
+            sublime.status_message("No project folder")
+
+
+class ClaudeOrderGotoCommand(sublime_plugin.TextCommand):
+    """Jump to the order location under cursor."""
+
+    def run(self, edit):
+        import re
+        from .order_table import get_table
+
+        if not self.view.settings().get("order_table_view"):
+            return
+
+        # Get current line
+        sel = self.view.sel()
+        if not sel:
+            return
+        line_region = self.view.line(sel[0])
+        line = self.view.substr(line_region)
+
+        # Extract order_id from line like "  [order_1] @ file.py:10"
+        match = re.search(r'\[(order_\d+)\]', line)
+        if not match:
+            return
+
+        order_id = match.group(1)
+        table = get_table(self.view.window())
+        if not table:
+            return
+
+        # Find the order
+        for o in table.list():
+            if o["id"] == order_id and o.get("file_path"):
+                file_path = o["file_path"]
+                row = o.get("row", 0)
+                col = o.get("col", 0)
+                # Open file and goto position
+                self.view.window().open_file(
+                    f"{file_path}:{row+1}:{col+1}",
+                    sublime.ENCODED_POSITION
+                )
+                return
+
+        sublime.status_message("Order has no location")
+
+
+class ClaudeOrderDeleteCommand(sublime_plugin.TextCommand):
+    """Delete the order under cursor."""
+
+    def run(self, edit):
+        import re
+        from .order_table import get_table, refresh_order_table
+
+        if not self.view.settings().get("order_table_view"):
+            return
+
+        # Get current line
+        sel = self.view.sel()
+        if not sel:
+            return
+        line_region = self.view.line(sel[0])
+        line = self.view.substr(line_region)
+
+        # Extract order_id
+        match = re.search(r'\[(order_\d+)\]', line)
+        if not match:
+            sublime.status_message("No order on this line")
+            return
+
+        order_id = match.group(1)
+        window = self.view.window()
+        table = get_table(window)
+        if not table:
+            return
+
+        ok, msg = table.delete(order_id)
+        if ok:
+            sublime.status_message(f"Deleted {order_id} (u to undo)")
+            # Defer refresh to after command completes
+            sublime.set_timeout(lambda: refresh_order_table(window), 10)
+        else:
+            sublime.status_message(msg)
+
+
+class ClaudeOrderUndoCommand(sublime_plugin.TextCommand):
+    """Undo last order deletion."""
+
+    def run(self, edit):
+        from .order_table import get_table, refresh_order_table
+
+        if not self.view.settings().get("order_table_view"):
+            return
+
+        window = self.view.window()
+        table = get_table(window)
+        if not table:
+            return
+
+        ok, msg = table.undo_delete()
+        sublime.status_message(msg)
+        if ok:
+            sublime.set_timeout(lambda: refresh_order_table(window), 10)

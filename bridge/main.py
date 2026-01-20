@@ -255,7 +255,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         # For fresh sessions (not resuming), specify session_id upfront via CLI arg
         # This avoids waiting for first query to get session_id from ResultMessage
         if not resume_id:
-            options_dict["extra_args"] = {"session-id": session_id}
+            extra_args = {"session-id": session_id}
+            # Add additional working directories from Sublime project folders
+            additional_dirs = params.get("additional_dirs", [])
+            if additional_dirs:
+                extra_args["add-dir"] = additional_dirs
+            options_dict["extra_args"] = extra_args
 
         self.options = ClaudeAgentOptions(**options_dict)
         self.client = ClaudeSDKClient(options=self.options)

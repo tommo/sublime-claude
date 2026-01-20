@@ -177,6 +177,44 @@ Use **Claude: Resume Session...** to pick and continue a previous conversation.
 
 After Sublime restarts, orphaned output views are automatically reconnected to their sessions.
 
+## Order Table
+
+A simple TODO list for human→agent task assignments. Add orders (tasks) that agents can subscribe to and complete.
+
+### Commands
+
+| Command | Keybinding | Description |
+|---------|------------|-------------|
+| Add Order at Cursor | `Cmd+Shift+O` | Pin an order at current cursor location |
+| Add Order | - | Add order without file location |
+| Show Order Table | `Cmd+Alt+O` | Open the order table view |
+
+### Order Table View
+
+The order table shows pending and completed orders:
+
+| Key | Action |
+|-----|--------|
+| `Enter` / `g` | Go to order location |
+| `d` / `Backspace` | Delete order |
+| `u` / `Cmd+Z` | Undo deletion |
+| `a` | Add new order |
+
+Orders pinned at cursor positions show a bookmark icon in the gutter.
+
+### Agent Subscription
+
+Agents can subscribe to order notifications via MCP:
+
+```
+order("subscribe Check for new orders")  # Subscribe with wake prompt
+order("list")                            # List all orders
+order("pending")                         # List pending orders only
+order("complete order_1")                # Mark order as done
+```
+
+When a new order is added, subscribed agents receive a notification with order details.
+
 ## Output View
 
 The output view shows:

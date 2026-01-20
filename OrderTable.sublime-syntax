@@ -1,0 +1,54 @@
+%YAML 1.2
+---
+name: Order Table
+scope: text.order-table
+hidden: true
+
+contexts:
+  main:
+    # Header
+    - match: '^═.*═$'
+      scope: markup.heading.order-table
+
+    # Pending section header
+    - match: '^PENDING\s+\((\d+)\)'
+      captures:
+        1: constant.numeric.order-table
+      scope: entity.name.section.order-table
+
+    # Done section (comment style)
+    - match: '^#.*$'
+      scope: comment.line.order-table
+
+    # Separator lines
+    - match: '^─+$'
+      scope: comment.line.order-table
+
+    # Order ID - pending
+    - match: '\[(order_\d+)\]'
+      captures:
+        1: entity.name.tag.order-table
+
+    # File location
+    - match: '@\s+([^:]+):(\d+)'
+      captures:
+        1: string.unquoted.order-table
+        2: constant.numeric.line.order-table
+
+    # Done by
+    - match: '\bby\s+(\S+)'
+      captures:
+        1: variable.parameter.order-table
+
+    # Hotkey hints
+    - match: '^(Cmd\+\S+|Enter|g|double-click)'
+      scope: keyword.operator.order-table
+
+    # No pending message
+    - match: '^No pending orders$'
+      scope: comment.line.order-table
+
+    # Prompt text (indented lines)
+    - match: '^\s{4}(.+)$'
+      captures:
+        1: string.quoted.order-table

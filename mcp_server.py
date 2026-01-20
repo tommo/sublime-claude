@@ -409,7 +409,14 @@ class MCPSocketServer:
             "signal_subsession_complete": self._signal_subsession_complete,
             "list_notifications": self._list_notifications,
             "discover_services": self._discover_services,
+            # Order table
+            "order_table_cmd": self._order_table_cmd,
         }
+
+        # Add context variables
+        window = sublime.active_window()
+        exec_globals["cwd"] = window.folders()[0] if window and window.folders() else None
+        exec_globals["AGENT_ID"] = str(caller_view_id) if caller_view_id else None
 
         # Handle return statements
         if "return " in code:
@@ -1745,6 +1752,57 @@ class MCPSocketServer:
             return {"services": services, "error": "notalone2 daemon not running"}
         except Exception as e:
             return {"services": services, "error": str(e)}
+
+    # ─── Order Table ───────────────────────────────────────────────────────
+
+    def _order_table_cmd(self, action: str, **kwargs) -> str:
+        """Dispatch order table commands."""
+        from .order_table import get_table_for_cwd, refresh_order_table, _relative_path
+
+        window = sublime.active_window()
+        cwd = window.folders()[0] if window and window.folders() else None
+        if not cwd:
+            return "error: No project folder"
+
+        table = get_table_for_cwd(cwd)
+        agent_id = str(self._caller_view_id) if self._caller_view_id else None
+        folders = window.folders()
+
+        if action == "list":
+            state = kwargs.get("state")
+            orders = table.list(state)
+            if not orders:
+                return "No orders" + (f" ({state})" if state else "")
+            lines = []
+            for o in orders:
+                loc = ""
+                if o.get("file_path"):
+                    rel = _relative_path(o["file_path"], folders)
+                    loc = f" @ {rel}:{o.get('row', 0)+1}"
+                status = "✓" if o["state"] == "done" else "○"
+                lines.append(f"{status} [{o['id']}]{loc} {o['prompt'][:50]}")
+            return "\n".join(lines)
+
+        elif action == "complete":
+            order_id = kwargs.get("order_id")
+            if not order_id:
+                return "error: Missing order_id"
+            ok, msg = table.complete(order_id, agent_id)
+            sublime.set_timeout(lambda: refresh_order_table(window), 100)
+            return f"✓ {order_id} done" if ok else f"error: {msg}"
+
+        elif action == "subscribe":
+            # Local subscription (no daemon needed)
+            from .order_table import subscribe_to_orders
+            wake_prompt = kwargs.get("wake_prompt") or "New order [{context[order_id]}]{context[location]}: {context[prompt]}"
+            view_id = self._caller_view_id
+            if not view_id:
+                return "error: No session view"
+            sub_id = subscribe_to_orders(cwd, view_id, wake_prompt)
+            return f"Subscribed to orders (id: {sub_id})"
+
+        else:
+            return f"error: Unknown action: {action}"
 
 
 # ============================================================================

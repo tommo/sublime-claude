@@ -110,8 +110,11 @@ class Session:
 
         default_model = settings.get("default_model")
         print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
+        # Get additional working directories from project folders (all except first which is cwd)
+        additional_dirs = self.window.folders()[1:] if len(self.window.folders()) > 1 else []
         init_params = {
             "cwd": self._cwd(),
+            "additional_dirs": additional_dirs,
             "allowed_tools": allowed_tools,
             "permission_mode": permission_mode,
             "view_id": str(self.output.view.id()) if self.output and self.output.view else None,

@@ -507,6 +507,33 @@ Examples:
                         },
                         "required": ["cmd"]
                     }
+                },
+                # ─── Order Table ─────────────────────────────────────────────
+                {
+                    "name": "order",
+                    "description": """Order table - human→agent task assignments. Commands:
+- list [state]         → list orders (optional: pending/done)
+- pending              → list pending orders only
+- complete <order_id>  → mark order as done
+- subscribe [prompt]   → subscribe to new order notifications
+
+Orders are created by user via Cmd+Shift+O at cursor position.
+Use subscribe() to get notified when new orders are added.
+
+Examples:
+  order("pending")
+  order("complete order_1")
+  order("subscribe Check for new orders")""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {
+                                "type": "string",
+                                "description": "Command string, e.g. 'pending' or 'complete order_1'"
+                            }
+                        },
+                        "required": ["cmd"]
+                    }
                 }
             ]
         })
