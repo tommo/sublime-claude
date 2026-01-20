@@ -108,9 +108,10 @@ class OrderTable:
         # Add visual bookmark marker
         if view and row is not None:
             point = view.text_point(row, col or 0)
+            end_point = point + selection_length if selection_length else point
             view.add_regions(
                 f"claude_order_{order.id}",
-                [sublime.Region(point, point)],
+                [sublime.Region(point, end_point)],
                 "region.bluish",
                 "bookmark",
                 sublime.HIDDEN | sublime.PERSISTENT
@@ -334,15 +335,17 @@ def sync_bookmarks(window):
             continue
         row = order.get("row", 0)
         col = order.get("col", 0)
+        selection_length = order.get("selection_length")
         order_id = order["id"]
 
         # Find view for this file
         for view in window.views():
             if view.file_name() == file_path:
                 point = view.text_point(row, col)
+                end_point = point + selection_length if selection_length else point
                 view.add_regions(
                     f"claude_order_{order_id}",
-                    [sublime.Region(point, point)],
+                    [sublime.Region(point, end_point)],
                     "region.bluish",
                     "bookmark",
                     sublime.HIDDEN | sublime.PERSISTENT
