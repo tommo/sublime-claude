@@ -122,5 +122,20 @@
     {
         "caption": "Claude: Show Order Table",
         "command": "claude_show_order_table"
+    },
+    {
+        "caption": "Claude: View Retain Content",
+        "command": "claude_retain",
+        "args": {"action": "view"}
+    },
+    {
+        "caption": "Claude: Edit Retain Content",
+        "command": "claude_retain",
+        "args": {"action": "edit"}
+    },
+    {
+        "caption": "Claude: Clear Retain Content",
+        "command": "claude_retain",
+        "args": {"action": "clear"}
     }
 ]

@@ -97,8 +97,14 @@ class Session:
         # Build profile docs list early (before init) so we can add to system prompt
         self._build_profile_docs_list()
 
+        # Load environment variables from settings and profile
+        env = self._load_env(settings)
+
+        # Sync sublime project retain content to file for hook
+        self._sync_project_retain()
+
         self.client = JsonRpcClient(self._on_notification)
-        self.client.start([python_path, BRIDGE_SCRIPT])
+        self.client.start([python_path, BRIDGE_SCRIPT], env=env)
         self._status("connecting...")
 
         permission_mode = settings.get("permission_mode", "acceptEdits")
@@ -196,6 +202,109 @@ class Session:
         # Auto-enter input mode when ready
         self._enter_input_with_draft()
 
+    def _load_env(self, settings) -> dict:
+        """Load environment variables from settings and project profile."""
+        import os
+        env = {}
+        # From user settings (ClaudeCode.sublime-settings)
+        settings_env = settings.get("env", {})
+        if isinstance(settings_env, dict):
+            env.update(settings_env)
+        # From sublime project settings (.sublime-project -> settings -> claude_env)
+        project_data = self.window.project_data() or {}
+        project_settings = project_data.get("settings", {})
+        project_env = project_settings.get("claude_env", {})
+        if isinstance(project_env, dict):
+            env.update(project_env)
+        # From project .claude/settings.json
+        cwd = self._cwd()
+        if cwd:
+            project_settings_path = os.path.join(cwd, ".claude", "settings.json")
+            if os.path.exists(project_settings_path):
+                try:
+                    with open(project_settings_path, "r") as f:
+                        import json
+                        project_settings = json.load(f)
+                    claude_env = project_settings.get("env", {})
+                    if isinstance(claude_env, dict):
+                        env.update(claude_env)
+                except Exception as e:
+                    print(f"[Claude] Failed to load project env: {e}")
+        # From profile (highest priority)
+        if self.profile:
+            profile_env = self.profile.get("env", {})
+            if isinstance(profile_env, dict):
+                env.update(profile_env)
+        if env:
+            print(f"[Claude] Custom env vars: {env}")
+        return env
+
+    def _sync_project_retain(self):
+        """Sync sublime project retain setting to file for hook."""
+        cwd = self._cwd()
+        if not cwd:
+            return
+        project_data = self.window.project_data() or {}
+        project_settings = project_data.get("settings", {})
+        retain_content = project_settings.get("claude_retain", "")
+
+        retain_path = os.path.join(cwd, ".claude", "sublime_project_retain.md")
+        if retain_content:
+            os.makedirs(os.path.dirname(retain_path), exist_ok=True)
+            with open(retain_path, "w") as f:
+                f.write(retain_content)
+        elif os.path.exists(retain_path):
+            os.remove(retain_path)
+
+    def _get_retain_path(self) -> Optional[str]:
+        """Get path to session's dynamic retain file."""
+        if not self.session_id:
+            return None
+        cwd = self._cwd()
+        if not cwd:
+            return None
+        return os.path.join(cwd, ".claude", "sessions", f"{self.session_id}_retain.md")
+
+    def retain(self, content: str = None, append: bool = False) -> Optional[str]:
+        """Write to or read session's retain file for compaction.
+
+        Args:
+            content: Content to write (None to read current)
+            append: If True, append to existing content
+
+        Returns:
+            Current retain content if reading, None if writing
+        """
+        path = self._get_retain_path()
+        if not path:
+            print("[Claude] Cannot access retain file - no session_id yet")
+            return None
+
+        if content is None:
+            # Read mode
+            if os.path.exists(path):
+                with open(path, "r") as f:
+                    return f.read()
+            return ""
+
+        # Write mode - ensure directory exists
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+        mode = "a" if append else "w"
+        with open(path, mode) as f:
+            if append and os.path.exists(path):
+                f.write("\n")
+            f.write(content)
+        print(f"[Claude] Retain file updated: {path}")
+        return None
+
+    def clear_retain(self):
+        """Clear session's retain file."""
+        path = self._get_retain_path()
+        if path and os.path.exists(path):
+            os.remove(path)
+            print(f"[Claude] Retain file cleared: {path}")
+
     def _build_profile_docs_list(self) -> None:
         """Build list of available docs from profile preload_docs patterns (no reading yet)."""
         if not self.profile or not self.profile.get("preload_docs"):
@@ -242,6 +351,29 @@ class Session:
         self.pending_context.append(ContextItem("folder", name, f"Folder: {path}"))
         self._update_context_display()
 
+    def add_context_image(self, image_data: bytes, mime_type: str) -> None:
+        """Add an image to pending context."""
+        import base64
+        import tempfile
+
+        # Save to temp file for reference
+        ext = ".png" if "png" in mime_type else ".jpg" if "jpeg" in mime_type or "jpg" in mime_type else ".img"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(image_data)
+            temp_path = f.name
+
+        # Store base64 encoded image
+        encoded = base64.b64encode(image_data).decode('utf-8')
+        # Use special format that query() will detect
+        name = f"image{ext}"
+        self.pending_context.append(ContextItem(
+            "image",
+            name,
+            f"__IMAGE__:{mime_type}:{encoded}"  # Special marker for image data
+        ))
+        print(f"[Claude] Added image to context: {name} ({len(image_data)} bytes, saved to {temp_path})")
+        self._update_context_display()
+
     def clear_context(self) -> None:
         """Clear pending context."""
         self.pending_context = []
@@ -251,13 +383,26 @@ class Session:
         """Update output view with pending context."""
         self.output.set_pending_context(self.pending_context)
 
-    def _build_prompt_with_context(self, prompt: str) -> str:
-        """Build full prompt with pending context."""
+    def _build_prompt_with_context(self, prompt: str) -> tuple:
+        """Build full prompt with pending context.
+
+        Returns:
+            (full_prompt, images) where images is list of {"mime_type": str, "data": str}
+        """
         if not self.pending_context:
-            return prompt
-        parts = [item.content for item in self.pending_context]
+            return prompt, []
+
+        parts = []
+        images = []
+        for item in self.pending_context:
+            if item.content.startswith("__IMAGE__:"):
+                # Extract image data: __IMAGE__:mime_type:base64data
+                _, mime_type, data = item.content.split(":", 2)
+                images.append({"mime_type": mime_type, "data": data})
+            else:
+                parts.append(item.content)
         parts.append(prompt)
-        return "\n\n".join(parts)
+        return "\n\n".join(parts), images
 
     def query(self, prompt: str, display_prompt: str = None, silent: bool = False) -> None:
         """
@@ -283,11 +428,14 @@ class Session:
         if self.output.view and not self.window.settings().has("claude_executing_view"):
             self.window.settings().set("claude_executing_view", self.output.view.id())
             self._is_executing_session = True
-        # Build prompt with context
-        full_prompt = self._build_prompt_with_context(prompt)
+        # Build prompt with context (may include images)
+        full_prompt, images = self._build_prompt_with_context(prompt)
         context_names = [item.name for item in self.pending_context]
         self.pending_context = []  # Clear after use
         self._update_context_display()
+
+        # Store images for RPC call
+        self._pending_images = images
 
         # Use display_prompt for UI if provided, otherwise use full prompt
         ui_prompt = display_prompt if display_prompt else prompt
@@ -311,7 +459,12 @@ class Session:
             print(f"[Claude] query() - calling _animate()")
             self._animate()
         print(f"[Claude] query() - sending RPC query request")
-        if not self.client.send("query", {"prompt": full_prompt}, self._on_done):
+        query_params = {"prompt": full_prompt}
+        if hasattr(self, '_pending_images') and self._pending_images:
+            query_params["images"] = self._pending_images
+            print(f"[Claude] Including {len(self._pending_images)} image(s) in query")
+            self._pending_images = []
+        if not self.client.send("query", query_params, self._on_done):
             self._status("error: bridge died")
             self.working = False
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")

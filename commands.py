@@ -1666,3 +1666,94 @@ class ClaudeOrderClearDoneCommand(sublime_plugin.TextCommand):
         sublime.status_message(f"Cleared {count} done orders")
         if count > 0:
             sublime.set_timeout(lambda: refresh_order_table(window), 10)
+
+
+class ClaudePasteImageCommand(sublime_plugin.TextCommand):
+    """Paste image from clipboard into context."""
+
+    def run(self, edit):
+        from .core import get_session_for_view
+
+        session = get_session_for_view(self.view)
+        if not session:
+            sublime.status_message("No active Claude session")
+            return
+
+        image_data, mime_type = self._get_clipboard_image()
+        if image_data:
+            session.add_context_image(image_data, mime_type)
+            sublime.status_message(f"Image added to context ({len(image_data)} bytes)")
+        else:
+            sublime.status_message("No image in clipboard")
+
+    def _get_clipboard_image(self):
+        """Check if clipboard contains image data using helper script."""
+        import platform
+        import subprocess
+        import base64
+
+        try:
+            if platform.system() == "Darwin":
+                helper_path = os.path.join(os.path.dirname(__file__), "helpers", "clipboard_image.py")
+                result = subprocess.run(
+                    ["/usr/bin/python3", helper_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                output = result.stdout.strip()
+
+                if output.startswith("image/"):
+                    lines = output.split("\n")
+                    mime_type = lines[0]
+                    b64_data = lines[1] if len(lines) > 1 else ""
+                    if b64_data:
+                        image_data = base64.b64decode(b64_data)
+                        return image_data, mime_type
+                elif output.startswith("error:"):
+                    print(f"[Claude] Clipboard error: {output}")
+
+            return None, None
+        except Exception as e:
+            print(f"[Claude] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return None, None
+
+
+class ClaudeRetainCommand(sublime_plugin.WindowCommand):
+    """Manage session retain content for compaction."""
+
+    def run(self, action="view"):
+        from .core import get_active_session
+
+        session = get_active_session(self.window)
+        if not session:
+            sublime.status_message("No active session")
+            return
+
+        if action == "view":
+            content = session.retain()
+            if content:
+                # Show in output panel
+                panel = self.window.create_output_panel("claude_retain")
+                panel.run_command("append", {"characters": f"# Session Retain Content\n\n{content}"})
+                self.window.run_command("show_panel", {"panel": "output.claude_retain"})
+            else:
+                sublime.status_message("Retain file is empty")
+
+        elif action == "edit":
+            path = session._get_retain_path()
+            if path:
+                import os
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if not os.path.exists(path):
+                    with open(path, "w") as f:
+                        f.write("# Session Retain Content\n# This content is preserved during compaction.\n\n")
+                self.window.open_file(path)
+            else:
+                sublime.status_message("Session not initialized yet")
+
+        elif action == "clear":
+            session.clear_retain()
+            sublime.status_message("Retain content cleared")

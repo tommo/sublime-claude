@@ -170,5 +170,12 @@
         "context": [
             { "key": "setting.order_table_view", "operator": "equal", "operand": true }
         ]
+    },
+    {
+        "keys": ["super+shift+v"],
+        "command": "claude_paste_image",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
     }
 ]

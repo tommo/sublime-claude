@@ -3,6 +3,7 @@
 import subprocess
 import threading
 import json
+import os
 from typing import Dict, Any, Optional, Callable
 
 
@@ -15,13 +16,18 @@ class JsonRpcClient:
         self.reader_thread: Optional[threading.Thread] = None
         self.running = False
 
-    def start(self, cmd: list) -> None:
+    def start(self, cmd: list, env: Dict[str, str] = None) -> None:
+        # Merge custom env with current environment
+        proc_env = os.environ.copy()
+        if env:
+            proc_env.update(env)
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=proc_env,
         )
         self.running = True
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)

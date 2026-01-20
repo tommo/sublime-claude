@@ -709,6 +709,32 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         send_result(id, {"status": "ok"})
 
+    async def _build_content_with_images(self, prompt: str, images: list):
+        """Build content stream with images for Claude SDK.
+
+        Args:
+            prompt: Text prompt
+            images: List of {"mime_type": str, "data": str} dicts
+
+        Returns:
+            Async generator yielding content blocks
+        """
+        async def content_stream():
+            # Yield images first (Claude prefers images before text)
+            for img in images:
+                yield {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img["mime_type"],
+                        "data": img["data"]
+                    }
+                }
+            # Yield text prompt
+            yield {"type": "text", "text": prompt}
+
+        return content_stream()
+
     async def query(self, id: int, params: dict) -> None:
         """Send a query and stream responses."""
         if not self.client:
@@ -716,12 +742,17 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             return
 
         prompt = params.get("prompt", "")
+        images = params.get("images", [])
         self.interrupted = False  # Reset at start of query
         self.query_id = id  # Store for inject_message to know query is active
 
         async def run_query():
-            # Send initial prompt
-            await self.client.query(prompt)
+            # Build content with images if present
+            if images:
+                content = await self._build_content_with_images(prompt, images)
+                await self.client.query(content)
+            else:
+                await self.client.query(prompt)
             # Stream responses
             async for message in self.client.receive_response():
                 await self.emit_message(message)

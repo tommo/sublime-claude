@@ -220,8 +220,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 if command_name == "paste":
                     file_paths = self._get_clipboard_file_paths()
                     if file_paths:
-                        print(f"[Claude] Detected {len(file_paths)} file(s) in clipboard, adding as context")
-                        # Add files as context instead of pasting text
                         session = get_session_for_view(self.view)
                         if session:
                             for path in file_paths:
@@ -231,7 +229,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                                     session.add_context_file(path, content)
                                 except Exception as e:
                                     print(f"[Claude] Failed to add file {path}: {e}")
-                        # Block the paste command since we handled it
                         return ("noop", {})
 
                 # For insert/paste commands, move cursor to end of input and allow the command
