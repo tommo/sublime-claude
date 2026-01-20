@@ -26,21 +26,26 @@ def subscribe_to_orders(project_root: str, view_id: int, wake_prompt: str) -> st
 CLAIM_TIMEOUT_SECS = 600  # 10 minutes - auto-release if claimed too long
 
 
-def _add_order_region(view, order_id: str, row: int, col: int, selection_length: int = None):
-    """Add visual region marker for an order."""
+def _add_order_region(view, order_id: str, row: int, col: int, selection_length: int = None, prompt: str = None):
+    """Add visual region marker and phantom for an order."""
+    key = f"claude_order_{order_id}"
+    # Clear existing first
+    view.erase_regions(key)
+    view.erase_phantoms(key)
+
     point = view.text_point(row, col or 0)
     end_point = point + selection_length if selection_length else point
     # Subtle outline if selection, otherwise just gutter icon
     flags = sublime.PERSISTENT | sublime.DRAW_NO_FILL
     if not selection_length:
         flags |= sublime.HIDDEN
-    view.add_regions(
-        f"claude_order_{order_id}",
-        [sublime.Region(point, end_point)],
-        "region.bluish",
-        "bookmark",
-        flags
-    )
+    view.add_regions(key, [sublime.Region(point, end_point)], "region.bluish", "bookmark", flags)
+    # Add phantom above the line at pin column
+    if prompt:
+        indent = " " * (col or 0)
+        short_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
+        html = f'<body style="margin:0;padding:0"><span style="color:color(var(--foreground) alpha(0.5));font-style:italic">{indent}📌 {order_id}: {short_prompt}</span></body>'
+        view.add_phantom(key, sublime.Region(point, point), html, sublime.LAYOUT_BLOCK)
 
 
 @dataclass
@@ -123,7 +128,7 @@ class OrderTable:
         self._save()
         self._notify_order_added(order)
         if view and row is not None:
-            _add_order_region(view, order.id, row, col, selection_length)
+            _add_order_region(view, order.id, row, col, selection_length, prompt)
         return order
 
     def _notify_order_added(self, order: Order):
@@ -285,11 +290,12 @@ class OrderTable:
         return True, f"Restored {order.id}"
 
     def _remove_bookmark(self, order_id: str):
-        """Remove bookmark for an order from all views."""
+        """Remove bookmark and phantom for an order from all views."""
         window = sublime.active_window()
         if window:
             for view in window.views():
                 view.erase_regions(f"claude_order_{order_id}")
+                view.erase_phantoms(f"claude_order_{order_id}")
 
     def clear_done(self) -> int:
         """Remove all done orders."""
@@ -344,12 +350,13 @@ def sync_bookmarks(window):
         row = order.get("row", 0)
         col = order.get("col", 0)
         selection_length = order.get("selection_length")
+        prompt = order.get("prompt")
         order_id = order["id"]
 
         # Find view for this file
         for view in window.views():
             if view.file_name() == file_path:
-                _add_order_region(view, order_id, row, col, selection_length)
+                _add_order_region(view, order_id, row, col, selection_length, prompt)
                 break
 
 
