@@ -1646,3 +1646,23 @@ class ClaudeOrderUndoCommand(sublime_plugin.TextCommand):
         sublime.status_message(msg)
         if ok:
             sublime.set_timeout(lambda: refresh_order_table(window), 10)
+
+
+class ClaudeOrderClearDoneCommand(sublime_plugin.TextCommand):
+    """Clear all done orders."""
+
+    def run(self, edit):
+        from .order_table import get_table, refresh_order_table
+
+        if not self.view.settings().get("order_table_view"):
+            return
+
+        window = self.view.window()
+        table = get_table(window)
+        if not table:
+            return
+
+        count = table.clear_done()
+        sublime.status_message(f"Cleared {count} done orders")
+        if count > 0:
+            sublime.set_timeout(lambda: refresh_order_table(window), 10)

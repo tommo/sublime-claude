@@ -422,7 +422,7 @@ class OrderTableView:
                 lines.append(f"#   ... and {len(done)-5} more")
 
         lines.append("─" * 50)
-        lines.append("a add | Cmd+Shift+O add@cursor | Enter goto | Cmd+Del | u undo")
+        lines.append("a add | Enter goto | Cmd+Del | u undo | x clear done")
 
         content = "\n".join(lines)
 

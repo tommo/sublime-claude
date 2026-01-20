@@ -163,5 +163,12 @@
         "context": [
             { "key": "setting.order_table_view", "operator": "equal", "operand": true }
         ]
+    },
+    {
+        "keys": ["x"],
+        "command": "claude_order_clear_done",
+        "context": [
+            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
+        ]
     }
 ]
