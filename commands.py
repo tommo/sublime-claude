@@ -1672,6 +1672,7 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
     """Paste image from clipboard into context."""
 
     def run(self, edit):
+        import os
         from .core import get_session_for_view
 
         session = get_session_for_view(self.view)
@@ -1683,39 +1684,60 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
         if image_data:
             session.add_context_image(image_data, mime_type)
             sublime.status_message(f"Image added to context ({len(image_data)} bytes)")
-        else:
-            sublime.status_message("No image in clipboard")
+            return
+
+        # No image, check for file paths
+        text = sublime.get_clipboard()
+        if text:
+            lines = [line.strip() for line in text.split('\n') if line.strip()]
+            file_paths = [line for line in lines if os.path.isfile(line)]
+            if file_paths:
+                for path in file_paths:
+                    try:
+                        with open(path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        session.add_context_file(path, content)
+                    except Exception as e:
+                        print(f"[Claude] Failed to add file {path}: {e}")
+                sublime.status_message(f"Added {len(file_paths)} file(s) to context")
+                return
+
+            # Normal text paste
+            self.view.run_command("insert", {"characters": text})
 
     def _get_clipboard_image(self):
-        """Check if clipboard contains image data using helper script."""
+        """Check if clipboard contains image data using platform-specific helper."""
+        import os
         import platform
         import subprocess
         import base64
 
         try:
-            if platform.system() == "Darwin":
-                helper_path = os.path.join(os.path.dirname(__file__), "helpers", "clipboard_image.py")
-                result = subprocess.run(
-                    ["/usr/bin/python3", helper_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                output = result.stdout.strip()
+            helpers_dir = os.path.join(os.path.dirname(__file__), "helpers")
+            system = platform.system()
 
-                if output.startswith("image/"):
-                    lines = output.split("\n")
-                    mime_type = lines[0]
-                    b64_data = lines[1] if len(lines) > 1 else ""
-                    if b64_data:
-                        image_data = base64.b64decode(b64_data)
-                        return image_data, mime_type
-                elif output.startswith("error:"):
-                    print(f"[Claude] Clipboard error: {output}")
+            if system == "Darwin":
+                cmd = ["osascript", "-l", "JavaScript", os.path.join(helpers_dir, "clipboard_image.js")]
+            elif system == "Linux":
+                cmd = ["bash", os.path.join(helpers_dir, "clipboard_image_linux.sh")]
+            elif system == "Windows":
+                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", os.path.join(helpers_dir, "clipboard_image_windows.ps1")]
+            else:
+                return None, None
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            output = result.stdout.strip()
+
+            if output.startswith("image/"):
+                lines = output.split("\n")
+                mime_type = lines[0]
+                b64_data = lines[1] if len(lines) > 1 else ""
+                if b64_data:
+                    return base64.b64decode(b64_data), mime_type
 
             return None, None
         except Exception as e:
-            print(f"[Claude] Error: {e}")
+            print(f"[Claude] Clipboard error: {e}")
             import traceback
             traceback.print_exc()
             return None, None

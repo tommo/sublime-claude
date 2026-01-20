@@ -208,6 +208,10 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if command_name in safe_commands:
             return None
 
+        # For paste, delegate to claude_paste_image which handles images
+        if command_name == "paste":
+            return ("claude_paste_image", {})
+
         # All other commands are potentially destructive - check if cursor is in input region
         input_start = s.output._input_start
         sel = self.view.sel()
@@ -216,31 +220,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         for region in sel:
             # If typing outside input region, refocus to input area
             if region.begin() < input_start or region.end() < input_start:
-                # For paste, check if clipboard contains file paths
-                if command_name == "paste":
-                    file_paths = self._get_clipboard_file_paths()
-                    if file_paths:
-                        session = get_session_for_view(self.view)
-                        if session:
-                            for path in file_paths:
-                                try:
-                                    with open(path, 'r', encoding='utf-8') as f:
-                                        content = f.read()
-                                    session.add_context_file(path, content)
-                                except Exception as e:
-                                    print(f"[Claude] Failed to add file {path}: {e}")
-                        return ("noop", {})
-
-                # For insert/paste commands, move cursor to end of input and allow the command
-                if command_name in ("insert", "paste") or (command_name == "insert" and args and "characters" in args):
-                    print(f"[Claude] Refocusing to input area for {command_name} (was at {region.begin()}, input_start={input_start})")
+                # For insert commands, move cursor to end of input and allow the command
+                if command_name == "insert" or (command_name == "insert" and args and "characters" in args):
                     # Move cursor to end of input area
                     input_end = self.view.size()
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(input_end, input_end))
-                    # Show the cursor
                     self.view.show(input_end)
-                    # Let the command proceed at new position
                     return None
 
                 # For other commands, block them
@@ -248,64 +234,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 return ("noop", {})
 
         return None
-
-    def _get_clipboard_file_paths(self):
-        """
-        Check if clipboard contains file paths (from Finder, etc).
-        Returns list of file paths, or empty list if none found.
-        """
-        try:
-            # Try to get file URLs from macOS pasteboard
-            if platform.system() == "Darwin":
-                try:
-                    from AppKit import NSPasteboard, NSURL
-                    pasteboard = NSPasteboard.generalPasteboard()
-
-                    # Debug: print available types
-                    types = pasteboard.types()
-                    print(f"[Claude] Pasteboard types: {types}")
-
-                    # Try to read file URLs (what Finder copies)
-                    if "public.file-url" in types:
-                        urls = pasteboard.readObjectsForClasses_options_([NSURL], None)
-                        if urls:
-                            paths = [url.path() for url in urls]
-                            print(f"[Claude] Found {len(paths)} file(s) in clipboard: {paths}")
-                            return paths
-
-                    # Also try NSFilenamesPboardType (older format)
-                    filenames = pasteboard.propertyListForType_("NSFilenamesPboardType")
-                    if filenames:
-                        print(f"[Claude] Found {len(filenames)} file(s) via NSFilenamesPboardType: {filenames}")
-                        return list(filenames)
-
-                except ImportError as e:
-                    print(f"[Claude] AppKit not available: {e}")
-                except Exception as e:
-                    print(f"[Claude] Error reading pasteboard: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-            # Fallback: check if clipboard text looks like file paths
-            text = sublime.get_clipboard()
-            print(f"[Claude] Clipboard text: {text[:100] if text else 'None'}")
-            if text:
-                lines = [line.strip() for line in text.split('\n') if line.strip()]
-                paths = []
-                for line in lines:
-                    # Check if it's a valid file path
-                    if os.path.isfile(line):
-                        paths.append(line)
-                        print(f"[Claude] Valid file path: {line}")
-                if paths:
-                    return paths
-
-            return []
-        except Exception as e:
-            print(f"[Claude] Error checking clipboard for files: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
 
     def on_selection_modified(self):
         """Dynamically toggle read_only based on cursor position to protect conversation history."""

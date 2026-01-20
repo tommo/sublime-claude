@@ -709,31 +709,30 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         send_result(id, {"status": "ok"})
 
-    async def _build_content_with_images(self, prompt: str, images: list):
-        """Build content stream with images for Claude SDK.
+    def _build_content_with_images(self, prompt: str, images: list) -> list:
+        """Build Claude content array with text and images.
 
         Args:
             prompt: Text prompt
             images: List of {"mime_type": str, "data": str} dicts
 
         Returns:
-            Async generator yielding content blocks
+            Content array for Claude API
         """
-        async def content_stream():
-            # Yield images first (Claude prefers images before text)
-            for img in images:
-                yield {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": img["mime_type"],
-                        "data": img["data"]
-                    }
+        content = []
+        # Add images first (Claude prefers images before text)
+        for img in images:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img["mime_type"],
+                    "data": img["data"]
                 }
-            # Yield text prompt
-            yield {"type": "text", "text": prompt}
-
-        return content_stream()
+            })
+        # Add text
+        content.append({"type": "text", "text": prompt})
+        return content
 
     async def query(self, id: int, params: dict) -> None:
         """Send a query and stream responses."""
@@ -747,10 +746,17 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         self.query_id = id  # Store for inject_message to know query is active
 
         async def run_query():
-            # Build content with images if present
             if images:
-                content = await self._build_content_with_images(prompt, images)
-                await self.client.query(content)
+                # Build multimodal content
+                content = self._build_content_with_images(prompt, images)
+                # Yield as user message stream
+                async def message_stream():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": content},
+                        "parent_tool_use_id": None,
+                    }
+                await self.client.query(message_stream())
             else:
                 await self.client.query(prompt)
             # Stream responses
