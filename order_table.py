@@ -26,6 +26,23 @@ def subscribe_to_orders(project_root: str, view_id: int, wake_prompt: str) -> st
 CLAIM_TIMEOUT_SECS = 600  # 10 minutes - auto-release if claimed too long
 
 
+def _add_order_region(view, order_id: str, row: int, col: int, selection_length: int = None):
+    """Add visual region marker for an order."""
+    point = view.text_point(row, col or 0)
+    end_point = point + selection_length if selection_length else point
+    # Subtle outline if selection, otherwise just gutter icon
+    flags = sublime.PERSISTENT | sublime.DRAW_NO_FILL
+    if not selection_length:
+        flags |= sublime.HIDDEN
+    view.add_regions(
+        f"claude_order_{order_id}",
+        [sublime.Region(point, end_point)],
+        "region.bluish",
+        "bookmark",
+        flags
+    )
+
+
 @dataclass
 class Order:
     id: str
@@ -105,21 +122,8 @@ class OrderTable:
         self._orders[order.id] = order
         self._save()
         self._notify_order_added(order)
-        # Add visual bookmark marker
         if view and row is not None:
-            point = view.text_point(row, col or 0)
-            end_point = point + selection_length if selection_length else point
-            # Show region outline if selection, otherwise just gutter icon
-            flags = sublime.PERSISTENT
-            if not selection_length:
-                flags |= sublime.HIDDEN
-            view.add_regions(
-                f"claude_order_{order.id}",
-                [sublime.Region(point, end_point)],
-                "region.bluish",
-                "bookmark",
-                flags
-            )
+            _add_order_region(view, order.id, row, col, selection_length)
         return order
 
     def _notify_order_added(self, order: Order):
@@ -345,18 +349,7 @@ def sync_bookmarks(window):
         # Find view for this file
         for view in window.views():
             if view.file_name() == file_path:
-                point = view.text_point(row, col)
-                end_point = point + selection_length if selection_length else point
-                flags = sublime.PERSISTENT
-                if not selection_length:
-                    flags |= sublime.HIDDEN
-                view.add_regions(
-                    f"claude_order_{order_id}",
-                    [sublime.Region(point, end_point)],
-                    "region.bluish",
-                    "bookmark",
-                    flags
-                )
+                _add_order_region(view, order_id, row, col, selection_length)
                 break
 
 
@@ -413,7 +406,8 @@ class OrderTableView:
                 if o.get("file_path"):
                     rel_path = _relative_path(o["file_path"], folders)
                     row = o.get('row', 0) + 1
-                    loc = f" @ {rel_path}:{row}"
+                    sel = f" [{o['selection_length']}ch]" if o.get("selection_length") else ""
+                    loc = f" @ {rel_path}:{row}{sel}"
                 prompt = o['prompt'][:60] + ("..." if len(o['prompt']) > 60 else "")
                 lines.append(f"  [{o['id']}]{loc}  {prompt}")
             if claimed:
@@ -424,7 +418,8 @@ class OrderTableView:
                     if o.get("file_path"):
                         rel_path = _relative_path(o["file_path"], folders)
                         row = o.get('row', 0) + 1
-                        loc = f" @ {rel_path}:{row}"
+                        sel = f" [{o['selection_length']}ch]" if o.get("selection_length") else ""
+                        loc = f" @ {rel_path}:{row}{sel}"
                     prompt = o['prompt'][:50] + ("..." if len(o['prompt']) > 50 else "")
                     lines.append(f"  ⏳ [{o['id']}]{loc}  {prompt} <- {o['claimed_by']}")
         else:
