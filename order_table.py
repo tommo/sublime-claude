@@ -109,12 +109,16 @@ class OrderTable:
         if view and row is not None:
             point = view.text_point(row, col or 0)
             end_point = point + selection_length if selection_length else point
+            # Show region outline if selection, otherwise just gutter icon
+            flags = sublime.PERSISTENT
+            if not selection_length:
+                flags |= sublime.HIDDEN
             view.add_regions(
                 f"claude_order_{order.id}",
                 [sublime.Region(point, end_point)],
                 "region.bluish",
                 "bookmark",
-                sublime.HIDDEN | sublime.PERSISTENT
+                flags
             )
         return order
 
@@ -343,12 +347,15 @@ def sync_bookmarks(window):
             if view.file_name() == file_path:
                 point = view.text_point(row, col)
                 end_point = point + selection_length if selection_length else point
+                flags = sublime.PERSISTENT
+                if not selection_length:
+                    flags |= sublime.HIDDEN
                 view.add_regions(
                     f"claude_order_{order_id}",
                     [sublime.Region(point, end_point)],
                     "region.bluish",
                     "bookmark",
-                    sublime.HIDDEN | sublime.PERSISTENT
+                    flags
                 )
                 break
 
