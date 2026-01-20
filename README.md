@@ -196,7 +196,7 @@ The order table shows pending and completed orders:
 | Key | Action |
 |-----|--------|
 | `Enter` / `g` | Go to order location |
-| `d` / `Backspace` | Delete order |
+| `Cmd+Backspace` | Delete order |
 | `u` / `Cmd+Z` | Undo deletion |
 | `a` | Add new order |
 

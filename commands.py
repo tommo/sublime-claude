@@ -1467,9 +1467,11 @@ class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
         if not sel:
             return
 
-        point = sel[0].begin()
+        region = sel[0]
+        point = region.begin()
         row, col = self.view.rowcol(point)
         file_path = self.view.file_name()
+        selection_length = region.size() if not region.empty() else None
 
         if not file_path:
             sublime.status_message("Cannot add order: file not saved")
@@ -1479,12 +1481,12 @@ class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
         self.view.window().show_input_panel(
             f"Order at {basename}:{row+1}:",
             "",
-            lambda prompt: self._on_done(prompt, file_path, row, col),
+            lambda prompt: self._on_done(prompt, file_path, row, col, selection_length),
             None,
             None
         )
 
-    def _on_done(self, prompt, file_path, row, col):
+    def _on_done(self, prompt, file_path, row, col, selection_length):
         from .order_table import get_table, show_order_table
 
         if not prompt or not prompt.strip():
@@ -1496,7 +1498,7 @@ class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
             sublime.status_message("No project folder")
             return
 
-        order = table.add(prompt.strip(), file_path, row, col, view=self.view)
+        order = table.add(prompt.strip(), file_path, row, col, selection_length, view=self.view)
         show_order_table(window)
         sublime.status_message(f"Order added: {order.id}")
 

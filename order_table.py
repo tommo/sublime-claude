@@ -31,6 +31,7 @@ class Order:
     file_path: Optional[str] = None
     row: Optional[int] = None
     col: Optional[int] = None
+    selection_length: Optional[int] = None  # length of selected text when pinned
     created_at: float = field(default_factory=time.time)
     done_at: Optional[float] = None
     done_by: Optional[str] = None  # agent_id
@@ -77,7 +78,7 @@ class OrderTable:
         except Exception as e:
             print(f"[OrderTable] Save failed: {e}")
 
-    def add(self, prompt: str, file_path: str = None, row: int = None, col: int = None, view=None) -> Order:
+    def add(self, prompt: str, file_path: str = None, row: int = None, col: int = None, selection_length: int = None, view=None) -> Order:
         """Add an order."""
         self._counter += 1
         order = Order(
@@ -85,7 +86,8 @@ class OrderTable:
             prompt=prompt,
             file_path=file_path,
             row=row,
-            col=col
+            col=col,
+            selection_length=selection_length
         )
         self._orders[order.id] = order
         self._save()
@@ -114,7 +116,9 @@ class OrderTable:
             "prompt": prompt_text,
             "location": loc,
             "file": order.file_path,
-            "row": order.row
+            "row": order.row,
+            "col": order.col,
+            "selection_length": order.selection_length
         }
 
         # Notify local subscribers via notalone inject
@@ -343,7 +347,7 @@ class OrderTableView:
                 lines.append(f"#   ... and {len(done)-5} more")
 
         lines.append("─" * 50)
-        lines.append("a add | Cmd+Shift+O add@cursor | Enter goto | d del | u undo")
+        lines.append("a add | Cmd+Shift+O add@cursor | Enter goto | Cmd+Del | u undo")
 
         content = "\n".join(lines)
 

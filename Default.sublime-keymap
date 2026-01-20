@@ -137,14 +137,7 @@
         ]
     },
     {
-        "keys": ["d"],
-        "command": "claude_order_delete",
-        "context": [
-            { "key": "setting.order_table_view", "operator": "equal", "operand": true }
-        ]
-    },
-    {
-        "keys": ["backspace"],
+        "keys": ["super+backspace"],
         "command": "claude_order_delete",
         "context": [
             { "key": "setting.order_table_view", "operator": "equal", "operand": true }

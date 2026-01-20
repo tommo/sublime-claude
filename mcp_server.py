@@ -1757,7 +1757,7 @@ class MCPSocketServer:
 
     def _order_table_cmd(self, action: str, **kwargs) -> str:
         """Dispatch order table commands."""
-        from .order_table import get_table_for_cwd, refresh_order_table, _relative_path
+        from .order_table import get_table_for_cwd, refresh_order_table
 
         window = sublime.active_window()
         cwd = window.folders()[0] if window and window.folders() else None
@@ -1766,7 +1766,6 @@ class MCPSocketServer:
 
         table = get_table_for_cwd(cwd)
         agent_id = str(self._caller_view_id) if self._caller_view_id else None
-        folders = window.folders()
 
         if action == "list":
             state = kwargs.get("state")
@@ -1777,8 +1776,7 @@ class MCPSocketServer:
             for o in orders:
                 loc = ""
                 if o.get("file_path"):
-                    rel = _relative_path(o["file_path"], folders)
-                    loc = f" @ {rel}:{o.get('row', 0)+1}"
+                    loc = f" @ {o['file_path']}:{o.get('row', 0)+1}"
                 status = "✓" if o["state"] == "done" else "○"
                 lines.append(f"{status} [{o['id']}]{loc} {o['prompt'][:50]}")
             return "\n".join(lines)
