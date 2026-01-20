@@ -514,16 +514,19 @@ Examples:
                     "description": """Order table - human→agent task assignments. Commands:
 - list [state]         → list orders (optional: pending/done)
 - pending              → list pending orders only
-- complete <order_id>  → mark order as done
+- claim <order_id>     → claim order (prevents other agents working on it)
+- release <order_id>   → release claimed order
+- complete <order_id>  → mark order as done (auto-releases claim)
 - subscribe [prompt]   → subscribe to new order notifications
 
+Claims auto-expire after 10 minutes or when agent session ends.
 Orders are created by user via Cmd+Shift+O at cursor position.
-Use subscribe() to get notified when new orders are added.
 
 Examples:
   order("pending")
+  order("claim order_1")
   order("complete order_1")
-  order("subscribe Check for new orders")""",
+  order("subscribe New order: {context[prompt]}")""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

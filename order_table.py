@@ -23,6 +23,9 @@ def subscribe_to_orders(project_root: str, view_id: int, wake_prompt: str) -> st
     return f"order_sub_{view_id}"
 
 
+CLAIM_TIMEOUT_SECS = 600  # 10 minutes - auto-release if claimed too long
+
+
 @dataclass
 class Order:
     id: str
@@ -33,6 +36,8 @@ class Order:
     col: Optional[int] = None
     selection_length: Optional[int] = None  # length of selected text when pinned
     created_at: float = field(default_factory=time.time)
+    claimed_by: Optional[str] = None  # view_id of claiming agent
+    claimed_at: Optional[float] = None
     done_at: Optional[float] = None
     done_by: Optional[str] = None  # agent_id
 
@@ -42,6 +47,14 @@ class Order:
     @classmethod
     def from_dict(cls, data: dict) -> "Order":
         return cls(**data)
+
+    def is_claimed(self) -> bool:
+        return self.claimed_by is not None and self.state == "pending"
+
+    def is_claim_expired(self) -> bool:
+        if not self.claimed_at:
+            return False
+        return time.time() - self.claimed_at > CLAIM_TIMEOUT_SECS
 
 
 class OrderTable:
@@ -158,12 +171,69 @@ class OrderTable:
             pass  # Silently fail - daemon may not support fire
 
     def list(self, state: str = None) -> List[dict]:
-        """List orders as dicts."""
+        """List orders as dicts. Auto-releases expired/orphaned claims."""
+        self._auto_release_claims()
         orders = list(self._orders.values())
         if state:
             orders = [o for o in orders if o.state == state]
         orders = sorted(orders, key=lambda o: o.created_at)
         return [o.to_dict() for o in orders]
+
+    def _auto_release_claims(self):
+        """Release claims that are expired or from gone agents."""
+        released = []
+        for order in self._orders.values():
+            if not order.is_claimed():
+                continue
+            # Check timeout
+            if order.is_claim_expired():
+                released.append((order.id, "timeout"))
+                order.claimed_by = None
+                order.claimed_at = None
+                continue
+            # Check if agent session is gone
+            if order.claimed_by:
+                try:
+                    view_id = int(order.claimed_by)
+                    if hasattr(sublime, '_claude_sessions') and view_id not in sublime._claude_sessions:
+                        released.append((order.id, "agent_gone"))
+                        order.claimed_by = None
+                        order.claimed_at = None
+                except ValueError:
+                    pass
+        if released:
+            self._save()
+            for oid, reason in released:
+                print(f"[OrderTable] auto-released {oid} ({reason})")
+
+    def claim(self, order_id: str, agent_id: str) -> Tuple[bool, str]:
+        """Claim an order for working on it."""
+        order = self._orders.get(order_id)
+        if not order:
+            return False, f"Order {order_id} not found"
+        if order.state == "done":
+            return False, "Order already done"
+        if order.is_claimed() and order.claimed_by != agent_id:
+            if not order.is_claim_expired():
+                return False, f"Already claimed by {order.claimed_by}"
+        order.claimed_by = agent_id
+        order.claimed_at = time.time()
+        self._save()
+        return True, "Claimed"
+
+    def release(self, order_id: str, agent_id: str = None) -> Tuple[bool, str]:
+        """Release a claimed order."""
+        order = self._orders.get(order_id)
+        if not order:
+            return False, f"Order {order_id} not found"
+        if not order.is_claimed():
+            return False, "Not claimed"
+        if agent_id and order.claimed_by != agent_id:
+            return False, f"Claimed by different agent ({order.claimed_by})"
+        order.claimed_by = None
+        order.claimed_at = None
+        self._save()
+        return True, "Released"
 
     def complete(self, order_id: str, agent_id: str = None) -> Tuple[bool, str]:
         """Mark order done."""
@@ -175,6 +245,8 @@ class OrderTable:
         order.state = "done"
         order.done_at = time.time()
         order.done_by = agent_id
+        order.claimed_by = None  # Clear claim on completion
+        order.claimed_at = None
         self._save()
         self._remove_bookmark(order_id)
         return True, "Done"

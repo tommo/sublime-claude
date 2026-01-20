@@ -258,8 +258,16 @@ def create_sublime_router() -> ToolRouter:
         elif action == 'subscribe':
             wake_prompt = ' '.join(parts[1:]) if len(parts) > 1 else None
             return f"return order_table_cmd('subscribe', wake_prompt={wake_prompt!r})"
+        elif action == 'claim':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: claim <order_id>'}"
+            return f"return order_table_cmd('claim', order_id={parts[1]!r})"
+        elif action == 'release':
+            if len(parts) < 2:
+                return "return {'error': 'Usage: release <order_id>'}"
+            return f"return order_table_cmd('release', order_id={parts[1]!r})"
         else:
-            return f"return {{'error': 'Unknown command: {action}. Try: list, pending, complete <id>, subscribe'}}"
+            return f"return {{'error': 'Unknown command: {action}. Try: list, pending, complete <id>, claim <id>, release <id>, subscribe'}}"
 
     router.register("order", order_handler)
 

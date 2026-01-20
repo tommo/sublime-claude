@@ -1777,7 +1777,12 @@ class MCPSocketServer:
                 loc = ""
                 if o.get("file_path"):
                     loc = f" @ {o['file_path']}:{o.get('row', 0)+1}"
-                status = "✓" if o["state"] == "done" else "○"
+                if o["state"] == "done":
+                    status = "✓"
+                elif o.get("claimed_by"):
+                    status = f"⏳({o['claimed_by']})"
+                else:
+                    status = "○"
                 lines.append(f"{status} [{o['id']}]{loc} {o['prompt'][:50]}")
             return "\n".join(lines)
 
@@ -1798,6 +1803,22 @@ class MCPSocketServer:
                 return "error: No session view"
             sub_id = subscribe_to_orders(cwd, view_id, wake_prompt)
             return f"Subscribed to orders (id: {sub_id})"
+
+        elif action == "claim":
+            order_id = kwargs.get("order_id")
+            if not order_id:
+                return "error: Missing order_id"
+            if not agent_id:
+                return "error: No agent context"
+            ok, msg = table.claim(order_id, agent_id)
+            return f"✓ Claimed {order_id}" if ok else f"error: {msg}"
+
+        elif action == "release":
+            order_id = kwargs.get("order_id")
+            if not order_id:
+                return "error: Missing order_id"
+            ok, msg = table.release(order_id, agent_id)
+            return f"✓ Released {order_id}" if ok else f"error: {msg}"
 
         else:
             return f"error: Unknown action: {action}"
