@@ -40,13 +40,16 @@ def _add_order_region(view, order_id: str, row: int, col: int, selection_length:
     if not selection_length:
         flags |= sublime.HIDDEN
     view.add_regions(key, [sublime.Region(point, end_point)], "region.bluish", "bookmark", flags)
-    # Add phantom above the line at pin column
+    # Add phantom above the line - anchor at end of previous line
     if prompt:
-        line_start = view.text_point(row, 0)
+        if row > 0:
+            prev_line_end = view.text_point(row, 0) - 1  # end of previous line (before \n)
+        else:
+            prev_line_end = 0
         indent = " " * (col or 0)
         short_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
         html = f'<body style="margin:0;padding:0"><span style="color:color(var(--foreground) alpha(0.5));font-style:italic">{indent}📌 {order_id}: {short_prompt}</span></body>'
-        view.add_phantom(key, sublime.Region(line_start, line_start), html, sublime.LAYOUT_BLOCK)
+        view.add_phantom(key, sublime.Region(prev_line_end, prev_line_end), html, sublime.LAYOUT_BELOW)
 
 
 @dataclass
