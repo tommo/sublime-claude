@@ -1487,7 +1487,7 @@ class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
         )
 
     def _on_done(self, prompt, file_path, row, col, selection_length):
-        from .order_table import get_table, show_order_table
+        from .order_table import get_table, refresh_order_table
 
         if not prompt or not prompt.strip():
             return
@@ -1499,7 +1499,7 @@ class ClaudeAddOrderCommand(sublime_plugin.TextCommand):
             return
 
         order = table.add(prompt.strip(), file_path, row, col, selection_length, view=self.view)
-        show_order_table(window)
+        refresh_order_table(window)
         sublime.status_message(f"Order added: {order.id}")
 
 
@@ -1523,7 +1523,7 @@ class ClaudeAddPlainOrderCommand(sublime_plugin.WindowCommand):
         )
 
     def _on_done(self, prompt):
-        from .order_table import get_table, show_order_table
+        from .order_table import get_table, refresh_order_table
 
         if not prompt or not prompt.strip():
             return
@@ -1533,7 +1533,7 @@ class ClaudeAddPlainOrderCommand(sublime_plugin.WindowCommand):
             return
 
         order = table.add(prompt.strip())
-        show_order_table(self.window)
+        refresh_order_table(self.window)
         sublime.status_message(f"Order added: {order.id}")
 
 

@@ -42,10 +42,11 @@ def _add_order_region(view, order_id: str, row: int, col: int, selection_length:
     view.add_regions(key, [sublime.Region(point, end_point)], "region.bluish", "bookmark", flags)
     # Add phantom above the line at pin column
     if prompt:
+        line_start = view.text_point(row, 0)
         indent = " " * (col or 0)
         short_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
         html = f'<body style="margin:0;padding:0"><span style="color:color(var(--foreground) alpha(0.5));font-style:italic">{indent}📌 {order_id}: {short_prompt}</span></body>'
-        view.add_phantom(key, sublime.Region(point, point), html, sublime.LAYOUT_BLOCK)
+        view.add_phantom(key, sublime.Region(line_start, line_start), html, sublime.LAYOUT_BLOCK)
 
 
 @dataclass
