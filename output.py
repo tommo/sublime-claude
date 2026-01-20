@@ -762,11 +762,12 @@ class OutputView:
         # NOTE: Don't call clear_stale_permission here - concurrent permissions are valid
         # Stale permission cleanup is handled by clear_all_permissions() on query completion
 
-        # Check if tool is auto-allowed for session
-        if tool in self.auto_allow_tools:
-            print(f"[Claude] permission_request pid={pid}: auto-allowed (in auto_allow_tools)")
-            callback(PERM_ALLOW)
-            return
+        # Check if tool is auto-allowed for session (match against saved patterns)
+        for pattern in self.auto_allow_tools:
+            if self._match_auto_allow_pattern(tool, tool_input, pattern):
+                print(f"[Claude] permission_request pid={pid}: auto-allowed (matched pattern: {pattern})")
+                callback(PERM_ALLOW)
+                return
 
         # Check if user chose "allow for 30s" recently
         now = time.time()
@@ -860,7 +861,25 @@ class OutputView:
         btn_y = "[Y] Allow"
         btn_n = "[N] Deny"
         btn_s = "[S] Allow 30s"
-        btn_a = f"[A] Always"
+
+        # Create descriptive "Always" button based on what pattern will be saved
+        always_hint = ""
+        if tool == "Bash" and "command" in tool_input:
+            cmd = tool_input["command"]
+            first_word = cmd.split()[0] if cmd.split() else ""
+            if '/' in first_word:
+                first_word = first_word.split('/')[-1]
+            if first_word:
+                always_hint = f" `{first_word}:*`"
+        elif tool in ("Read", "Write", "Edit") and "file_path" in tool_input:
+            import os
+            dir_path = os.path.dirname(tool_input["file_path"])
+            if dir_path:
+                # Shorten long paths
+                if len(dir_path) > 25:
+                    dir_path = "..." + dir_path[-22:]
+                always_hint = f" in `{dir_path}/`"
+        btn_a = f"[A] Always{always_hint}"
 
         lines.append(btn_y)
         lines.append("  ")
@@ -950,9 +969,11 @@ class OutputView:
         """Create a fine-grained auto-allow pattern from tool and input.
 
         For Bash: extracts command prefix (first word) -> "Bash(git:*)"
-        For Read/Write/Edit: uses full tool name (paths vary too much)
+        For Read/Write/Edit: uses directory path -> "Read(/src/)"
         For MCP tools: uses full tool name
         """
+        import os
+
         if not tool_input:
             return tool
 
@@ -962,13 +983,89 @@ class OutputView:
                 # Extract first word as prefix (e.g., "git", "npm", "python")
                 first_word = command.split()[0] if command.split() else ""
                 if first_word:
+                    # Strip path prefix (e.g., /usr/bin/git -> git)
+                    if '/' in first_word:
+                        first_word = first_word.split('/')[-1]
                     return f"Bash({first_word}:*)"
+        elif tool in ("Read", "Write", "Edit"):
+            file_path = tool_input.get("file_path", "")
+            if file_path:
+                # Use directory as pattern (like Claude CLI)
+                dir_path = os.path.dirname(file_path)
+                if dir_path:
+                    return f"{tool}({dir_path}/)"
         elif tool == "Skill":
             skill_name = tool_input.get("skill", "")
             if skill_name:
                 return f"Skill({skill_name})"
-        # For other tools, just use the tool name (file paths vary too much)
+        # For other tools, just use the tool name
         return tool
+
+    def _match_auto_allow_pattern(self, tool: str, tool_input: dict, pattern: str) -> bool:
+        """Check if tool use matches an auto-allow pattern.
+
+        Supports:
+            - Simple tool match: "Bash" matches any Bash command
+            - Prefix match: "Bash(git:*)" matches commands starting with "git"
+            - Directory match: "Read(/src/)" matches files under /src/
+        """
+        import fnmatch
+        import os
+
+        # Parse pattern: "Tool(specifier)" or just "Tool"
+        if '(' in pattern and pattern.endswith(')'):
+            paren_idx = pattern.index('(')
+            parsed_tool = pattern[:paren_idx]
+            specifier = pattern[paren_idx + 1:-1]
+        else:
+            parsed_tool = pattern
+            specifier = None
+
+        # Tool name must match
+        if not fnmatch.fnmatch(tool, parsed_tool):
+            return False
+
+        # No specifier = match all uses of this tool
+        if specifier is None:
+            return True
+
+        # Bash command matching
+        if tool == "Bash":
+            command = tool_input.get("command", "")
+            if not command:
+                return False
+            # Prefix match with :*
+            if specifier.endswith(":*"):
+                prefix = specifier[:-2]
+                # Check if command or any sub-command starts with prefix
+                if command.startswith(prefix):
+                    return True
+                # Extract first word of command
+                first_word = command.split()[0] if command.split() else ""
+                if '/' in first_word:
+                    first_word = first_word.split('/')[-1]
+                return first_word.startswith(prefix)
+            return command == specifier
+
+        # Read/Write/Edit directory matching
+        if tool in ("Read", "Write", "Edit"):
+            file_path = tool_input.get("file_path", "")
+            if not file_path:
+                return False
+            # Directory match (pattern ends with /)
+            if specifier.endswith('/'):
+                return file_path.startswith(specifier) or os.path.dirname(file_path) + '/' == specifier
+            # Glob match
+            if any(c in specifier for c in ['*', '?', '[']):
+                return fnmatch.fnmatch(file_path, specifier)
+            return file_path == specifier
+
+        # Skill matching
+        if tool == "Skill":
+            skill_name = tool_input.get("skill", "")
+            return skill_name == specifier
+
+        return False
 
     def _respond_permission_with_callback(self, response: str, callback, tool: str, tool_input: dict = None) -> None:
         """Respond to a permission request with given callback."""
@@ -1057,9 +1154,14 @@ class OutputView:
             perm = self._permission_queue.pop(0)
 
             # Check if auto-allowed now (user may have clicked "Always" or "30s")
-            if perm.tool in self.auto_allow_tools:
-                print(f"[Claude] _process_queue pid={perm.id}: auto-allowed")
-                perm.callback(PERM_ALLOW)
+            auto_allowed = False
+            for pattern in self.auto_allow_tools:
+                if self._match_auto_allow_pattern(perm.tool, perm.tool_input, pattern):
+                    print(f"[Claude] _process_queue pid={perm.id}: auto-allowed (matched: {pattern})")
+                    perm.callback(PERM_ALLOW)
+                    auto_allowed = True
+                    break
+            if auto_allowed:
                 continue
 
             now = time.time()

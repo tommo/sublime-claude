@@ -96,8 +96,8 @@ def create_sublime_router() -> ToolRouter:
 
     router.register("spawn_session", lambda args:
         f"return spawn_session({args.get('prompt', '')!r}, {args.get('name')!r}, "
-        f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('wait_for_completion', False)}, "
-        f"_caller_view_id={args.get('_caller_view_id')})")
+        f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('fork_current', False)}, "
+        f"{args.get('wait_for_completion', False)}, _caller_view_id={args.get('_caller_view_id')})")
 
     router.register("send_to_session", lambda args:
         f"return send_to_session({args.get('view_id')}, {args.get('prompt', '')!r})")

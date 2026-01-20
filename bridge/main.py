@@ -374,6 +374,61 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             return tool_name, specifier
         return pattern, None
 
+    def _extract_bash_commands(self, command: str) -> list[str]:
+        """Extract individual command names from a bash command string.
+
+        Handles:
+        - Command chains: cmd1 && cmd2, cmd1 || cmd2, cmd1 ; cmd2
+        - Pipes: cmd1 | cmd2
+        - Environment variables: FOO=bar cmd
+        - Subshells: $(cmd), `cmd`
+
+        Returns list of command names (e.g., ["cd", "git", "npm"])
+        """
+        import re
+        import shlex
+
+        commands = []
+
+        # Split on command separators: &&, ||, ;, |, but not inside quotes
+        # Simple approach: split on these patterns
+        parts = re.split(r'\s*(?:&&|\|\||;|\|)\s*', command)
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+
+            # Skip subshell wrappers
+            part = re.sub(r'^\$\(|\)$|^`|`$', '', part).strip()
+
+            # Skip leading environment variable assignments (VAR=value)
+            while part and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=\S*\s+', part):
+                part = re.sub(r'^[A-Za-z_][A-Za-z0-9_]*=\S*\s+', '', part)
+
+            if not part:
+                continue
+
+            # Extract first word as command name
+            try:
+                tokens = shlex.split(part)
+                if tokens:
+                    cmd = tokens[0]
+                    # Handle path prefixes like /usr/bin/git -> git
+                    if '/' in cmd:
+                        cmd = cmd.split('/')[-1]
+                    commands.append(cmd)
+            except ValueError:
+                # shlex parsing failed, try simple split
+                words = part.split()
+                if words:
+                    cmd = words[0]
+                    if '/' in cmd:
+                        cmd = cmd.split('/')[-1]
+                    commands.append(cmd)
+
+        return commands
+
     def _match_permission_pattern(self, tool_name: str, tool_input: dict, pattern: str) -> bool:
         """Check if tool use matches a permission pattern.
 
@@ -395,13 +450,71 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if specifier is None:
             return True
 
+        # Special handling for Bash - extract and match individual commands
+        if tool_name == "Bash":
+            full_command = tool_input.get("command", "")
+            if not full_command:
+                return False
+
+            # Extract individual command names from the bash string
+            cmd_names = self._extract_bash_commands(full_command)
+
+            # Handle prefix match with :* suffix
+            if specifier.endswith(":*"):
+                prefix = specifier[:-2]
+                # Match if ANY command starts with prefix OR full command starts with prefix
+                if full_command.startswith(prefix):
+                    return True
+                return any(cmd.startswith(prefix) for cmd in cmd_names)
+
+            # Handle glob/fnmatch patterns
+            if any(c in specifier for c in ['*', '?', '[']):
+                # Match against full command OR any individual command
+                if fnmatch.fnmatch(full_command, specifier):
+                    return True
+                return any(fnmatch.fnmatch(cmd, specifier) for cmd in cmd_names)
+
+            # Exact match - check full command OR any individual command name
+            if full_command == specifier:
+                return True
+            return specifier in cmd_names
+
+        # Special handling for Read/Write/Edit - directory-based permissions
+        # Like Claude CLI: permission granted for a file extends to its directory
+        if tool_name in ("Read", "Write", "Edit"):
+            file_path = tool_input.get("file_path", "")
+            if not file_path:
+                return False
+
+            # Handle glob patterns (e.g., /src/**/*.py)
+            if any(c in specifier for c in ['*', '?', '[']):
+                return fnmatch.fnmatch(file_path, specifier)
+
+            # Handle prefix match with :* suffix
+            if specifier.endswith(":*"):
+                prefix = specifier[:-2]
+                return file_path.startswith(prefix)
+
+            # Directory-based permission: if specifier is a file path,
+            # allow access to any file in the same directory
+            # e.g., pattern "/src/foo.py" allows "/src/bar.py"
+            specifier_dir = os.path.dirname(specifier.rstrip('/'))
+            file_dir = os.path.dirname(file_path)
+
+            # If specifier looks like a directory (ends with /), match files within
+            if specifier.endswith('/'):
+                return file_path.startswith(specifier)
+
+            # Same directory = allowed
+            if specifier_dir and file_dir == specifier_dir:
+                return True
+
+            # Exact match still works
+            return file_path == specifier
+
         # Get the value to match against based on tool type
         match_value = None
-        if tool_name == "Bash":
-            match_value = tool_input.get("command", "")
-        elif tool_name in ("Read", "Write", "Edit"):
-            match_value = tool_input.get("file_path", "")
-        elif tool_name in ("Glob", "Grep"):
+        if tool_name in ("Glob", "Grep"):
             match_value = tool_input.get("pattern", "")
         elif tool_name == "WebFetch":
             match_value = tool_input.get("url", "")
