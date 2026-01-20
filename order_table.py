@@ -404,9 +404,11 @@ class OrderTableView:
         folders = self.window.folders() if self.window else []
 
         if pending:
+            claimed = [o for o in pending if o.get("claimed_by")]
+            unclaimed = [o for o in pending if not o.get("claimed_by")]
             lines.append(f"PENDING ({len(pending)})")
             lines.append("─" * 50)
-            for o in pending:
+            for o in unclaimed:
                 loc = ""
                 if o.get("file_path"):
                     rel_path = _relative_path(o["file_path"], folders)
@@ -414,6 +416,17 @@ class OrderTableView:
                     loc = f" @ {rel_path}:{row}"
                 prompt = o['prompt'][:60] + ("..." if len(o['prompt']) > 60 else "")
                 lines.append(f"  [{o['id']}]{loc}  {prompt}")
+            if claimed:
+                lines.append("")
+                lines.append(f"⏳ CLAIMED ({len(claimed)})")
+                for o in claimed:
+                    loc = ""
+                    if o.get("file_path"):
+                        rel_path = _relative_path(o["file_path"], folders)
+                        row = o.get('row', 0) + 1
+                        loc = f" @ {rel_path}:{row}"
+                    prompt = o['prompt'][:50] + ("..." if len(o['prompt']) > 50 else "")
+                    lines.append(f"  ⏳ [{o['id']}]{loc}  {prompt} <- {o['claimed_by']}")
         else:
             lines.append("No pending orders")
 
