@@ -41,6 +41,7 @@ from claude_agent_sdk import (
     ThinkingBlock,
     PermissionResultAllow,
     PermissionResultDeny,
+    HookMatcher,
 )
 
 
@@ -71,6 +72,78 @@ def send_result(id: int, result: Any) -> None:
 
 def send_notification(method: str, params: Any) -> None:
     send({"jsonrpc": "2.0", "method": method, "params": params})
+
+
+async def pre_compact_hook(input_data: dict, tool_use_id: Optional[str], context: Any) -> dict:
+    """Handle PreCompact hook - gather and inject retain content before compaction."""
+    print(f"[Claude Bridge] PreCompact hook fired! input_data keys: {list(input_data.keys())}", file=sys.stderr)
+    cwd = input_data.get("cwd", "")
+    print(f"[Claude Bridge] PreCompact cwd={cwd}", file=sys.stderr)
+    if not cwd:
+        print("[Claude Bridge] PreCompact: no cwd, returning empty", file=sys.stderr)
+        return {}
+
+    prompts = []
+
+    # 1. Static retain file (.claude/RETAIN.md)
+    static_path = os.path.join(cwd, ".claude", "RETAIN.md")
+    if os.path.exists(static_path):
+        try:
+            with open(static_path, "r") as f:
+                content = f.read().strip()
+            if content:
+                prompts.append(f"# Retained Context (Project)\n\n{content}")
+        except Exception as e:
+            _logger.warning(f"Error reading static retain: {e}")
+
+    # 2. Sublime project retain file (.claude/sublime_project_retain.md)
+    sublime_retain_path = os.path.join(cwd, ".claude", "sublime_project_retain.md")
+    if os.path.exists(sublime_retain_path):
+        try:
+            with open(sublime_retain_path, "r") as f:
+                content = f.read().strip()
+            if content:
+                prompts.append(f"# Retained Context (Sublime Project)\n\n{content}")
+        except Exception as e:
+            _logger.warning(f"Error reading sublime project retain: {e}")
+
+    # 3. Session retain file (if session_id available)
+    session_id = input_data.get("session_id", "")
+    if session_id:
+        # Extract base session ID (remove 'sublime.' prefix if present)
+        base_session_id = session_id.replace("sublime.", "") if session_id.startswith("sublime.") else session_id
+        session_retain_path = os.path.join(cwd, ".claude", "sessions", f"{base_session_id}_retain.md")
+        if os.path.exists(session_retain_path):
+            try:
+                with open(session_retain_path, "r") as f:
+                    content = f.read().strip()
+                if content:
+                    prompts.append(f"# Retained Context (Session)\n\n{content}")
+            except Exception as e:
+                _logger.warning(f"Error reading session retain: {e}")
+
+    # 4. Project settings pre_compact_prompt
+    settings = load_project_settings(cwd)
+    if settings and settings.get("pre_compact_prompt"):
+        prompts.append(settings["pre_compact_prompt"])
+
+    # 5. Profile pre_compact_prompt (passed from session)
+    if _profile_pre_compact_prompt:
+        prompts.append(_profile_pre_compact_prompt)
+
+    print(f"[Claude Bridge] PreCompact found {len(prompts)} prompts to inject", file=sys.stderr)
+    if prompts:
+        combined = "\n\n---\n\n".join(prompts)
+        print(f"[Claude Bridge] PreCompact injecting {len(combined)} chars of retain content", file=sys.stderr)
+        # For PreCompact, only systemMessage is valid - no hookSpecificOutput
+        return {"systemMessage": combined}
+
+    print("[Claude Bridge] PreCompact: no prompts found, returning empty", file=sys.stderr)
+    return {}
+
+
+# Module-level state for pre_compact_hook to access
+_profile_pre_compact_prompt: Optional[str] = None
 
 
 class Bridge:
@@ -227,11 +300,15 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "cli_path": "claude",
         }
 
-        # Profile config: model and betas
+        # Profile config: model, betas, and pre_compact_prompt
         if params.get("model"):
             options_dict["model"] = params["model"]
         if params.get("betas"):
             options_dict["betas"] = params["betas"]
+
+        # Store profile's pre_compact_prompt for hook access
+        global _profile_pre_compact_prompt
+        _profile_pre_compact_prompt = params.get("pre_compact_prompt")
 
         # Sandbox settings from project config
         sandbox = self._load_sandbox_settings(cwd)
@@ -251,6 +328,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         # Add plugins if found
         if plugins:
             options_dict["plugins"] = plugins
+
+        # PreCompact hook disabled - retain content is now sent as prompt
+        # after compact_boundary via session.py _inject_retain_after_compact()
+        # options_dict["hooks"] = {
+        #     "PreCompact": [HookMatcher(hooks=[pre_compact_hook])]
+        # }
 
         # For fresh sessions (not resuming), specify session_id upfront via CLI arg
         # This avoids waiting for first query to get session_id from ResultMessage

@@ -1356,12 +1356,18 @@ class OutputView:
             if tool.result and tool.status == DONE:
                 detail += self._format_read_result(tool.result)
         elif tool.name == "Edit" and "file_path" in tool_input:
-            detail = f": {tool_input['file_path']}"
-            # Show diff for Edit tool
+            file_path = tool_input['file_path']
             old = tool_input.get("old_string", "")
             new = tool_input.get("new_string", "")
-            if old or new:
-                detail += self._format_edit_diff(old, new)
+            # Get line number and diff
+            line_num, diff_str = self._format_edit_diff(old, new)
+            # Show path with line number for Cmd+click
+            if line_num:
+                detail = f": {file_path}:{line_num}"
+            else:
+                detail = f": {file_path}"
+            if diff_str:
+                detail += diff_str
         elif tool.name == "Write" and "file_path" in tool_input:
             detail = f": {tool_input['file_path']}"
         elif tool.name == "Glob" and "pattern" in tool_input:
@@ -1532,11 +1538,16 @@ class OutputView:
             print(f"[Claude] _format_ask_user_result error: {e}, result={result[:50]}")
             return ""
 
-    def _format_edit_diff(self, old: str, new: str) -> str:
-        """Format Edit diff using unified diff format."""
+    def _format_edit_diff(self, old: str, new: str) -> tuple:
+        """Format Edit diff with line numbers.
+
+        Returns:
+            (line_number, diff_string) - line_number may be None
+        """
         import difflib
+        import re
         if not old and not new:
-            return ""
+            return None, ""
 
         old_lines = old.splitlines(keepends=True)
         new_lines = new.splitlines(keepends=True)
@@ -1550,20 +1561,29 @@ class OutputView:
         diff = list(difflib.unified_diff(old_lines, new_lines, lineterm=''))
 
         if not diff:
-            return ""
+            return None, ""
 
-        # Skip the --- and +++ header lines, start from @@
+        # Process diff lines, extracting first line number and converting @@ headers
         diff_lines = []
+        first_line_num = None
         for line in diff:
             if line.startswith('---') or line.startswith('+++'):
                 continue
-            # Remove trailing newline for display
+            # Extract line number from @@ -X,Y +A,B @@
+            if line.startswith('@@'):
+                match = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+                if match:
+                    line_num = int(match.group(1))
+                    if first_line_num is None:
+                        first_line_num = line_num
+                    diff_lines.append(f"L{line_num}:")
+                continue
             diff_lines.append(line.rstrip('\n'))
 
         if not diff_lines:
-            return ""
+            return None, ""
 
-        return "\n```diff\n" + "\n".join(diff_lines) + "\n```"
+        return first_line_num, "\n```diff\n" + "\n".join(diff_lines) + "\n```"
 
 
 # --- Helper commands for text manipulation ---

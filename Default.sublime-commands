@@ -137,5 +137,13 @@
         "caption": "Claude: Clear Retain Content",
         "command": "claude_retain",
         "args": {"action": "clear"}
+    },
+    {
+        "caption": "Claude: Edit Project Retain",
+        "command": "claude_project_retain"
+    },
+    {
+        "caption": "Claude: Open Link at Cursor",
+        "command": "claude_open_link"
     }
 ]

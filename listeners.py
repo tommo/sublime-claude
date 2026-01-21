@@ -202,7 +202,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             "copy", "select_all", "find_all_under",
             "drag_select", "context_menu",
             "move", "move_to", "scroll_lines",
-            "claude_submit_input", "claude_code_interrupt"
+            "claude_submit_input", "claude_code_interrupt",
+            "claude_open_link"
         }
 
         if command_name in safe_commands:

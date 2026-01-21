@@ -404,17 +404,35 @@ class ClaudeCodeCompactCommand(sublime_plugin.WindowCommand):
         if s:
             # Gather pre-compact prompts from multiple sources
             from .hooks import get_project_hook_prompt, combine_hook_prompts
+            import os
 
             prompts = []
-
-            # 1. Project-level hook file (.claude/hooks/pre-compact)
             cwd = self.window.folders()[0] if self.window.folders() else None
+
+            # 1. Static retain file (.claude/RETAIN.md)
+            if cwd:
+                static_path = os.path.join(cwd, ".claude", "RETAIN.md")
+                if os.path.exists(static_path):
+                    try:
+                        with open(static_path, "r") as f:
+                            content = f.read().strip()
+                        if content:
+                            prompts.append(f"# Retained Context (Project)\n\n{content}")
+                    except:
+                        pass
+
+            # 2. Session retain file
+            session_retain = s.retain()
+            if session_retain:
+                prompts.append(f"# Retained Context (Session)\n\n{session_retain}")
+
+            # 3. Project-level hook file (.claude/hooks/pre-compact)
             if cwd:
                 project_prompt = get_project_hook_prompt("pre-compact", cwd)
                 if project_prompt:
                     prompts.append(project_prompt)
 
-            # 2. Project-level settings (.claude/settings.json)
+            # 4. Project-level settings (.claude/settings.json)
             if cwd:
                 from .settings import load_project_settings
                 project_settings = load_project_settings(cwd)
@@ -423,7 +441,7 @@ class ClaudeCodeCompactCommand(sublime_plugin.WindowCommand):
                     if settings_prompt:
                         prompts.append(settings_prompt)
 
-            # 3. Profile-level pre-compact prompt
+            # 5. Profile-level pre-compact prompt
             if s.profile and "pre_compact_prompt" in s.profile:
                 profile_prompt = s.profile["pre_compact_prompt"]
                 if profile_prompt:
@@ -1743,6 +1761,66 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
             return None, None
 
 
+class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
+    """Open file path or URL under cursor with Cmd+click."""
+
+    def run(self, edit, event=None):
+        import os
+        import re
+        import webbrowser
+
+        # Get click position from event or use cursor
+        if event:
+            pt = self.view.window_to_text((event["x"], event["y"]))
+        else:
+            sel = self.view.sel()
+            if not sel:
+                return
+            pt = sel[0].begin()
+
+        # Get the line at cursor
+        line_region = self.view.line(pt)
+        line = self.view.substr(line_region)
+        col = pt - line_region.begin()
+
+        # Try to find URL at position
+        url_pattern = r'https?://[^\s\]\)>\'"]+|file://[^\s\]\)>\'"]+'
+        for match in re.finditer(url_pattern, line):
+            if match.start() <= col <= match.end():
+                url = match.group()
+                webbrowser.open(url)
+                return
+
+        # Try to find file path at position (absolute or relative with common extensions)
+        # Match paths like /foo/bar.py, ./foo/bar.nim, src/file.ts:123
+        path_pattern = r'(?:[/.]|[a-zA-Z]:)[^\s:,\]\)\}>\'\"]+(?::\d+)?'
+        for match in re.finditer(path_pattern, line):
+            if match.start() <= col <= match.end():
+                path_with_line = match.group()
+                # Extract line number if present (path:123)
+                line_num = None
+                if ':' in path_with_line:
+                    parts = path_with_line.rsplit(':', 1)
+                    if parts[1].isdigit():
+                        path_with_line = parts[0]
+                        line_num = int(parts[1])
+
+                # Check if file exists
+                if os.path.isfile(path_with_line):
+                    window = self.view.window()
+                    if window:
+                        if line_num:
+                            window.open_file(f"{path_with_line}:{line_num}", sublime.ENCODED_POSITION)
+                        else:
+                            window.open_file(path_with_line)
+                    return
+
+        sublime.status_message("No link or file path found at cursor")
+
+    def want_event(self):
+        return True
+
+
 class ClaudeRetainCommand(sublime_plugin.WindowCommand):
     """Manage session retain content for compaction."""
 
@@ -1771,7 +1849,7 @@ class ClaudeRetainCommand(sublime_plugin.WindowCommand):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 if not os.path.exists(path):
                     with open(path, "w") as f:
-                        f.write("# Session Retain Content\n# This content is preserved during compaction.\n\n")
+                        f.write("")
                 self.window.open_file(path)
             else:
                 sublime.status_message("Session not initialized yet")
@@ -1779,3 +1857,26 @@ class ClaudeRetainCommand(sublime_plugin.WindowCommand):
         elif action == "clear":
             session.clear_retain()
             sublime.status_message("Retain content cleared")
+
+
+class ClaudeProjectRetainCommand(sublime_plugin.WindowCommand):
+    """Edit project retain file (.claude/RETAIN.md) for compaction."""
+
+    def run(self):
+        import os
+
+        folders = self.window.folders()
+        if not folders:
+            sublime.status_message("No project folder open")
+            return
+
+        cwd = folders[0]
+        retain_path = os.path.join(cwd, ".claude", "RETAIN.md")
+
+        # Create .claude dir and file if needed
+        os.makedirs(os.path.dirname(retain_path), exist_ok=True)
+        if not os.path.exists(retain_path):
+            with open(retain_path, "w") as f:
+                f.write("")
+
+        self.window.open_file(retain_path)
