@@ -631,6 +631,7 @@ class Session:
         # 4. GATE: Only process deferred actions on success
         if completion != "success":
             self._clear_deferred_state()
+            sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
             return
 
         # 5. Process deferred actions (retain injection, queued prompts)
@@ -654,6 +655,7 @@ class Session:
         """Clear all deferred action state. Called on error/interrupt."""
         self._compact_query_count = -1
         self._queued_prompts.clear()
+        self._input_mode_entered = False  # Allow re-entry to input mode
 
     def _enter_input_with_draft(self) -> None:
         """Enter input mode and restore draft with cursor at end."""
@@ -719,7 +721,9 @@ class Session:
             self.client.send("interrupt", {})
             self._status("interrupting...")
             self.working = False
-            self._clear_deferred_state()
+            # Clear pending state but don't touch _input_mode_entered yet
+            self._compact_query_count = -1
+            self._queued_prompts.clear()
 
         # Break any active channel connection (only for user-initiated interrupts)
         if break_channel and self.output.view:
@@ -870,7 +874,7 @@ class Session:
         elif t == "system":
             subtype = params.get("subtype", "")
             data = params.get("data", {})
-            print(f"[Claude] system subtype={subtype} data={data}")
+            print(f"[Claude] system subtype={subtype}")
             if subtype == "compact_boundary":
                 # Track which query had compact - only inject when THAT query ends
                 self._compact_query_count = self.query_count
