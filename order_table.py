@@ -47,7 +47,7 @@ def _add_order_region(view, order_id: str, row: int, col: int, selection_length:
         else:
             prev_line_end = 0
         indent = " " * (col or 0)
-        short_prompt = prompt[:60] + "..." if len(prompt) > 60 else prompt
+        short_prompt = prompt[:120] + "..." if len(prompt) > 120 else prompt
         html = f'<body style="margin:0;padding:0"><span style="color:color(var(--foreground) alpha(0.5));font-style:italic">{indent}📌 {order_id}: {short_prompt}</span></body>'
         view.add_phantom(key, sublime.Region(prev_line_end, prev_line_end), html, sublime.LAYOUT_BELOW)
 
@@ -419,7 +419,7 @@ class OrderTableView:
                     row = o.get('row', 0) + 1
                     sel = f" [{o['selection_length']}ch]" if o.get("selection_length") else ""
                     loc = f" @ {rel_path}:{row}{sel}"
-                prompt = o['prompt'][:60] + ("..." if len(o['prompt']) > 60 else "")
+                prompt = o['prompt'][:200] + ("..." if len(o['prompt']) > 200 else "")
                 lines.append(f"  [{o['id']}]{loc}  {prompt}")
             if claimed:
                 lines.append("")
@@ -431,7 +431,7 @@ class OrderTableView:
                         row = o.get('row', 0) + 1
                         sel = f" [{o['selection_length']}ch]" if o.get("selection_length") else ""
                         loc = f" @ {rel_path}:{row}{sel}"
-                    prompt = o['prompt'][:50] + ("..." if len(o['prompt']) > 50 else "")
+                    prompt = o['prompt'][:150] + ("..." if len(o['prompt']) > 150 else "")
                     lines.append(f"  ⏳ [{o['id']}]{loc}  {prompt} <- {o['claimed_by']}")
         else:
             lines.append("No pending orders")
@@ -442,7 +442,7 @@ class OrderTableView:
             lines.append(f"# DONE ({len(done)})")
             for o in done[-5:]:
                 by = f" <- {o.get('done_by', '?')}" if o.get("done_by") else ""
-                prompt = o['prompt'][:50] + ("..." if len(o['prompt']) > 50 else "")
+                prompt = o['prompt'][:150] + ("..." if len(o['prompt']) > 150 else "")
                 lines.append(f"#   [{o['id']}] {prompt}{by}")
             if len(done) > 5:
                 lines.append(f"#   ... and {len(done)-5} more")

@@ -1783,7 +1783,7 @@ class MCPSocketServer:
                     status = f"⏳({o['claimed_by']})"
                 else:
                     status = "○"
-                lines.append(f"{status} [{o['id']}]{loc} {o['prompt'][:50]}")
+                lines.append(f"{status} [{o['id']}]{loc} {o['prompt']}")
             return "\n".join(lines)
 
         elif action == "complete":

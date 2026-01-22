@@ -71,8 +71,8 @@ class Session:
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
         self._response_callback: Optional[Callable[[str], None]] = None
-        # Flag to inject retain content after compact completes
-        self._pending_retain_inject: bool = False
+        # Track query count when compact_boundary received (inject when that query ends)
+        self._compact_query_count: int = -1
         # Queue of prompts to send after current query completes
         self._queued_prompts: List[str] = []
 
@@ -577,39 +577,41 @@ class Session:
         self.current_tool = None
 
         # Clear executing session marker - MCP tools should no longer target this session
-        # Only clear if this session was the one that set it (don't clear parent session's marker)
         if self.output.view and getattr(self, '_is_executing_session', False):
             self.window.settings().erase("claude_executing_view")
             self._is_executing_session = False
 
-        status = result.get("status", "")
+        # 1. Determine completion type
         if "error" in result:
+            completion = "error"
+        elif result.get("status") == "interrupted":
+            completion = "interrupted"
+        else:
+            completion = "success"
+
+        # 2. Handle UI for each completion type
+        if completion == "error":
             error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
             self._status("error")
             print(f"[Claude] query error: {error_msg}")
-            # Show error to user
             self.output.text(f"\n\n*Error: {error_msg}*\n")
-            # Mark conversation as done on error
             if self.output.current:
                 self.output.current.working = False
                 self.output._render_current()
-        elif status == "interrupted":
+        elif completion == "interrupted":
             self._status("interrupted")
             self.output.interrupted()
         else:
             self._status("done")
             sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
-        # Update view title to reflect idle state
-        self.output.set_name(self.name or "Claude")
 
-        # Clear any stale permission UI (query finished, no more permissions expected)
+        self.output.set_name(self.name or "Claude")
         self.output.clear_all_permissions()
 
-        # Call response callback if set (channel mode)
+        # 3. Response callback fires for ALL completions (channel mode needs to know)
         if self._response_callback:
             callback = self._response_callback
-            self._response_callback = None  # Clear before calling
-            # Extract response text from current conversation
+            self._response_callback = None
             response_text = ""
             if self.output.current:
                 response_text = "".join(self.output.current.text_chunks)
@@ -619,32 +621,39 @@ class Session:
             except Exception as e:
                 print(f"[Claude] response callback error: {e}")
 
-        # Notify ALL bridges that this subsession completed (for notalone2)
-        # Other sessions may be waiting on this subsession via notifications
+        # Notify subsession completion (for notalone2)
         if self.output.view:
             view_id = str(self.output.view.id())
-            # Broadcast to all active sessions' bridges
             for session in sublime._claude_sessions.values():
                 if session.client:
                     session.client.send("subsession_complete", {"subsession_id": view_id})
 
-        # Check if we need to inject retain content after compaction
-        if self._pending_retain_inject:
-            self._pending_retain_inject = False
-            print("[Claude] _on_done: injecting retain content after compact")
-            self._inject_retain_after_compact()
-            return  # Don't enter input mode - new query will be started
+        # 4. GATE: Only process deferred actions on success
+        if completion != "success":
+            self._clear_deferred_state()
+            return
 
-        # Process queued prompts
+        # 5. Process deferred actions (retain injection, queued prompts)
+        if self._compact_query_count == self.query_count:
+            self._compact_query_count = -1
+            print(f"[Claude] _on_done: query #{self.query_count} had compact_boundary, injecting retain")
+            self._inject_retain_after_compact()
+            return
+
         if self._queued_prompts:
             prompt = self._queued_prompts.pop(0)
             print(f"[Claude] _on_done: sending queued prompt: {prompt[:60]}...")
             self.output.text(f"\n**[queued]** {prompt}\n\n")
             self.query(prompt)
-            return  # Don't enter input mode - new query started
+            return
 
-        # Auto-enter input mode when idle
+        # 6. Enter input mode
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+
+    def _clear_deferred_state(self) -> None:
+        """Clear all deferred action state. Called on error/interrupt."""
+        self._compact_query_count = -1
+        self._queued_prompts.clear()
 
     def _enter_input_with_draft(self) -> None:
         """Enter input mode and restore draft with cursor at end."""
@@ -710,6 +719,7 @@ class Session:
             self.client.send("interrupt", {})
             self._status("interrupting...")
             self.working = False
+            self._clear_deferred_state()
 
         # Break any active channel connection (only for user-initiated interrupts)
         if break_channel and self.output.view:
@@ -859,11 +869,12 @@ class Session:
             self._update_status_bar()
         elif t == "system":
             subtype = params.get("subtype", "")
-            print(f"[Claude] system subtype={subtype}")
+            data = params.get("data", {})
+            print(f"[Claude] system subtype={subtype} data={data}")
             if subtype == "compact_boundary":
-                # Flag to inject retain content after query completes
-                self._pending_retain_inject = True
-                print("[Claude] compact_boundary received, will inject retain after query done")
+                # Track which query had compact - only inject when THAT query ends
+                self._compact_query_count = self.query_count
+                print(f"[Claude] compact_boundary received in query #{self.query_count}, will inject retain when it completes")
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""
