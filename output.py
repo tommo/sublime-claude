@@ -1340,6 +1340,15 @@ class OutputView:
         detail = ""
         tool_input = tool.tool_input or {}
 
+        # Plan mode tools
+        if tool.name == "EnterPlanMode":
+            return ": entering plan mode..."
+        elif tool.name == "ExitPlanMode":
+            allowed = tool_input.get("allowedPrompts", [])
+            if allowed:
+                return f": {len(allowed)} requested permissions"
+            return ": awaiting approval..."
+
         if tool.name == "Skill" and "skill" in tool_input:
             # Show the actual skill name instead of just "Skill"
             skill_name = tool_input["skill"]

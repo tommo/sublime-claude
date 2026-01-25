@@ -1587,9 +1587,13 @@ class ClaudeOrderGotoCommand(sublime_plugin.TextCommand):
         if edit_match and '[order_' not in line:
             rel_path = edit_match.group(1).strip()
             line_num = int(edit_match.group(2))
-            # Find full path from edits
-            file_path = self._find_edit_file(rel_path, line_num)
-            if file_path:
+            # Find full path and edit entry from edits
+            edit_entry = self._find_edit_entry(rel_path, line_num)
+            if edit_entry:
+                file_path = edit_entry["file_path"]
+                # Also reveal in agent's session view (without focus)
+                self._reveal_in_session(edit_entry)
+                # Open file in code view (with focus)
                 self._open_in_main_group(file_path, line_num, 1)
             return
 
@@ -1632,8 +1636,8 @@ class ClaudeOrderGotoCommand(sublime_plugin.TextCommand):
         window.focus_group(target_group)
         window.open_file(f"{file_path}:{row}:{col}", sublime.ENCODED_POSITION)
 
-    def _find_edit_file(self, rel_path: str, line_num: int):
-        """Find full file path from relative path and line number."""
+    def _find_edit_entry(self, rel_path: str, line_num: int):
+        """Find edit entry from relative path and line number."""
         from .order_table import get_table, _relative_path
 
         window = self.view.window()
@@ -1648,12 +1652,66 @@ class ClaudeOrderGotoCommand(sublime_plugin.TextCommand):
             for e in table.list_edits():
                 full_rel = _relative_path(e["file_path"], folders)
                 if full_rel.endswith(suffix) and e["line_num"] == line_num:
-                    return e["file_path"]
+                    return e
         else:
             for e in table.list_edits():
                 if _relative_path(e["file_path"], folders) == rel_path and e["line_num"] == line_num:
-                    return e["file_path"]
+                    return e
         return None
+
+    def _reveal_in_session(self, edit_entry: dict):
+        """Reveal the edit in the agent's session view without focusing it."""
+        import os
+
+        agent_view_id = edit_entry.get("agent_view_id", 0)
+        if not agent_view_id:
+            return
+
+        # Find the agent's session
+        if not hasattr(sublime, '_claude_sessions') or agent_view_id not in sublime._claude_sessions:
+            return
+
+        session = sublime._claude_sessions[agent_view_id]
+        if not session.output.view or not session.output.view.is_valid():
+            return
+
+        session_view = session.output.view
+        file_basename = os.path.basename(edit_entry["file_path"])
+        line_num = edit_entry["line_num"]
+        tool = edit_entry.get("tool", "Edit")
+
+        # Search for the edit in session view
+        # Look for patterns like "✔ Edit: /path/to/file.py:123" or "✔ Write: /path/to/file.py"
+        content = session_view.substr(sublime.Region(0, session_view.size()))
+
+        # Try multiple patterns
+        patterns = [
+            f"{tool}: {edit_entry['file_path']}:{line_num}",  # Full path with line
+            f"{tool}: {edit_entry['file_path']}",  # Full path without line
+            f"{tool}: {file_basename}:{line_num}",  # Basename with line
+        ]
+
+        found_pos = -1
+        for pattern in patterns:
+            pos = content.rfind(pattern)  # Find last occurrence (most recent)
+            if pos >= 0:
+                found_pos = pos
+                break
+
+        if found_pos >= 0:
+            # Reveal without focusing - show the region but keep current focus
+            region = sublime.Region(found_pos, found_pos + len(patterns[0]))
+            session_view.show_at_center(region)
+            # Add a brief highlight
+            session_view.add_regions(
+                "claude_edit_highlight",
+                [sublime.Region(found_pos, session_view.line(found_pos).end())],
+                "region.yellowish",
+                "",
+                sublime.DRAW_NO_FILL | sublime.DRAW_SOLID_UNDERLINE
+            )
+            # Clear highlight after a moment
+            sublime.set_timeout(lambda: session_view.erase_regions("claude_edit_highlight"), 2000)
 
 
 class ClaudeOrderDeleteCommand(sublime_plugin.TextCommand):
@@ -1864,7 +1922,7 @@ class ClaudeEditMessageCommand(sublime_plugin.TextCommand):
 
 
 class ClaudeClearEditsCommand(sublime_plugin.TextCommand):
-    """Clear edit(s) - uses selection to determine which items to clear."""
+    """Clear edit(s) or done order(s) - uses selection to determine which items to clear."""
 
     def run(self, edit, all_edits=False):
         import re
@@ -1881,7 +1939,8 @@ class ClaudeClearEditsCommand(sublime_plugin.TextCommand):
         # If all_edits flag, clear everything
         if all_edits:
             table.clear_edits()
-            sublime.status_message("All edit history cleared")
+            table.clear_done()
+            sublime.status_message("All edit history and done orders cleared")
             sublime.set_timeout(lambda: refresh_order_table(window), 10)
             return
 
@@ -1892,14 +1951,25 @@ class ClaudeClearEditsCommand(sublime_plugin.TextCommand):
         if not sel:
             return
 
-        # Collect edit IDs from selected lines (use set to dedupe)
+        # Collect edit IDs and done order IDs from selected lines
         edits_to_clear = set()
+        orders_to_delete = set()
+
         for region in sel:
             for line_region in self.view.lines(region):
                 line = self.view.substr(line_region)
-                # Skip order lines
+
+                # Check for done order line (starts with # and has [order_N])
+                if line.strip().startswith('#') and '[order_' in line:
+                    match = re.search(r'\[(order_\d+)\]', line)
+                    if match:
+                        orders_to_delete.add(match.group(1))
+                    continue
+
+                # Skip pending order lines
                 if '[order_' in line:
                     continue
+
                 # Parse edit line: file:line ... [agent_id]
                 edit_match = re.match(r'\s+(.+?):(\d+)\s+', line)
                 if not edit_match:
@@ -1919,8 +1989,8 @@ class ClaudeClearEditsCommand(sublime_plugin.TextCommand):
                         edits_to_clear.add(e["id"])
                         break
 
-        if not edits_to_clear:
-            sublime.status_message("No edits in selection (C to clear all)")
+        if not edits_to_clear and not orders_to_delete:
+            sublime.status_message("No edits or done orders in selection")
             return
 
         # Save cursor row for restoration after refresh
@@ -1930,7 +2000,17 @@ class ClaudeClearEditsCommand(sublime_plugin.TextCommand):
         for edit_id in edits_to_clear:
             table.clear_edits(edit_id=edit_id)
 
-        sublime.status_message(f"Cleared {len(edits_to_clear)} edit(s)")
+        # Delete all found done orders
+        for order_id in orders_to_delete:
+            table.delete(order_id)
+
+        # Build status message
+        parts = []
+        if edits_to_clear:
+            parts.append(f"{len(edits_to_clear)} edit(s)")
+        if orders_to_delete:
+            parts.append(f"{len(orders_to_delete)} done order(s)")
+        sublime.status_message(f"Cleared {' and '.join(parts)}")
 
         def refresh_and_restore():
             refresh_order_table(window)
@@ -2273,3 +2353,36 @@ class ClaudeProjectRetainCommand(sublime_plugin.WindowCommand):
                 f.write("")
 
         self.window.open_file(retain_path)
+
+
+class ClaudeCodeViewPlanCommand(sublime_plugin.WindowCommand):
+    """Open current or most recent plan file."""
+
+    def run(self):
+        import os
+        import glob
+
+        session = get_active_session(self.window)
+
+        # Try session's plan file first
+        if session and session.plan_file and os.path.exists(session.plan_file):
+            self.window.open_file(session.plan_file)
+            return
+
+        # Otherwise find most recent plan file
+        plans_dir = os.path.expanduser("~/.claude/plans")
+        if not os.path.exists(plans_dir):
+            sublime.status_message("No plan files found")
+            return
+
+        plan_files = glob.glob(os.path.join(plans_dir, "*.md"))
+        if not plan_files:
+            sublime.status_message("No plan files found")
+            return
+
+        # Open most recent
+        most_recent = max(plan_files, key=os.path.getmtime)
+        self.window.open_file(most_recent)
+
+    def is_enabled(self):
+        return True

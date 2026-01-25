@@ -94,6 +94,10 @@ class Session:
             self.persona_session_id = None
             self.persona_url = None
 
+        # Plan mode state
+        self.plan_mode: bool = False
+        self.plan_file: Optional[str] = None
+
     def start(self) -> None:
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
         python_path = settings.get("python_path", "python3")
@@ -641,7 +645,6 @@ class Session:
             cb("Error: failed to send query")
 
     def _on_done(self, result: dict) -> None:
-        self.working = False
         self.current_tool = None
 
         # Clear executing session marker - MCP tools should no longer target this session
@@ -670,10 +673,7 @@ class Session:
             self._status("interrupted")
             self.output.interrupted()
         else:
-            # Skip "done" if inject is pending (another query will start)
-            if not self._inject_pending:
-                self._status("done")
-                sublime.set_timeout(lambda: self._status("ready") if not self.working else None, 2000)
+            self._status("ready")
 
         self.output.set_name(self.name or "Claude")
         self.output.clear_all_permissions()
@@ -700,11 +700,12 @@ class Session:
 
         # 4. GATE: Only process deferred actions on success
         if completion != "success":
+            self.working = False
             self._clear_deferred_state()
             sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
             return
 
-        # 5. Process queued prompts
+        # 5. Process queued prompts (keep working=True, animation continues)
         print(f"[Claude] _on_done: query #{self.query_count}")
         if self._queued_prompts:
             prompt = self._queued_prompts.pop(0)
@@ -713,9 +714,13 @@ class Session:
             self.query(prompt)
             return
 
-        # 6. Enter input mode (skip if inject is pending)
-        if not self._inject_pending:
-            sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+        # 6. Clear inject_pending - if inject was mid-query, it's done now
+        # If inject was queued, queued_inject notification will start new query
+        self._inject_pending = False
+
+        # 7. Now set working=False and enter input mode
+        self.working = False
+        sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
     def _clear_deferred_state(self) -> None:
         """Clear deferred action state. Called on error/interrupt."""
@@ -841,6 +846,18 @@ class Session:
 
         if method == "question_request":
             self._handle_question_request(params)
+            return
+
+        if method == "plan_mode_enter":
+            self._handle_plan_mode_enter(params)
+            return
+
+        if method == "plan_mode_exit":
+            self._handle_plan_mode_exit(params)
+            return
+
+        if method == "plan_response":
+            # Response handled via pending_plan_approvals in bridge
             return
 
         if method == "queued_inject":
@@ -996,7 +1013,8 @@ class Session:
     def _status(self, text: str) -> None:
         """Update status on output view only."""
         if self.output.view and self.output.view.is_valid():
-            self.output.view.set_status("claude", f"Claude: {text}")
+            prefix = "[PLAN] " if self.plan_mode else ""
+            self.output.view.set_status("claude", f"Claude: {prefix}{text}")
 
     def _update_status_bar(self) -> None:
         """Update status bar with session info on output view."""
@@ -1122,6 +1140,98 @@ class Session:
             self.window.show_quick_panel(items, on_select, placeholder=f"{header}: {question_text}")
 
         sublime.set_timeout(ask_next, 0)
+
+    # ─── Plan Mode ─────────────────────────────────────────────────────
+
+    def _handle_plan_mode_enter(self, params: dict) -> None:
+        """Handle entering plan mode."""
+        self.plan_mode = True
+        self._status("plan mode")
+        self.output.text("\n⚙ *Entering plan mode...*\n")
+        print(f"[Claude] Entered plan mode")
+
+    def _handle_plan_mode_exit(self, params: dict) -> None:
+        """Handle exiting plan mode - show plan approval UI."""
+        plan_id = params.get("id")
+        tool_input = params.get("tool_input", {})
+
+        # Find the most recent plan file
+        plan_file = self._find_plan_file()
+        self.plan_file = plan_file
+
+        # Show plan summary in output
+        allowed_prompts = tool_input.get("allowedPrompts", [])
+        self.output.text("\n⚙ *Plan complete. Awaiting approval...*\n")
+        if allowed_prompts:
+            self.output.text(f"  Requested permissions: {len(allowed_prompts)}\n")
+            for p in allowed_prompts[:5]:
+                self.output.text(f"    • {p.get('tool', 'unknown')}: {p.get('prompt', '')}\n")
+            if len(allowed_prompts) > 5:
+                self.output.text(f"    ... and {len(allowed_prompts) - 5} more\n")
+
+        # Open plan file in a new view if found
+        if plan_file and os.path.exists(plan_file):
+            plan_view = self.window.open_file(plan_file)
+            # Position side by side
+            self.window.set_view_index(plan_view, 1, 0)
+
+        # Show approval quick panel
+        self._show_plan_approval(plan_id)
+
+    def _find_plan_file(self) -> Optional[str]:
+        """Find the most recent plan file in ~/.claude/plans/."""
+        import glob
+        plans_dir = os.path.expanduser("~/.claude/plans")
+        if not os.path.exists(plans_dir):
+            return None
+
+        plan_files = glob.glob(os.path.join(plans_dir, "*.md"))
+        if not plan_files:
+            return None
+
+        # Return most recently modified
+        return max(plan_files, key=os.path.getmtime)
+
+    def _show_plan_approval(self, plan_id: int) -> None:
+        """Show quick panel for plan approval."""
+        items = [
+            ["✓ Approve Plan", "Proceed with implementation"],
+            ["↻ Continue Planning", "Let Claude refine the plan further"],
+            ["✗ Cancel", "Reject and stop"],
+        ]
+
+        def on_select(idx: int) -> None:
+            if idx == -1:
+                # Dismissed - treat as continue
+                approved = None
+            elif idx == 0:
+                approved = True
+                self.plan_mode = False
+            elif idx == 1:
+                approved = None  # Continue planning
+            else:
+                approved = False
+                self.plan_mode = False
+
+            # Send response to bridge
+            if self.client:
+                self.client.send("plan_response", {
+                    "id": plan_id,
+                    "approved": approved,
+                })
+
+            if approved:
+                self.output.text("\n✓ *Plan approved. Starting implementation...*\n")
+                self._status("implementing...")
+            elif approved is False:
+                self.output.text("\n✗ *Plan rejected.*\n")
+                self._status("ready")
+
+        self.window.show_quick_panel(
+            items,
+            on_select,
+            placeholder="Review plan and choose action"
+        )
 
     # ─── Notification API (notalone2) ──────────────────────────────────
 

@@ -41,7 +41,6 @@ from claude_agent_sdk import (
     ThinkingBlock,
     PermissionResultAllow,
     PermissionResultDeny,
-    HookMatcher,
 )
 
 
@@ -74,78 +73,6 @@ def send_notification(method: str, params: Any) -> None:
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
 
-async def pre_compact_hook(input_data: dict, tool_use_id: Optional[str], context: Any) -> dict:
-    """Handle PreCompact hook - gather and inject retain content before compaction."""
-    print(f"[Claude Bridge] PreCompact hook fired! input_data keys: {list(input_data.keys())}", file=sys.stderr)
-    cwd = input_data.get("cwd", "")
-    print(f"[Claude Bridge] PreCompact cwd={cwd}", file=sys.stderr)
-    if not cwd:
-        print("[Claude Bridge] PreCompact: no cwd, returning empty", file=sys.stderr)
-        return {}
-
-    prompts = []
-
-    # 1. Static retain file (.claude/RETAIN.md)
-    static_path = os.path.join(cwd, ".claude", "RETAIN.md")
-    if os.path.exists(static_path):
-        try:
-            with open(static_path, "r") as f:
-                content = f.read().strip()
-            if content:
-                prompts.append(f"# Retained Context (Project)\n\n{content}")
-        except Exception as e:
-            _logger.warning(f"Error reading static retain: {e}")
-
-    # 2. Sublime project retain file (.claude/sublime_project_retain.md)
-    sublime_retain_path = os.path.join(cwd, ".claude", "sublime_project_retain.md")
-    if os.path.exists(sublime_retain_path):
-        try:
-            with open(sublime_retain_path, "r") as f:
-                content = f.read().strip()
-            if content:
-                prompts.append(f"# Retained Context (Sublime Project)\n\n{content}")
-        except Exception as e:
-            _logger.warning(f"Error reading sublime project retain: {e}")
-
-    # 3. Session retain file (if session_id available)
-    session_id = input_data.get("session_id", "")
-    if session_id:
-        # Extract base session ID (remove 'sublime.' prefix if present)
-        base_session_id = session_id.replace("sublime.", "") if session_id.startswith("sublime.") else session_id
-        session_retain_path = os.path.join(cwd, ".claude", "sessions", f"{base_session_id}_retain.md")
-        if os.path.exists(session_retain_path):
-            try:
-                with open(session_retain_path, "r") as f:
-                    content = f.read().strip()
-                if content:
-                    prompts.append(f"# Retained Context (Session)\n\n{content}")
-            except Exception as e:
-                _logger.warning(f"Error reading session retain: {e}")
-
-    # 4. Project settings pre_compact_prompt
-    settings = load_project_settings(cwd)
-    if settings and settings.get("pre_compact_prompt"):
-        prompts.append(settings["pre_compact_prompt"])
-
-    # 5. Profile pre_compact_prompt (passed from session)
-    if _profile_pre_compact_prompt:
-        prompts.append(_profile_pre_compact_prompt)
-
-    print(f"[Claude Bridge] PreCompact found {len(prompts)} prompts to inject", file=sys.stderr)
-    if prompts:
-        combined = "\n\n---\n\n".join(prompts)
-        print(f"[Claude Bridge] PreCompact injecting {len(combined)} chars of retain content", file=sys.stderr)
-        # For PreCompact, only systemMessage is valid - no hookSpecificOutput
-        return {"systemMessage": combined}
-
-    print("[Claude Bridge] PreCompact: no prompts found, returning empty", file=sys.stderr)
-    return {}
-
-
-# Module-level state for pre_compact_hook to access
-_profile_pre_compact_prompt: Optional[str] = None
-
-
 class Bridge:
     def __init__(self):
         self.client: ClaudeSDKClient | None = None
@@ -154,8 +81,10 @@ class Bridge:
         self.current_task: asyncio.Task | None = None
         self.pending_permissions: dict[int, asyncio.Future] = {}
         self.pending_questions: dict[int, asyncio.Future] = {}  # For AskUserQuestion
+        self.pending_plan_approvals: dict[int, asyncio.Future] = {}  # For plan mode
         self.permission_id = 0
         self.question_id = 0
+        self.plan_id = 0
         self.interrupted = False  # Set by interrupt(), checked by query()
         self.query_id: int | None = None  # Track active query for inject_message
         self.cwd: str | None = None  # Current working directory (set by initialize)
@@ -184,6 +113,8 @@ class Bridge:
                 await self.handle_permission_response(id, params)
             elif method == "question_response":
                 await self.handle_question_response(id, params)
+            elif method == "plan_response":
+                await self.handle_plan_response(id, params)
             elif method == "cancel_pending":
                 await self.cancel_pending(id)
             elif method == "inject_message":
@@ -300,15 +231,11 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "cli_path": "claude",
         }
 
-        # Profile config: model, betas, and pre_compact_prompt
+        # Profile config: model, betas
         if params.get("model"):
             options_dict["model"] = params["model"]
         if params.get("betas"):
             options_dict["betas"] = params["betas"]
-
-        # Store profile's pre_compact_prompt for hook access
-        global _profile_pre_compact_prompt
-        _profile_pre_compact_prompt = params.get("pre_compact_prompt")
 
         # Sandbox settings from project config
         sandbox = self._load_sandbox_settings(cwd)
@@ -328,12 +255,6 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         # Add plugins if found
         if plugins:
             options_dict["plugins"] = plugins
-
-        # PreCompact hook disabled - retain content is now sent as prompt
-        # after compact_boundary via session.py _inject_retain_after_compact()
-        # options_dict["hooks"] = {
-        #     "PreCompact": [HookMatcher(hooks=[pre_compact_hook])]
-        # }
 
         # For fresh sessions (not resuming), specify session_id upfront via CLI arg
         # This avoids waiting for first query to get session_id from ResultMessage
@@ -669,6 +590,15 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if tool_name == "AskUserQuestion":
             return await self._handle_ask_user_question(tool_input)
 
+        # Handle EnterPlanMode - notify Sublime and auto-allow
+        if tool_name == "EnterPlanMode":
+            send_notification("plan_mode_enter", {})
+            return PermissionResultAllow(updated_input=tool_input)
+
+        # Handle ExitPlanMode - wait for user approval
+        if tool_name == "ExitPlanMode":
+            return await self._handle_exit_plan_mode(tool_input)
+
         # Auto-allow built-in sublime MCP tools
         if tool_name.startswith("mcp__sublime__"):
             return PermissionResultAllow(updated_input=tool_input)
@@ -792,6 +722,58 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         send_result(id, {"status": "ok"})
 
+    async def _handle_exit_plan_mode(self, tool_input: dict):
+        """Handle ExitPlanMode - show plan approval UI and wait for response."""
+        self.plan_id += 1
+        pid = self.plan_id
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"ExitPlanMode: pid={pid}, input={str(tool_input)[:200]}\n")
+
+        future = asyncio.get_event_loop().create_future()
+        self.pending_plan_approvals[pid] = future
+
+        # Send notification to Sublime with plan details
+        send_notification("plan_mode_exit", {
+            "id": pid,
+            "tool_input": tool_input,
+        })
+
+        try:
+            result = await asyncio.wait_for(future, timeout=3600)  # 1 hour timeout
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"ExitPlanMode response: pid={pid}, approved={result}\n")
+
+            if result is True:
+                # Approved - allow the tool
+                return PermissionResultAllow(updated_input=tool_input)
+            elif result is False:
+                # Rejected - deny and stop
+                return PermissionResultDeny(message="Plan rejected by user")
+            else:
+                # None = continue planning - deny but with continue message
+                return PermissionResultDeny(message="User wants to continue planning")
+        except asyncio.TimeoutError:
+            return PermissionResultDeny(message="Plan approval timed out")
+        finally:
+            self.pending_plan_approvals.pop(pid, None)
+
+    async def handle_plan_response(self, id: int, params: dict) -> None:
+        """Handle plan approval response from Sublime."""
+        pid = params.get("id")
+        approved = params.get("approved")  # True, False, or None (continue)
+
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"plan_response: pid={pid}, approved={approved}\n")
+
+        if pid in self.pending_plan_approvals:
+            self.pending_plan_approvals[pid].set_result(approved)
+        else:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"  -> WARNING: pid {pid} not found!\n")
+
+        send_result(id, {"status": "ok"})
+
     def _build_content_with_images(self, prompt: str, images: list) -> list:
         """Build Claude content array with text and images.
 
@@ -842,7 +824,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 await self.client.query(message_stream())
             else:
                 await self.client.query(prompt)
-            # Stream responses
+            # Stream responses (PostToolUse hook will inject queued messages between tool calls)
             async for message in self.client.receive_response():
                 await self.emit_message(message)
             # Check if we were interrupted (set by interrupt() method)
@@ -943,6 +925,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 "total_cost_usd": message.total_cost_usd,
             })
         elif isinstance(message, SystemMessage):
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"SystemMessage: subtype={message.subtype}, data={message.data}\n")
             send_notification("message", {
                 "type": "system",
                 "subtype": message.subtype,
@@ -1000,7 +984,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
     # _on_notalone_inject removed - handled by global client in plugin
 
     async def inject_message(self, id: int, params: dict) -> None:
-        """Inject a user message into the current conversation."""
+        """Inject a user message into the current conversation mid-query."""
         message = params.get("message", "")
         if not message:
             send_error(id, -32602, "Missing message parameter")
@@ -1009,7 +993,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         with open("/tmp/claude_bridge.log", "a") as f:
             f.write(f"inject_message: {message[:60]}...\n")
 
-        # If no active query, queue the message to be sent when next query starts
+        # If no active query, queue the message to be sent when query ends
         if not self.query_id:
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  no active query, queuing inject\n")
@@ -1017,7 +1001,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             send_result(id, {"status": "queued"})
             return
 
-        # Try to inject immediately
+        # Try to inject immediately via client.query()
         try:
             await self.client.query(message)
             send_result(id, {"status": "ok"})
