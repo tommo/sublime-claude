@@ -11,6 +11,32 @@ function output(str) {
     );
 }
 
+// If clipboard has file URLs (e.g. copied from Finder), extract full paths.
+// Finder copies include a thumbnail icon as public.tiff/public.png which we don't want.
+if (types.containsObject('NSFilenamesPboardType')) {
+    var plist = pb.propertyListForType('NSFilenamesPboardType');
+    if (plist && plist.count > 0) {
+        output('file_paths');
+        for (var i = 0; i < plist.count; i++) {
+            output(plist.objectAtIndex(i).js);
+        }
+        ObjC.import('stdlib');
+        $.exit(0);
+    }
+}
+if (types.containsObject('public.file-url')) {
+    var urlStr = pb.stringForType('public.file-url');
+    if (urlStr) {
+        var url = $.NSURL.URLWithString(urlStr);
+        if (url && url.isFileURL) {
+            output('file_paths');
+            output(url.path.js);
+            ObjC.import('stdlib');
+            $.exit(0);
+        }
+    }
+}
+
 // Check for PNG
 if (types.containsObject('public.png')) {
     var data = pb.dataForType('public.png');

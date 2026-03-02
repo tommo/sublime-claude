@@ -391,6 +391,30 @@ class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
             s.interrupt()
 
 
+class ClaudeCloseSessionCommand(sublime_plugin.TextCommand):
+    """Close Claude session view with confirmation."""
+    def run(self, edit):
+        view = self.view
+        session = sublime._claude_sessions.get(view.id())
+        if not session or not session.initialized:
+            view.close()
+            return
+        # Use set_timeout so the dialog doesn't block the command dispatch loop.
+        # Blocking mid-dispatch can cause the next Cmd+W to bypass our keybinding.
+        def _ask():
+            # Re-check session (may have closed in the meantime)
+            s = sublime._claude_sessions.get(view.id())
+            if not s or not s.initialized:
+                view.close()
+                return
+            if sublime.ok_cancel_dialog("Close this Claude session?", "Close"):
+                s.stop()
+                if view.id() in sublime._claude_sessions:
+                    del sublime._claude_sessions[view.id()]
+                view.close()
+        sublime.set_timeout(_ask, 0)
+
+
 class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
@@ -2343,13 +2367,24 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
             sublime.status_message("No active Claude session")
             return
 
-        image_data, mime_type = self._get_clipboard_image()
+        image_data, mime_type, file_paths_from_clip = self._get_clipboard_image()
+
+        # File/dir paths from Finder copy — use full paths from pasteboard
+        if file_paths_from_clip:
+            valid_paths = [p for p in file_paths_from_clip if os.path.exists(p)]
+            if valid_paths:
+                # Paste paths as text into the input
+                path_text = "\n".join(valid_paths)
+                self.view.run_command("insert", {"characters": path_text})
+                sublime.status_message(f"Pasted {len(valid_paths)} path(s)")
+                return
+
         if image_data:
             session.add_context_image(image_data, mime_type)
             sublime.status_message(f"Image added to context ({len(image_data)} bytes)")
             return
 
-        # No image, check for file paths
+        # No image or file paths from pasteboard, check text clipboard
         text = sublime.get_clipboard()
         if text:
             lines = [line.strip() for line in text.split('\n') if line.strip()]
@@ -2365,13 +2400,11 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
                 sublime.status_message(f"Added {len(file_paths)} file(s) to context")
                 return
 
-            # Check if pasted from Sublime — add as context with file:line info
             print(f"[Claude] paste: trying context paste...")
             if self._try_paste_as_context(session, text):
                 print(f"[Claude] paste: added as context")
                 return
             print(f"[Claude] paste: plain text insert")
-            # Plain text paste
             self.view.run_command("insert", {"characters": text})
 
     def _try_paste_as_context(self, session, text):
@@ -2418,19 +2451,24 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             output = result.stdout.strip()
 
+            if output.startswith("file_paths"):
+                paths = output.split("\n")[1:]
+                paths = [p.strip() for p in paths if p.strip()]
+                return None, None, paths
+
             if output.startswith("image/"):
                 lines = output.split("\n")
                 mime_type = lines[0]
                 b64_data = lines[1] if len(lines) > 1 else ""
                 if b64_data:
-                    return base64.b64decode(b64_data), mime_type
+                    return base64.b64decode(b64_data), mime_type, None
 
-            return None, None
+            return None, None, None
         except Exception as e:
             print(f"[Claude] Clipboard error: {e}")
             import traceback
             traceback.print_exc()
-            return None, None
+            return None, None, None
 
 
 class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
