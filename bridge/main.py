@@ -810,6 +810,26 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         self.interrupted = False  # Reset at start of query
         self.query_id = id  # Store for inject_message to know query is active
 
+        async def _drain_stale():
+            """Drain stale buffered messages from previous query's background work (e.g. auto-compaction).
+            Call after client.query() but before receive_response().
+            At this point, anything already in the buffer predates our query."""
+            stale_iter = self.client.receive_messages().__aiter__()
+            count = 0
+            while True:
+                try:
+                    # Very short timeout — only catches already-buffered messages
+                    msg = await asyncio.wait_for(stale_iter.__anext__(), timeout=0.05)
+                    count += 1
+                    with open("/tmp/claude_bridge.log", "a") as f:
+                        f.write(f"pre-drain stale: {type(msg).__name__}\n")
+                    # Don't emit stale messages — they'd confuse the current conversation
+                except (asyncio.TimeoutError, StopAsyncIteration):
+                    break
+            if count:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"pre-drain: consumed {count} stale messages\n")
+
         async def run_query():
             if images:
                 # Build multimodal content
@@ -824,7 +844,9 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 await self.client.query(message_stream())
             else:
                 await self.client.query(prompt)
-            # Stream responses (PostToolUse hook will inject queued messages between tool calls)
+            # Drain stale messages before reading response
+            await _drain_stale()
+            # Stream responses
             async for message in self.client.receive_response():
                 await self.emit_message(message)
             # Check if we were interrupted (set by interrupt() method)

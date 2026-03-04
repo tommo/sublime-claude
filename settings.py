@@ -50,8 +50,25 @@ def load_project_settings(cwd: str = None) -> dict:
         mcp_path = os.path.join(cwd, MCP_CONFIG_FILE)
         project_settings = safe_json_load(mcp_path, default={})
 
-    # Merge settings: project overrides user
-    return merge_settings(user_settings, project_settings)
+    # Load settings.local.json (Claude CLI's native local settings)
+    local_path = os.path.join(cwd, PROJECT_SETTINGS_DIR, "settings.local.json")
+    local_settings = safe_json_load(local_path, default={})
+
+    # Merge: user < project < local
+    result = merge_settings(user_settings, project_settings)
+    result = merge_settings(result, local_settings)
+
+    # Merge permissions.allow into autoAllowedMcpTools (Claude CLI format → our format)
+    permissions_allow = result.get("permissions", {}).get("allow", [])
+    if permissions_allow:
+        auto_allowed = result.get("autoAllowedMcpTools", [])
+        existing = set(auto_allowed)
+        for pattern in permissions_allow:
+            if pattern not in existing:
+                auto_allowed.append(pattern)
+        result["autoAllowedMcpTools"] = auto_allowed
+
+    return result
 
 
 def merge_settings(user: dict, project: dict) -> dict:

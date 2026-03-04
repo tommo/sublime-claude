@@ -49,6 +49,7 @@ class JsonRpcClient:
 
     def stop(self) -> None:
         self.running = False
+        self.pending.clear()
         if self.proc:
             self.proc.terminate()
             self.proc.wait()

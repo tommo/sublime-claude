@@ -39,14 +39,6 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         print(f"[Claude] copy tracked: {path} regions={regions}")
 
     def on_window_command(self, window: sublime.Window, command: str, args: dict) -> None:
-        if command == "close_file":
-            view = window.active_view()
-            if view and view.id() in sublime._claude_sessions:
-                session = sublime._claude_sessions[view.id()]
-                if session.initialized:
-                    if not sublime.ok_cancel_dialog("Close this Claude session?", "Close"):
-                        return ("noop",)
-
         if command == "close_window":
             # Stop all sessions in this window
             to_remove = []
@@ -238,7 +230,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             "drag_select", "context_menu",
             "move", "move_to", "scroll_lines",
             "claude_submit_input", "claude_code_interrupt",
-            "claude_open_link"
+            "claude_open_link", "claude_close_session"
         }
 
         if command_name in safe_commands:

@@ -244,18 +244,16 @@ class OutputView:
 
     def enter_input_mode(self) -> None:
         """Enter input mode - show prompt marker and allow typing."""
-        # print(f"[Claude] enter_input_mode: called, view_valid={self.view and self.view.is_valid()}, already_in_input={self._input_mode}")
         if not self.view or not self.view.is_valid():
             return
         if self._input_mode:
-            # print(f"[Claude] enter_input_mode: already in input mode, returning")
-            return  # Already in input mode
+            return
 
         # Check session-level working flag (authoritative busy state)
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
         if session and session.working:
-            return  # Can't input while session is busy
+            return
 
         # Exit any current conversation's working state
         if self.current and self.current.working:
@@ -590,10 +588,9 @@ class OutputView:
     def tool(self, name: str, tool_input: dict = None) -> None:
         """Add a pending tool."""
         if not self.current:
-            print(f"[Claude] tool({name}) - no current conversation")
+            return
             return
 
-        print(f"[Claude] tool({name}) - adding pending")
         tool_input = tool_input or {}
         tool_call = ToolCall(name=name, tool_input=tool_input)
         self.current.events.append(tool_call)
@@ -610,18 +607,15 @@ class OutputView:
     def tool_done(self, name: str, result: str = None) -> None:
         """Mark most recent pending tool with this name as done."""
         if not self.current:
-            print(f"[Claude] tool_done({name}) - no current conversation")
             return
         # Find the last pending tool with this name
         for event in reversed(self.current.events):
             if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
                 event.status = DONE
                 event.result = result
-                print(f"[Claude] tool_done({name}) - marked done")
                 self._render_current()
                 return
         # No pending tool found, add as done
-        print(f"[Claude] tool_done({name}) - not found pending, adding as done")
         self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE, result=result))
         self._render_current()
 
@@ -772,9 +766,17 @@ class OutputView:
             self.view.erase_regions(f"claude_btn_{btn_type}")
         # Get current region from tracked region (auto-adjusted for text shifts)
         regions = self.view.get_regions("claude_permission_block")
-        if regions:
+        if regions and regions[0].size() > 0:
             region = regions[0]
             self._replace(region.begin(), region.end(), "")
+        else:
+            # Tracked region lost (zero-width or missing) — fallback:
+            # permission block is everything after conversation region
+            if self.current:
+                conv_end = self.current.region[1]
+                view_size = self.view.size()
+                if view_size > conv_end:
+                    self._replace(conv_end, view_size, "")
         self.view.erase_regions("claude_permission_block")
 
     # --- Permission UI ---
@@ -786,7 +788,6 @@ class OutputView:
 
         # If pending permission is for an older pid, it's stale
         if self.pending_permission.id < current_pid:
-            print(f"[Claude] clearing stale permission pid={self.pending_permission.id} (current={current_pid})")
             self._clear_permission()
             self.pending_permission = None
             self._permission_queue.clear()  # Also clear queue - they're all stale
@@ -794,7 +795,6 @@ class OutputView:
     def clear_all_permissions(self) -> None:
         """Clear all pending permissions (called when query finishes)."""
         if self.pending_permission:
-            print(f"[Claude] clearing leftover permission pid={self.pending_permission.id}")
             self._clear_permission()
             self.pending_permission = None
         self._permission_queue.clear()
@@ -815,14 +815,12 @@ class OutputView:
         # Check if tool is auto-allowed for session (match against saved patterns)
         for pattern in self.auto_allow_tools:
             if self._match_auto_allow_pattern(tool, tool_input, pattern):
-                print(f"[Claude] permission_request pid={pid}: auto-allowed (matched pattern: {pattern})")
                 callback(PERM_ALLOW)
                 return
 
         # Check if user chose "allow for 30s" recently
         now = time.time()
         if self._last_allowed_tool == tool and (now - self._last_allowed_time) < 30:
-            print(f"[Claude] permission_request pid={pid}: auto-allowing (30s window)")
             callback(PERM_ALLOW)
             return
 
@@ -836,12 +834,10 @@ class OutputView:
 
         # If there's already a pending permission, queue this one
         if self.pending_permission and self.pending_permission.callback:
-            print(f"[Claude] permission_request pid={pid}: queued (existing pending pid={self.pending_permission.id})")
             self._permission_queue.append(perm)
             return
 
         # Show this one
-        print(f"[Claude] permission_request pid={pid}: showing prompt (queue={len(self._permission_queue)})")
         self.pending_permission = perm
         self._render_permission()
         self._scroll_to_end()
@@ -915,12 +911,11 @@ class OutputView:
         # Create descriptive "Always" button based on what pattern will be saved
         always_hint = ""
         if tool == "Bash" and "command" in tool_input:
-            cmd = tool_input["command"]
-            first_word = cmd.split()[0] if cmd.split() else ""
-            if '/' in first_word:
-                first_word = first_word.split('/')[-1]
-            if first_word:
-                always_hint = f" `{first_word}:*`"
+            # Preview the pattern that _make_auto_allow_pattern would create
+            pattern = self._make_auto_allow_pattern(tool, tool_input)
+            if pattern != tool and "(" in pattern:
+                # Extract the specifier part: "Bash(git:*)" → "git:*"
+                always_hint = f" `{pattern[pattern.index('(')+1:-1]}`"
         elif tool in ("Read", "Write", "Edit") and "file_path" in tool_input:
             import os
             dir_path = os.path.dirname(tool_input["file_path"])
@@ -1002,14 +997,19 @@ class OutputView:
 
         # Get current region from tracked region (auto-adjusted for text shifts)
         regions = self.view.get_regions("claude_permission_block")
-        if regions:
+        if regions and regions[0].size() > 0:
             region = regions[0]
             self._replace(region.begin(), region.end(), "")
+        elif self.current:
+            # Fallback: remove everything after conversation region
+            conv_end = self.current.region[1]
+            view_size = self.view.size()
+            if view_size > conv_end:
+                self._replace(conv_end, view_size, "")
 
-            # Update conversation region end to account for removed permission block
-            # This prevents _do_render from extending and overwriting content
-            if self.current:
-                self.current.region = (self.current.region[0], self.view.size())
+        # Update conversation region end to account for removed permission block
+        if self.current:
+            self.current.region = (self.current.region[0], self.view.size())
 
         self.view.erase_regions("claude_permission_block")
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
@@ -1030,13 +1030,37 @@ class OutputView:
         if tool == "Bash":
             command = tool_input.get("command", "")
             if command:
-                # Extract first word as prefix (e.g., "git", "npm", "python")
-                first_word = command.split()[0] if command.split() else ""
-                if first_word:
-                    # Strip path prefix (e.g., /usr/bin/git -> git)
+                # Extract meaningful command from chains like "cd /dir && git commit"
+                # Split on chain operators, skip trivial commands (cd, export, etc.)
+                import re
+                parts = re.split(r'\s*(?:&&|\|\||;|\|)\s*', command)
+                trivial = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false"}
+                best = None
+                for part in parts:
+                    part = part.strip()
+                    if not part:
+                        continue
+                    # Skip env var assignments (FOO=bar cmd)
+                    words = part.split()
+                    idx = 0
+                    while idx < len(words) and '=' in words[idx] and not words[idx].startswith('-'):
+                        idx += 1
+                    if idx >= len(words):
+                        continue
+                    word = words[idx]
+                    if '/' in word:
+                        word = word.split('/')[-1]
+                    if word and word not in trivial:
+                        best = word
+                        break  # Use first non-trivial command
+                if not best:
+                    # All commands trivial — use the last one
+                    first_word = command.split()[0] if command.split() else ""
                     if '/' in first_word:
                         first_word = first_word.split('/')[-1]
-                    return f"Bash({first_word}:*)"
+                    best = first_word
+                if best:
+                    return f"Bash({best}:*)"
         elif tool in ("Read", "Write", "Edit"):
             file_path = tool_input.get("file_path", "")
             if file_path:
@@ -1207,7 +1231,6 @@ class OutputView:
             auto_allowed = False
             for pattern in self.auto_allow_tools:
                 if self._match_auto_allow_pattern(perm.tool, perm.tool_input, pattern):
-                    print(f"[Claude] _process_queue pid={perm.id}: auto-allowed (matched: {pattern})")
                     perm.callback(PERM_ALLOW)
                     auto_allowed = True
                     break
@@ -1216,12 +1239,10 @@ class OutputView:
 
             now = time.time()
             if self._last_allowed_tool == perm.tool and (now - self._last_allowed_time) < 30:
-                print(f"[Claude] _process_queue pid={perm.id}: auto-allowing (30s window)")
                 perm.callback(PERM_ALLOW)
                 continue
 
             # Show this one
-            print(f"[Claude] _process_queue pid={perm.id}: showing prompt")
             self.pending_permission = perm
             self._render_permission()
             self._scroll_to_end()
@@ -1352,8 +1373,13 @@ class OutputView:
             self.view.erase_regions(f"claude_plan_btn_{btn_type}")
 
         regions = self.view.get_regions("claude_plan_block")
-        if regions:
+        if regions and regions[0].size() > 0:
             self._replace(regions[0].begin(), regions[0].end(), "")
+        elif self.current:
+            conv_end = self.current.region[1]
+            view_size = self.view.size()
+            if view_size > conv_end:
+                self._replace(conv_end, view_size, "")
         self.view.erase_regions("claude_plan_block")
 
     def handle_plan_key(self, key: str) -> bool:
@@ -1459,12 +1485,18 @@ class OutputView:
 
         # Erase the block
         regions = self.view.get_regions("claude_question_block")
-        if regions:
+        if regions and regions[0].size() > 0:
             region = regions[0]
             if summary:
                 self._replace(region.begin(), region.end(), f"\n  ❓ {summary}\n")
             else:
                 self._replace(region.begin(), region.end(), "")
+        elif not summary and self.current:
+            # Fallback: remove everything after conversation region
+            conv_end = self.current.region[1]
+            view_size = self.view.size()
+            if view_size > conv_end:
+                self._replace(conv_end, view_size, "")
         self.view.erase_regions("claude_question_block")
 
     def _advance_question(self) -> None:

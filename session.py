@@ -585,8 +585,6 @@ class Session:
         # Use display_prompt for UI if provided, otherwise use full prompt
         ui_prompt = display_prompt if display_prompt else prompt
 
-        print(f"[Claude] >>> {ui_prompt[:60]}...")
-
         # Check if bridge is alive before sending
         if not self.client.is_alive():
             self._status("error: bridge died")
@@ -599,22 +597,16 @@ class Session:
             # Auto-name session from first prompt if not already named
             if not self.name:
                 self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
-            print(f"[Claude] query() - calling output.prompt()")
             self.output.prompt(ui_prompt, context_names)
-            print(f"[Claude] query() - calling _animate()")
             self._animate()
-        print(f"[Claude] query() - sending RPC query request")
         query_params = {"prompt": full_prompt}
         if hasattr(self, '_pending_images') and self._pending_images:
             query_params["images"] = self._pending_images
-            print(f"[Claude] Including {len(self._pending_images)} image(s) in query")
             self._pending_images = []
         if not self.client.send("query", query_params, self._on_done):
             self._status("error: bridge died")
             self.working = False
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
-        else:
-            print(f"[Claude] query() - RPC query sent successfully")
 
     def send_message_with_callback(self, message: str, callback: Callable[[str], None], silent: bool = False, display_prompt: str = None) -> None:
         """Send message and call callback with Claude's response.
@@ -669,7 +661,6 @@ class Session:
         if completion == "error":
             error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
             self._status("error")
-            print(f"[Claude] query error: {error_msg}")
             self.output.text(f"\n\n*Error: {error_msg}*\n")
             if self.output.current:
                 self.output.current.working = False
@@ -690,7 +681,6 @@ class Session:
             response_text = ""
             if self.output.current:
                 response_text = "".join(self.output.current.text_chunks)
-            print(f"[Claude] _on_done: calling response callback with {len(response_text)} chars")
             try:
                 callback(response_text)
             except Exception as e:
@@ -707,7 +697,6 @@ class Session:
         if completion == "interrupted" and self._pending_retain:
             retain_content = self._pending_retain
             self._pending_retain = None
-            print(f"[Claude] Sending pending retain content after interrupt")
             self.output.text(f"\n◎ [retain] ▶\n\n")
             self.query(retain_content, display_prompt="[retain context]")
             return
@@ -720,10 +709,8 @@ class Session:
             return
 
         # 5. Process queued prompts (keep working=True, animation continues)
-        print(f"[Claude] _on_done: query #{self.query_count}")
         if self._queued_prompts:
             prompt = self._queued_prompts.pop(0)
-            print(f"[Claude] _on_done: sending queued prompt: {prompt[:60]}...")
             self.output.text(f"\n**[queued]** {prompt}\n\n")
             self.query(prompt)
             return
@@ -770,7 +757,6 @@ class Session:
 
     def queue_prompt(self, prompt: str) -> None:
         """Inject a prompt into the current query stream."""
-        print(f"[Claude] Injecting prompt: {prompt[:60]}... working={self.working}")
         self._status(f"injected: {prompt[:30]}...")
 
         if self.working and self.client:
@@ -888,13 +874,10 @@ class Session:
             return
 
         if method == "queued_inject":
-            # Injected prompt was queued because query completed too fast
-            # Auto-submit it now (visual marker already shown by queue_prompt)
             message = params.get("message", "")
             if message:
-                self._inject_pending = False  # Clear flag, new query starting
+                self._inject_pending = False
                 self.working = True
-                print(f"[Claude] Auto-submitting queued inject: {message[:60]}...")
                 self.query(message)
             return
 
@@ -913,18 +896,15 @@ class Session:
                 first_line = wake_prompt.split("\n")[0].strip() if wake_prompt else ""
                 user_message = first_line if first_line else "🔔 Notification received"
 
-            print(f"[Claude] {user_message}")
-
             # If session is still working, queue the wake query for when it becomes idle
             if self.working:
-                print(f"[Claude] Session is busy, will start when idle...")
 
                 def start_wake_query():
                     if not self.working:
                         try:
                             self.query(wake_prompt, display_prompt=user_message)
                         except Exception as e:
-                            print(f"[Claude] ✗ ERROR starting deferred wake query: {e}")
+                            print(f"[Claude] deferred wake query error: {e}")
                     else:
                         # Still working, try again later
                         sublime.set_timeout(start_wake_query, 500)
@@ -936,16 +916,13 @@ class Session:
             try:
                 self.query(wake_prompt, display_prompt=user_message)
             except Exception as e:
-                print(f"[Claude] ✗ ERROR starting wake query: {e}")
-                import traceback
-                traceback.print_exc()
+                print(f"[Claude] wake query error: {e}")
             return
 
         if method != "message":
             return
 
         t = params.get("type")
-        print(f"[Claude] notification: type={t}")
         if t == "tool_use":
             # Mark previous tool as done if any (skip if empty/anonymous)
             if self.current_tool and self.current_tool.strip():
@@ -958,7 +935,6 @@ class Session:
                 return
 
             tool_input = params.get("input", {})
-            print(f"[Claude] tool_use input: {tool_input}")
             self.output.tool(self.current_tool, tool_input)
         elif t == "tool_result":
             # Skip anonymous/empty tool results
@@ -970,6 +946,9 @@ class Session:
             # Convert content to string if it's a list
             if isinstance(content, list):
                 content = "\n".join(str(c) for c in content)
+            # Truncate large results (e.g., image base64) — only used for display summaries
+            if len(content) > 10000:
+                content = content[:10000]
             is_error = params.get("is_error")
 
             # Track Edit/Write for edit log
@@ -997,10 +976,7 @@ class Session:
         elif t == "system":
             subtype = params.get("subtype", "")
             data = params.get("data", {})
-            print(f"[Claude] system subtype={subtype} data={data}")
             if subtype == "compact_boundary":
-                # Inject retain content mid-query (between tool calls)
-                print(f"[Claude] compact_boundary received! Injecting retain mid-query")
                 self._inject_retain_midquery()
 
     def _set_name(self, name: str) -> None:
@@ -1084,9 +1060,6 @@ class Session:
         pid = params.get("id")
         tool = params.get("tool", "Unknown")
         tool_input = params.get("input", {})
-        print(f"[Claude] _handle_permission_request: pid={pid}, tool={tool}")
-        print(f"[Claude] output.pending_permission={self.output.pending_permission}")
-
         def on_response(response: str) -> None:
             if self.client:
                 allow = (response == PERM_ALLOW)
@@ -1108,8 +1081,6 @@ class Session:
         """Handle AskUserQuestion from Claude - show inline question UI."""
         qid = params.get("id")
         questions = params.get("questions", [])
-        print(f"[Claude] _handle_question_request: qid={qid}, questions={len(questions)}")
-
         if not questions:
             if self.client:
                 self.client.send("question_response", {"id": qid, "answers": {}})
@@ -1127,7 +1098,6 @@ class Session:
         """Handle entering plan mode."""
         self.plan_mode = True
         self._status("plan mode")
-        print(f"[Claude] Entered plan mode")
 
     def _handle_plan_mode_exit(self, params: dict) -> None:
         """Handle exiting plan mode - show inline approval UI."""

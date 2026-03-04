@@ -348,8 +348,7 @@ class OrderTable:
         if self.project_root not in _undo_stack:
             _undo_stack[self.project_root] = []
         _undo_stack[self.project_root].append(order)
-        # Keep only last 10 deletions
-        _undo_stack[self.project_root] = _undo_stack[self.project_root][-10:]
+        _undo_stack[self.project_root] = _undo_stack[self.project_root][-20:]
         self._save()
         self._remove_bookmark(order_id)
         return True, "Deleted"

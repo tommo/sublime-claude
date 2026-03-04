@@ -115,12 +115,12 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "get_symbols",
-                    "description": "Batch lookup symbols in project index. Accepts single symbol, comma-separated, or JSON array.",
+                    "description": "Fast project-wide symbol search — find classes, functions, methods, variables by name. Use this FIRST to locate definitions before reading files. Accepts single symbol, comma-separated list, or JSON array for batch lookup. Powered by Sublime's index so results are instant even in large codebases.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": {"description": "Symbol name(s): string, comma-separated, or JSON array"},
-                            "file_path": {"type": "string", "description": "Optional: limit to specific file"},
+                            "query": {"description": "Symbol name(s) to find: string, comma-separated, or JSON array. Examples: 'MyClass', 'handle_request,process_event', '[\"foo\", \"bar\"]'"},
+                            "file_path": {"type": "string", "description": "Optional: limit search to specific file"},
                             "limit": {"type": "number", "description": "Max results per symbol (default 10)"}
                         },
                         "required": ["query"]
@@ -219,6 +219,34 @@ def handle_request(request: dict) -> dict:
                         "required": ["path"]
                     }
                 },
+                # ─── LSP Tools ───────────────────────────────────────────
+                {
+                    "name": "lsp",
+                    "description": """Language server integration - get type info, definitions, references, diagnostics from running LSP servers. Commands:
+- hover <file> <line> <col>         → type info and docs at position
+- definition <file> <line> <col>    → jump to symbol definition
+- references <file> <line> <col>    → find all usages of symbol
+- symbols <file>                    → list all symbols in file
+- workspace_symbols <query>         → search symbols across project
+- diagnostics [file]                → errors/warnings (default: active file)
+
+Line and col are 0-based. File can be a path or view name.
+
+Examples:
+  lsp("hover /path/to/file.py 42 10")
+  lsp("definition /path/to/file.py 42 10")
+  lsp("references /path/to/file.py 42 10")
+  lsp("symbols /path/to/file.py")
+  lsp("workspace_symbols MyClass")
+  lsp("diagnostics")""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string", "description": "Command string"}
+                        },
+                        "required": ["cmd"]
+                    }
+                },
                 # ─── Custom Tools ─────────────────────────────────────────
                 {
                     "name": "sublime_eval",
@@ -253,8 +281,7 @@ For simple operations, prefer the dedicated tools above.""",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 # ─── Terminal Tools ──────────────────────────────────────────
-                # For long-running commands, use terminal_run instead of Bash.
-                # You can monitor output with terminal_read while command runs.
+                # For interactive/long-running processes (dev servers, REPLs, watch modes).
                 {
                     "name": "terminal_list",
                     "description": "List open terminal views in the editor. Shows tag and title for each terminal.",
@@ -262,14 +289,14 @@ For simple operations, prefer the dedicated tools above.""",
                 },
                 {
                     "name": "terminal_run",
-                    "description": """Run a command in a terminal. PREFER THIS over Bash for: long-running commands, interactive commands, or when you need to see live output.
+                    "description": """Run a command in a persistent terminal. Only use for interactive CLI sessions (e.g. dev servers, REPLs, watch modes, build monitors) where you need a live terminal. For normal one-shot commands, use Bash instead.
 
-IMPORTANT: Your session automatically has a dedicated terminal that is reused across calls. DO NOT specify tag or target_id unless you need to share with other sessions. Just call terminal_run(command="...") and it will use your existing terminal.""",
+Your session has a dedicated terminal reused across calls. Do not specify tag or target_id unless sharing with other sessions.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "command": {"type": "string", "description": "Command to run"},
-                            "wait": {"type": "number", "description": "Wait N seconds then return output. Use small values (1-2s) for quick commands, larger for builds. 0=fire and forget, use terminal_read later."},
+                            "wait": {"type": "number", "description": "Max seconds to wait for command to finish (default 30). Blocks until output is available. Set 0 for fire-and-forget (use terminal_read later).", "default": 30},
                             "target_id": {"type": "string", "description": "RARELY NEEDED: Only use to share terminal with other sessions. Omit to use your session's dedicated terminal."},
                             "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to use your session's dedicated terminal."}
                         },

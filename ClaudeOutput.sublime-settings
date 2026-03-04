@@ -1,9 +1,10 @@
 {
-    "font_size": 12,
+    "font_size": 13,
     "line_numbers": false,
-    "gutter": false,
+    "gutter": true,
     "word_wrap": true,
     "margin": 4,
     "draw_indent_guides": false,
-    "highlight_line": false
+    "highlight_line": true,
+    "fold_buttons": true
 }

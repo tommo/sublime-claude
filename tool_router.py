@@ -117,7 +117,7 @@ def create_sublime_router() -> ToolRouter:
         cmd := args.get('command', ''),
         cmd_with_newline := cmd if cmd.endswith('\n') else cmd + '\n',
         f"return terminus_run({cmd_with_newline!r}, tag={args.get('tag')!r}, "
-        f"wait={args.get('wait', 0)}, target_id={args.get('target_id')!r})"
+        f"wait={args.get('wait', 30)}, target_id={args.get('target_id')!r})"
     )[-1])  # Return last element of tuple
 
     router.register("terminal_read", lambda args:
@@ -270,6 +270,43 @@ def create_sublime_router() -> ToolRouter:
             return f"return {{'error': 'Unknown command: {action}. Try: list, pending, complete <id>, claim <id>, release <id>, subscribe'}}"
 
     router.register("order", order_handler)
+
+    # ─── LSP ──────────────────────────────────────────────────────────────
+    def lsp_handler(args: Dict[str, Any]) -> str:
+        cmd = args.get("cmd", "").strip()
+        parts = cmd.split(None, 1)
+        action = parts[0] if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        if action in ("hover", "definition", "references"):
+            # Parse: <file> <line> <col>
+            tokens = rest.rsplit(None, 2)
+            if len(tokens) < 3:
+                return f"return {{'error': 'Usage: {action} <file> <line> <col>'}}"
+            file_path = tokens[0]
+            try:
+                line, col = int(tokens[1]), int(tokens[2])
+            except ValueError:
+                return f"return {{'error': 'line and col must be integers'}}"
+            func = f"lsp_{action}"
+            return f"return {func}({file_path!r}, {line}, {col})"
+        elif action == "symbols":
+            file_path = rest.strip()
+            if not file_path:
+                return "return {'error': 'Usage: symbols <file>'}"
+            return f"return lsp_symbols({file_path!r})"
+        elif action == "workspace_symbols":
+            query = rest.strip()
+            if not query:
+                return "return {'error': 'Usage: workspace_symbols <query>'}"
+            return f"return lsp_workspace_symbols({query!r})"
+        elif action == "diagnostics":
+            file_path = rest.strip() or None
+            return f"return lsp_diagnostics({file_path!r})"
+        else:
+            return f"return {{'error': 'Unknown lsp command: {action}. Try: hover, definition, references, symbols, workspace_symbols, diagnostics'}}"
+
+    router.register("lsp", lsp_handler)
 
     # ─── Garage Session Search ────────────────────────────────────────────
     router.register("garage_search", lambda args:

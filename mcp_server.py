@@ -411,6 +411,13 @@ class MCPSocketServer:
             "discover_services": self._discover_services,
             # Order table
             "order_table_cmd": self._order_table_cmd,
+            # LSP tools
+            "lsp_hover": self._lsp_hover,
+            "lsp_definition": self._lsp_definition,
+            "lsp_references": self._lsp_references,
+            "lsp_symbols": self._lsp_symbols,
+            "lsp_workspace_symbols": self._lsp_workspace_symbols,
+            "lsp_diagnostics": self._lsp_diagnostics,
         }
 
         # Add context variables
@@ -1095,18 +1102,14 @@ class MCPSocketServer:
                 })
         return result
 
-    def _terminus_run(self, command: str, tag: str = None, wait: float = 0, target_id: str = None) -> dict:
-        """Run command in terminal, optionally wait and return output.
+    def _terminus_run(self, command: str, tag: str = None, wait: float = 30, target_id: str = None) -> dict:
+        """Run command in terminal, block until done and return output.
 
         Args:
             command: Command to run (newline appended if missing)
             tag: Terminal tag (default: claude-agent)
-            wait: Seconds to wait before reading output (0 = don't wait/read)
+            wait: Max seconds to wait for output (default 30, 0 = fire and forget)
             target_id: Optional terminal ID for sharing across sessions
-
-        Returns:
-            If wait=0: just confirmation of send
-            If wait>0: send confirmation + terminal output after waiting
         """
         # Priority: target_id > tag > session-specific default
         if target_id:
@@ -1333,6 +1336,377 @@ class MCPSocketServer:
             "view_id": view_id,
             "tag": tag_val,
         }
+
+    # ─── LSP Tools ────────────────────────────────────────────────────────
+
+    def _resolve_file_view(self, file_path):
+        """Resolve a file path to a Sublime view, opening if needed."""
+        window = sublime.active_window()
+        if not window:
+            return None, "No window"
+
+        # Resolve relative paths
+        if not os.path.isabs(file_path):
+            for folder in window.folders():
+                full = os.path.join(folder, file_path)
+                if os.path.exists(full):
+                    file_path = full
+                    break
+
+        file_path = os.path.normpath(file_path)
+
+        # Find existing view
+        for v in window.views():
+            if v.file_name() and os.path.normpath(v.file_name()) == file_path:
+                return v, None
+
+        # Open transiently
+        if os.path.exists(file_path):
+            view = window.open_file(file_path, sublime.TRANSIENT)
+            max_wait = 2.0
+            start = time.time()
+            while view.is_loading() and time.time() - start < max_wait:
+                time.sleep(0.05)
+            return view, None
+
+        return None, f"File not found: {file_path}"
+
+    def _get_lsp_session(self, view, capability=None):
+        """Get best LSP session for a view."""
+        try:
+            from LSP.plugin.core.registry import windows as lsp_windows
+        except ImportError:
+            return None, "LSP package not installed"
+
+        listener = lsp_windows.listener_for_view(view)
+        if not listener:
+            return None, "No LSP listener for this view"
+
+        if capability:
+            session = listener.session_async(capability)
+            if not session:
+                return None, f"No LSP server with {capability} capability"
+            return session, None
+        else:
+            sessions = listener.sessions_async()
+            if sessions:
+                return sessions[0], None
+            return None, "No LSP server for this view"
+
+    def _lsp_request_sync(self, session, method, params, view=None, timeout=5):
+        """Blocking LSP request via threading.Event."""
+        try:
+            from LSP.plugin.core.protocol import Request
+        except ImportError:
+            return None, "LSP package not installed"
+
+        event = threading.Event()
+        result = [None]
+        error = [None]
+
+        def on_result(r):
+            result[0] = r
+            event.set()
+
+        def on_error(e):
+            error[0] = str(e) if e else "Unknown error"
+            event.set()
+
+        request = Request(method, params, view=view)
+        session.send_request(request, on_result, on_error)
+        event.wait(timeout)
+
+        if error[0]:
+            return None, error[0]
+        return result[0], None
+
+    def _lsp_hover(self, file_path, line, col):
+        """Get hover info (type, docs) at position."""
+        try:
+            from LSP.plugin.core.views import text_document_position_params
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        view, err = self._resolve_file_view(file_path)
+        if err:
+            return {"error": err}
+
+        session, err = self._get_lsp_session(view, "hoverProvider")
+        if err:
+            return {"error": err}
+
+        point = view.text_point(line, col)
+        params = text_document_position_params(view, point)
+        result, err = self._lsp_request_sync(session, "textDocument/hover", params, view)
+        if err:
+            return {"error": err}
+        if not result:
+            return {"result": None, "message": "No hover info at this position"}
+
+        # Extract content from hover result
+        contents = result.get("contents", "")
+        if isinstance(contents, dict):
+            # MarkupContent: {kind, value}
+            text = contents.get("value", "")
+        elif isinstance(contents, list):
+            # MarkedString[]
+            parts = []
+            for item in contents:
+                if isinstance(item, dict):
+                    parts.append(item.get("value", ""))
+                else:
+                    parts.append(str(item))
+            text = "\n\n".join(parts)
+        else:
+            text = str(contents)
+
+        return {"content": text}
+
+    def _lsp_definition(self, file_path, line, col):
+        """Get definition location(s) for symbol at position."""
+        try:
+            from LSP.plugin.core.views import text_document_position_params
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        view, err = self._resolve_file_view(file_path)
+        if err:
+            return {"error": err}
+
+        session, err = self._get_lsp_session(view, "definitionProvider")
+        if err:
+            return {"error": err}
+
+        point = view.text_point(line, col)
+        params = text_document_position_params(view, point)
+        result, err = self._lsp_request_sync(session, "textDocument/definition", params, view)
+        if err:
+            return {"error": err}
+        if not result:
+            return {"locations": [], "message": "No definition found"}
+
+        return {"locations": self._parse_locations(result)}
+
+    def _lsp_references(self, file_path, line, col):
+        """Find all references to symbol at position."""
+        try:
+            from LSP.plugin.core.views import text_document_position_params
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        view, err = self._resolve_file_view(file_path)
+        if err:
+            return {"error": err}
+
+        session, err = self._get_lsp_session(view, "referencesProvider")
+        if err:
+            return {"error": err}
+
+        point = view.text_point(line, col)
+        params = text_document_position_params(view, point)
+        params["context"] = {"includeDeclaration": True}
+        result, err = self._lsp_request_sync(session, "textDocument/references", params, view)
+        if err:
+            return {"error": err}
+        if not result:
+            return {"locations": [], "message": "No references found"}
+
+        return {"locations": self._parse_locations(result), "count": len(result)}
+
+    def _lsp_symbols(self, file_path):
+        """List all symbols in a file."""
+        try:
+            from LSP.plugin.core.views import text_document_identifier
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        view, err = self._resolve_file_view(file_path)
+        if err:
+            return {"error": err}
+
+        session, err = self._get_lsp_session(view, "documentSymbolProvider")
+        if err:
+            return {"error": err}
+
+        params = {"textDocument": text_document_identifier(view)}
+        result, err = self._lsp_request_sync(session, "textDocument/documentSymbol", params, view)
+        if err:
+            return {"error": err}
+        if not result:
+            return {"symbols": []}
+
+        symbols = self._flatten_document_symbols(result)
+        return {"symbols": symbols, "count": len(symbols)}
+
+    def _lsp_workspace_symbols(self, query):
+        """Search symbols across the workspace."""
+        try:
+            from LSP.plugin.core.registry import windows as lsp_windows
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        window = sublime.active_window()
+        if not window:
+            return {"error": "No window"}
+
+        # Find any session with workspace symbol capability
+        session = None
+        for w_manager_window in sublime.windows():
+            listener = None
+            active = w_manager_window.active_view()
+            if active:
+                listener = lsp_windows.listener_for_view(active)
+            if listener:
+                s = listener.session_async("workspaceSymbolProvider")
+                if s:
+                    session = s
+                    break
+
+        if not session:
+            return {"error": "No LSP server with workspaceSymbolProvider capability"}
+
+        params = {"query": query}
+        result, err = self._lsp_request_sync(session, "workspace/symbol", params)
+        if err:
+            return {"error": err}
+        if not result:
+            return {"symbols": []}
+
+        symbols = []
+        for sym in result:
+            location = sym.get("location", {})
+            uri = location.get("uri", "")
+            range_info = location.get("range", {}).get("start", {})
+            file_path = self._uri_to_path(uri)
+            symbols.append({
+                "name": sym.get("name", ""),
+                "kind": self._symbol_kind_name(sym.get("kind", 0)),
+                "file": file_path,
+                "line": range_info.get("line", 0),
+                "col": range_info.get("character", 0),
+                "container": sym.get("containerName", ""),
+            })
+
+        return {"symbols": symbols, "count": len(symbols)}
+
+    def _lsp_diagnostics(self, file_path=None):
+        """Get diagnostics (errors/warnings) for a file or active file."""
+        try:
+            from LSP.plugin.core.registry import windows as lsp_windows
+        except ImportError:
+            return {"error": "LSP package not installed"}
+
+        if file_path:
+            view, err = self._resolve_file_view(file_path)
+            if err:
+                return {"error": err}
+        else:
+            window = sublime.active_window()
+            view = window.active_view() if window else None
+            if not view:
+                return {"error": "No active view"}
+
+        listener = lsp_windows.listener_for_view(view)
+        if not listener:
+            return {"error": "No LSP listener for this view"}
+
+        sessions = listener.sessions_async()
+        if not sessions:
+            return {"error": "No LSP server for this view"}
+
+        all_diagnostics = []
+        for session in sessions:
+            try:
+                from LSP.plugin.core.views import uri_from_view
+                uri = uri_from_view(view)
+                diags = session.diagnostics.get_diagnostics_for_uri(uri)
+                severity_names = {1: "error", 2: "warning", 3: "info", 4: "hint"}
+                for d in diags:
+                    range_info = d.get("range", {}).get("start", {})
+                    all_diagnostics.append({
+                        "severity": severity_names.get(d.get("severity", 4), "unknown"),
+                        "message": d.get("message", ""),
+                        "line": range_info.get("line", 0),
+                        "col": range_info.get("character", 0),
+                        "source": d.get("source", ""),
+                    })
+            except Exception as e:
+                all_diagnostics.append({"error": f"Failed to get diagnostics from {session.config.name}: {e}"})
+
+        file_name = view.file_name() or "(untitled)"
+        return {
+            "file": file_name,
+            "diagnostics": all_diagnostics,
+            "count": len(all_diagnostics),
+        }
+
+    def _uri_to_path(self, uri):
+        """Convert file:// URI to filesystem path."""
+        if uri.startswith("file://"):
+            from urllib.parse import unquote, urlparse
+            parsed = urlparse(uri)
+            return unquote(parsed.path)
+        return uri
+
+    def _parse_locations(self, result):
+        """Parse Location or Location[] from LSP response."""
+        if isinstance(result, dict):
+            result = [result]
+        locations = []
+        for loc in result:
+            uri = loc.get("uri", loc.get("targetUri", ""))
+            range_info = loc.get("range", loc.get("targetRange", loc.get("targetSelectionRange", {}))).get("start", {})
+            file_path = self._uri_to_path(uri)
+            locations.append({
+                "file": file_path,
+                "line": range_info.get("line", 0),
+                "col": range_info.get("character", 0),
+            })
+        return locations
+
+    def _flatten_document_symbols(self, symbols, parent_name=""):
+        """Flatten DocumentSymbol tree into flat list."""
+        result = []
+        for sym in symbols:
+            name = sym.get("name", "")
+            full_name = f"{parent_name}.{name}" if parent_name else name
+
+            # DocumentSymbol has 'range', SymbolInformation has 'location'
+            if "range" in sym:
+                range_info = sym["range"]["start"]
+                result.append({
+                    "name": full_name,
+                    "kind": self._symbol_kind_name(sym.get("kind", 0)),
+                    "line": range_info.get("line", 0),
+                    "col": range_info.get("character", 0),
+                })
+            elif "location" in sym:
+                range_info = sym["location"].get("range", {}).get("start", {})
+                result.append({
+                    "name": full_name,
+                    "kind": self._symbol_kind_name(sym.get("kind", 0)),
+                    "line": range_info.get("line", 0),
+                    "col": range_info.get("character", 0),
+                })
+
+            # Recurse into children
+            children = sym.get("children", [])
+            if children:
+                result.extend(self._flatten_document_symbols(children, full_name))
+
+        return result
+
+    _SYMBOL_KIND_NAMES = {
+        1: "File", 2: "Module", 3: "Namespace", 4: "Package", 5: "Class",
+        6: "Method", 7: "Property", 8: "Field", 9: "Constructor", 10: "Enum",
+        11: "Interface", 12: "Function", 13: "Variable", 14: "Constant",
+        15: "String", 16: "Number", 17: "Boolean", 18: "Array", 19: "Object",
+        20: "Key", 21: "Null", 22: "EnumMember", 23: "Struct", 24: "Event",
+        25: "Operator", 26: "TypeParameter",
+    }
+
+    def _symbol_kind_name(self, kind):
+        return self._SYMBOL_KIND_NAMES.get(kind, f"Unknown({kind})")
 
     # ─── Session Helpers ──────────────────────────────────────────────────
 
