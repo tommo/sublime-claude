@@ -842,7 +842,8 @@ class MCPSocketServer:
         if profile:
             if profile not in profiles:
                 return {"error": f"Profile '{profile}' not found"}
-            profile_config = profiles[profile]
+            profile_config = profiles[profile].copy()
+            profile_config["_name"] = profile  # Store name for status bar
 
         # Fork from current session if requested
         if fork_current:
