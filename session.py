@@ -59,8 +59,10 @@ class Session:
         self.resume_id: Optional[str] = resume_id  # ID to resume from
         self.fork: bool = fork  # Fork from resume_id instead of continuing it
         self.profile: Optional[Dict] = profile  # Profile config (model, betas, system_prompt, preload_docs)
+        self.profile_name: Optional[str] = profile.get("_name") if profile else None  # Profile name for status bar
         self.initial_context: Optional[Dict] = initial_context  # Initial context (subsession_id, parent_view_id, etc.)
         self.name: Optional[str] = None
+        self.sdk_model: Optional[str] = None  # Model from SDK SystemMessage init
         self.total_cost: float = 0.0
         self.query_count: int = 0
         self.context_usage: Optional[Dict] = None  # Latest usage/context stats
@@ -985,7 +987,12 @@ class Session:
         elif t == "system":
             subtype = params.get("subtype", "")
             data = params.get("data", {})
-            if subtype == "compact_boundary":
+            if subtype == "init":
+                # Capture SDK model from init message
+                if data.get("model"):
+                    self.sdk_model = data["model"]
+                    self._update_status_bar()
+            elif subtype == "compact_boundary":
                 self._inject_retain_midquery()
 
     def _set_name(self, name: str) -> None:
@@ -1035,6 +1042,16 @@ class Session:
         parts = []
         if self.name:
             parts.append(self.name)
+        # Show model (short form) and profile
+        model_info = []
+        if self.sdk_model:
+            # Shorten model name: claude-opus-4-5-20251101 -> opus-4.5
+            short = self.sdk_model.replace("claude-", "").split("-202")[0].replace("-", ".")
+            model_info.append(short)
+        if self.profile_name:
+            model_info.append(f"@{self.profile_name}")
+        if model_info:
+            parts.append("".join(model_info))
         if self.total_cost > 0:
             parts.append(f"${self.total_cost:.4f}")
         if self.query_count > 0:
