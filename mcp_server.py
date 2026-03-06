@@ -842,10 +842,17 @@ class MCPSocketServer:
         }
 
     def _list_sessions(self) -> dict:
-        """List all active sessions across all windows (formatted)."""
+        """List subsessions only (spawned via spawn_session)."""
+        caller_id = self._caller_view_id
         sessions = []
         lines = []
         for view_id, session in sublime._claude_sessions.items():
+            # Skip the calling session itself
+            if view_id == caller_id:
+                continue
+            # Only show subsessions (spawned sessions have a parent_view_id)
+            if not getattr(session, 'parent_view_id', None):
+                continue
             status = "⏳" if session.working else "✓"
             cost = f"${session.total_cost:.4f}" if session.total_cost else ""
             name = session.name or "(unnamed)"
@@ -853,7 +860,7 @@ class MCPSocketServer:
             sessions.append({"view_id": view_id, "name": name, "working": session.working})
 
         if not lines:
-            return {"summary": "No active sessions", "sessions": []}
+            return {"summary": "No subsessions", "sessions": []}
         return {"summary": "\n".join(lines), "sessions": sessions, "count": len(sessions)}
 
     def _read_session_output(self, view_id: int, lines: int = None, max_chars: int = 30000) -> dict:

@@ -188,7 +188,7 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List all active Claude sessions (including spawned subsessions) with their view_ids",
+                    "description": "List spawned subsessions with their view_ids and status.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
