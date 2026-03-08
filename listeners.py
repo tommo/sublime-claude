@@ -182,7 +182,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             name = name[name.index("] ") + 2:]
 
         # Strip trailing ellipsis from truncation
-        if name.endswith("…"):
+        name_was_truncated = name.endswith("…")
+        if name_was_truncated:
             name = name[:-1]
 
         # Extract session name (before " - " suffix if present)
@@ -191,13 +192,37 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         elif name and name != "Claude":
             session_name = name
 
-        # Try to find session_id from saved sessions (only if it was actually used)
+        # Try to find session_id from saved sessions
         resume_id = None
+        was_truncated = name_was_truncated
+        saved_sessions = load_saved_sessions()
+
+        # Method 1: Match by name
         if session_name:
-            for saved in load_saved_sessions():
-                if saved.get("name") == session_name and saved.get("query_count", 0) > 0:
+            for saved in saved_sessions:
+                saved_name = saved.get("name", "")
+                if saved.get("query_count", 0) <= 0:
+                    continue
+                if saved_name == session_name or (was_truncated and saved_name.startswith(session_name)):
                     resume_id = saved.get("session_id")
+                    session_name = saved_name
                     break
+
+        # Method 2: Match by first prompt in view content
+        if not resume_id:
+            content = view.substr(sublime.Region(0, min(500, view.size())))
+            import re as re2
+            m = re2.search(r'◎ (.+?) ▶', content)
+            if m:
+                first_prompt = m.group(1).strip()
+                for saved in saved_sessions:
+                    fp = saved.get("first_prompt", "")
+                    if fp and fp == first_prompt and saved.get("query_count", 0) > 0:
+                        resume_id = saved.get("session_id")
+                        session_name = saved.get("name") or session_name
+                        break
+
+        print(f"[Claude] reconnect: view_name={view.name()!r}, extracted={session_name!r}, resume_id={resume_id}, truncated={was_truncated}")
 
         # Create session - with resume_id if found, fresh otherwise
         session = Session(window, resume_id=resume_id)

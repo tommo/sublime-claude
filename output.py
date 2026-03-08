@@ -218,10 +218,13 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return end
 
+        old_size = self.view.size()
         self.view.set_read_only(False)
         self.view.run_command("claude_replace", {"start": start, "end": end, "text": text})
         self.view.set_read_only(True)
-        return start + len(text)
+        # Calculate actual new end from view size delta (more reliable than len())
+        new_size = self.view.size()
+        return end + (new_size - old_size)
 
     def _scroll_to_end(self, force: bool = False) -> None:
         """Scroll to end, respecting user scroll position.
@@ -1795,10 +1798,7 @@ class OutputView:
 
         text = "".join(lines)
 
-        # Replace the region (re-read tracked region for latest bounds)
-        tracked = self.view.get_regions("claude_conversation")
-        if tracked and tracked[0].size() > 0:
-            start, end = tracked[0].begin(), tracked[0].end()
+        # Re-read view size (may have changed during text building)
         view_size = self.view.size()
         # If there's content after our region, extend end to clean it up
         # This handles race conditions where content was orphaned from previous renders
