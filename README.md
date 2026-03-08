@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) integration.
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) and [Codex CLI](https://github.com/openai/codex) integration.
 
 ![Multi-session chess game demo](sessions_demo.jpg)
 *Multi-agent workflow: A coordinator orchestrating three sessions - White player, Black player, and a Board display - playing chess via MCP tools.*
@@ -9,19 +9,21 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) integrati
 
 - Sublime Text 4
 - Python 3.10+ (for the bridge process)
-- Claude Code CLI (authenticated)
-- `claude-agent-sdk` package
+- Claude Code CLI (authenticated) and/or Codex CLI
+- `claude-agent-sdk` package (for Claude backend)
 
 ```bash
-# Install Claude Code CLI and login
+# Claude Code
 npm install -g @anthropic-ai/claude-code
 claude  # Follow prompts to authenticate
-
-# Install SDK
 pip install claude-agent-sdk
+
+# Codex CLI (optional)
+npm install -g @openai/codex
+codex  # Follow prompts to authenticate
 ```
 
-**Note:** You must authenticate Claude Code CLI before using this plugin. If you see connection errors, run `claude` in terminal to login.
+**Note:** You must authenticate your chosen CLI before using this plugin. If you see connection errors, run `claude` or `codex` in terminal to login.
 
 ## Installation
 
@@ -56,7 +58,8 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Add Open Files | - | Add all open files to context |
 | Add Current Folder | - | Add folder path to context |
 | Clear Context | - | Clear pending context |
-| New Session | - | Start a fresh session |
+| New Session | - | Start a fresh Claude session |
+| Codex: New Session | - | Start a fresh Codex session |
 | Restart Session | - | Restart current session, keep output view |
 | Resume Session... | - | Resume a previous session |
 | Switch Session... | - | Switch between active sessions |
@@ -231,7 +234,10 @@ View title shows session status:
 - `◉` Active + working
 - `◇` Active + idle
 - `•` Inactive + working
-- (no prefix) Inactive + idle
+- `◇` Inactive + idle
+- `❓` Waiting for permission/question response
+
+Codex sessions show a `[codex]` prefix in the tab title.
 
 Supports markdown formatting and fenced code blocks with language-specific syntax highlighting.
 
@@ -348,21 +354,29 @@ Agents run with separate context, preventing conversation bloat. Custom agents o
 
 ```
 ┌─────────────────┐     JSON-RPC/stdio     ┌─────────────────┐
-│  Sublime Text   │ ◄────────────────────► │  bridge/main.py │
-│  (Python 3.8)   │                        │  (Python 3.10+) │
-│  claude_code.py │                        │  Agent SDK      │
-└─────────────────┘                        └─────────────────┘
-        │
-        │ Unix socket
-        ▼
-┌─────────────────┐     stdio              ┌─────────────────┐
-│  mcp_server.py  │ ◄────────────────────► │  mcp/server.py  │
-│  (socket server)│                        │  (MCP server)   │
-└─────────────────┘                        └─────────────────┘
+│  Sublime Text   │ ◄────────────────────► │  bridge/main.py │ (Claude)
+│  (Python 3.8)   │                        │  Agent SDK      │
+│                 │                        └─────────────────┘
+│                 │     JSON-RPC/stdio     ┌─────────────────┐
+│                 │ ◄────────────────────► │  bridge/codex_  │ (Codex)
+│                 │                        │  main.py        │
+└─────────────────┘                        └────────┬────────┘
+        │                                           │ JSON-RPC/stdio
+        │ Unix socket                               ▼
+        ▼                                  ┌─────────────────┐
+┌─────────────────┐     stdio              │  codex          │
+│  mcp_server.py  │ ◄────────────────────► │  app-server     │
+│  (socket server)│    ┌─────────────────┐ └─────────────────┘
+└─────────────────┘    │  mcp/server.py  │
+                       │  (MCP server)   │
+                       └─────────────────┘
 ```
 
 The plugin runs in Sublime's Python 3.8 environment and spawns a separate
-bridge process using Python 3.10+ which runs the Claude Agent SDK.
+bridge process using Python 3.10+. The bridge translates between Sublime's
+JSON-RPC protocol and the backend CLI:
+- **Claude**: `bridge/main.py` uses the Claude Agent SDK
+- **Codex**: `bridge/codex_main.py` translates to Codex's `app-server` protocol
 
 ```
 sublime-claude/
@@ -374,10 +388,12 @@ sublime-claude/
 ├── listeners.py           # Event handlers
 ├── rpc.py                 # JSON-RPC client
 ├── mcp_server.py          # MCP socket server
-├── bridge/main.py         # Python 3.10+ bridge
+├── bridge/
+│   ├── main.py            # Claude bridge (Agent SDK)
+│   └── codex_main.py      # Codex bridge (app-server)
 ├── mcp/server.py          # MCP protocol server
 │
-└── Core Utilities (2024-12):
+└── Core Utilities:
     ├── constants.py       # Config & magic strings
     ├── logger.py          # Unified logging
     ├── error_handler.py   # Error handling
@@ -388,7 +404,7 @@ sublime-claude/
     └── context_parser.py  # Context menus
 ```
 
-**Recent Improvements:** Refactored Dec 2024 - removed ~400 lines of duplication, added self-contained utility modules, improved performance with O(1) tool routing. See `NOTES.md` for details.
+Both bridges emit identical JSON-RPC notifications to Sublime, so the output view, permissions, and MCP tools work the same regardless of backend.
 
 ## License
 
