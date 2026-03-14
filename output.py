@@ -21,6 +21,7 @@ PERM_ALLOW_SESSION = "allow_session"  # Allow same tool for 30s
 
 PLAN_APPROVE = "approve"
 PLAN_REJECT = "reject"
+PLAN_VIEW = "view"
 
 
 @dataclass
@@ -1353,10 +1354,13 @@ class OutputView:
 
         btn_y = "[Y] Approve"
         btn_n = "[N] Reject"
+        btn_v = "[V] View Plan"
 
         lines.append(btn_y)
         lines.append("  ")
         lines.append(btn_n)
+        lines.append("  ")
+        lines.append(btn_v)
         lines.append("\n")
 
         text = "".join(lines)
@@ -1378,13 +1382,20 @@ class OutputView:
         plan.button_regions[PLAN_APPROVE] = (btn_start, btn_start + len(btn_y))
         btn_start += len(btn_y) + 2
         plan.button_regions[PLAN_REJECT] = (btn_start, btn_start + len(btn_n))
+        btn_start += len(btn_n) + 2
+        plan.button_regions[PLAN_VIEW] = (btn_start, btn_start + len(btn_v))
 
         # Highlight buttons
+        scope_map = {
+            PLAN_APPROVE: "claude.permission.button.allow",
+            PLAN_REJECT: "claude.permission.button.deny",
+            PLAN_VIEW: "claude.permission.button.allow_session",
+        }
         for btn_type, (bs, be) in plan.button_regions.items():
             self.view.add_regions(
                 f"claude_plan_btn_{btn_type}",
                 [sublime.Region(bs, be)],
-                f"claude.permission.button.{'allow' if btn_type == PLAN_APPROVE else 'deny'}",
+                scope_map.get(btn_type, ""),
                 "", sublime.DRAW_NO_OUTLINE,
             )
 
@@ -1415,6 +1426,11 @@ class OutputView:
 
         plan = self.pending_plan
         key = key.lower()
+
+        if key == "v":
+            if plan.plan_file:
+                sublime.active_window().open_file(plan.plan_file)
+            return True
 
         if key == "y":
             response = PLAN_APPROVE

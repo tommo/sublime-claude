@@ -48,6 +48,14 @@
         ]
     },
     {
+        "keys": ["v"],
+        "command": "claude_view_plan",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
+        ]
+    },
+    {
         "keys": ["1"],
         "command": "claude_question_key",
         "args": { "key": "1" },

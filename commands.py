@@ -1523,6 +1523,14 @@ class ClaudePermissionDenyCommand(sublime_plugin.TextCommand):
                 s.output.handle_permission_key("n")
 
 
+class ClaudeViewPlanCommand(sublime_plugin.TextCommand):
+    """Handle V key - view plan file."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if s:
+            s.output.handle_plan_key("v")
+
+
 class ClaudePermissionAllowSessionCommand(sublime_plugin.TextCommand):
     """Handle S key - allow for 30s."""
     def run(self, edit):
