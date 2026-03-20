@@ -35,6 +35,7 @@ from claude_agent_sdk import (
     UserMessage,
     SystemMessage,
     ResultMessage,
+    StreamEvent,
     TextBlock,
     ToolUseBlock,
     ToolResultBlock,
@@ -228,6 +229,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "fork_session": fork_session,
             "setting_sources": ["user", "project"],
             "max_buffer_size": 100 * 1024 * 1024,  # 100MB for large images/files
+            "include_partial_messages": True,
             "cli_path": "claude",
         }
 
@@ -897,19 +899,24 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
     async def emit_message(self, message: Any) -> None:
         """Emit a message notification."""
-        msg_type = type(message).__name__
-        with open("/tmp/claude_bridge.log", "a") as f:
-            f.write(f"emit_message: type={msg_type}\n")
+        if isinstance(message, StreamEvent):
+            event = message.event
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    send_notification("message", {
+                        "type": "text_delta",
+                        "text": delta["text"],
+                    })
+            return
 
         if isinstance(message, AssistantMessage):
             with open("/tmp/claude_bridge.log", "a") as f:
                 f.write(f"  blocks: {[type(b).__name__ for b in message.content]}\n")
             for block in message.content:
                 if isinstance(block, TextBlock):
-                    send_notification("message", {
-                        "type": "text",
-                        "text": block.text,
-                    })
+                    # Text was already streamed via StreamEvent text_deltas — skip
+                    pass
                 elif isinstance(block, ToolUseBlock):
                     send_notification("message", {
                         "type": "tool_use",

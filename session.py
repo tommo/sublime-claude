@@ -964,7 +964,7 @@ class Session:
             else:
                 self.output.tool_done(self.current_tool, content)
             self.current_tool = None
-        elif t == "text":
+        elif t in ("text_delta", "text"):
             self.output.text(params.get("text", ""))
         elif t == "result":
             # Capture session ID for resume
