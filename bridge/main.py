@@ -228,7 +228,6 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "fork_session": fork_session,
             "setting_sources": ["user", "project"],
             "max_buffer_size": 100 * 1024 * 1024,  # 100MB for large images/files
-            "cli_path": "claude",
         }
 
         # Profile config: model, betas
