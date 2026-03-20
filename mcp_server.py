@@ -9,8 +9,10 @@ import sublime
 import sublime_plugin
 
 from .settings import load_profiles_and_checkpoints
+from .constants import MCP_SOCKET_PATH, USER_PROFILES_DIR, PROFILES_FILE
 
-SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
+SOCKET_PATH = MCP_SOCKET_PATH
+USER_PROFILES_PATH = str(USER_PROFILES_DIR / PROFILES_FILE)
 
 _server = None
 
@@ -388,8 +390,9 @@ class MCPSocketServer:
             lines.append(f"Active: {active_view.file_name()}:{row+1}:{col+1}")
 
         # Open files (compact list)
-        open_files = [v.file_name() for v in window.views() if v.file_name()]
-        dirty_files = [v.file_name() for v in window.views() if v.file_name() and v.is_dirty()]
+        all_views = window.views()
+        open_files = [v.file_name() for v in all_views if v.file_name()]
+        dirty_files = [v.file_name() for v in all_views if v.file_name() and v.is_dirty()]
 
         lines.append(f"Open files ({len(open_files)}):")
         for f in open_files[:20]:  # Limit to 20 files

@@ -1833,11 +1833,13 @@ class OutputView:
         )
         if has_trailing_ui:
             # Clamp end to not eat the trailing UI block
-            ui_region = (
-                self.view.get_regions("claude_permission_block") or
-                self.view.get_regions("claude_plan_block") or
-                self.view.get_regions("claude_question_block")
-            )
+            if self.pending_permission and self.pending_permission.callback:
+                ui_key = "claude_permission_block"
+            elif self.pending_plan and self.pending_plan.callback:
+                ui_key = "claude_plan_block"
+            else:
+                ui_key = "claude_question_block"
+            ui_region = self.view.get_regions(ui_key)
             if ui_region and ui_region[0].size() > 0:
                 end = min(end, ui_region[0].begin())
             else:
