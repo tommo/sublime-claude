@@ -1157,33 +1157,25 @@ class Session:
         if not self.session_id:
             return
         sessions = load_saved_sessions()
-        # Update or add this session
-        found = False
-        for s in sessions:
+        # Update or add this session — always move to front (most recently active)
+        entry = None
+        for i, s in enumerate(sessions):
             if s.get("session_id") == self.session_id:
-                s["name"] = self.name
-                s["project"] = self._cwd()
-                s["total_cost"] = self.total_cost
-                s["query_count"] = self.query_count
-                if self._pending_resume_at:
-                    s["resume_session_at"] = self._pending_resume_at
-                else:
-                    s.pop("resume_session_at", None)
-                found = True
+                entry = sessions.pop(i)
                 break
-        if not found:
-            entry = {
-                "session_id": self.session_id,
-                "name": self.name,
-                "project": self._cwd(),
-                "total_cost": self.total_cost,
-                "query_count": self.query_count,
-            }
-            if self._pending_resume_at:
-                entry["resume_session_at"] = self._pending_resume_at
-            sessions.insert(0, entry)
-        # Keep only last 50 sessions
-        sessions = sessions[:50]
+        if not entry:
+            entry = {"session_id": self.session_id}
+        entry["name"] = self.name
+        entry["project"] = self._cwd()
+        entry["total_cost"] = self.total_cost
+        entry["query_count"] = self.query_count
+        if self._pending_resume_at:
+            entry["resume_session_at"] = self._pending_resume_at
+        else:
+            entry.pop("resume_session_at", None)
+        sessions.insert(0, entry)
+        # Keep last 200 sessions
+        sessions = sessions[:200]
         save_sessions(sessions)
 
     def _status(self, text: str) -> None:

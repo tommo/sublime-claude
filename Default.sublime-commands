@@ -80,6 +80,10 @@
         "command": "claude_undo_message"
     },
     {
+        "caption": "Claude: Search Sessions",
+        "command": "claude_search_sessions"
+    },
+    {
         "caption": "Claude: Copy Conversation",
         "command": "claude_code_copy"
     },

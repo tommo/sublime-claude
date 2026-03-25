@@ -600,6 +600,110 @@ class ClaudeCodeUsageCommand(sublime_plugin.WindowCommand):
         self.window.run_command("show_panel", {"panel": "output.claude_usage"})
 
 
+class ClaudeSearchSessionsCommand(sublime_plugin.WindowCommand):
+    """Search all Claude sessions by title/summary."""
+    def run(self) -> None:
+        self.window.show_input_panel("Search sessions:", "", self._on_done, None, None)
+
+    def _on_done(self, query: str) -> None:
+        if not query.strip():
+            return
+        import threading
+        q = query.lower()
+
+        def search():
+            import os, json, time
+            from .session import load_saved_sessions
+
+            # Build lookup of sublime-claude session names by session_id
+            saved = {s["session_id"]: s.get("name", "") for s in load_saved_sessions() if s.get("session_id")}
+
+            projects_dir = os.path.expanduser("~/.claude/projects")
+            results = []  # [(session_id, title, mtime, proj_key)]
+            if not os.path.isdir(projects_dir):
+                return
+
+            for proj_key in os.listdir(projects_dir):
+                proj_path = os.path.join(projects_dir, proj_key)
+                if not os.path.isdir(proj_path):
+                    continue
+                for fname in os.listdir(proj_path):
+                    if not fname.endswith(".jsonl"):
+                        continue
+                    fpath = os.path.join(proj_path, fname)
+                    sid = fname[:-6]  # strip .jsonl
+                    # Check sublime-claude saved name first
+                    saved_name = saved.get(sid, "")
+                    # Read first few lines to find JSONL title
+                    jsonl_title = None
+                    try:
+                        with open(fpath, "r") as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                entry = json.loads(line)
+                                if entry.get("type") == "custom-title":
+                                    jsonl_title = entry.get("title", "")
+                                    break
+                                # First real user prompt as fallback
+                                if entry.get("type") == "user" and not entry.get("isSidechain"):
+                                    msg = entry.get("message", {})
+                                    content = msg.get("content", [])
+                                    if isinstance(content, list):
+                                        has_tool_result = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+                                        if has_tool_result:
+                                            continue
+                                        for b in content:
+                                            if isinstance(b, dict) and b.get("type") == "text":
+                                                t = b.get("text", "")
+                                                if t and not t.startswith("[Request interrupted"):
+                                                    jsonl_title = t[:80]
+                                                    break
+                                    elif isinstance(content, str) and not content.startswith("[Request interrupted"):
+                                        jsonl_title = content[:80]
+                                    if jsonl_title:
+                                        break
+                    except Exception:
+                        continue
+                    # Match against both saved name and JSONL title
+                    searchable = f"{saved_name} {jsonl_title or ''}".lower()
+                    if q not in searchable:
+                        continue
+                    # Use saved name as display title if available
+                    title = saved_name or jsonl_title or "untitled"
+                    mtime = os.path.getmtime(fpath)
+                    results.append((sid, title, mtime, proj_key))
+
+            results.sort(key=lambda x: x[2], reverse=True)
+            results = results[:50]
+
+            if not results:
+                sublime.set_timeout(lambda: sublime.status_message(f"No sessions matching '{query}'"), 0)
+                return
+
+            items = []
+            for sid, title, mtime, proj_key in results:
+                ts = time.strftime("%m/%d %H:%M", time.localtime(mtime))
+                proj_short = proj_key.rsplit("-", 1)[-1] if "-" in proj_key else proj_key
+                items.append([title, f"{proj_short} | {ts} | {sid[:8]}..."])
+
+            def show_panel():
+                from .core import create_session
+
+                def on_select(idx):
+                    if idx < 0:
+                        return
+                    sid = results[idx][0]
+                    create_session(self.window, resume_id=sid, fork=True)
+
+                self.window.show_quick_panel(items, on_select)
+
+            sublime.set_timeout(show_panel, 0)
+
+        threading.Thread(target=search, daemon=True).start()
+
+
 class ClaudeCodeViewHistoryCommand(sublime_plugin.WindowCommand):
     """View session history from Claude's stored conversation."""
     def run(self) -> None:
