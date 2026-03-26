@@ -4,11 +4,7 @@
         "command": "claude_code_switch"
     },
     {
-        "keys": ["super+shift+alt+c"],
-        "command": "claude_code_query_selection"
-    },
-    {
-        "keys": ["super+shift+escape"],
+        "keys": ["command+shift+escape"],
         "command": "claude_code_interrupt"
     },
     {
@@ -133,11 +129,8 @@
         ]
     },
     {
-        "keys": ["super+escape"],
-        "command": "claude_code_interrupt",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
-        ]
+        "keys": ["alt+escape"],
+        "command": "claude_code_interrupt"
     },
     {
         "keys": ["f"],

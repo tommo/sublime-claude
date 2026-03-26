@@ -993,8 +993,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
     async def interrupt(self, id: int) -> None:
         """Interrupt current query and drain pending messages."""
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"interrupt: called, has_task={self.current_task is not None and not self.current_task.done()}\n")
         if self.current_task and not self.current_task.done():
             self.interrupted = True  # Signal to query() that we were interrupted
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"interrupt: sending to SDK\n")
             await self.client.interrupt()
             # Cancel any pending permission requests
             for pid, future in list(self.pending_permissions.items()):
