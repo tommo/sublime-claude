@@ -1164,9 +1164,6 @@ class Session:
         self.output.set_name(name)
         self._update_status_bar()
         self._save_session()
-        # Sync name to CLI session JSONL via bridge
-        if self.session_id and name and self.client:
-            self.client.send("rename_session", {"name": name})
 
     def _save_session(self) -> None:
         """Save session info to disk for later resume."""

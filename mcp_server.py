@@ -272,6 +272,18 @@ class MCPSocketServer:
         finally:
             conn.close()
 
+    def _get_window(self):
+        """Get the window for the calling session, falling back to active window."""
+        if self._caller_view_id:
+            for w in sublime.windows():
+                v = w.find_open_file_by_id(self._caller_view_id) if hasattr(w, 'find_open_file_by_id') else None
+                if v:
+                    return w
+                for v in w.views():
+                    if v.id() == self._caller_view_id:
+                        return w
+        return sublime.active_window()
+
     def _eval(self, code: str, tool: str = None, caller_view_id: int = None):
         """Execute code in Sublime's context.
 
@@ -285,7 +297,7 @@ class MCPSocketServer:
 
         # Load saved tool if specified
         if tool:
-            window = sublime.active_window()
+            window = self._get_window()
             if window and window.folders():
                 tool_path = os.path.join(window.folders()[0], ".claude", "sublime_tools", f"{tool}.py")
                 if os.path.exists(tool_path):
@@ -339,7 +351,7 @@ class MCPSocketServer:
         }
 
         # Add context variables
-        window = sublime.active_window()
+        window = self._get_window()
         exec_globals["cwd"] = window.folders()[0] if window and window.folders() else None
         exec_globals["AGENT_ID"] = str(caller_view_id) if caller_view_id else None
 
@@ -363,14 +375,14 @@ class MCPSocketServer:
 
     def _get_open_files(self) -> list:
         """Get list of open files."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return []
         return [v.file_name() for v in window.views() if v.file_name()]
 
     def _get_window_summary(self) -> dict:
         """Get summary of current window state (formatted for reduced context)."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -408,7 +420,7 @@ class MCPSocketServer:
         """Fuzzy find files by name, optionally filtered by glob pattern."""
         import fnmatch
 
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return []
 
@@ -485,7 +497,7 @@ class MCPSocketServer:
             file_path: Optional file to limit search to
             limit: Max results per symbol (default 10)
         """
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"success": False, "error": "No window"}
 
@@ -537,7 +549,7 @@ class MCPSocketServer:
 
     def _list_tools(self) -> list:
         """List available saved tools."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window or not window.folders():
             return []
 
@@ -576,7 +588,7 @@ class MCPSocketServer:
 
     def _goto_symbol(self, query: str) -> dict:
         """Navigate to a symbol definition. Returns the symbol info or error."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -598,7 +610,7 @@ class MCPSocketServer:
         """
         import os
         import re
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -785,7 +797,7 @@ class MCPSocketServer:
         from .core import create_session, get_active_session
         import uuid
 
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -989,7 +1001,7 @@ class MCPSocketServer:
 
     def _list_profile_docs(self) -> dict:
         """List documentation files available from current session's profile."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No active window"}
 
@@ -1015,7 +1027,7 @@ class MCPSocketServer:
 
     def _read_profile_doc(self, path: str) -> dict:
         """Read a documentation file from current session's profile docset."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No active window"}
 
@@ -1064,7 +1076,7 @@ class MCPSocketServer:
 
     def _terminus_list(self) -> list:
         """List all Terminus terminal views in the current window."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return []
 
@@ -1096,7 +1108,7 @@ class MCPSocketServer:
             # Default tag uses active Claude session's view ID for isolation
             # Each session gets its own terminal to avoid state pollution
             from . import core
-            window = sublime.active_window()
+            window = self._get_window()
             # Find active session via window's active view setting
             active_view_id = window.settings().get("claude_active_view") if window else None
             if active_view_id and active_view_id in sublime._claude_sessions:
@@ -1144,7 +1156,7 @@ class MCPSocketServer:
         If no tag specified, uses "claude-agent-{window_id}" tag to keep agent commands
         in a dedicated terminal per window (won't hijack user's terminals).
         """
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -1237,7 +1249,7 @@ class MCPSocketServer:
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
             from . import core
-            window = sublime.active_window()
+            window = self._get_window()
             active_view_id = window.settings().get("claude_active_view") if window else None
             if active_view_id and active_view_id in sublime._claude_sessions:
                 tag = f"claude-agent-{active_view_id}"
@@ -1281,7 +1293,7 @@ class MCPSocketServer:
         elif not tag:
             # Default tag uses active Claude session's view ID for isolation
             from . import core
-            window = sublime.active_window()
+            window = self._get_window()
             active_view_id = window.settings().get("claude_active_view") if window else None
             if active_view_id and active_view_id in sublime._claude_sessions:
                 tag = f"claude-agent-{active_view_id}"
@@ -1319,7 +1331,7 @@ class MCPSocketServer:
 
     def _resolve_file_view(self, file_path):
         """Resolve a file path to a Sublime view, opening if needed."""
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return None, "No window"
 
@@ -1523,7 +1535,7 @@ class MCPSocketServer:
         except ImportError:
             return {"error": "LSP package not installed"}
 
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return {"error": "No window"}
 
@@ -1579,7 +1591,7 @@ class MCPSocketServer:
             if err:
                 return {"error": err}
         else:
-            window = sublime.active_window()
+            window = self._get_window()
             view = window.active_view() if window else None
             if not view:
                 return {"error": "No active view"}
@@ -1709,7 +1721,7 @@ class MCPSocketServer:
             return sublime._claude_sessions[session_id], None
 
         # Try to find session from execution context
-        window = sublime.active_window()
+        window = self._get_window()
         if not window:
             return None, {"error": "No active window"}
 
@@ -2111,7 +2123,7 @@ class MCPSocketServer:
         """Dispatch order table commands."""
         from .order_table import get_table_for_cwd, refresh_order_table
 
-        window = sublime.active_window()
+        window = self._get_window()
         cwd = window.folders()[0] if window and window.folders() else None
         if not cwd:
             return "error: No project folder"

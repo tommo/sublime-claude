@@ -141,16 +141,6 @@ class Bridge:
                 subsession_id = params.get("subsession_id")
                 if subsession_id:
                     await self.signal_subsession_complete(subsession_id)
-            elif method == "rename_session":
-                name = params.get("name", "")
-                if name and self._session_id:
-                    try:
-                        from claude_agent_sdk import rename_session
-                        rename_session(self._session_id, name)
-                    except Exception as e:
-                        with open("/tmp/claude_bridge.log", "a") as f:
-                            f.write(f"rename_session error: {e}\n")
-                send_result(id, {"ok": True})
             elif method == "list_notifications":
                 result = await self.list_notifications()
                 send_result(id, result)
