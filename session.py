@@ -1333,7 +1333,13 @@ class Session:
 
         # Open plan file if found
         if plan_file and os.path.exists(plan_file):
-            self.window.open_file(plan_file)
+            view = self.window.open_file(plan_file)
+            def enable_wrap(v=view):
+                if v.is_loading():
+                    sublime.set_timeout(lambda: enable_wrap(v), 100)
+                    return
+                v.settings().set("word_wrap", True)
+            enable_wrap()
 
     def _find_plan_file(self) -> Optional[str]:
         """Find the most recent plan file in ~/.claude/plans/."""
