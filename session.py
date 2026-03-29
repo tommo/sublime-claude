@@ -136,7 +136,9 @@ class Session:
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        default_model = settings.get("default_model")
+        # Per-backend default model, fallback to legacy default_model
+        default_models = settings.get("default_models", {})
+        default_model = default_models.get(self.backend) or settings.get("default_model")
         print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
         # Get additional working directories from project folders + project settings
         additional_dirs = self.window.folders()[1:] if len(self.window.folders()) > 1 else []

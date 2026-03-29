@@ -126,10 +126,11 @@ class CodexBridge:
 
         # Build config overrides
         config = []
-        # Only pass model if it's a Codex-compatible model (not Claude models)
+        # Map Claude model names to codex default, or use as-is
         claude_models = ("opus", "sonnet", "haiku", "claude")
-        if model and not any(m in model.lower() for m in claude_models):
-            config.append(f'model="{model}"')
+        if not model or any(m in model.lower() for m in claude_models):
+            model = "gpt-5.3-codex"
+        config.append(f'model="{model}"')
 
         # Map permission modes
         if permission_mode == "bypassPermissions":

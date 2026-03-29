@@ -8,6 +8,29 @@ from .session import Session, load_saved_sessions
 from .prompt_builder import PromptBuilder
 from .command_parser import CommandParser
 
+# Fallback model lists per backend (used when no cache/settings available)
+DEFAULT_MODELS = {
+    "claude": [
+        ["opus", "Opus 4.6"],
+        ["sonnet", "Sonnet 4.6"],
+        ["haiku", "Haiku 4.5"],
+        ["claude-opus-4-5", "Opus 4.5"],
+        ["claude-sonnet-4-5", "Sonnet 4.5"],
+    ],
+    "copilot": [
+        ["claude-sonnet-4-6", "Sonnet 4.6"],
+        ["claude-opus-4-6", "Opus 4.6"],
+        ["gpt-5.3-codex", "GPT-5.3 Codex"],
+        ["gpt-5-mini", "GPT-5 Mini (free)"],
+    ],
+    "codex": [
+        ["gpt-5.4", "GPT-5.4"],
+        ["gpt-5.3-codex", "GPT-5.3 Codex"],
+        ["gpt-5.4-mini", "GPT-5.4 Mini"],
+        ["o3", "O3"],
+    ],
+}
+
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
     """Start a new session. Shows profile picker if profiles are configured."""
@@ -549,6 +572,181 @@ class ClaudeCodeUsageCommand(sublime_plugin.WindowCommand):
         self.window.run_command("show_panel", {"panel": "output.claude_usage"})
 
 
+class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
+    """Quick panel to select model for current session."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if not s:
+            sublime.status_message("No active session")
+            return
+        if s.working:
+            sublime.status_message("Session is busy")
+            return
+        backend = s.backend
+        models = self._get_models(backend)
+        if not models:
+            sublime.status_message(f"No models for {backend}. Run Claude: Refresh Models first.")
+            return
+        items = []
+        model_ids = []
+        for m in models:
+            if isinstance(m, str):
+                mid, mname = m, m
+            elif isinstance(m, list) and len(m) >= 2:
+                mid, mname = m[0], m[1]
+            else:
+                continue
+            items.append([mname, mid])
+            model_ids.append(mid)
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            mid = model_ids[idx]
+            if s.client:
+                s.client.send("set_model", {"model": mid})
+            sublime.status_message(f"Model: {mid}")
+
+        self.window.show_quick_panel(items, on_select)
+
+    def _get_models(self, backend):
+        import os
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        all_models = settings.get("models", {})
+        # Merge cached
+        cached_file = os.path.expanduser("~/.claude/sublime_cached_models.json")
+        if os.path.exists(cached_file):
+            try:
+                import json as _json
+                with open(cached_file) as f:
+                    cached = _json.load(f)
+                for b, models in cached.items():
+                    if b not in all_models:
+                        all_models[b] = models
+            except Exception:
+                pass
+        if backend not in all_models:
+            all_models[backend] = DEFAULT_MODELS.get(backend, [])
+        return all_models.get(backend, [])
+
+
+class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
+    """Set default model per backend in settings."""
+    def run(self) -> None:
+        backends = ["claude", "codex", "copilot"]
+        items = [[b.title(), f"Set default model for {b}"] for b in backends]
+
+        def on_backend(idx):
+            if idx < 0:
+                return
+            backend = backends[idx]
+            models = ClaudeSelectModelCommand._get_models(None, backend)
+            if not models:
+                sublime.status_message(f"No models for {backend}. Run Claude: Refresh Models first.")
+                return
+            model_items = []
+            model_ids = []
+            for m in models:
+                if isinstance(m, str):
+                    mid, mname = m, m
+                elif isinstance(m, list) and len(m) >= 2:
+                    mid, mname = m[0], m[1]
+                else:
+                    continue
+                model_items.append([mname, mid])
+                model_ids.append(mid)
+
+            def on_model(midx):
+                if midx < 0:
+                    return
+                mid = model_ids[midx]
+                settings = sublime.load_settings("ClaudeCode.sublime-settings")
+                defaults = settings.get("default_models", {})
+                defaults[backend] = mid
+                settings.set("default_models", defaults)
+                # Also set legacy default_model for claude
+                if backend == "claude":
+                    settings.set("default_model", mid)
+                sublime.save_settings("ClaudeCode.sublime-settings")
+                sublime.status_message(f"Default {backend} model: {mid}")
+
+            self.window.show_quick_panel(model_items, on_model)
+
+        self.window.show_quick_panel(items, on_backend)
+
+
+class ClaudeRefreshModelsCommand(sublime_plugin.WindowCommand):
+    """Fetch available models from backends and cache them."""
+    def run(self) -> None:
+        import threading
+
+        def fetch():
+            import os, json as _json
+            cached = {}
+
+            # Claude models (from Anthropic API)
+            try:
+                import urllib.request
+                api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+                if api_key:
+                    req = urllib.request.Request(
+                        "https://api.anthropic.com/v1/models",
+                        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+                    )
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        data = _json.loads(resp.read().decode())
+                    result = []
+                    for m in data.get("data", []):
+                        mid = m.get("id", "")
+                        name = m.get("display_name", mid)
+                        result.append([mid, name])
+                    if result:
+                        cached["claude"] = result
+            except Exception as e:
+                print(f"[Claude] refresh models claude error: {e}")
+
+            # Copilot models (live from SDK)
+            try:
+                import asyncio
+                from copilot import CopilotClient
+
+                async def get_copilot_models():
+                    client = CopilotClient()
+                    await client.start()
+                    models = await client.list_models()
+                    result = []
+                    for m in models:
+                        mid = getattr(m, 'id', '')
+                        name = getattr(m, 'name', '')
+                        billing = getattr(m, 'billing', None)
+                        mult = getattr(billing, 'multiplier', 1) if billing else 1
+                        label = f"{name} ({mult}x)" if mult != 1 else name
+                        result.append([mid, label])
+                    await client.stop()
+                    return result
+
+                cached["copilot"] = asyncio.run(get_copilot_models())
+            except Exception as e:
+                print(f"[Claude] refresh models copilot error: {e}")
+
+            # Fallback for backends without list API
+            for backend_name, fallback_models in DEFAULT_MODELS.items():
+                if backend_name not in cached:
+                    cached[backend_name] = fallback_models
+
+            # Write cache
+            cache_path = os.path.expanduser("~/.claude/sublime_cached_models.json")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w") as f:
+                _json.dump(cached, f, indent=2)
+
+            count = sum(len(v) for v in cached.values())
+            sublime.set_timeout(lambda: sublime.status_message(f"Cached {count} models"), 0)
+
+        sublime.status_message("Fetching models...")
+        threading.Thread(target=fetch, daemon=True).start()
+
+
 class ClaudeSearchSessionsCommand(sublime_plugin.WindowCommand):
     """Search all Claude sessions by title/summary."""
     def run(self) -> None:
@@ -921,8 +1119,34 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         actions.append(("persona", persona_url))
 
         # Add "New Session" option
+        # Add "New Session with Model" option
         items.append([f"🆕 {backend_prefix}New Session", "Start fresh with default settings"])
         actions.append(("new", None))
+
+        # Model selection from settings + cached models
+        all_models = sublime_settings.get("models", {})
+        # Also read cached models from copilot SDK
+        cached_models_file = os.path.expanduser("~/.claude/sublime_cached_models.json")
+        if os.path.exists(cached_models_file):
+            try:
+                import json as _json
+                with open(cached_models_file) as f:
+                    cached = _json.load(f)
+                for b, models in cached.items():
+                    if b not in all_models:
+                        all_models[b] = models
+            except Exception:
+                pass
+        backend_models = all_models.get(backend, [])
+        for m in backend_models:
+            if isinstance(m, str):
+                model_id, model_name = m, m
+            elif isinstance(m, list) and len(m) >= 2:
+                model_id, model_name = m[0], m[1]
+            else:
+                continue
+            items.append([f"🆕 {backend_prefix}{model_name}", f"New session with {model_id}"])
+            actions.append(("new_model", model_id))
 
         # Add "Fork Session" option when in a session window
         if in_output_view and active_session:
@@ -965,6 +1189,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                         print(f"[Claude] Error adding file context: {e}")
                 elif action == "new":
                     create_session(self.window, backend=backend)
+                elif action == "new_model":
+                    create_session(self.window, profile={"model": data}, backend=backend)
                 elif action == "profile":
                     create_session(self.window, profile=data, backend=backend)
                 elif action == "checkpoint":

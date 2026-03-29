@@ -67,7 +67,7 @@ class CopilotBridge:
         from copilot import CopilotClient, PermissionHandler
 
         cwd = params.get("cwd", os.getcwd())
-        model = params.get("model", "gpt-5")
+        model = params.get("model", "claude-sonnet-4-6")
         system_prompt = params.get("system_prompt", "")
         view_id = params.get("view_id", "")
         resume_id = params.get("resume")
@@ -76,21 +76,7 @@ class CopilotBridge:
         model_map = {"opus": "claude-opus-4-6", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5"}
         model = model_map.get(model, model)
 
-        # MCP server config — must pass via CLI args, not session config
-        import json as _json
-        client_opts = {}
-        mcp_server_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "mcp", "server.py"
-        )
-        if os.path.exists(mcp_server_path):
-            mcp_args = [mcp_server_path]
-            if view_id:
-                mcp_args.append(f"--view-id={view_id}")
-            mcp_config = {"mcpServers": {"sublime": {"command": sys.executable, "args": mcp_args}}}
-            client_opts["cli_args"] = ["--additional-mcp-config", _json.dumps(mcp_config)]
-
-        self.client = CopilotClient(client_opts if client_opts else None)
+        self.client = CopilotClient()
         await self.client.start()
 
         # Build session config
@@ -102,6 +88,28 @@ class CopilotBridge:
         }
         if system_prompt:
             config["system_message"] = {"content": system_prompt}
+
+        # Load global MCP config and add our sublime server
+        import json as _json
+        mcp_servers = {}
+        global_mcp = os.path.expanduser("~/.copilot/mcp-config.json")
+        if os.path.exists(global_mcp):
+            try:
+                with open(global_mcp) as f:
+                    mcp_servers = _json.load(f).get("mcpServers", {})
+            except Exception:
+                pass
+        mcp_server_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "mcp", "server.py"
+        )
+        if os.path.exists(mcp_server_path):
+            mcp_args = [mcp_server_path]
+            if view_id:
+                mcp_args.append(f"--view-id={view_id}")
+            mcp_servers["sublime"] = {"type": "local", "command": sys.executable, "args": mcp_args, "tools": ["*"]}
+        if mcp_servers:
+            config["mcp_servers"] = mcp_servers
 
         self._session_config = config
         log(f"Session config: mcp_servers={config.get('mcp_servers', {})}, model={model}, resume={resume_id}")

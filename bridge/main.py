@@ -132,6 +132,11 @@ class Bridge:
             elif method == "discover_services":
                 result = await self.discover_services()
                 send_result(id, result)
+            elif method == "set_model":
+                model = params.get("model")
+                if model and self.client:
+                    await self.client.set_model(model)
+                send_result(id, {"ok": True})
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
