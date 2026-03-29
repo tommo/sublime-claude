@@ -112,9 +112,14 @@ class CopilotBridge:
             config["mcp_servers"] = mcp_servers
 
         self._session_config = config
-        log(f"Session config: mcp_servers={config.get('mcp_servers', {})}, model={model}, resume={resume_id}")
+        log(f"Session config: model={model}, resume={resume_id}, mcp={bool(config.get('mcp_servers'))}")
         if resume_id:
-            self.session = await self.client.resume_session(resume_id, config)
+            log(f"Resuming session {resume_id}, cwd={cwd}")
+            try:
+                self.session = await self.client.resume_session(resume_id, config)
+            except Exception as e:
+                log(f"Resume failed: {e}, falling back to create")
+                self.session = await self.client.create_session(config)
         else:
             self.session = await self.client.create_session(config)
         self.session.on(self._on_event)
@@ -296,7 +301,6 @@ class CopilotBridge:
                 send_notification("message", {"type": "thinking", "thinking": text})
 
         elif etype == SessionEventType.TOOL_EXECUTION_START:
-            log(f"TOOL_START raw: tool_name={getattr(data, 'tool_name', '')}, args={getattr(data, 'arguments', None)}, tool_call_id={getattr(data, 'tool_call_id', '')}")
             tool_name = getattr(data, 'tool_name', '') or ''
             mcp_server = getattr(data, 'mcp_server_name', '') or ''
             mcp_tool = getattr(data, 'mcp_tool_name', '') or ''
@@ -325,7 +329,6 @@ class CopilotBridge:
             cached = self._perm_data_cache.pop(tool_call_id, None)
             if cached:
                 tool_input.update(cached)
-            log(f"TOOL_USE sent: name={name}, input_keys={list(tool_input.keys())}")
             send_notification("message", {"type": "tool_use", "id": tool_call_id, "name": name, "input": tool_input})
 
         elif etype == SessionEventType.TOOL_EXECUTION_COMPLETE:

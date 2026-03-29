@@ -436,7 +436,6 @@ class ClaudeCodeQueuePromptCommand(sublime_plugin.WindowCommand):
 class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
-        print(f"[Claude] interrupt: session={s is not None}, working={s.working if s else None}, initialized={s.initialized if s else None}")
         if not s:
             return
         # If in input mode with text, clear the input instead of interrupting
