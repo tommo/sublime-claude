@@ -98,7 +98,7 @@ class CopilotBridge:
             if view_id:
                 args.append(f"--view-id={view_id}")
             config["mcp_servers"] = {
-                "sublime": {"type": "stdio", "command": sys.executable, "args": args, "tools": []}
+                "sublime": {"type": "stdio", "command": sys.executable, "args": args}
             }
 
         self._session_config = config
