@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) and [Codex CLI](https://github.com/openai/codex) integration.
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), and [GitHub Copilot CLI](https://github.com/features/copilot/cli) integration.
 
 ![Multi-session chess game demo](sessions_demo.jpg)
 *Multi-agent workflow: A coordinator orchestrating three sessions - White player, Black player, and a Board display - playing chess via MCP tools.*
@@ -9,8 +9,10 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code) and [Code
 
 - Sublime Text 4
 - Python 3.10+ (for the bridge process)
-- Claude Code CLI (authenticated) and/or Codex CLI
-- `claude-agent-sdk` package (for Claude backend)
+- One or more CLI backends (authenticated):
+  - Claude Code CLI + `claude-agent-sdk`
+  - Codex CLI
+  - GitHub Copilot CLI via `github-copilot-sdk`
 
 ```bash
 # Claude Code
@@ -21,9 +23,12 @@ pip install claude-agent-sdk
 # Codex CLI (optional)
 npm install -g @openai/codex
 codex  # Follow prompts to authenticate
+
+# GitHub Copilot CLI (optional)
+pip install github-copilot-sdk  # Bundles CLI binary
 ```
 
-**Note:** You must authenticate your chosen CLI before using this plugin. If you see connection errors, run `claude` or `codex` in terminal to login.
+**Note:** Authenticate your chosen CLI before using this plugin. If you see connection errors, run the CLI in terminal to login.
 
 ## Installation
 
@@ -60,6 +65,10 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Clear Context | - | Clear pending context |
 | New Session | - | Start a fresh Claude session |
 | Codex: New Session | - | Start a fresh Codex session |
+| Copilot: New Session | - | Start a fresh GitHub Copilot session |
+| Undo Message | - | Rewind last conversation turn |
+| Search Sessions | - | Search all sessions by title |
+| Clear Notifications | - | List and clear active notifications |
 | Restart Session | - | Restart current session, keep output view |
 | Resume Session... | - | Resume a previous session |
 | Switch Session... | - | Switch between active sessions |
@@ -69,7 +78,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | Stop Session | - | Disconnect and stop |
 | Toggle Output | `Cmd+Alt+C` | Show/hide output view |
 | Clear Output | `Cmd+Ctrl+Alt+C` | Clear output view |
-| Interrupt | `Cmd+Shift+Escape` | Stop current query |
+| Interrupt | `Alt+Escape` | Stop current query |
 | Permission Mode... | - | Change permission settings |
 | Manage Auto-Allowed Tools... | - | Configure tools that skip permission prompts |
 
@@ -81,16 +90,15 @@ The output view features an inline input area (marked with `◎`) where you type
 - **Shift+Enter** - Insert newline (multiline prompts)
 - **@** - Open context menu (add files, selection, folder, or clear context)
 - **Cmd+K** - Clear output
-- **Cmd+Escape** - Clear input text, or interrupt current query if input is empty
-- **Cmd+Z** - Undo clear (restores cleared content)
+- **Alt+Escape** - Interrupt current query
 
 When a permission prompt appears:
 - **Y/N/S/A** - Respond to permission prompts
 
-Quick prompts (when not in input mode):
-- **F** - Refresh (re-read docs, continue)
-- **R** - Retry (different approach)
-- **C** - Continue
+When viewing plan approval:
+- **Y** - Approve plan
+- **N** - Reject plan
+- **V** - View plan file
 
 ### Menu
 
@@ -121,6 +129,7 @@ Right-click selected text and choose "Ask Claude" to query about the selection.
 
 - `default` - Prompt for all tool actions
 - `acceptEdits` - Auto-accept file operations
+- `auto` - AI classifier auto-approves (Team/Enterprise plan, Sonnet 4.6+)
 - `bypassPermissions` - Skip all permission checks
 
 ### Permission Prompt
@@ -156,6 +165,27 @@ Automatically allow specific tools without permission prompts. Configure via:
 ```
 
 Supports wildcards (`*`) for pattern matching. User-level settings apply to all projects, project settings override.
+
+### Project Settings (.sublime-project)
+
+```json
+{
+  "settings": {
+    "claude_additional_dirs": [
+      "/path/to/extra/dir",
+      "~/another/dir"
+    ],
+    "claude_retain": "Important context to preserve across compactions",
+    "claude_env": {
+      "MY_VAR": "value"
+    }
+  }
+}
+```
+
+- **claude_additional_dirs** — Extra `--add-dir` paths for CLI access
+- **claude_retain** — Content preserved across context compactions
+- **claude_env** — Environment variables passed to bridge
 
 ## Context
 
@@ -237,7 +267,9 @@ View title shows session status:
 - `◇` Inactive + idle
 - `❓` Waiting for permission/question response
 
-Codex sessions show a `[codex]` prefix in the tab title.
+Non-Claude sessions show backend name in tab title and have distinct background colors:
+- **Codex** - Green-tinted background
+- **Copilot** - Purple-tinted background
 
 Supports markdown formatting and fenced code blocks with language-specific syntax highlighting.
 
@@ -285,8 +317,10 @@ Add a docstring at the top - it's shown when calling `list_tools()`.
 
 ### Session Spawning
 
-- `spawn_session(prompt, name?)` - Start a new Claude session with a prompt
+- `spawn_session(prompt, name?, profile?, persona_id?, backend?, fork_current?)` - Spawn a subsession
 - `list_sessions()` - List active sessions in current window
+- `list_personas()` - List available personas from persona server
+- `list_profiles()` - List profiles and checkpoints
 
 ### Alarm System (Event-Driven Waiting)
 
@@ -355,28 +389,31 @@ Agents run with separate context, preventing conversation bloat. Custom agents o
 ```
 ┌─────────────────┐     JSON-RPC/stdio     ┌─────────────────┐
 │  Sublime Text   │ ◄────────────────────► │  bridge/main.py │ (Claude)
-│  (Python 3.8)   │                        │  Agent SDK      │
+│  (Python 3.8)   │                        │  claude-agent-sdk│
 │                 │                        └─────────────────┘
 │                 │     JSON-RPC/stdio     ┌─────────────────┐
 │                 │ ◄────────────────────► │  bridge/codex_  │ (Codex)
 │                 │                        │  main.py        │
-└─────────────────┘                        └────────┬────────┘
-        │                                           │ JSON-RPC/stdio
-        │ Unix socket                               ▼
-        ▼                                  ┌─────────────────┐
-┌─────────────────┐     stdio              │  codex          │
-│  mcp_server.py  │ ◄────────────────────► │  app-server     │
-│  (socket server)│    ┌─────────────────┐ └─────────────────┘
-└─────────────────┘    │  mcp/server.py  │
-                       │  (MCP server)   │
-                       └─────────────────┘
+│                 │                        └────────┬────────┘
+│                 │     JSON-RPC/stdio     ┌────────┴────────┐
+│                 │ ◄────────────────────► │  bridge/copilot_│ (Copilot)
+│                 │                        │  main.py        │
+└─────────────────┘                        └─────────────────┘
+        │
+        │ Unix socket
+        ▼
+┌─────────────────┐     stdio     ┌─────────────────┐
+│  mcp_server.py  │ ◄──────────► │  mcp/server.py  │
+│  (socket server)│              │  (MCP server)   │
+└─────────────────┘              └─────────────────┘
 ```
 
 The plugin runs in Sublime's Python 3.8 environment and spawns a separate
-bridge process using Python 3.10+. The bridge translates between Sublime's
+bridge process using Python 3.10+. Each bridge translates between Sublime's
 JSON-RPC protocol and the backend CLI:
-- **Claude**: `bridge/main.py` uses the Claude Agent SDK
-- **Codex**: `bridge/codex_main.py` translates to Codex's `app-server` protocol
+- **Claude**: `bridge/main.py` — Claude Agent SDK
+- **Codex**: `bridge/codex_main.py` — Codex app-server protocol
+- **Copilot**: `bridge/copilot_main.py` — GitHub Copilot SDK
 
 ```
 sublime-claude/
@@ -390,7 +427,9 @@ sublime-claude/
 ├── mcp_server.py          # MCP socket server
 ├── bridge/
 │   ├── main.py            # Claude bridge (Agent SDK)
-│   └── codex_main.py      # Codex bridge (app-server)
+│   ├── codex_main.py      # Codex bridge (app-server)
+│   ├── copilot_main.py    # Copilot bridge (Copilot SDK)
+│   └── rpc_helpers.py     # Shared JSON-RPC helpers
 ├── mcp/server.py          # MCP protocol server
 │
 └── Core Utilities:
