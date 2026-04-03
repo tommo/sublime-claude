@@ -132,11 +132,16 @@ class CodexBridge:
             model = "gpt-5.3-codex"
         config.append(f'model="{model}"')
 
-        # Map permission modes
-        if permission_mode == "bypassPermissions":
-            config.append('approval_policy="full-auto"')
-        elif permission_mode == "acceptEdits":
-            config.append('approval_policy="auto-edit"')
+        # Map permission modes to codex approval_policy
+        # Valid: untrusted, on-failure, on-request, granular, never
+        perm_map = {
+            "bypassPermissions": "never",
+            "acceptEdits": "on-failure",
+            "auto": "on-failure",
+            "default": "on-request",
+        }
+        codex_policy = perm_map.get(permission_mode, "on-request")
+        config.append(f'approval_policy="{codex_policy}"')
 
         # Configure Sublime MCP server so Codex can use editor tools
         mcp_server_path = os.path.join(
