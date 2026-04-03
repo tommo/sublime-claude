@@ -439,7 +439,11 @@ class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
         s = get_active_session(self.window)
         if not s:
             return
-        # If in input mode with text, clear the input instead of interrupting
+        # If working, always interrupt — don't just clear input
+        if s.working:
+            s.interrupt()
+            return
+        # If idle in input mode with text, clear the input
         if s.output.is_input_mode() and s.output.get_input_text().strip():
             view = s.output.view
             start = s.output._input_start
