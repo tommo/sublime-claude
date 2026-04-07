@@ -116,7 +116,6 @@ class Session:
         self._pending_retain: Optional[str] = None
 
     def start(self, resume_session_at: str = None) -> None:
-        # Show connecting phantom in view
         self._show_connecting_phantom()
 
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -1098,8 +1097,6 @@ class Session:
                     view.run_command("claude_replace", {"start": erase_from, "end": view.size(), "text": ""})
                     view.set_read_only(True)
         self._show_overlay_phantom("\u23f8 Session paused \u2014 press Enter to wake")
-        if self.output and self.output.view:
-            self.output.view.show(self.output.view.size())
 
     def _get_overlay_phantom_set(self):
         if not hasattr(self, '_overlay_phantom_set') or self._overlay_phantom_set is None:
@@ -1111,9 +1108,16 @@ class Session:
         ps = self._get_overlay_phantom_set()
         if not ps or not self.output or not self.output.view:
             return
-        pt = self.output.view.size()
+        view = self.output.view
+        # Place phantom on the last line of content (not after it) so it's within scroll bounds
+        content = view.substr(sublime.Region(0, view.size()))
+        last_nl = content.rfind("\n")
+        pt = last_nl if last_nl >= 0 else 0
         html = f'<body style="margin: 8px 0; color: color(var(--foreground) alpha(0.5));">{html_body}</body>'
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
+        view.sel().clear()
+        view.sel().add(sublime.Region(view.size(), view.size()))
+        view.show(view.size())
 
     def _clear_overlay_phantom(self) -> None:
         ps = self._get_overlay_phantom_set()
@@ -1134,7 +1138,12 @@ class Session:
         self._terminal_tag = None
         self._clear_overlay_phantom()
         if self.output and self.output.view:
-            self.output.view.settings().erase("claude_sleeping")
+            view = self.output.view
+            view.settings().erase("claude_sleeping")
+            end = view.size()
+            view.sel().clear()
+            view.sel().add(end)
+            view.show(end)
         self.resume_id = self.session_id
         self.fork = False
         resume_at = self._pending_resume_at

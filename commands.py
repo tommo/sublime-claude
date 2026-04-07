@@ -463,7 +463,7 @@ class ClaudeCloseSessionCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         view = self.view
         session = sublime._claude_sessions.get(view.id())
-        if not session or not session.initialized:
+        if not session or not (session.initialized or session.is_sleeping):
             view.close()
             return
         # Use set_timeout so the dialog doesn't block the command dispatch loop.
@@ -471,7 +471,7 @@ class ClaudeCloseSessionCommand(sublime_plugin.TextCommand):
         def _ask():
             # Re-check session (may have closed in the meantime)
             s = sublime._claude_sessions.get(view.id())
-            if not s or not s.initialized:
+            if not s or not (s.initialized or s.is_sleeping):
                 view.close()
                 return
             if sublime.ok_cancel_dialog("Close this Claude session?", "Close"):

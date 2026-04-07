@@ -49,10 +49,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             for view_id in to_remove:
                 del sublime._claude_sessions[view_id]
 
-        # Intercept close/close_all/close_others for claude output views
-        if command in ("close", "close_by_index"):
+        # Intercept close for claude output views
+        if command in ("close", "close_file", "close_by_index"):
             view = window.active_view()
-            # close_by_index passes group/index args — resolve to the actual view
             if command == "close_by_index" and args:
                 group = args.get("group", 0)
                 index = args.get("index", 0)
@@ -61,10 +60,10 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                     view = views[index]
             if view and view.settings().get("claude_output"):
                 session = sublime._claude_sessions.get(view.id())
-                if session and session.initialized:
+                if session and (session.initialized or session.is_sleeping):
                     def _ask():
                         s = sublime._claude_sessions.get(view.id())
-                        if not s or not s.initialized:
+                        if not s or not (s.initialized or s.is_sleeping):
                             view.close()
                             return
                         if sublime.ok_cancel_dialog("Close this Claude session?", "Close"):
@@ -73,7 +72,8 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                                 del sublime._claude_sessions[view.id()]
                             view.close()
                     sublime.set_timeout(_ask, 0)
-                    return ("noop",)  # Cancel the original close
+                    return ("noop",)
+
 
     def on_activated(self, view: sublime.View) -> None:
         """Handle view activated - check if it's for context adding from goto."""
@@ -123,6 +123,7 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                     session.output.view.sel().add(sublime.Region(end, end))
 
             sublime.set_timeout(refocus, 100)
+
 
     def on_close(self, view: sublime.View) -> None:
         # Clean up session when output view is closed

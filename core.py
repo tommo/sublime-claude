@@ -63,6 +63,10 @@ def plugin_loaded() -> None:
                 if not resume_id:
                     continue
 
+                # Ensure scratch is restored (may have been unset by previous buggy code)
+                if not view.is_scratch():
+                    view.set_scratch(True)
+
                 backend = view.settings().get("claude_backend", "claude")
                 session = Session(window, resume_id=resume_id, backend=backend)
                 session.name = session_name
