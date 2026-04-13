@@ -1916,14 +1916,23 @@ class OutputView:
             file_path = tool_input['file_path']
             old = tool_input.get("old_string", "")
             new = tool_input.get("new_string", "")
-            # Get line number from file (where old_string starts) and diff
-            line_num = self._find_line_number(file_path, old, new)
-            diff_str = self._format_edit_diff(old, new)
-            # Show path with line number for Cmd+click
-            if line_num:
-                detail = f": {file_path}:{line_num}"
+            unified = tool_input.get("unified_diff", "")
+            if unified:
+                # Pre-computed unified diff (e.g. from codex)
+                diff_str = self._format_unified_diff(unified)
+                line_num = self._extract_diff_line_num(unified)
+                if line_num:
+                    detail = f": {file_path}:{line_num}"
+                else:
+                    detail = f": {file_path}"
             else:
-                detail = f": {file_path}"
+                # Get line number from file (where old_string starts) and diff
+                line_num = self._find_line_number(file_path, old, new)
+                diff_str = self._format_edit_diff(old, new)
+                if line_num:
+                    detail = f": {file_path}:{line_num}"
+                else:
+                    detail = f": {file_path}"
             if diff_str:
                 detail += diff_str
         elif tool.name == "Write" and "file_path" in tool_input:
@@ -2154,6 +2163,27 @@ class OutputView:
             return ""
 
         return "\n```diff\n" + "\n".join(diff_lines) + "\n```"
+
+    def _extract_diff_line_num(self, unified: str) -> int:
+        """Extract the starting line number from the first hunk header of a unified diff."""
+        import re
+        m = re.search(r'^@@\s+-(\d+)', unified, re.MULTILINE)
+        if m:
+            return int(m.group(1))
+        return 0
+
+    def _format_unified_diff(self, unified: str) -> str:
+        """Render a pre-computed unified diff, stripping headers."""
+        if not unified:
+            return ""
+        lines = []
+        for line in unified.splitlines():
+            if line.startswith("---") or line.startswith("+++") or line.startswith("@@"):
+                continue
+            lines.append(line)
+        if not lines:
+            return ""
+        return "\n```diff\n" + "\n".join(lines) + "\n```"
 
 
 # --- Helper commands for text manipulation ---

@@ -24,6 +24,38 @@ def log(msg: str) -> None:
 from rpc_helpers import send, send_error, send_result, send_notification
 
 
+# ── Command → Tool Conversions ──────────────────────────────────────────
+
+import re
+
+def _detect_read_command(cmd: str) -> Optional[dict]:
+    """Detect file-read commands (sed/cat/head/tail) and return Read params."""
+    if not cmd:
+        return None
+    s = cmd.strip()
+    # sed -n 'N,Mp' FILE  or  sed -n Np FILE
+    m = re.match(r"sed\s+-n\s+'?(\d+)(?:,(\d+))?p'?\s+(\S+)\s*$", s)
+    if m:
+        start, end, path = m.group(1), m.group(2), m.group(3)
+        start = int(start)
+        if end:
+            return {"path": path, "offset": start, "limit": int(end) - start + 1}
+        return {"path": path, "offset": start, "limit": 1}
+    # cat FILE
+    m = re.match(r"cat\s+(\S+)\s*$", s)
+    if m:
+        return {"path": m.group(1)}
+    # head -n N FILE  or  head -N FILE
+    m = re.match(r"head\s+(?:-n\s+)?-?(\d+)\s+(\S+)\s*$", s)
+    if m:
+        return {"path": m.group(2), "limit": int(m.group(1))}
+    # tail -n N FILE  (treat as read, ignore negative offset distinction)
+    m = re.match(r"tail\s+(?:-n\s+)?-?(\d+)\s+(\S+)\s*$", s)
+    if m:
+        return {"path": m.group(2), "limit": int(m.group(1))}
+    return None
+
+
 # ── Codex Bridge ────────────────────────────────────────────────────────
 
 class CodexBridge:
@@ -378,20 +410,44 @@ class CodexBridge:
             cmd = actions[0].get("command", "") if actions else ""
             if not cmd:
                 cmd = item.get("command", "")
-            send_notification("message", {
-                "type": "tool_use",
-                "id": item_id,
-                "name": "Bash",
-                "input": {"command": cmd},
-            })
+
+            # Detect file-read commands and convert to Read tool
+            read_info = _detect_read_command(cmd)
+            if read_info:
+                input_data = {"file_path": read_info["path"]}
+                if read_info.get("offset"):
+                    input_data["offset"] = read_info["offset"]
+                if read_info.get("limit"):
+                    input_data["limit"] = read_info["limit"]
+                send_notification("message", {
+                    "type": "tool_use",
+                    "id": item_id,
+                    "name": "Read",
+                    "input": input_data,
+                })
+            else:
+                send_notification("message", {
+                    "type": "tool_use",
+                    "id": item_id,
+                    "name": "Bash",
+                    "input": {"command": cmd},
+                })
         elif item_type == "fileChange":
-            # Determine if it's a new file or edit
-            filepath = item.get("filePath", "")
+            # Codex sends changes[] with {path, kind:{type: add|update|delete}, diff}
+            changes = item.get("changes", [])
+            first = changes[0] if changes else {}
+            filepath = first.get("path", item.get("filePath", ""))
+            kind = (first.get("kind") or {}).get("type", "update")
+            tool_name = "Write" if kind == "add" else "Edit"
+            input_data = {"file_path": filepath}
+            diff = first.get("diff")
+            if diff:
+                input_data["unified_diff"] = diff
             send_notification("message", {
                 "type": "tool_use",
                 "id": item_id,
-                "name": "Edit",
-                "input": {"file_path": filepath},
+                "name": tool_name,
+                "input": input_data,
             })
         elif item_type == "mcpToolCall":
             tool_name = item.get("toolName", "")
