@@ -15,6 +15,21 @@ CODEX_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "codex_m
 COPILOT_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "copilot_main.py")
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
 
+# @suffix → max context tokens (stripped from model ID before sending to bridge)
+_CONTEXT_LIMITS = {
+    "@400k": 400000,
+    "@200k": 200000,
+}
+
+def _resolve_model_id(model_id: str):
+    """Resolve virtual model ID. Returns (real_model_id, max_context_tokens or None)."""
+    if not model_id:
+        return model_id, None
+    for suffix, tokens in _CONTEXT_LIMITS.items():
+        if model_id.endswith(suffix):
+            return model_id[:-len(suffix)], tokens
+    return model_id, None
+
 
 def load_saved_sessions() -> List[Dict]:
     """Load saved sessions from disk."""
@@ -127,6 +142,15 @@ class Session:
         # Load environment variables from settings and profile
         env = self._load_env(settings)
 
+        # Resolve virtual model ID (e.g. @400k suffix) → real model + context limit
+        default_models = settings.get("default_models", {})
+        default_model = default_models.get(self.backend) or settings.get("default_model")
+        model_for_env = (self.profile.get("model") if self.profile else None) or default_model
+        if model_for_env:
+            _, ctx = _resolve_model_id(model_for_env)
+            if ctx:
+                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx)
+
         # Sync sublime project retain content to file for hook
         self._sync_project_retain()
 
@@ -147,9 +171,6 @@ class Session:
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        # Per-backend default model, fallback to legacy default_model
-        default_models = settings.get("default_models", {})
-        default_model = default_models.get(self.backend) or settings.get("default_model")
         print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
         # Get additional working directories from project folders + project settings
         additional_dirs = self.window.folders()[1:] if len(self.window.folders()) > 1 else []
@@ -197,7 +218,8 @@ class Session:
         # Apply profile config or default model
         if self.profile:
             if self.profile.get("model"):
-                init_params["model"] = self.profile["model"]
+                real_model, _ = _resolve_model_id(self.profile["model"])
+                init_params["model"] = real_model
             if self.profile.get("betas"):
                 init_params["betas"] = self.profile["betas"]
             if self.profile.get("pre_compact_prompt"):
@@ -212,7 +234,8 @@ class Session:
         else:
             # No profile - use default_model setting if available
             if default_model:
-                init_params["model"] = default_model
+                real_model, _ = _resolve_model_id(default_model)
+                init_params["model"] = real_model
         self.client.send("initialize", init_params, self._on_init)
 
     def _cwd(self) -> str:
@@ -1416,42 +1439,56 @@ class Session:
 
         t = params.get("type")
         if t == "tool_use":
-            # Mark previous tool as done if any (skip if empty/anonymous)
-            if self.current_tool and self.current_tool.strip():
-                self.output.tool_done(self.current_tool)
-            self.current_tool = params.get("name", "")
+            name = params.get("name", "")
+            tool_input = params.get("input", {})
+            background = params.get("background", False)
+            tool_id = params.get("id")
 
             # Skip anonymous/empty tool_use notifications
-            if not self.current_tool or not self.current_tool.strip():
-                self.current_tool = None
+            if not name or not name.strip():
                 return
 
-            tool_input = params.get("input", {})
-            self.output.tool(self.current_tool, tool_input)
+            if background:
+                # Background tools do not take over current_tool (spinner stays on foreground)
+                self.output.tool(name, tool_input, tool_id=tool_id, background=True)
+                self._update_status_bar()
+                return
+
+            # Foreground: mark previous tool done, take over as current
+            if self.current_tool and self.current_tool.strip():
+                self.output.tool_done(self.current_tool)
+            self.current_tool = name
+            self.output.tool(name, tool_input, tool_id=tool_id, background=False)
         elif t == "tool_result":
-            # Skip anonymous/empty tool results
-            if not self.current_tool or not self.current_tool.strip():
-                self.current_tool = None
-                return
-
+            tool_use_id = params.get("tool_use_id")
             content = params.get("content", "")
-            # Convert content to string if it's a list
             if isinstance(content, list):
                 content = "\n".join(str(c) for c in content)
-            # Truncate large results (e.g., image base64) — only used for display summaries
             if len(content) > 10000:
                 content = content[:10000]
             is_error = params.get("is_error")
 
-            # Track Edit/Write for edit log
-            if self.current_tool in ("Edit", "Write") and not is_error:
-                self._record_edit(self.current_tool)
+            # Resolve the tool — prefer id match (handles background tools across turns)
+            matched = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
+            was_background = matched is not None and matched.status == "background"
+            tool_name = matched.name if matched else self.current_tool
+
+            if not tool_name or not str(tool_name).strip():
+                self.current_tool = None
+                return
+
+            if tool_name in ("Edit", "Write") and not is_error:
+                self._record_edit(tool_name)
 
             if is_error:
-                self.output.tool_error(self.current_tool, content)
+                self.output.tool_error(tool_name, content, tool_id=tool_use_id)
             else:
-                self.output.tool_done(self.current_tool, content)
-            self.current_tool = None
+                self.output.tool_done(tool_name, content, tool_id=tool_use_id)
+
+            # Only clear current_tool if this was the foreground tool
+            if not was_background and tool_name == self.current_tool:
+                self.current_tool = None
+            self._update_status_bar()
         elif t in ("text_delta", "text"):
             self.output.text(params.get("text", ""))
         elif t == "turn_usage":
@@ -1540,6 +1577,9 @@ class Session:
             parts.append(f"${self.total_cost:.4f}")
         if self.query_count > 0:
             parts.append(f"{self.query_count}q")
+        bg_count = self.output.background_tool_count() if self.output else 0
+        if bg_count:
+            parts.append(f"bg:{bg_count}")
         if self.context_usage:
             ctx_k = self._context_tokens_k()
             if ctx_k is not None:

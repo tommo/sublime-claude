@@ -136,6 +136,9 @@ class Bridge:
                 model = params.get("model")
                 if model and self.client:
                     await self.client.set_model(model)
+                max_ctx = params.get("max_context_tokens")
+                if max_ctx:
+                    os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_ctx)
                 send_result(id, {"ok": True})
             else:
                 send_error(id, -32601, f"Method not found: {method}")
@@ -935,11 +938,13 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                     # Text was already streamed via StreamEvent text_deltas — skip
                     pass
                 elif isinstance(block, ToolUseBlock):
+                    tool_input = block.input or {}
                     send_notification("message", {
                         "type": "tool_use",
                         "id": block.id,
                         "name": block.name,
-                        "input": block.input,
+                        "input": tool_input,
+                        "background": bool(tool_input.get("run_in_background") if isinstance(tool_input, dict) else False),
                     })
                 elif isinstance(block, ToolResultBlock):
                     with open("/tmp/claude_bridge.log", "a") as f:

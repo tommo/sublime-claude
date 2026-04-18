@@ -11,7 +11,11 @@ from .command_parser import CommandParser
 # Fallback model lists per backend (used when no cache/settings available)
 DEFAULT_MODELS = {
     "claude": [
-        ["opus", "Opus 4.6"],
+        ["opus", "Opus 4.7"],
+        ["opus@400k", "Opus 4.7 (400K context)"],
+        ["claude-opus-4-6[1m]", "Opus 4.6 (1M context)"],
+        ["claude-opus-4-6[1m]@400k", "Opus 4.6 (400K context)"],
+        ["claude-opus-4-6", "Opus 4.6"],
         ["sonnet", "Sonnet 4.6"],
         ["haiku", "Haiku 4.5"],
         ["claude-opus-4-5", "Opus 4.5"],
@@ -610,15 +614,15 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
         if not s:
-            sublime.status_message("No active session")
+            sublime.error_message("No active Claude session")
             return
         if s.working:
-            sublime.status_message("Session is busy")
+            sublime.error_message("Session is busy — wait for the current request to finish")
             return
         backend = s.backend
         models = self._get_models(backend)
         if not models:
-            sublime.status_message(f"No models for {backend}. Run Claude: Refresh Models first.")
+            sublime.error_message(f"No models for {backend}.\nRun 'Claude: Refresh Models' first.")
             return
         items = []
         model_ids = []
@@ -636,8 +640,13 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
             if idx < 0:
                 return
             mid = model_ids[idx]
+            from .session import _resolve_model_id
+            real_model, ctx = _resolve_model_id(mid)
             if s.client:
-                s.client.send("set_model", {"model": mid})
+                params = {"model": real_model}
+                if ctx:
+                    params["max_context_tokens"] = ctx
+                s.client.send("set_model", params)
             sublime.status_message(f"Model: {mid}")
 
         self.window.show_quick_panel(items, on_select)
@@ -1088,18 +1097,21 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
         items = []
         for s in sessions:
             name = s.get("name") or "(unnamed)"
+            backend = s.get("backend", "claude")
+            prefix = f"[{backend}] " if backend != "claude" else ""
             project = s.get("project", "")
             if project:
                 project = "  " + project.split("/")[-1]
             cost = s.get("total_cost", 0)
             cost_str = f"  ${cost:.4f}" if cost else ""
-            items.append([name, f"{project}{cost_str}"])
+            items.append([f"{prefix}{name}", f"{project}{cost_str}"])
 
         def on_select(idx):
             if idx >= 0:
                 session_id = sessions[idx].get("session_id")
                 name = sessions[idx].get("name")
-                s = create_session(self.window, resume_id=session_id)
+                backend = sessions[idx].get("backend", "claude")
+                s = create_session(self.window, resume_id=session_id, backend=backend)
                 if name:
                     s.name = name
                     s.output.show()

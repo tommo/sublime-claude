@@ -11,6 +11,7 @@ from .constants import SPINNER_FRAMES
 PENDING = "pending"
 DONE = "done"
 ERROR = "error"
+BACKGROUND = "background"
 
 # Permission button constants
 PERM_ALLOW = "allow"
@@ -64,8 +65,9 @@ class ToolCall:
     """A single tool call."""
     name: str
     tool_input: dict
-    status: str = PENDING  # pending, done, error
+    status: str = PENDING  # pending, done, error, background
     result: Optional[str] = None  # tool result content
+    id: Optional[str] = None  # tool_use_id, for precise matching
 
 
 @dataclass
@@ -107,6 +109,7 @@ class OutputView:
         "pending": "☐",
         "done": "✔",
         "error": "✘",
+        "background": "⚙",
     }
 
     def __init__(self, window: sublime.Window):
@@ -612,14 +615,14 @@ class OutputView:
         )
         self._scroll_to_end()
 
-    def tool(self, name: str, tool_input: dict = None) -> None:
+    def tool(self, name: str, tool_input: dict = None, tool_id: str = None, background: bool = False) -> None:
         """Add a pending tool."""
         if not self.current:
             return
-            return
 
         tool_input = tool_input or {}
-        tool_call = ToolCall(name=name, tool_input=tool_input)
+        status = BACKGROUND if background else PENDING
+        tool_call = ToolCall(name=name, tool_input=tool_input, status=status, id=tool_id)
         self.current.events.append(tool_call)
 
         # Capture TodoWrite state
@@ -631,34 +634,59 @@ class OutputView:
 
         self._render_current()
 
-    def tool_done(self, name: str, result: str = None) -> None:
-        """Mark most recent pending tool with this name as done."""
-        if not self.current:
-            return
-        # Find the last pending tool with this name
-        for event in reversed(self.current.events):
-            if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
-                event.status = DONE
-                event.result = result
+    def _find_pending_or_background_by_id(self, tool_id: str) -> Optional[ToolCall]:
+        """Find a ToolCall by id across ALL conversations (background may span turns)."""
+        if not tool_id:
+            return None
+        for conv in self.conversations:
+            for event in conv.events:
+                if isinstance(event, ToolCall) and event.id == tool_id:
+                    return event
+        return None
+
+    def find_tool_by_id(self, tool_id: str) -> Optional[ToolCall]:
+        return self._find_pending_or_background_by_id(tool_id)
+
+    def background_tool_count(self) -> int:
+        n = 0
+        for conv in self.conversations:
+            for event in conv.events:
+                if isinstance(event, ToolCall) and event.status == BACKGROUND:
+                    n += 1
+        return n
+
+    def tool_done(self, name: str, result: str = None, tool_id: str = None) -> None:
+        """Mark tool as done. Prefer tool_id match, fall back to name+PENDING."""
+        target = self._find_pending_or_background_by_id(tool_id)
+        if target is None and self.current:
+            for event in reversed(self.current.events):
+                if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
+                    target = event
+                    break
+        if target is None:
+            if self.current:
+                self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE, result=result, id=tool_id))
                 self._render_current()
-                return
-        # No pending tool found, add as done
-        self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE, result=result))
+            return
+        target.status = DONE
+        target.result = result
         self._render_current()
 
-    def tool_error(self, name: str, result: str = None) -> None:
-        """Mark most recent pending tool with this name as error."""
-        if not self.current:
-            return
-        # Find the last pending tool with this name
-        for event in reversed(self.current.events):
-            if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
-                event.status = ERROR
-                event.result = result
+    def tool_error(self, name: str, result: str = None, tool_id: str = None) -> None:
+        """Mark tool as error. Prefer tool_id match, fall back to name+PENDING."""
+        target = self._find_pending_or_background_by_id(tool_id)
+        if target is None and self.current:
+            for event in reversed(self.current.events):
+                if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
+                    target = event
+                    break
+        if target is None:
+            if self.current:
+                self.current.events.append(ToolCall(name=name, tool_input={}, status=ERROR, result=result, id=tool_id))
                 self._render_current()
-                return
-        # No pending tool found, add as error
-        self.current.events.append(ToolCall(name=name, tool_input={}, status=ERROR))
+            return
+        target.status = ERROR
+        target.result = result
         self._render_current()
 
     def text(self, content: str) -> None:
@@ -688,9 +716,9 @@ class OutputView:
         if not self.current:
             return
         self.current.working = False
-        # Mark any pending tools as error
+        # Mark any pending/background tools as error
         for event in self.current.events:
-            if isinstance(event, ToolCall) and event.status == PENDING:
+            if isinstance(event, ToolCall) and event.status in (PENDING, BACKGROUND):
                 event.status = ERROR
         # Clear any pending permission prompt
         if self.pending_permission:
@@ -781,7 +809,7 @@ class OutputView:
         if self.current:
             had_pending = False
             for event in self.current.events:
-                if isinstance(event, ToolCall) and event.status == PENDING:
+                if isinstance(event, ToolCall) and event.status in (PENDING, BACKGROUND):
                     event.status = ERROR
                     had_pending = True
             if had_pending:
@@ -1972,6 +2000,9 @@ class OutputView:
         # Generic MCP tool result display
         elif tool.name.startswith("mcp__sublime__") and tool.result and tool.status == DONE:
             detail += self._format_mcp_result(tool.result)
+
+        if tool.status == BACKGROUND:
+            detail += " (background)"
 
         return detail
 

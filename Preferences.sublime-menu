@@ -1,0 +1,30 @@
+[
+    {
+        "caption": "Package Settings",
+        "mnemonic": "P",
+        "id": "package-settings",
+        "children": [
+            {
+                "caption": "Claude Code",
+                "children": [
+                    {
+                        "caption": "Settings",
+                        "command": "edit_settings",
+                        "args": {
+                            "base_file": "${packages}/ClaudeCode/ClaudeCode.sublime-settings",
+                            "default": "// Claude Code Settings\n// See default settings on the left for available options\n{\n}\n"
+                        }
+                    },
+                    {
+                        "caption": "Key Bindings",
+                        "command": "edit_settings",
+                        "args": {
+                            "base_file": "${packages}/ClaudeCode/Default.sublime-keymap",
+                            "default": "// Claude Code Key Bindings\n// See default bindings on the left\n[\n]\n"
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+]

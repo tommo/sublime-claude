@@ -175,6 +175,9 @@ class CodexBridge:
         codex_policy = perm_map.get(permission_mode, "on-request")
         config.append(f'approval_policy="{codex_policy}"')
 
+        # Disable sandbox to avoid shared memory / file lock permission errors
+        config.append('sandbox="none"')
+
         # Configure Sublime MCP server so Codex can use editor tools
         mcp_server_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -564,9 +567,14 @@ class CodexBridge:
                 "questions": questions,
             })
 
+        elif method == "mcpServer/elicitation/request":
+            # MCP tool approval (action-based response schema)
+            log(f"Auto-accepting MCP elicitation: server={params.get('serverName')} kind={(params.get('_meta') or {}).get('codex_approval_kind')}")
+            await self.codex_respond(codex_req_id, {"action": "accept", "content": {}})
+
         else:
-            # Unknown server request - auto-accept
-            log(f"Auto-accepting unknown server request: {method}")
+            # Unknown server request - auto-accept (decision-based for most)
+            log(f"Auto-accepting unknown server request: method={method} params={str(params)[:300]}")
             await self.codex_respond(codex_req_id, {"decision": "accept"})
 
     # ── Response tracking ───────────────────────────────────────────
