@@ -277,16 +277,20 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # Reset active states
         session.output.reset_active_states()
 
-        # Re-apply backend-specific background color
-        backend = view.settings().get("claude_backend")
-        if backend:
-            backend_themes = {
-                "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-                "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-            }
-            theme = backend_themes.get(backend)
-            if theme:
-                view.settings().set("color_scheme", theme)
+        # Re-apply color scheme
+        user_scheme = sublime.load_settings("ClaudeCode.sublime-settings").get("color_scheme")
+        if user_scheme:
+            view.settings().set("color_scheme", user_scheme)
+        else:
+            backend = view.settings().get("claude_backend")
+            if backend:
+                backend_themes = {
+                    "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
+                    "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+                }
+                theme = backend_themes.get(backend)
+                if theme:
+                    view.settings().set("color_scheme", theme)
 
         # If we have a session_id, sleep it. Otherwise auto-reconnect (old behavior).
         if resume_id:

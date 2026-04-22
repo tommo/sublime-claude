@@ -1,11 +1,12 @@
 {
     // Path to Python 3.10+ interpreter for the bridge process
     // Must have claude-agent-sdk installed: pip install claude-agent-sdk
-    "python_path": "python3",
+    "python_path": "/opt/homebrew/bin/python3.11",
 
     // Default model when no profile is selected
     // Options: "opus", "sonnet", "haiku"
-    "default_model": "opus",
+    "default_model": "claude-opus-4-7",
+    "effort": "medium",
 
     // Tools Claude is allowed to use
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
@@ -13,10 +14,15 @@
 
     // Permission mode for tool execution
     // Options: "default", "acceptEdits", "plan", "bypassPermissions"
-    "permission_mode": "acceptEdits",
+    "permission_mode": "bypassPermissions",
 
     // Persona service URL for identity management
-    "persona_url": "http://localhost:5002/personas"
+    "persona_url": "http://localhost:5002/personas",
+
+    // Color scheme for the Claude output panel.
+    // Set to null to use the built-in ClaudeOutput theme, or provide a path like:
+    //   "Packages/Color Scheme - Default/Monokai.sublime-color-scheme"
+    "color_scheme": "Packages/ClaudeCode/ClaudeOutput-monokai.sublime-color-scheme"
 
     // Profiles and checkpoints are stored in separate files:
     //   User-level:    ~/.claude-sublime/profiles.json

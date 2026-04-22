@@ -156,7 +156,11 @@ class OutputView:
                 self.view.settings().set(key, val)
         try:
             self.view.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
-            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
+            settings = sublime.load_settings("ClaudeCode.sublime-settings")
+            color_scheme = settings.get("color_scheme")
+            if not color_scheme:
+                color_scheme = "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme"
+            self.view.settings().set("color_scheme", color_scheme)
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
 

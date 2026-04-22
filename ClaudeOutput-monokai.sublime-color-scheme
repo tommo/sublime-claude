@@ -1,0 +1,116 @@
+{
+    "name": "Claude Output (Monokai)",
+    "author": "Sublime HQ Pty Ltd, Wimer Hazenberg",
+    "extends": "Packages/Color Scheme - Default/Monokai.sublime-color-scheme",
+    "variables":
+    {
+        "black2": "hsl(60, 17%, 11%)",
+        "black3": "hsl(70, 8%, 15%)",
+        "blue": "hsl(190, 81%, 67%)",
+        "grey": "hsla(55, 8%, 31%, 0.7)",
+        "orange": "hsl(32, 98%, 56%)",
+        "orange3": "hsl(47, 100%, 79%)",
+        "red2": "hsl(338, 95%, 56%)",
+        "white2": "hsl(60, 36%, 96%)",
+        "white3": "hsl(60, 30%, 96%)",
+        "yellow": "hsl(54, 70%, 68%)",
+        "yellow2": "hsl(80, 76%, 53%)",
+        "yellow4": "hsl(55, 11%, 22%)",
+        "yellow5": "hsl(50, 11%, 41%)"
+    },
+    "globals":
+    {
+        "foreground": "var(white3)",
+        "background": "var(black3)",
+        "caret": "color(var(white2) alpha(0.9))",
+        "selection": "var(grey)",
+        "selection_border": "var(black2)",
+        "line_highlight": "var(yellow4)"
+    },
+    "rules":
+    [
+        {
+            "name": "Claude Prompt",
+            "scope": "claude.prompt",
+            "foreground": "var(blue)",
+            "font_style": "bold"
+        },
+        {
+            "name": "Claude Tool Pending",
+            "scope": "claude.tool.pending",
+            "foreground": "var(orange)"
+        },
+        {
+            "name": "Claude Tool Background",
+            "scope": "claude.tool.background",
+            "foreground": "var(yellow5)"
+        },
+        {
+            "name": "Claude Tool Done",
+            "scope": "claude.tool.done",
+            "foreground": "var(yellow2)"
+        },
+        {
+            "name": "Claude Tool Error",
+            "scope": "claude.tool.error",
+            "foreground": "var(red2)"
+        },
+        {
+            "name": "Claude Done Tag",
+            "scope": "claude.meta.done",
+            "foreground": "var(yellow5)",
+            "font_style": "italic"
+        },
+        {
+            "name": "Claude Interrupted",
+            "scope": "claude.interrupted",
+            "foreground": "var(orange)",
+            "font_style": "italic"
+        },
+        {
+            "name": "Claude Tool Output",
+            "scope": "claude.tool.output",
+            "foreground": "var(yellow5)"
+        },
+        {
+            "name": "Claude Tool Result",
+            "scope": "claude.tool.result",
+            "foreground": "color(var(yellow5) alpha(0.7))",
+            "font_style": "italic"
+        },
+        {
+            "name": "Claude Permission Icon",
+            "scope": "claude.permission.icon",
+            "foreground": "var(yellow)"
+        },
+        {
+            "name": "Claude Permission Tool",
+            "scope": "claude.permission.tool",
+            "foreground": "var(blue)",
+            "font_style": "bold"
+        },
+        {
+            "name": "Claude Permission Allow",
+            "scope": "claude.permission.button.allow",
+            "foreground": "var(yellow2)",
+            "font_style": "bold"
+        },
+        {
+            "name": "Claude Permission Deny",
+            "scope": "claude.permission.button.deny",
+            "foreground": "var(red2)",
+            "font_style": "bold"
+        },
+        {
+            "name": "Claude Permission Allow All",
+            "scope": "claude.permission.button.allowall",
+            "foreground": "var(orange3)",
+            "font_style": "bold"
+        },
+        {
+            "name": "Code Block Background",
+            "scope": "markup.raw.block",
+            "background": "var(yellow4)"
+        }
+    ]
+}

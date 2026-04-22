@@ -137,6 +137,13 @@
         ]
     },
     {
+        "keys": ["ctrl+l"],
+        "command": "claude_code_clear",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
         "keys": ["alt+escape"],
         "command": "claude_code_interrupt"
     },

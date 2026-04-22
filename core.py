@@ -86,6 +86,22 @@ def plugin_loaded() -> None:
 
     sublime.set_timeout(sync_orders, 1000)
 
+    # Live-update color scheme on all Claude output views when setting changes
+    def _apply_color_scheme_to_all():
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        color_scheme = settings.get("color_scheme")
+        for window in sublime.windows():
+            for view in window.views():
+                if view.settings().get("claude_output"):
+                    if color_scheme:
+                        view.settings().set("color_scheme", color_scheme)
+                    else:
+                        view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
+
+    sublime.load_settings("ClaudeCode.sublime-settings").add_on_change(
+        "claude_color_scheme", _apply_color_scheme_to_all
+    )
+
 
 def plugin_unloaded() -> None:
     """Called when plugin is unloaded. Stop MCP server and notalone client."""
@@ -94,6 +110,8 @@ def plugin_unloaded() -> None:
 
     from . import notalone
     notalone.stop()
+
+    sublime.load_settings("ClaudeCode.sublime-settings").clear_on_change("claude_color_scheme")
 
 
 def get_session_for_view(view: sublime.View) -> Optional[Session]:
@@ -133,14 +151,17 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         s.output.view.settings().set("claude_backend", backend)
         backend_names = {"codex": "Codex", "copilot": "Copilot"}
         s.output.set_name(backend_names.get(backend, backend.title()))
-        # Apply backend-specific background
-        backend_themes = {
-            "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-            "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-        }
-        theme = backend_themes.get(backend)
-        if theme:
-            s.output.view.settings().set("color_scheme", theme)
+        user_scheme = sublime.load_settings("ClaudeCode.sublime-settings").get("color_scheme")
+        if user_scheme:
+            s.output.view.settings().set("color_scheme", user_scheme)
+        else:
+            backend_themes = {
+                "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
+                "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+            }
+            theme = backend_themes.get(backend)
+            if theme:
+                s.output.view.settings().set("color_scheme", theme)
     s.start()
     # Register by view id and mark as active
     if s.output.view:

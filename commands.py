@@ -73,11 +73,6 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         # Default option (always available)
         options.append(("default", None, "🆕 New Session", "Start fresh with default settings"))
 
-        # Personas - get URL from sublime settings
-        sublime_settings = sublime.load_settings("ClaudeCode.sublime-settings")
-        persona_url = sublime_settings.get("persona_url", "http://localhost:5002/personas")
-        options.append(("persona", persona_url, "👤 From Persona...", "Acquire a persona identity"))
-
         # Profiles
         for name, config in profiles.items():
             desc = config.get("description", f"{config.get('model', 'default')} model")
