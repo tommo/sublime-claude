@@ -146,7 +146,8 @@ class Session:
 
         # Resolve virtual model ID (e.g. @400k suffix) → real model + context limit
         default_models = settings.get("default_models", {})
-        default_model = default_models.get(self.backend) or settings.get("default_model")
+        _backend_fallback_models = {"deepseek": "deepseek-v4-pro"}
+        default_model = default_models.get(self.backend) or _backend_fallback_models.get(self.backend) or settings.get("default_model")
         model_for_env = (self.profile.get("model") if self.profile else None) or default_model
         if model_for_env:
             _, ctx = _resolve_model_id(model_for_env)
@@ -155,6 +156,15 @@ class Session:
 
         # Sync sublime project retain content to file for hook
         self._sync_project_retain()
+
+        # DeepSeek uses the Claude bridge with Anthropic-compatible endpoint
+        if self.backend == "deepseek":
+            ds_key = settings.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY", "")
+            env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
+            if ds_key:
+                env["ANTHROPIC_AUTH_TOKEN"] = ds_key
+            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+            env.setdefault("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1")
 
         if self.backend == "codex":
             bridge_script = CODEX_BRIDGE_SCRIPT

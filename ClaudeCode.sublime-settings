@@ -16,7 +16,23 @@
     "permission_mode": "acceptEdits",
 
     // Persona service URL for identity management
-    "persona_url": "http://localhost:5002/personas"
+    "persona_url": "http://localhost:5002/personas",
+
+    // Reasoning effort level: "low", "high", "max"
+    "effort": "high",
+
+    // DeepSeek API key (for deepseek backend)
+    // Get one at https://platform.deepseek.com
+    // "deepseek_api_key": "",
+
+    // Default models per backend (overrides built-in defaults)
+    // "default_models": {
+    //     "claude": "opus",
+    //     "deepseek": "deepseek-v4-pro"
+    // },
+
+    // Environment variables passed to bridge process
+    // "env": {},
 
     // Profiles and checkpoints are stored in separate files:
     //   User-level:    ~/.claude-sublime/profiles.json

@@ -29,7 +29,7 @@ from rpc_helpers import send, send_error, send_result, send_notification
 import re
 
 def _detect_read_command(cmd: str) -> Optional[dict]:
-    """Detect file-read commands (sed/cat/head/tail) and return Read params."""
+    """Detect file-read commands and return simplified tool params."""
     if not cmd:
         return None
     s = cmd.strip()
@@ -39,20 +39,34 @@ def _detect_read_command(cmd: str) -> Optional[dict]:
         start, end, path = m.group(1), m.group(2), m.group(3)
         start = int(start)
         if end:
-            return {"path": path, "offset": start, "limit": int(end) - start + 1}
-        return {"path": path, "offset": start, "limit": 1}
+            return {"_tool": "Read", "path": path, "offset": start, "limit": int(end) - start + 1}
+        return {"_tool": "Read", "path": path, "offset": start, "limit": 1}
+    # nl -ba FILE | sed -n 'N,Mp'
+    m = re.match(r"nl\s+-ba\s+(\S+)\s*\|\s*sed\s+-n\s+'?(\d+),(\d+)p'?\s*$", s)
+    if m:
+        path, start, end = m.group(1), int(m.group(2)), int(m.group(3))
+        return {"_tool": "Read", "path": path, "offset": start, "limit": end - start + 1}
     # cat FILE
     m = re.match(r"cat\s+(\S+)\s*$", s)
     if m:
-        return {"path": m.group(1)}
+        return {"_tool": "Read", "path": m.group(1)}
     # head -n N FILE  or  head -N FILE
     m = re.match(r"head\s+(?:-n\s+)?-?(\d+)\s+(\S+)\s*$", s)
     if m:
-        return {"path": m.group(2), "limit": int(m.group(1))}
-    # tail -n N FILE  (treat as read, ignore negative offset distinction)
+        return {"_tool": "Read", "path": m.group(2), "limit": int(m.group(1))}
+    # tail -n N FILE
     m = re.match(r"tail\s+(?:-n\s+)?-?(\d+)\s+(\S+)\s*$", s)
     if m:
-        return {"path": m.group(2), "limit": int(m.group(1))}
+        return {"_tool": "Read", "path": m.group(2), "limit": int(m.group(1))}
+    # rg [flags] PATTERN [PATHS...] → Grep hint
+    m = re.match(r'rg\s+(?:-[a-zA-Z]+\s+)*(?:\'([^\']+)\'|"([^"]+)"|(\S+))\s*(.*)', s)
+    if m:
+        pattern = m.group(1) or m.group(2) or m.group(3)
+        paths = m.group(4).strip() if m.group(4) else ""
+        result = {"_tool": "Grep", "pattern": pattern}
+        if paths:
+            result["path"] = paths
+        return result
     return None
 
 
@@ -76,6 +90,9 @@ class CodexBridge:
         self._turn_start_time: float = 0
         self._query_req_id: Optional[int] = None
         self._last_usage: Optional[dict] = None
+
+        # Accumulate command output from outputDelta events
+        self._command_output: dict[str, list[str]] = {}
 
     # ── Codex subprocess management ─────────────────────────────────
 
@@ -394,10 +411,14 @@ class CodexBridge:
             self._handle_item_completed(params)
 
         elif method == "item/commandExecution/outputDelta":
-            pass  # Could forward as tool output streaming
+            delta = params.get("delta", "")
+            item_id = params.get("itemId", "")
+            if delta and item_id:
+                if item_id not in self._command_output:
+                    self._command_output[item_id] = []
+                self._command_output[item_id].append(delta)
 
         elif method == "thread/tokenUsage/updated":
-            log(f"Token usage: {params}")
             self._last_usage = params
 
         elif method == "codex/event/task_complete":
@@ -426,18 +447,26 @@ class CodexBridge:
             if not cmd:
                 cmd = item.get("command", "")
 
-            # Detect file-read commands and convert to Read tool
-            read_info = _detect_read_command(cmd)
-            if read_info:
-                input_data = {"file_path": read_info["path"]}
-                if read_info.get("offset"):
-                    input_data["offset"] = read_info["offset"]
-                if read_info.get("limit"):
-                    input_data["limit"] = read_info["limit"]
+            # Detect file-read/grep commands and convert to simplified tool
+            detected = _detect_read_command(cmd)
+            if detected:
+                tool_name = detected.pop("_tool", "Read")
+                if tool_name == "Read":
+                    input_data = {"file_path": detected["path"]}
+                    if detected.get("offset"):
+                        input_data["offset"] = detected["offset"]
+                    if detected.get("limit"):
+                        input_data["limit"] = detected["limit"]
+                elif tool_name == "Grep":
+                    input_data = {"pattern": detected["pattern"]}
+                    if detected.get("path"):
+                        input_data["path"] = detected["path"]
+                else:
+                    input_data = detected
                 send_notification("message", {
                     "type": "tool_use",
                     "id": item_id,
-                    "name": "Read",
+                    "name": tool_name,
                     "input": input_data,
                 })
             else:
@@ -490,6 +519,10 @@ class CodexBridge:
         if item_type == "commandExecution":
             exit_code = item.get("exitCode", 0)
             output = item.get("output", "")
+            if not output and item_id in self._command_output:
+                output = "".join(self._command_output.pop(item_id))
+            else:
+                self._command_output.pop(item_id, None)
             send_notification("message", {
                 "type": "tool_result",
                 "tool_use_id": item_id,

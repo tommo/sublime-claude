@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), and [GitHub Copilot CLI](https://github.com/features/copilot/cli) integration.
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), and [DeepSeek](https://api-docs.deepseek.com/) integration.
 
 ## Requirements
 
@@ -10,6 +10,7 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex C
   - Claude Code CLI + `claude-agent-sdk`
   - Codex CLI
   - GitHub Copilot CLI via `github-copilot-sdk`
+  - DeepSeek API key (uses Claude bridge with Anthropic-compatible endpoint)
 
 ```bash
 # Claude Code
@@ -23,6 +24,9 @@ codex  # Follow prompts to authenticate
 
 # GitHub Copilot CLI (optional)
 pip install github-copilot-sdk  # Bundles CLI binary
+
+# DeepSeek (optional) — no extra install, just set API key
+# Get key at https://platform.deepseek.com
 ```
 
 **Note:** Authenticate your chosen CLI before using this plugin. If you see connection errors, run the CLI in terminal to login.
@@ -63,6 +67,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | New Session | - | Start a fresh Claude session |
 | Codex: New Session | - | Start a fresh Codex session |
 | Copilot: New Session | - | Start a fresh GitHub Copilot session |
+| DeepSeek: New Session | - | Start a fresh DeepSeek session |
 | Undo Message | - | Rewind last conversation turn |
 | Search Sessions | - | Search all sessions by title |
 | Clear Notifications | - | List and clear active notifications |
@@ -120,7 +125,10 @@ Right-click selected text and choose "Ask Claude" to query about the selection.
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
 
     // Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
-    "permission_mode": "acceptEdits"
+    "permission_mode": "acceptEdits",
+
+    // DeepSeek API key (for deepseek backend)
+    // "deepseek_api_key": "sk-...",
 }
 ```
 
@@ -278,6 +286,7 @@ View title shows session status:
 Non-Claude sessions show backend name in tab title and have distinct background colors:
 - **Codex** - Green-tinted background
 - **Copilot** - Purple-tinted background
+- **DeepSeek** - Default background
 
 Supports markdown formatting and fenced code blocks with language-specific syntax highlighting.
 
@@ -422,6 +431,7 @@ JSON-RPC protocol and the backend CLI:
 - **Claude**: `bridge/main.py` — Claude Agent SDK
 - **Codex**: `bridge/codex_main.py` — Codex app-server protocol
 - **Copilot**: `bridge/copilot_main.py` — GitHub Copilot SDK
+- **DeepSeek**: `bridge/main.py` — Same Claude bridge, Anthropic-compatible endpoint
 
 ```
 sublime-claude/

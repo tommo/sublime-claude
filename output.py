@@ -1122,6 +1122,49 @@ class OutputView:
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
 
+    @staticmethod
+    def _extract_bash_subcommands(command: str) -> list:
+        """Extract subcommands from a compound bash command.
+
+        Splits on &&, ||, ;, |, |&, &, and newlines.
+        Strips process wrappers (timeout, time, nice, nohup, stdbuf).
+        Strips bare xargs. Skips env var assignments.
+        Returns list of (executable_name, full_subcommand) tuples.
+        """
+        import re
+        parts = re.split(r'\s*(?:&&|\|\||\|&|[;&|\n])\s*', command)
+        wrappers = {"timeout", "time", "nice", "nohup", "stdbuf"}
+        result = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            words = part.split()
+            idx = 0
+            # Skip env var assignments
+            while idx < len(words) and '=' in words[idx] and not words[idx].startswith('-'):
+                idx += 1
+            if idx >= len(words):
+                continue
+            # Strip process wrappers
+            while idx < len(words) and words[idx] in wrappers:
+                idx += 1
+                # Skip wrapper's numeric/flag args
+                while idx < len(words) and (words[idx].startswith('-') or words[idx].replace('.', '').isdigit()):
+                    idx += 1
+            if idx >= len(words):
+                continue
+            # Strip bare xargs (no flags)
+            if words[idx] == "xargs" and (idx + 1 >= len(words) or not words[idx + 1].startswith('-')):
+                idx += 1
+            if idx >= len(words):
+                continue
+            word = words[idx]
+            if '/' in word:
+                word = word.split('/')[-1]
+            result.append((word, part))
+        return result
+
     def _make_auto_allow_pattern(self, tool: str, tool_input: dict) -> str:
         """Create a fine-grained auto-allow pattern from tool and input.
 
@@ -1137,35 +1180,15 @@ class OutputView:
         if tool == "Bash":
             command = tool_input.get("command", "")
             if command:
-                # Extract meaningful command from chains like "cd /dir && git commit"
-                # Split on chain operators, skip trivial commands (cd, export, etc.)
-                import re
-                parts = re.split(r'\s*(?:&&|\|\||;|\|)\s*', command)
                 trivial = {"cd", "pushd", "popd", "export", "set", "unset", "source", ".", "true", "false"}
+                subcmds = self._extract_bash_subcommands(command)
                 best = None
-                for part in parts:
-                    part = part.strip()
-                    if not part:
-                        continue
-                    # Skip env var assignments (FOO=bar cmd)
-                    words = part.split()
-                    idx = 0
-                    while idx < len(words) and '=' in words[idx] and not words[idx].startswith('-'):
-                        idx += 1
-                    if idx >= len(words):
-                        continue
-                    word = words[idx]
-                    if '/' in word:
-                        word = word.split('/')[-1]
-                    if word and word not in trivial:
+                for word, _ in subcmds:
+                    if word not in trivial:
                         best = word
-                        break  # Use first non-trivial command
-                if not best:
-                    # All commands trivial — use the last one
-                    first_word = command.split()[0] if command.split() else ""
-                    if '/' in first_word:
-                        first_word = first_word.split('/')[-1]
-                    best = first_word
+                        break
+                if not best and subcmds:
+                    best = subcmds[0][0]
                 if best:
                     return f"Bash({best}:*)"
         elif tool in ("Read", "Write", "Edit"):
@@ -1210,22 +1233,16 @@ class OutputView:
         if specifier is None:
             return True
 
-        # Bash command matching
+        # Bash command matching — each subcommand must match independently
         if tool == "Bash":
             command = tool_input.get("command", "")
             if not command:
                 return False
-            # Prefix match with :*
             if specifier.endswith(":*"):
                 prefix = specifier[:-2]
-                # Check if command or any sub-command starts with prefix
-                if command.startswith(prefix):
-                    return True
-                # Extract first word of command
-                first_word = command.split()[0] if command.split() else ""
-                if '/' in first_word:
-                    first_word = first_word.split('/')[-1]
-                return first_word.startswith(prefix)
+                subcmds = self._extract_bash_subcommands(command)
+                return any(word.startswith(prefix) for word, _ in subcmds)
+            # Exact match
             return command == specifier
 
         # Read/Write/Edit directory matching

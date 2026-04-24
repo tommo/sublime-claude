@@ -33,6 +33,10 @@ DEFAULT_MODELS = {
         ["gpt-5.4-mini", "GPT-5.4 Mini"],
         ["o3", "O3"],
     ],
+    "deepseek": [
+        ["deepseek-v4-pro", "DeepSeek V4 Pro"],
+        ["deepseek-v4-flash", "DeepSeek V4 Flash"],
+    ],
 }
 
 
@@ -234,6 +238,17 @@ class CopilotStartCommand(sublime_plugin.WindowCommand):
             sublime.error_message("Copilot bridge not found")
             return
         create_session(self.window, backend="copilot")
+
+
+class DeepSeekStartCommand(sublime_plugin.WindowCommand):
+    """Start a new DeepSeek session (Anthropic-compatible endpoint)."""
+    def run(self) -> None:
+        import os
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        if not settings.get("deepseek_api_key") and not os.environ.get("DEEPSEEK_API_KEY"):
+            sublime.error_message("DeepSeek API key not set. Add \"deepseek_api_key\" to ClaudeCode settings or set DEEPSEEK_API_KEY env var.")
+            return
+        create_session(self.window, backend="deepseek")
 
 
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
@@ -1140,6 +1155,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         backend_prefix = f"[{backend}] " if backend != "claude" else ""
         has_codex = bool(shutil.which("codex"))
         has_copilot = os.path.exists(os.path.join(os.path.dirname(__file__), "bridge", "copilot_main.py"))
+        has_deepseek = bool(sublime.load_settings("ClaudeCode.sublime-settings").get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY"))
 
         # Get all sessions in this window
         sessions_in_window = []
@@ -1287,6 +1303,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             other_backends.append("codex")
         if has_copilot and backend != "copilot":
             other_backends.append("copilot")
+        if has_deepseek and backend != "deepseek":
+            other_backends.append("deepseek")
         if backend != "claude":
             other_backends.append("claude")
         for other in other_backends:

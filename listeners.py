@@ -114,6 +114,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             # Focus back to Claude output and re-enter input mode
             def refocus():
                 session.output.show()
+                # set_pending_context already restored input text if input mode was active
+                if session.output.is_input_mode():
+                    return
                 session.output.enter_input_mode()
                 if session.draft_prompt:
                     session.output.view.run_command("append", {"characters": session.draft_prompt})
