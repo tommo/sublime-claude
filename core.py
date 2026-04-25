@@ -6,7 +6,7 @@ import sublime_plugin
 from typing import Dict, Optional
 
 from .session import Session, load_saved_sessions, save_sessions
-from .constants import BACKEND_LABELS
+from . import backends
 
 
 _auto_sleep_timer = None
@@ -131,16 +131,11 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend)
     s.output.show()  # Create view first
     if s.output.view and backend != "claude":
+        spec = backends.get(backend)
         s.output.view.settings().set("claude_backend", backend)
-        s.output.set_name(BACKEND_LABELS.get(backend, backend.title()))
-        # Apply backend-specific background
-        backend_themes = {
-            "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-            "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-        }
-        theme = backend_themes.get(backend)
-        if theme:
-            s.output.view.settings().set("color_scheme", theme)
+        s.output.set_name(spec.label)
+        if spec.theme:
+            s.output.view.settings().set("color_scheme", spec.theme)
     s.start()
     # Register by view id and mark as active
     if s.output.view:

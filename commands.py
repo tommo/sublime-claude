@@ -7,39 +7,11 @@ from .core import get_active_session, get_session_for_view, create_session
 from .session import Session, load_saved_sessions
 from .prompt_builder import PromptBuilder
 from .command_parser import CommandParser
+from . import backends
 
-# Fallback model lists per backend (used when no cache/settings available)
-DEFAULT_MODELS = {
-    "claude": [
-        ["opus", "Opus 4.7"],
-        ["opus@400k", "Opus 4.7 (400K context)"],
-        ["claude-opus-4-6[1m]", "Opus 4.6 (1M context)"],
-        ["claude-opus-4-6[1m]@400k", "Opus 4.6 (400K context)"],
-        ["claude-opus-4-6", "Opus 4.6"],
-        ["sonnet", "Sonnet 4.6"],
-        ["haiku", "Haiku 4.5"],
-        ["claude-opus-4-5", "Opus 4.5"],
-        ["claude-sonnet-4-5", "Sonnet 4.5"],
-    ],
-    "copilot": [
-        ["claude-sonnet-4-6", "Sonnet 4.6"],
-        ["claude-opus-4-6", "Opus 4.6"],
-        ["gpt-5.3-codex", "GPT-5.3 Codex"],
-        ["gpt-5-mini", "GPT-5 Mini (free)"],
-    ],
-    "codex": [
-        ["gpt-5.5", "GPT-5.5"],
-        ["gpt-5.4", "GPT-5.4"],
-        ["gpt-5.4-mini", "GPT-5.4 Mini"],
-        ["gpt-5.3-codex", "GPT-5.3 Codex"],
-        ["o3", "O3"],
-    ],
-    "deepseek": [
-        ["opus", "Opus → V4 Pro (1M)"],
-        ["sonnet", "Sonnet → V4 Pro"],
-        ["haiku", "Haiku → V4 Flash"],
-    ],
-}
+# Fallback model lists per backend (used when no cache/settings available).
+# Sourced from backends.BACKENDS registry — one place to add a backend.
+DEFAULT_MODELS = backends.default_models_dict()
 
 
 class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
@@ -1155,9 +1127,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         from .core import create_session
 
         backend_prefix = f"[{backend}] " if backend != "claude" else ""
-        has_codex = bool(shutil.which("codex"))
-        has_copilot = os.path.exists(os.path.join(os.path.dirname(__file__), "bridge", "copilot_main.py"))
-        has_deepseek = bool(sublime.load_settings("ClaudeCode.sublime-settings").get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY"))
+        # Backend availability flags — sourced from backends registry
+        has_codex = backends.is_available("codex")
+        has_copilot = backends.is_available("copilot")
+        has_deepseek = backends.is_available("deepseek")
 
         # Get all sessions in this window
         sessions_in_window = []

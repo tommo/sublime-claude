@@ -9,11 +9,9 @@ import sublime
 from .rpc import JsonRpcClient
 from .output import OutputView
 from .constants import LOOP_PREFIX, BACKGROUND_PREFIX
+from . import backends
 
 
-BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "main.py")
-CODEX_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "codex_main.py")
-COPILOT_BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "copilot_main.py")
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
 
 # @suffix → max context tokens (stripped from model ID before sending to bridge)
@@ -148,10 +146,13 @@ class Session:
         # Load environment variables from settings and profile
         env = self._load_env(settings)
 
+        # Resolve backend spec — single source of truth for bridge script,
+        # fallback model, env overrides, etc.
+        spec = backends.get(self.backend)
+
         # Resolve virtual model ID (e.g. @400k suffix) → real model + context limit
         default_models = settings.get("default_models", {})
-        _backend_fallback_models = {"deepseek": "opus", "codex": "gpt-5.5"}
-        default_model = default_models.get(self.backend) or _backend_fallback_models.get(self.backend) or settings.get("default_model")
+        default_model = default_models.get(self.backend) or spec.fallback_model or settings.get("default_model")
         model_for_env = (self.profile.get("model") if self.profile else None) or default_model
         if model_for_env:
             _, ctx = _resolve_model_id(model_for_env)
@@ -161,25 +162,18 @@ class Session:
         # Sync sublime project retain content to file for hook
         self._sync_project_retain()
 
-        # DeepSeek uses the Claude bridge with Anthropic-compatible endpoint.
-        # Claude model IDs (opus/sonnet/haiku) are mapped server-side via env vars.
-        if self.backend == "deepseek":
-            ds_key = settings.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY", "")
-            env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
-            if ds_key:
-                env["ANTHROPIC_AUTH_TOKEN"] = ds_key
-            env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro[1m]")
-            env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "deepseek-v4-pro")
-            env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-v4-flash")
-            env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            env.setdefault("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1")
+        # Apply backend-specific env. static_env is always defaults; dynamic_env
+        # returns (overwrite, defaults) — overwrite always wins, defaults use setdefault.
+        for k, v in spec.static_env.items():
+            env.setdefault(k, v)
+        if spec.dynamic_env is not None:
+            settings_dict = {"deepseek_api_key": settings.get("deepseek_api_key")}
+            overwrite, defaults = spec.dynamic_env(settings_dict)
+            env.update(overwrite)
+            for k, v in defaults.items():
+                env.setdefault(k, v)
 
-        if self.backend == "codex":
-            bridge_script = CODEX_BRIDGE_SCRIPT
-        elif self.backend == "copilot":
-            bridge_script = COPILOT_BRIDGE_SCRIPT
-        else:
-            bridge_script = BRIDGE_SCRIPT
+        bridge_script = os.path.join(os.path.dirname(__file__), "bridge", spec.bridge_script)
         self.client = JsonRpcClient(self._on_notification)
         self.client.start([python_path, bridge_script], env=env)
         self._status("connecting...")
@@ -1783,7 +1777,7 @@ class Session:
         """Update status on output view only."""
         if not self.output.view or not self.output.view.is_valid():
             return
-        label = self.backend.title() if self.backend != "claude" else "Claude"
+        label = backends.get(self.backend).label
         prefix = "[PLAN] " if self.plan_mode else ""
         parts = [f"{prefix}{text}"]
         if self.backend == "claude":
