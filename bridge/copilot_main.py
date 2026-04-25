@@ -19,9 +19,25 @@ except ImportError:
 
 from rpc_helpers import send, send_error, send_result, send_notification
 
+# ── Logging: stderr → plugin console; also append to shared bridge log file ──
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).parent.parent))
+try:
+    from logger import get_bridge_logger
+    _file_log = get_bridge_logger()
+except Exception:
+    _file_log = None
+
+
 def log(msg):
-    sys.stderr.write(f"[copilot-bridge] {msg}\n")
+    line = f"[copilot-bridge] {msg}"
+    sys.stderr.write(line + "\n")
     sys.stderr.flush()
+    if _file_log is not None:
+        try:
+            _file_log.info(line)
+        except Exception:
+            pass  # benign: file logging is best-effort
 
 
 class CopilotBridge:

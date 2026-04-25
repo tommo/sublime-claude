@@ -14,11 +14,25 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-# ── Logging to stderr (stdout is reserved for JSON-RPC) ────────────────
+# ── Logging: stderr → plugin console; also append to shared bridge log file ──
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+try:
+    from logger import get_bridge_logger
+    _file_log = get_bridge_logger()
+except Exception:
+    _file_log = None
+
 
 def log(msg: str) -> None:
-    sys.stderr.write(f"[codex-bridge] {msg}\n")
+    line = f"[codex-bridge] {msg}"
+    sys.stderr.write(line + "\n")
     sys.stderr.flush()
+    if _file_log is not None:
+        try:
+            _file_log.info(line)
+        except Exception:
+            pass  # benign: file logging is best-effort
 
 
 from rpc_helpers import send, send_error, send_result, send_notification

@@ -557,8 +557,8 @@ class Session:
             pos = content.find(search)
             if pos >= 0:
                 return content[:pos].count('\n') + 1
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Claude] _find_edit_line({file_path!r}) failed: {e}")
         return None
 
     def _build_profile_docs_list(self) -> None:
@@ -1445,7 +1445,8 @@ class Session:
             with open(jsonl_path, "r") as f:
                 f.seek(start_pos)
                 new_lines = f.readlines()
-        except Exception:
+        except Exception as e:
+            print(f"[Claude] terminal sync skipped (jsonl read failed): {e}")
             return
         if not new_lines:
             return

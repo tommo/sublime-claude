@@ -134,8 +134,8 @@ class NotaloneClient:
                 if sock:
                     try:
                         sock.close()
-                    except:
-                        pass
+                    except Exception:
+                        pass  # benign: best-effort socket close on reconnect
 
             if self._running:
                 time.sleep(reconnect_delay)

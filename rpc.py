@@ -37,14 +37,26 @@ class JsonRpcClient:
         self.stderr_thread.start()
 
     def _stderr_loop(self) -> None:
-        """Read stderr and print to console."""
+        """Read stderr and print to console.
+
+        Bridges self-prefix their log lines (e.g. "[codex-bridge] ..."), so we
+        forward verbatim. We only add a generic "[bridge]" wrapper when the line
+        has no bracket prefix at all.
+        """
         while self.running and self.proc and self.proc.stderr:
             try:
                 line = self.proc.stderr.readline()
                 if not line:
                     break
-                print(f"[Claude Bridge] {line.decode().rstrip()}")
-            except:
+                text = line.decode(errors="replace").rstrip()
+                if not text:
+                    continue
+                if text.startswith("["):
+                    print(text)
+                else:
+                    print(f"[bridge] {text}")
+            except Exception as e:
+                print(f"[Claude] stderr_loop error: {e}")
                 continue
 
     def stop(self) -> None:
