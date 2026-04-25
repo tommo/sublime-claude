@@ -214,9 +214,10 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if name.startswith("Claude: "):
             name = name[8:]
 
-        # Strip backend prefix like "[codex] "
+        # Strip backend prefix like "[codex] " (legacy) or "CX> " (current)
         if name.startswith("[") and "] " in name:
             name = name[name.index("] ") + 2:]
+        name = re.sub(r'^(?:CX|DS|CP)(?:>|:)\s*', '', name)
 
         # Strip trailing ellipsis from truncation
         name_was_truncated = name.endswith("…")

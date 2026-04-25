@@ -205,7 +205,8 @@ class OutputView:
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
-            name = f"[{backend}] {name}"
+            abbr = {"codex": "CX", "deepseek": "DS", "copilot": "CP"}.get(backend, backend[:2].upper())
+            name = f"{abbr}> {name}"
         # Truncate to keep tab bar usable
         if len(name) > 24:
             name = name[:23] + "…"

@@ -1860,6 +1860,18 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if not text:
             return
 
+        # Check for loop:[duration] prompt or loop:cancel
+        from .command_parser import parse_loop
+        loop_cmd = parse_loop(text)
+        if loop_cmd:
+            s.output.exit_input_mode(keep_text=False)
+            s.draft_prompt = ""
+            if loop_cmd.cancel:
+                s.stop_loop()
+            elif loop_cmd.prompt:
+                s.start_loop(loop_cmd.prompt, loop_cmd.interval_sec)
+            return
+
         # Check for slash commands
         cmd = CommandParser.parse(text)
         if cmd:
@@ -1879,6 +1891,10 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
     def _handle_command(self, session, cmd):
         """Handle a slash command."""
+        # /loop syntax: name may be "loop" or "loop:<duration>" or "loop:cancel"
+        if cmd.name == "loop" or cmd.name.startswith("loop:"):
+            self._cmd_loop(session, cmd.name, cmd.args)
+            return
         if cmd.name == "clear":
             self._cmd_clear(session)
         elif cmd.name == "compact":
@@ -1888,6 +1904,32 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         else:
             # Unknown command - send as regular prompt to Claude
             session.query(cmd.raw)
+
+    def _cmd_loop(self, session, name, args):
+        """Handle /loop <prompt> (no duration) or /loop:<duration> <prompt> or /loop:cancel."""
+        from .command_parser import _parse_duration
+        # Parse the suffix after "loop"
+        if name == "loop":
+            # No duration — args is the entire prompt
+            if not args.strip():
+                session.output.text("\n*Usage: /loop <prompt> | /loop:<duration> <prompt> | /loop:cancel*\n")
+                return
+            session.start_loop(args.strip(), None)
+            return
+        # name starts with "loop:"
+        suffix = name[5:]  # after "loop:"
+        if suffix in ("cancel", "stop", "off"):
+            session.stop_loop()
+            return
+        # Otherwise suffix is a duration
+        interval = _parse_duration(suffix)
+        if interval is None:
+            session.output.text(f"\n*Invalid duration: {suffix!r}. Try /loop:5m, /loop:30s, /loop:1h*\n")
+            return
+        if not args.strip():
+            session.output.text("\n*Missing prompt after duration*\n")
+            return
+        session.start_loop(args.strip(), interval)
 
     def _cmd_clear(self, session):
         """Clear conversation history."""

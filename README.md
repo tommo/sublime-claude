@@ -96,6 +96,20 @@ The output view features an inline input area (marked with `◎`) where you type
 - **Cmd+K** - Clear output
 - **Alt+Escape** - Interrupt current query
 
+### Loop (Idle Re-prompt)
+
+Keep nudging the agent every time it goes idle. Useful for "until satisfied" workflows.
+
+- `/loop <prompt>` — re-fire prompt as soon as the session becomes idle
+- `/loop:<duration> <prompt>` — same, but enforce a minimum gap between fires
+  (e.g. `/loop:5m check builds` — wait at least 5 min before re-firing)
+- `/loop:cancel` — stop the active loop
+- Status bar shows `↻ loop` (or `↻ loop ≥5m`) while active
+- Loop only fires when session is idle — never interrupts an in-flight query
+- Stops automatically when session sleeps or stops
+- Works for all backends (Claude / Codex / Copilot / DeepSeek)
+- Same syntax also works as a prefix without slash: `loop:5m check builds`
+
 When a permission prompt appears:
 - **Y/N/S/A** - Respond to permission prompts
 

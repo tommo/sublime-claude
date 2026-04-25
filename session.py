@@ -94,6 +94,9 @@ class Session:
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
         self._response_callback: Optional[Callable[[str], None]] = None
+        # Active loop: dict with prompt, interval_sec, _timer_token (or None)
+        self.active_loop: Optional[Dict] = None
+        self._loop_token: int = 0  # Cancellation token to invalidate stale timers
         # Queue of prompts to send after current query completes
         self._queued_prompts: List[str] = []
         # Track if inject was sent (to skip "done" status until inject query completes)
@@ -965,6 +968,9 @@ class Session:
         self.working = False
         self.last_activity = time.time()
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+        # Loop hook: re-fire prompt now that we're idle (respecting min interval)
+        if self.active_loop:
+            sublime.set_timeout(self._loop_maybe_fire, 200)
 
     def _clear_deferred_state(self) -> None:
         """Clear deferred action state. Called on error/interrupt."""
@@ -1016,6 +1022,119 @@ class Session:
             # No client - queue locally for later
             self._queued_prompts.append(prompt)
 
+    DEFAULT_LOOP_INTERVAL_SEC = 300
+
+    def _loop_log(self, msg: str) -> None:
+        sid = (self.session_id or "?")[:8]
+        print(f"[Claude loop {sid}] {msg}")
+
+    def start_loop(self, prompt: str, interval_sec: Optional[int] = None) -> None:
+        """Start an idle-triggered loop. interval_sec is the MINIMUM gap between fires."""
+        if not prompt:
+            self._loop_log("start aborted: empty prompt")
+            return
+        if self.active_loop:
+            self._loop_log(f"replacing existing loop (was: {self.active_loop['prompt'][:40]!r})")
+        self.stop_loop(silent=True)
+        min_interval = interval_sec or 0  # 0 = fire immediately on idle
+        self._loop_token += 1
+        token = self._loop_token
+        import time
+        self.active_loop = {
+            "prompt": prompt,
+            "min_interval_sec": min_interval,
+            "token": token,
+            "last_fire": 0.0,  # epoch seconds
+        }
+        gap = self._fmt_duration(min_interval) if min_interval else "no min"
+        self._loop_log(f"started: min_interval={gap}, token={token}, prompt={prompt[:80]!r}")
+        short = prompt[:80] + "…" if len(prompt) > 80 else prompt
+        self.output.text(f"\n↻ loop started (min gap: {gap}): {short}\n")
+        self._update_status_bar()
+        # Trigger immediately if currently idle
+        if not self.working:
+            self._loop_maybe_fire()
+
+    def stop_loop(self, silent: bool = False) -> None:
+        """Cancel the active loop."""
+        if not self.active_loop:
+            return
+        self._loop_log(f"stopped (token={self.active_loop['token']}, silent={silent})")
+        self._loop_token += 1  # Invalidate any pending deferred fire
+        self.active_loop = None
+        if not silent:
+            self.output.text("\n↻ loop cancelled\n")
+        self._update_status_bar()
+        # Re-enter input mode so user can type again (only if idle and not silent cleanup)
+        if not silent and not self.working:
+            self._input_mode_entered = False
+            sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+
+    def _loop_maybe_fire(self) -> None:
+        """Called when session goes idle (or loop just started while idle).
+
+        Fires the loop prompt if min_interval has elapsed since last fire,
+        otherwise schedules a one-shot to fire when interval has elapsed.
+        """
+        if not self.active_loop:
+            return
+        if self.working:
+            self._loop_log("maybe_fire skipped: session working")
+            return
+        import time
+        loop = self.active_loop
+        token = loop["token"]
+        elapsed = time.time() - loop["last_fire"]
+        remaining = loop["min_interval_sec"] - elapsed
+        if remaining > 0:
+            wait_ms = int(remaining * 1000) + 100  # tiny buffer
+            self._loop_log(f"deferred {self._fmt_duration(int(remaining))} (min interval not elapsed)")
+            sublime.set_timeout(lambda: self._loop_deferred_fire(token), wait_ms)
+            return
+        self._loop_fire(token)
+
+    def _loop_deferred_fire(self, token: int) -> None:
+        """Wake up after deferred wait. Re-check state."""
+        if not self.active_loop or self.active_loop.get("token") != token:
+            self._loop_log(f"deferred fire skipped: stale token={token}")
+            return
+        if self.working:
+            self._loop_log("deferred fire: session became busy, will retry on next idle")
+            return
+        self._loop_fire(token)
+
+    def _loop_fire(self, token: int) -> None:
+        """Actually fire the loop prompt."""
+        if not self.active_loop or self.active_loop.get("token") != token:
+            return
+        if self.working:
+            self._loop_log("fire aborted: session working")
+            return
+        loop = self.active_loop
+        prompt = loop["prompt"]
+        import time
+        loop["last_fire"] = time.time()
+        self._loop_log(f"fire (token={token}, backend={self.backend}, prompt={prompt[:60]!r})")
+        try:
+            if self.client and self.initialized:
+                self.query(prompt, display_prompt=f"↻ {prompt[:80]}")
+            else:
+                self._loop_log(f"fire skipped: client={bool(self.client)}, initialized={self.initialized}")
+        except Exception as e:
+            self._loop_log(f"fire error: {e}")
+        # Schedule next iteration
+        interval_ms = loop["interval_sec"] * 1000
+        self._loop_log(f"next tick scheduled in {self._fmt_duration(loop['interval_sec'])}")
+        sublime.set_timeout(lambda: self._tick_loop(token), interval_ms)
+
+    @staticmethod
+    def _fmt_duration(sec: int) -> str:
+        if sec >= 3600 and sec % 3600 == 0:
+            return f"{sec // 3600}h"
+        if sec >= 60 and sec % 60 == 0:
+            return f"{sec // 60}m"
+        return f"{sec}s"
+
     def show_queue_input(self) -> None:
         """Show input panel to queue a prompt while session is working."""
         if not self.working:
@@ -1063,6 +1182,7 @@ class Session:
 
     def stop(self) -> None:
         # Persist closed state before cleanup
+        self.stop_loop(silent=True)
         self._persist_state("closed")
 
         # Clean up terminal mode if active
@@ -1096,9 +1216,10 @@ class Session:
     @property
     def display_name(self) -> str:
         base = self.name or "Claude"
-        # Strip any stale sleep prefixes from name
+        # Strip any stale prefixes from name (status icons + backend abbrevs)
         import re
-        base = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', base) or "Claude"
+        base = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', base)
+        base = re.sub(r'^(?:CX|DS|CP)(?:>|:)\s*', '', base) or "Claude"
         return base
 
     def sleep(self) -> None:
@@ -1109,6 +1230,7 @@ class Session:
             self.interrupt()
             sublime.set_timeout(self.sleep, 500)
             return
+        self.stop_loop(silent=True)
         if self.client:
             client = self.client
             self.client = None
@@ -1652,6 +1774,9 @@ class Session:
             ctx_k = self._context_tokens_k()
             if ctx_k is not None:
                 parts.append(f"ctx:{ctx_k}k")
+        if self.active_loop:
+            min_iv = self.active_loop.get("min_interval_sec", 0)
+            parts.append(f"↻ loop" + (f" ≥{self._fmt_duration(min_iv)}" if min_iv else ""))
         self.output.view.set_status("claude", f"{label}: {', '.join(parts)}")
 
     def _update_status_bar(self) -> None:
