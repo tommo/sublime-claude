@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Callable, Any
 
 from .constants import SPINNER_FRAMES, BACKEND_ABBREV, CONTEXT_PREFIX, BACKGROUND_PREFIX
+from .output_pending import clear_pending_block
 
 
 # Status constants
@@ -1096,30 +1097,16 @@ class OutputView:
         """Remove permission block from view (but keep pending_permission for same-tool detection)."""
         if not self.pending_permission or not self.view:
             return
-
-        perm = self.pending_permission
-
-        # Remove button regions
-        for btn_type in perm.button_regions:
-            self.view.erase_regions(f"claude_btn_{btn_type}")
-
-        # Get current region from tracked region (auto-adjusted for text shifts)
-        regions = self.view.get_regions("claude_permission_block")
-        if regions and regions[0].size() > 0:
-            region = regions[0]
-            self._replace(region.begin(), region.end(), "")
-        elif self.current:
-            # Fallback: remove everything after conversation region
-            conv_end = self.current.region[1]
-            view_size = self.view.size()
-            if view_size > conv_end:
-                self._replace(conv_end, view_size, "")
-
+        clear_pending_block(
+            self.view,
+            block_region_key="claude_permission_block",
+            button_prefix="claude_btn_",
+            button_keys=self.pending_permission.button_regions,
+            fallback_region_end=self.current.region[1] if self.current else None,
+        )
         # Update conversation region end to account for removed permission block
         if self.current:
             self.current.region = (self.current.region[0], self.view.size())
-
-        self.view.erase_regions("claude_permission_block")
         # Don't clear pending_permission - keep it to detect rapid same-tool requests
         # It will be overwritten when a different tool request comes in
 
@@ -1503,19 +1490,13 @@ class OutputView:
         """Remove plan approval block from view."""
         if not self.pending_plan or not self.view:
             return
-
-        for btn_type in self.pending_plan.button_regions:
-            self.view.erase_regions(f"claude_plan_btn_{btn_type}")
-
-        regions = self.view.get_regions("claude_plan_block")
-        if regions and regions[0].size() > 0:
-            self._replace(regions[0].begin(), regions[0].end(), "")
-        elif self.current:
-            conv_end = self.current.region[1]
-            view_size = self.view.size()
-            if view_size > conv_end:
-                self._replace(conv_end, view_size, "")
-        self.view.erase_regions("claude_plan_block")
+        clear_pending_block(
+            self.view,
+            block_region_key="claude_plan_block",
+            button_prefix="claude_plan_btn_",
+            button_keys=self.pending_plan.button_regions,
+            fallback_region_end=self.current.region[1] if self.current else None,
+        )
 
     def handle_plan_key(self, key: str) -> bool:
         """Handle Y/N key for plan approval. Returns True if handled."""
@@ -1641,23 +1622,18 @@ class OutputView:
         """Remove question block and optionally write compact summary."""
         if not self.pending_question or not self.view:
             return
-
-        # Erase the block
-        regions = self.view.get_regions("claude_question_block")
-        if regions and regions[0].size() > 0:
-            region = regions[0]
-            if summary:
-                self._replace(region.begin(), region.end(), f"\n  ❓ {summary}\n")
-            else:
-                self._replace(region.begin(), region.end(), "")
-        elif not summary and self.current:
-            # Fallback: remove everything after conversation region
-            conv_end = self.current.region[1]
-            view_size = self.view.size()
-            if view_size > conv_end:
-                self._replace(conv_end, view_size, "")
-        self.view.erase_regions("claude_question_block")
-        self.view.erase_regions("claude_question_keys")
+        replacement = f"\n  ❓ {summary}\n" if summary else ""
+        # No fallback when writing a summary — only the tracked region applies
+        fallback = (self.current.region[1] if self.current and not summary else None)
+        clear_pending_block(
+            self.view,
+            block_region_key="claude_question_block",
+            button_prefix="claude_question_btn_",  # questions don't actually use this prefix
+            button_keys={},  # questions don't have per-button hit-box regions
+            fallback_region_end=fallback,
+            replacement=replacement,
+            extra_region_keys=("claude_question_keys",),
+        )
 
     def _advance_question(self) -> None:
         """Advance to next question or fire callback."""
