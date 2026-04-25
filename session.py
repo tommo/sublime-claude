@@ -11,6 +11,7 @@ from .output import OutputView
 from .constants import LOOP_PREFIX, BACKGROUND_PREFIX
 from . import backends
 from .loop_controller import LoopController
+from .context_manager import ContextManager, ContextItem  # ContextItem re-exported for back-compat
 
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
@@ -51,12 +52,7 @@ def save_sessions(sessions: List[Dict]) -> None:
         print(f"[Claude] Failed to save sessions: {e}")
 
 
-class ContextItem:
-    """A pending context item to attach to next query."""
-    def __init__(self, kind: str, name: str, content: str):
-        self.kind = kind  # "file", "selection"
-        self.name = name  # Display name
-        self.content = content  # Actual content
+# NOTE: ContextItem moved to context_manager.py and re-exported above for callers
 
 
 class Session:
@@ -81,8 +77,8 @@ class Session:
         self.total_cost: float = 0.0
         self.query_count: int = 0
         self.context_usage: Optional[Dict] = None  # Latest usage/context stats
-        # Pending context for next query
-        self.pending_context: List[ContextItem] = []
+        # Pending context for next query (delegated to ContextManager)
+        self.context = ContextManager(self)
         # Profile docs available for reading (paths only, not content)
         self.profile_docs: List[str] = []
         # Draft prompt (persists across input panel open/close)
@@ -582,77 +578,37 @@ class Session:
         except Exception as e:
             print(f"[Claude] preload_docs error: {e}")
 
+    # ── Context API delegated to ContextManager (back-compat shims) ──────
+    @property
+    def pending_context(self) -> List[ContextItem]:
+        return self.context.items
+
+    @pending_context.setter
+    def pending_context(self, items: List[ContextItem]) -> None:
+        # Used by code that does `self.pending_context = []` to reset
+        self.context.items = list(items)
+        self.context._refresh_display()
+
     def add_context_file(self, path: str, content: str) -> None:
-        """Add a file to pending context."""
-        name = os.path.basename(path)
-        self.pending_context.append(ContextItem("file", name, f"File: {path}\n```\n{content}\n```"))
-        # print(f"[Claude] add_context_file: added {name}, pending_context={[c.name for c in self.pending_context]}")
-        self._update_context_display()
+        self.context.add_file(path, content)
 
     def add_context_selection(self, path: str, content: str) -> None:
-        """Add a selection to pending context."""
-        name = os.path.basename(path) if path else "selection"
-        self.pending_context.append(ContextItem("selection", name, f"Selection from {path}:\n```\n{content}\n```"))
-        self._update_context_display()
+        self.context.add_selection(path, content)
 
     def add_context_folder(self, path: str) -> None:
-        """Add a folder path to pending context."""
-        name = os.path.basename(path) + "/"
-        self.pending_context.append(ContextItem("folder", name, f"Folder: {path}"))
-        self._update_context_display()
+        self.context.add_folder(path)
 
     def add_context_image(self, image_data: bytes, mime_type: str) -> None:
-        """Add an image to pending context."""
-        import base64
-        import tempfile
-
-        # Save to temp file for reference
-        ext = ".png" if "png" in mime_type else ".jpg" if "jpeg" in mime_type or "jpg" in mime_type else ".img"
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
-            f.write(image_data)
-            temp_path = f.name
-
-        # Store base64 encoded image
-        encoded = base64.b64encode(image_data).decode('utf-8')
-        # Use special format that query() will detect
-        name = f"image{ext}"
-        self.pending_context.append(ContextItem(
-            "image",
-            name,
-            f"__IMAGE__:{mime_type}:{encoded}"  # Special marker for image data
-        ))
-        print(f"[Claude] Added image to context: {name} ({len(image_data)} bytes, saved to {temp_path})")
-        self._update_context_display()
+        self.context.add_image(image_data, mime_type)
 
     def clear_context(self) -> None:
-        """Clear pending context."""
-        self.pending_context = []
-        self._update_context_display()
+        self.context.clear()
 
     def _update_context_display(self) -> None:
-        """Update output view with pending context."""
-        self.output.set_pending_context(self.pending_context)
+        self.context._refresh_display()
 
     def _build_prompt_with_context(self, prompt: str) -> tuple:
-        """Build full prompt with pending context.
-
-        Returns:
-            (full_prompt, images) where images is list of {"mime_type": str, "data": str}
-        """
-        if not self.pending_context:
-            return prompt, []
-
-        parts = []
-        images = []
-        for item in self.pending_context:
-            if item.content.startswith("__IMAGE__:"):
-                # Extract image data: __IMAGE__:mime_type:base64data
-                _, mime_type, data = item.content.split(":", 2)
-                images.append({"mime_type": mime_type, "data": data})
-            else:
-                parts.append(item.content)
-        parts.append(prompt)
-        return "\n\n".join(parts), images
+        return self.context.build_prompt(prompt)
 
     def undo_message(self) -> None:
         """Undo last conversation turn by rewinding the CLI session."""
@@ -826,11 +782,9 @@ class Session:
         if self.output.view and not self.window.settings().has("claude_executing_view"):
             self.window.settings().set("claude_executing_view", self.output.view.id())
             self._is_executing_session = True
-        # Build prompt with context (may include images)
+        # Build prompt with context (may include images), then consume
         full_prompt, images = self._build_prompt_with_context(prompt)
-        context_names = [item.name for item in self.pending_context]
-        self.pending_context = []  # Clear after use
-        self._update_context_display()
+        _, context_names = self.context.take()
 
         # Store images for RPC call
         self._pending_images = images
@@ -1112,7 +1066,7 @@ class Session:
         # Release accumulated state
         if self.output:
             self.output.conversations.clear()
-        self.pending_context.clear()
+        self.context.clear()
         self._queued_prompts.clear()
 
     @property
