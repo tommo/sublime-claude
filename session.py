@@ -8,6 +8,7 @@ import sublime
 
 from .rpc import JsonRpcClient
 from .output import OutputView
+from .constants import LOOP_PREFIX, BACKGROUND_PREFIX
 
 
 BRIDGE_SCRIPT = os.path.join(os.path.dirname(__file__), "bridge", "main.py")
@@ -212,12 +213,21 @@ class Session:
             if self.fork:
                 init_params["fork_session"] = True
             # Use saved session's project dir as cwd (session may belong to different project)
+            # Also restore lightweight UI state (context_usage, plan_file) so it survives sleep
             for saved in load_saved_sessions():
                 if saved.get("session_id") == self.resume_id:
                     saved_project = saved.get("project", "")
                     if saved_project and saved_project != init_params["cwd"]:
                         print(f"[Claude] resume: using saved project {saved_project}")
                         init_params["cwd"] = saved_project
+                    # Restore optional state — best-effort, ignore parse errors
+                    try:
+                        if saved.get("context_usage"):
+                            self.context_usage = saved.get("context_usage")
+                        if saved.get("plan_file"):
+                            self.plan_file = saved.get("plan_file")
+                    except Exception:
+                        pass  # benign: restored state is purely cosmetic
                     break
             if resume_session_at:
                 init_params["resume_session_at"] = resume_session_at
@@ -1053,7 +1063,7 @@ class Session:
         gap = self._fmt_duration(min_interval) if min_interval else "no min"
         self._loop_log(f"started: min_interval={gap}, token={token}, prompt={prompt[:80]!r}")
         short = prompt[:80] + "…" if len(prompt) > 80 else prompt
-        self.output.text(f"\n↻ loop started (min gap: {gap}): {short}\n")
+        self.output.text(f"\n{LOOP_PREFIX}loop started (min gap: {gap}): {short}\n")
         self._update_status_bar()
         # Trigger immediately if currently idle
         if not self.working:
@@ -1067,7 +1077,7 @@ class Session:
         self._loop_token += 1  # Invalidate any pending deferred fire
         self.active_loop = None
         if not silent:
-            self.output.text("\n↻ loop cancelled\n")
+            self.output.text(f"\n{LOOP_PREFIX}loop cancelled\n")
         self._update_status_bar()
         # Re-enter input mode so user can type again (only if idle and not silent cleanup)
         if not silent and not self.working:
@@ -1121,7 +1131,7 @@ class Session:
         self._loop_log(f"fire (token={token}, backend={self.backend}, prompt={prompt[:60]!r})")
         try:
             if self.client and self.initialized:
-                self.query(prompt, display_prompt=f"↻ {prompt[:80]}")
+                self.query(prompt, display_prompt=f"{LOOP_PREFIX}{prompt[:80]}")
             else:
                 self._loop_log(f"fire skipped: client={bool(self.client)}, initialized={self.initialized}")
         except Exception as e:
@@ -1715,7 +1725,7 @@ class Session:
                         if self.working:
                             self._queued_prompts.append(wake_prompt)
                         else:
-                            self.query(wake_prompt, display_prompt=f"⚙ {summary}", silent=True)
+                            self.query(wake_prompt, display_prompt=f"{BACKGROUND_PREFIX}{summary}", silent=True)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""
@@ -1754,6 +1764,15 @@ class Session:
             entry["resume_session_at"] = self._pending_resume_at
         else:
             entry.pop("resume_session_at", None)
+        # Persist optional state for post-resume continuity
+        if self.context_usage:
+            entry["context_usage"] = self.context_usage
+        else:
+            entry.pop("context_usage", None)
+        if self.plan_file:
+            entry["plan_file"] = self.plan_file
+        else:
+            entry.pop("plan_file", None)
         sessions.insert(0, entry)
         # Keep last 200 sessions
         sessions = sessions[:200]
@@ -1780,7 +1799,7 @@ class Session:
                 parts.append(f"ctx:{ctx_k}k")
         if self.active_loop:
             min_iv = self.active_loop.get("min_interval_sec", 0)
-            parts.append(f"↻ loop" + (f" ≥{self._fmt_duration(min_iv)}" if min_iv else ""))
+            parts.append(f"{LOOP_PREFIX}loop" + (f" ≥{self._fmt_duration(min_iv)}" if min_iv else ""))
         self.output.view.set_status("claude", f"{label}: {', '.join(parts)}")
 
     def _update_status_bar(self) -> None:

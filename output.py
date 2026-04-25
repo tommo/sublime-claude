@@ -4,7 +4,7 @@ import sublime_plugin
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Callable, Any
 
-from .constants import SPINNER_FRAMES
+from .constants import SPINNER_FRAMES, BACKEND_ABBREV, CONTEXT_PREFIX, BACKGROUND_PREFIX
 
 
 # Status constants
@@ -205,7 +205,7 @@ class OutputView:
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
-            abbr = {"codex": "CX", "deepseek": "DS", "copilot": "CP"}.get(backend, backend[:2].upper())
+            abbr = BACKEND_ABBREV.get(backend, backend[:2].upper())
             name = f"{abbr}> {name}"
         # Truncate to keep tab bar usable
         if len(name) > 24:
@@ -310,9 +310,9 @@ class OutputView:
                 # Input marker: starts with "◎ " but no " ▶" (which prompts have)
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
                 # Context line: only treat as stale if we don't have actual pending context
-                is_context_line = line.startswith('📎 ') and not has_pending_context
+                is_context_line = line.startswith(CONTEXT_PREFIX) and not has_pending_context
                 # Background task hint lines from previous input mode
-                is_bg_hint = line.strip().startswith(('⚙ ', '✔ ', '✘ '))
+                is_bg_hint = line.strip().startswith((BACKGROUND_PREFIX, '✔ ', '✘ '))
                 if is_input_marker or is_context_line or is_bg_hint:
                     cleanup_start = len('\n'.join(lines[:i]))
                     if i > 0:
@@ -368,14 +368,14 @@ class OutputView:
         if bg_tools:
             for bt in bg_tools:
                 detail = self._format_tool_detail(bt)
-                self.view.run_command("append", {"characters": f"  ⚙ {bt.name}{detail}\n"})
+                self.view.run_command("append", {"characters": f"  {BACKGROUND_PREFIX}{bt.name}{detail}\n"})
 
         # Add context line if any
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
         if session and session.pending_context:
             names = [item.name for item in session.pending_context]
-            ctx_line = f"📎 {', '.join(names)}\n"
+            ctx_line = f"{CONTEXT_PREFIX}{', '.join(names)}\n"
             # print(f"[Claude] enter_input_mode: adding context line: {repr(ctx_line)}")
             self.view.run_command("append", {"characters": ctx_line})
         # else:
@@ -448,7 +448,7 @@ class OutputView:
             line = lines[i]
             # Input marker line: starts with "◎ " but does NOT contain " ▶" (which prompts have)
             is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
-            is_context_line = line.startswith('📎 ')
+            is_context_line = line.startswith(CONTEXT_PREFIX)
             if is_input_marker or is_context_line:
                 # Found input area - calculate position to remove
                 cleanup_start = len('\n'.join(lines[:i]))
@@ -531,7 +531,7 @@ class OutputView:
 
         # Build context display
         names = [item.name for item in context_items]
-        text = f"\n📎 {', '.join(names)} ({len(names)} file{'s' if len(names) > 1 else ''})\n"
+        text = f"\n{CONTEXT_PREFIX}{', '.join(names)} ({len(names)} file{'s' if len(names) > 1 else ''})\n"
         # print(f"[Claude] set_pending_context: writing context text: {repr(text)}")
 
         # Write at end
@@ -567,7 +567,7 @@ class OutputView:
                 if not line.strip():
                     continue
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
-                is_context_line = line.startswith('📎 ')
+                is_context_line = line.startswith(CONTEXT_PREFIX)
                 is_queued_line = line.startswith('⏳ ')
                 if is_input_marker or is_context_line or is_queued_line:
                     # Found stale input marker - clean it up
@@ -609,7 +609,7 @@ class OutputView:
             indented = text
         if context_names:
             context_str = ", ".join(context_names)
-            line = f"{prefix}◎ {indented} ▶\n  📎 {context_str}\n"
+            line = f"{prefix}◎ {indented} ▶\n  {CONTEXT_PREFIX}{context_str}\n"
             # print(f"[Claude] prompt: writing with context: {repr(line)}")
         else:
             line = f"{prefix}◎ {indented} ▶\n"
@@ -1870,7 +1870,7 @@ class OutputView:
         if self.current.context_names:
             context_str = ", ".join(self.current.context_names)
             lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
-            lines.append(f"  📎 {context_str}\n")
+            lines.append(f"  {CONTEXT_PREFIX}{context_str}\n")
         else:
             lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
 
