@@ -12,17 +12,30 @@ class LoopCommand:
     cancel: bool = False  # True if "loop:cancel"
 
 
-_DURATION_RE = re.compile(r'^(\d+)\s*([smhd]?)$', re.IGNORECASE)
+_DURATION_RE = re.compile(r'^(\d+)\s*([a-z]*)$', re.IGNORECASE)
+
+# Map every accepted unit alias to its base-second multiplier.
+# Empty string defaults to seconds, matching the legacy "5" → 5s case.
+_DURATION_UNITS = {
+    "":  1,
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+}
 
 
 def _parse_duration(s: str) -> Optional[int]:
-    """Parse "5m", "30s", "1h", "2d" or plain seconds. Returns seconds or None."""
+    """Parse "5m", "30s", "1h", "2d", "10 minutes", "2 hours". Returns seconds or None."""
     m = _DURATION_RE.match(s.strip())
     if not m:
         return None
     n = int(m.group(1))
-    unit = m.group(2).lower() or "s"
-    return n * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    unit = m.group(2).lower()
+    mult = _DURATION_UNITS.get(unit)
+    if mult is None:
+        return None
+    return n * mult
 
 
 def parse_loop(text: str) -> Optional[LoopCommand]:
