@@ -1371,208 +1371,232 @@ class Session:
     # - notalone2 daemon: timers, session completion, list/unregister
     # - vibekanban MCP server: watch_kanban for ticket state changes
 
+    # ── Notification dispatch ────────────────────────────────────────────
+    # Method-level handlers (top-level RPC notifications from the bridge).
+    # For "message" notifications, we then dispatch on params["type"] via
+    # the _MESSAGE_HANDLERS table; for "system" messages, on params["subtype"]
+    # via _SYSTEM_HANDLERS. Each handler is small and isolated; the giant
+    # if/elif chain it replaced lived right here.
+
     def _on_notification(self, method: str, params: dict) -> None:
-        if method == "permission_request":
-            self._handle_permission_request(params)
+        # Pre-built handler set for top-level methods (one-time lookup is fine)
+        method_handler = self._notification_method_handlers().get(method)
+        if method_handler is not None:
+            method_handler(params)
             return
-
-        if method == "question_request":
-            self._handle_question_request(params)
-            return
-
-        if method == "plan_mode_enter":
-            self._handle_plan_mode_enter(params)
-            return
-
-        if method == "plan_mode_exit":
-            self._handle_plan_mode_exit(params)
-            return
-
-        if method == "plan_response":
-            # Response handled via pending_plan_approvals in bridge
-            return
-
-        if method == "queued_inject":
-            message = params.get("message", "")
-            if message:
-                self._inject_pending = False
-                self.working = True
-                self.query(message)
-            return
-
-        if method == "notification_wake":
-            # Notification fired - start a new query with the wake prompt
-            wake_prompt = params.get("wake_prompt", "")
-            display_message = params.get("display_message", "")  # User-friendly message
-            notification_id = params.get("notification_id", "")
-
-            # Use display_message for user (concise), wake_prompt goes to agent (detailed)
-            # If no display_message, extract first line of wake_prompt
-            if display_message:
-                user_message = display_message
-            else:
-                # Extract first meaningful line for display
-                first_line = wake_prompt.split("\n")[0].strip() if wake_prompt else ""
-                user_message = first_line if first_line else "🔔 Notification received"
-
-            # If session is still working, queue the wake query for when it becomes idle
-            if self.working:
-
-                def start_wake_query():
-                    if not self.working:
-                        try:
-                            self.query(wake_prompt, display_prompt=user_message)
-                        except Exception as e:
-                            print(f"[Claude] deferred wake query error: {e}")
-                    else:
-                        # Still working, try again later
-                        sublime.set_timeout(start_wake_query, 500)
-
-                sublime.set_timeout(start_wake_query, 500)
-                return
-
-            # Session is idle, start wake query immediately
-            try:
-                self.query(wake_prompt, display_prompt=user_message)
-            except Exception as e:
-                print(f"[Claude] wake query error: {e}")
-            return
-
         if method != "message":
             return
-
         t = params.get("type")
-        if t == "tool_use":
-            name = params.get("name", "")
-            tool_input = params.get("input", {})
-            background = params.get("background", False)
-            tool_id = params.get("id")
+        msg_handler = self._notification_message_handlers().get(t)
+        if msg_handler is not None:
+            msg_handler(params)
 
-            # Skip anonymous/empty tool_use notifications
-            if not name or not name.strip():
-                return
+    def _notification_method_handlers(self):
+        return {
+            "permission_request": self._handle_permission_request,
+            "question_request": self._handle_question_request,
+            "plan_mode_enter": self._handle_plan_mode_enter,
+            "plan_mode_exit": self._handle_plan_mode_exit,
+            "plan_response": lambda _p: None,  # handled via pending_plan_approvals in bridge
+            "queued_inject": self._on_queued_inject,
+            "notification_wake": self._on_notification_wake,
+        }
 
-            if background:
-                # Background tools do not take over current_tool (spinner stays on foreground)
-                self.output.tool(name, tool_input, tool_id=tool_id, background=True)
-                self._update_status_bar()
-                return
+    def _notification_message_handlers(self):
+        return {
+            "tool_use": self._on_msg_tool_use,
+            "tool_result": self._on_msg_tool_result,
+            "text_delta": self._on_msg_text,
+            "text": self._on_msg_text,
+            "turn_usage": self._on_msg_turn_usage,
+            "result": self._on_msg_result,
+            "system": self._on_msg_system,
+        }
 
-            # Foreground: mark previous tool done, take over as current
-            if self.current_tool and self.current_tool.strip():
-                self.output.tool_done(self.current_tool)
-            self.current_tool = name
-            self.output.tool(name, tool_input, tool_id=tool_id, background=False)
-        elif t == "tool_result":
-            tool_use_id = params.get("tool_use_id")
-            content = params.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(str(c) for c in content)
-            if len(content) > 10000:
-                content = content[:10000]
-            is_error = params.get("is_error")
+    # ── method-level handlers ────────────────────────────────────────────
 
-            # Resolve the tool — prefer id match (handles background tools across turns)
-            matched = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
-            was_background = matched is not None and matched.status == "background"
-            tool_name = matched.name if matched else self.current_tool
+    def _on_queued_inject(self, params: dict) -> None:
+        message = params.get("message", "")
+        if message:
+            self._inject_pending = False
+            self.working = True
+            self.query(message)
 
-            if not tool_name or not str(tool_name).strip():
-                self.current_tool = None
-                return
+    def _on_notification_wake(self, params: dict) -> None:
+        """Fire a new query from a notification wake event (timer, channel, etc)."""
+        wake_prompt = params.get("wake_prompt", "")
+        display_message = params.get("display_message", "")
+        if display_message:
+            user_message = display_message
+        else:
+            first_line = wake_prompt.split("\n")[0].strip() if wake_prompt else ""
+            user_message = first_line if first_line else "🔔 Notification received"
 
-            if was_background:
-                # Background tool_result is just an ack ("running in background..."),
-                # not the final result. Status change comes from task_notification.
-                return
+        # If still working, defer until idle (poll every 500ms)
+        if self.working:
+            def start_wake_query():
+                if not self.working:
+                    try:
+                        self.query(wake_prompt, display_prompt=user_message)
+                    except Exception as e:
+                        print(f"[Claude] deferred wake query error: {e}")
+                else:
+                    sublime.set_timeout(start_wake_query, 500)
+            sublime.set_timeout(start_wake_query, 500)
+            return
 
-            if tool_name in ("Edit", "Write") and not is_error:
-                self._record_edit(tool_name)
+        try:
+            self.query(wake_prompt, display_prompt=user_message)
+        except Exception as e:
+            print(f"[Claude] wake query error: {e}")
 
-            if is_error:
-                self.output.tool_error(tool_name, content, tool_id=tool_use_id)
+    # ── message-level handlers ───────────────────────────────────────────
+
+    def _on_msg_tool_use(self, params: dict) -> None:
+        name = params.get("name", "")
+        tool_input = params.get("input", {})
+        background = params.get("background", False)
+        tool_id = params.get("id")
+        if not name or not name.strip():
+            return
+        if background:
+            # Background tools don't take over current_tool (spinner stays on foreground)
+            self.output.tool(name, tool_input, tool_id=tool_id, background=True)
+            self._update_status_bar()
+            return
+        if self.current_tool and self.current_tool.strip():
+            self.output.tool_done(self.current_tool)
+        self.current_tool = name
+        self.output.tool(name, tool_input, tool_id=tool_id, background=False)
+
+    def _on_msg_tool_result(self, params: dict) -> None:
+        tool_use_id = params.get("tool_use_id")
+        content = params.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(str(c) for c in content)
+        if len(content) > 10000:
+            content = content[:10000]
+        is_error = params.get("is_error")
+
+        matched = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
+        was_background = matched is not None and matched.status == "background"
+        tool_name = matched.name if matched else self.current_tool
+
+        if not tool_name or not str(tool_name).strip():
+            self.current_tool = None
+            return
+        if was_background:
+            # Background tool_result is just an ack; final status comes via task_notification
+            return
+        if tool_name in ("Edit", "Write") and not is_error:
+            self._record_edit(tool_name)
+        if is_error:
+            self.output.tool_error(tool_name, content, tool_id=tool_use_id)
+        else:
+            self.output.tool_done(tool_name, content, tool_id=tool_use_id)
+        if tool_name == self.current_tool:
+            self.current_tool = None
+        self._update_status_bar()
+
+    def _on_msg_text(self, params: dict) -> None:
+        self.output.text(params.get("text", ""))
+
+    def _on_msg_turn_usage(self, params: dict) -> None:
+        usage = params.get("usage", {})
+        if usage:
+            self.context_usage = usage
+            self._update_status_bar()
+
+    def _on_msg_result(self, params: dict) -> None:
+        # Capture session ID for resume
+        if params.get("session_id"):
+            self.session_id = params["session_id"]
+            self._save_session()
+        cost = params.get("total_cost_usd") or 0
+        self.total_cost += cost
+        dur = params.get("duration_ms", 0) / 1000
+        usage = params.get("usage")
+        if usage:
+            self.context_usage = usage
+        print(f"[Claude] [{dur:.1f}s, ${cost:.4f}]" if cost else f"[Claude] [{dur:.1f}s]")
+        if usage:
+            print(f"[Claude] usage: {usage}")
+        self.output.meta(dur, cost, usage=usage)
+        self._update_status_bar()
+
+    def _on_msg_system(self, params: dict) -> None:
+        """Dispatch system messages by subtype."""
+        handlers = {
+            "compact_boundary": self._on_sys_compact_boundary,
+            "task_started": self._on_sys_task_started,
+            "task_updated": self._on_sys_task_updated,
+            "task_notification": self._on_sys_task_notification,
+        }
+        h = handlers.get(params.get("subtype", ""))
+        if h is not None:
+            h(params.get("data", {}) or {})
+
+    # ── system message subtypes ──────────────────────────────────────────
+
+    def _on_sys_compact_boundary(self, _data: dict) -> None:
+        self.context_usage = None
+        self._update_status_bar()
+        self._inject_retain_midquery()
+
+    def _on_sys_task_started(self, data: dict) -> None:
+        task_id = data.get("task_id", "")
+        tool_use_id = data.get("tool_use_id", "")
+        if task_id and tool_use_id:
+            self._task_tool_map[task_id] = tool_use_id
+
+    def _on_sys_task_updated(self, data: dict) -> None:
+        task_id = data.get("task_id", "")
+        patch = data.get("patch", {})
+        if not patch.get("is_backgrounded"):
+            return
+        tool_use_id = self._task_tool_map.get(task_id)
+        if not tool_use_id:
+            return
+        tool = self.output.find_tool_by_id(tool_use_id)
+        if tool and tool.status != "background":
+            from .output import BACKGROUND
+            tool.status = BACKGROUND
+            if self.output._is_in_current(tool):
+                self.output._render_current()
             else:
-                self.output.tool_done(tool_name, content, tool_id=tool_use_id)
+                self.output._patch_tool_symbol(tool, "pending")
 
-            if tool_name == self.current_tool:
-                self.current_tool = None
-            self._update_status_bar()
-        elif t in ("text_delta", "text"):
-            self.output.text(params.get("text", ""))
-        elif t == "turn_usage":
-            usage = params.get("usage", {})
-            if usage:
-                self.context_usage = usage
-                self._update_status_bar()
-        elif t == "result":
-            # Capture session ID for resume
-            if params.get("session_id"):
-                self.session_id = params["session_id"]
-                self._save_session()
-            cost = params.get("total_cost_usd") or 0
-            self.total_cost += cost
-            dur = params.get("duration_ms", 0) / 1000
-            usage = params.get("usage")
-            if usage:
-                self.context_usage = usage
-            print(f"[Claude] [{dur:.1f}s, ${cost:.4f}]" if cost else f"[Claude] [{dur:.1f}s]")
-            if usage:
-                print(f"[Claude] usage: {usage}")
-            self.output.meta(dur, cost, usage=usage)
-            self._update_status_bar()
-        elif t == "system":
-            subtype = params.get("subtype", "")
-            data = params.get("data", {})
-
-            if subtype == "compact_boundary":
-                self.context_usage = None
-                self._update_status_bar()
-                self._inject_retain_midquery()
-            elif subtype == "task_started":
-                task_id = data.get("task_id", "")
-                tool_use_id = data.get("tool_use_id", "")
-                if task_id and tool_use_id:
-                    self._task_tool_map[task_id] = tool_use_id
-            elif subtype == "task_updated":
-                task_id = data.get("task_id", "")
-                patch = data.get("patch", {})
-                if patch.get("is_backgrounded"):
-                    tool_use_id = self._task_tool_map.get(task_id)
-                    if tool_use_id:
-                        tool = self.output.find_tool_by_id(tool_use_id)
-                        if tool and tool.status != "background":
-                            from .output import BACKGROUND
-                            tool.status = BACKGROUND
-                            if self.output._is_in_current(tool):
-                                self.output._render_current()
-                            else:
-                                self.output._patch_tool_symbol(tool, "pending")
-            elif subtype == "task_notification":
-                task_id = data.get("task_id", "")
-                status = data.get("status", "")
-                tool_use_id = self._task_tool_map.pop(task_id, None)
-                if tool_use_id and status == "completed":
-                    tool = self.output.find_tool_by_id(tool_use_id)
-                    if tool and tool.status == "background":
-                        from .output import DONE
-                        old_status = tool.status
-                        tool.status = DONE
-                        self.output._patch_tool_symbol(tool, old_status)
-                        # Feed result back to agent
-                        output = ""
-                        output_file = data.get("output_file", "")
-                        if output_file:
-                            try:
-                                with open(output_file, "r") as f:
-                                    output = f.read().strip()
-                            except Exception:
-                                pass
-                        summary = data.get("summary", "")
-                        wake_prompt = f"<task-notification>{summary}\n{output}</task-notification>" if output else f"<task-notification>{summary}</task-notification>"
-                        if self.working:
-                            self._queued_prompts.append(wake_prompt)
-                        else:
-                            self.query(wake_prompt, display_prompt=f"{BACKGROUND_PREFIX}{summary}", silent=True)
+    def _on_sys_task_notification(self, data: dict) -> None:
+        task_id = data.get("task_id", "")
+        status = data.get("status", "")
+        tool_use_id = self._task_tool_map.pop(task_id, None)
+        if not (tool_use_id and status == "completed"):
+            return
+        tool = self.output.find_tool_by_id(tool_use_id)
+        if not (tool and tool.status == "background"):
+            return
+        from .output import DONE
+        old_status = tool.status
+        tool.status = DONE
+        self.output._patch_tool_symbol(tool, old_status)
+        # Feed result back to agent
+        output = ""
+        output_file = data.get("output_file", "")
+        if output_file:
+            try:
+                with open(output_file, "r") as f:
+                    output = f.read().strip()
+            except Exception as e:
+                print(f"[Claude] task notification output read failed ({output_file}): {e}")
+        summary = data.get("summary", "")
+        wake_prompt = (
+            f"<task-notification>{summary}\n{output}</task-notification>"
+            if output else f"<task-notification>{summary}</task-notification>"
+        )
+        if self.working:
+            self._queued_prompts.append(wake_prompt)
+        else:
+            self.query(wake_prompt, display_prompt=f"{BACKGROUND_PREFIX}{summary}", silent=True)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""
