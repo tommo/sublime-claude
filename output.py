@@ -6,6 +6,7 @@ from typing import List, Optional, Dict, Callable, Any
 
 from .constants import SPINNER_FRAMES, BACKEND_ABBREV, CONTEXT_PREFIX, BACKGROUND_PREFIX
 from .output_pending import clear_pending_block
+from .tool_formatters import format_tool_detail
 
 
 # Status constants
@@ -1953,99 +1954,8 @@ class OutputView:
             self._scroll_to_end()
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
-        """Format tool detail string."""
-        detail = ""
-        tool_input = tool.tool_input or {}
-
-        # Plan mode tools
-        if tool.name == "EnterPlanMode":
-            return ": entering plan mode..."
-        elif tool.name == "ExitPlanMode":
-            allowed = tool_input.get("allowedPrompts", [])
-            if allowed:
-                return f": {len(allowed)} requested permissions"
-            return ": awaiting approval..."
-
-        if tool.name == "Skill" and "skill" in tool_input:
-            # Show the actual skill name instead of just "Skill"
-            skill_name = tool_input["skill"]
-            detail = f": {skill_name}"
-        elif tool.name == "Bash" and "command" in tool_input:
-            cmd = tool_input["command"]
-            detail = f": {cmd}"
-            # Show output for completed Bash commands
-            if tool.result and tool.status in (DONE, ERROR):
-                detail += self._format_bash_result(tool.result)
-        elif tool.name == "Read" and "file_path" in tool_input:
-            detail = f": {tool_input['file_path']}"
-            # Show line count for completed Read
-            if tool.result and tool.status == DONE:
-                detail += self._format_read_result(tool.result)
-        elif tool.name == "Edit" and "file_path" in tool_input:
-            file_path = tool_input['file_path']
-            old = tool_input.get("old_string", "")
-            new = tool_input.get("new_string", "")
-            unified = tool_input.get("unified_diff", "")
-            if unified:
-                # Pre-computed unified diff (e.g. from codex)
-                diff_str = self._format_unified_diff(unified)
-                line_num = self._extract_diff_line_num(unified)
-                if line_num:
-                    detail = f": {file_path}:{line_num}"
-                else:
-                    detail = f": {file_path}"
-            else:
-                # Get line number from file (where old_string starts) and diff
-                line_num = self._find_line_number(file_path, old, new)
-                diff_str = self._format_edit_diff(old, new)
-                if line_num:
-                    detail = f": {file_path}:{line_num}"
-                else:
-                    detail = f": {file_path}"
-            if diff_str:
-                detail += diff_str
-        elif tool.name == "Write" and "file_path" in tool_input:
-            detail = f": {tool_input['file_path']}"
-        elif tool.name == "Glob" and "pattern" in tool_input:
-            detail = f": {tool_input['pattern']}"
-            # Show file count for completed Glob
-            if tool.result and tool.status == DONE:
-                detail += self._format_glob_result(tool.result)
-        elif tool.name == "Grep" and "pattern" in tool_input:
-            detail = f": {tool_input['pattern']}"
-            # Show match count for completed Grep
-            if tool.result and tool.status == DONE:
-                detail += self._format_grep_result(tool.result)
-        elif tool.name == "WebSearch" and "query" in tool_input:
-            detail = f": {tool_input['query']}"
-        elif tool.name == "WebFetch" and "url" in tool_input:
-            detail = f": {tool_input['url']}"
-        elif tool.name == "Task" and "subagent_type" in tool_input:
-            # Show agent type and description for Task launches
-            subagent = tool_input["subagent_type"]
-            desc = tool_input.get("description", "")
-            detail = f": {subagent}" + (f" - {desc}" if desc else "")
-        elif tool.name == "NotebookEdit" and "notebook_path" in tool_input:
-            detail = f": {tool_input['notebook_path']}"
-        elif tool.name == "TodoWrite" and "todos" in tool_input:
-            # Show todo count for TodoWrite
-            todos = tool_input["todos"]
-            count = len(todos) if isinstance(todos, list) else "?"
-            detail = f": {count} task{'s' if count != 1 else ''}"
-        elif tool.name in ("ask_user", "mcp__sublime__ask_user") and "question" in tool_input:
-            question = tool_input["question"]
-            detail = f": {question}"
-            # Show Q&A for completed ask_user
-            if tool.result and tool.status == DONE:
-                detail += self._format_ask_user_result(tool.result, question)
-        # Generic MCP tool result display
-        elif tool.name.startswith("mcp__sublime__") and tool.result and tool.status == DONE:
-            detail += self._format_mcp_result(tool.result)
-
-        if tool.status == BACKGROUND:
-            detail += " (background)"
-
-        return detail
+        """Format tool detail string. Dispatches via TOOL_FORMATTERS registry."""
+        return format_tool_detail(self, tool)
 
     def _format_bash_result(self, result: str) -> str:
         """Format Bash command output (head + tail if long)."""
