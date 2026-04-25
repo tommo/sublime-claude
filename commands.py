@@ -1882,11 +1882,16 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
     def _cmd_loop(self, session, name, args):
         """Handle /loop <prompt> (no duration) or /loop:<duration> <prompt> or /loop:cancel."""
         from .command_parser import _parse_duration
+
+        def _err(msg):
+            session.output.text(f"\n*{msg}*\n")
+            session.resume_input_mode()  # let user retry — restore the input area
+
         # Parse the suffix after "loop"
         if name == "loop":
             # No duration — args is the entire prompt
             if not args.strip():
-                session.output.text("\n*Usage: /loop <prompt> | /loop:<duration> <prompt> | /loop:cancel*\n")
+                _err("Usage: /loop <prompt> | /loop:<duration> <prompt> | /loop:cancel")
                 return
             session.start_loop(args.strip(), None)
             return
@@ -1898,10 +1903,10 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         # Otherwise suffix is a duration
         interval = _parse_duration(suffix)
         if interval is None:
-            session.output.text(f"\n*Invalid duration: {suffix!r}. Try /loop:5m, /loop:30s, /loop:1h*\n")
+            _err(f"Invalid duration: {suffix!r}. Try /loop:5m, /loop:30s, /loop:1h")
             return
         if not args.strip():
-            session.output.text("\n*Missing prompt after duration*\n")
+            _err("Missing prompt after duration")
             return
         session.start_loop(args.strip(), interval)
 

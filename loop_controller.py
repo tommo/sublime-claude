@@ -95,10 +95,8 @@ class LoopController:
             self.session.output.text(f"\n{LOOP_PREFIX}loop cancelled\n")
         self.session._update_status_bar()
         # Re-enter input mode so user can type again (only if idle and not silent cleanup)
-        if not silent and not self.session.working:
-            self.session._input_mode_entered = False
-            session = self.session
-            sublime.set_timeout(lambda: session._enter_input_with_draft() if not session.working else None, 100)
+        if not silent:
+            self.session.resume_input_mode()
 
     def on_idle(self) -> None:
         """Hook called when session transitions to idle. Fires the prompt if due."""

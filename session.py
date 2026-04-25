@@ -941,6 +941,15 @@ class Session:
         self._pending_retain = None
         self._input_mode_entered = False  # Allow re-entry to input mode
 
+    def resume_input_mode(self) -> None:
+        """Re-enter input mode after a non-query action (errors, cancellation, etc.)
+        consumed the input. Idempotent: bails if already in input mode or working.
+        """
+        if self.working or not self.output:
+            return
+        self._input_mode_entered = False
+        sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+
     def _enter_input_with_draft(self) -> None:
         """Enter input mode and restore draft with cursor at end."""
         # Skip if already in input mode or session is working
