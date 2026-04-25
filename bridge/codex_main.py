@@ -127,12 +127,15 @@ class CodexBridge(BaseBridge):
                 cmd.extend(["-c", c])
 
         log(f"Starting: {' '.join(cmd)}")
+        # 1GB buffer to handle large codex responses on resume (default 64KB
+        # overflowed with "Separator is found, but chunk is longer than limit")
         self.codex_proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            limit=1024 * 1024 * 1024,
         )
 
     async def send_to_codex(self, msg: dict) -> None:
