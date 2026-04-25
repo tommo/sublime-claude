@@ -18,6 +18,7 @@ except ImportError:
 
 
 from rpc_helpers import send, send_error, send_result, send_notification
+from base import BaseBridge
 
 # ── Logging: stderr → plugin console; also append to shared bridge log file ──
 from pathlib import Path as _Path
@@ -40,44 +41,22 @@ def log(msg):
             pass  # benign: file logging is best-effort
 
 
-class CopilotBridge:
+class CopilotBridge(BaseBridge):
+    BACKEND_NAME = "copilot"
+
     def __init__(self):
+        super().__init__()
         self.client = None
         self.session = None
-        self.running = True
         self.session_id = None
-        self._query_req_id = None
         self._turn_start_time = 0
         self._session_config = {}
         self.permission_counter = 0
-        self.pending_permissions = {}
-        self.pending_questions = {}
         self._got_first_delta = False
         self._perm_data_cache = {}  # toolCallId → extra tool_input from permission
 
-    async def handle_request(self, req: dict) -> None:
-        method = req.get("method")
-        params = req.get("params", {})
-        req_id = req.get("id")
-
-        try:
-            if method == "initialize":
-                await self.handle_initialize(req_id, params)
-            elif method == "query":
-                await self.handle_query(req_id, params)
-            elif method == "interrupt":
-                await self.handle_interrupt(req_id)
-            elif method == "permission_response":
-                await self.handle_permission_response(req_id, params)
-            elif method == "question_response":
-                await self.handle_question_response(req_id, params)
-            elif method == "shutdown":
-                await self.handle_shutdown(req_id)
-            else:
-                send_error(req_id, -32601, f"Unknown method: {method}")
-        except Exception as e:
-            log(f"Error handling {method}: {e}")
-            send_error(req_id, -32000, str(e))
+    def log(self, msg):  # type: ignore[override]
+        log(msg)  # delegate to module-level log() which also writes to file
 
     async def handle_initialize(self, req_id: int, params: dict) -> None:
         from copilot import CopilotClient, PermissionHandler
@@ -181,7 +160,7 @@ class CopilotBridge:
 
         await self.session.send(message_opts)
 
-    async def handle_interrupt(self, req_id: int) -> None:
+    async def handle_interrupt(self, req_id, params=None) -> None:
         if self.session:
             try:
                 await self.session.abort()
@@ -194,26 +173,7 @@ class CopilotBridge:
         # Also respond to the interrupt RPC itself
         send_result(req_id, {"status": "interrupted"})
 
-    async def handle_permission_response(self, req_id: int, params: dict) -> None:
-        perm_id = params.get("id")
-        allow = params.get("allow", False)
-        future = self.pending_permissions.pop(perm_id, None)
-        if future and not future.done():
-            if allow:
-                future.set_result({"kind": "approved"})
-            else:
-                future.set_result({"kind": "denied-interactively-by-user"})
-        send_result(req_id, {"ok": True})
-
-    async def handle_question_response(self, req_id: int, params: dict) -> None:
-        q_id = params.get("id")
-        answers = params.get("answers")
-        future = self.pending_questions.pop(q_id, None)
-        if future and not future.done():
-            future.set_result(answers)
-        send_result(req_id, {"ok": True})
-
-    async def handle_shutdown(self, req_id: int) -> None:
+    async def handle_shutdown(self, req_id, params=None) -> None:
         self.running = False
         if self.session:
             try:
@@ -398,24 +358,7 @@ class CopilotBridge:
 async def main():
     bridge = CopilotBridge()
     log("Bridge started")
-
-    # Read JSON-RPC from stdin (1GB limit to match Claude bridge)
-    reader = asyncio.StreamReader(limit=1024 * 1024 * 1024)
-    protocol = asyncio.StreamReaderProtocol(reader)
-    await asyncio.get_running_loop().connect_read_pipe(lambda: protocol, sys.stdin)
-
-    while bridge.running:
-        try:
-            line = await reader.readline()
-            if not line:
-                break
-            req = json.loads(line.decode().strip())
-            await bridge.handle_request(req)
-        except json.JSONDecodeError:
-            continue
-        except Exception as e:
-            log(f"Main loop error: {e}")
-
+    await bridge.run_stdin_loop()
     log("Bridge stopped")
 
 

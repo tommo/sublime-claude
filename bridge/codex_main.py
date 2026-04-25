@@ -36,6 +36,7 @@ def log(msg: str) -> None:
 
 
 from rpc_helpers import send, send_error, send_result, send_notification
+from base import BaseBridge
 
 
 # ── Command → Tool Conversions ──────────────────────────────────────────
@@ -86,27 +87,34 @@ def _detect_read_command(cmd: str) -> Optional[dict]:
 
 # ── Codex Bridge ────────────────────────────────────────────────────────
 
-class CodexBridge:
+class CodexBridge(BaseBridge):
+    BACKEND_NAME = "codex"
+
     def __init__(self):
+        super().__init__()
         self.codex_proc: Optional[asyncio.subprocess.Process] = None
-        self.running = True
         self.thread_id: Optional[str] = None
         self.turn_id: Optional[str] = None
         self.session_id: Optional[str] = None
         self.codex_request_counter = 1
 
         # Map our permission_id → codex server-request id
+        # NOTE: pending_approvals stores codex request IDs (int), not Futures —
+        # different from the BaseBridge default. We override the handlers below.
         self.pending_approvals: dict[int, Any] = {}
-        self.pending_questions: dict[int, Any] = {}
+        # Override pending_questions too (BaseBridge uses Future, we use ids)
+        self.pending_questions = {}
         self.permission_counter = 0
 
         # Track turn timing
         self._turn_start_time: float = 0
-        self._query_req_id: Optional[int] = None
         self._last_usage: Optional[dict] = None
 
         # Accumulate command output from outputDelta events
         self._command_output: dict[str, list[str]] = {}
+
+    def log(self, msg):  # type: ignore[override]
+        log(msg)  # delegate to module-level log() which also writes to file
 
     # ── Codex subprocess management ─────────────────────────────────
 
@@ -155,30 +163,7 @@ class CodexBridge:
 
     # ── Handle requests from Sublime ────────────────────────────────
 
-    async def handle_sublime_request(self, req: dict) -> None:
-        """Route a JSON-RPC request from Sublime."""
-        method = req.get("method")
-        params = req.get("params", {})
-        req_id = req.get("id")
-
-        try:
-            if method == "initialize":
-                await self.handle_initialize(req_id, params)
-            elif method == "query":
-                await self.handle_query(req_id, params)
-            elif method == "interrupt":
-                await self.handle_interrupt(req_id)
-            elif method == "permission_response":
-                await self.handle_permission_response(req_id, params)
-            elif method == "question_response":
-                await self.handle_question_response(req_id, params)
-            elif method == "shutdown":
-                await self.handle_shutdown(req_id)
-            else:
-                send_error(req_id, -32601, f"Unknown method: {method}")
-        except Exception as e:
-            log(f"Error handling {method}: {e}")
-            send_error(req_id, -32000, str(e))
+    # Dispatch handled by BaseBridge.handle_request via _dispatch_table
 
     async def handle_initialize(self, req_id: int, params: dict) -> None:
         """Initialize: spawn codex app-server, create thread."""
@@ -312,7 +297,7 @@ class CodexBridge:
             "input": user_input,
         })
 
-    async def handle_interrupt(self, req_id: int) -> None:
+    async def handle_interrupt(self, req_id, params=None) -> None:
         """Interrupt current turn."""
         if self.thread_id and self.turn_id:
             await self.codex_request("turn/interrupt", {
@@ -325,8 +310,8 @@ class CodexBridge:
             self._query_req_id = None
         send_result(req_id, {"status": "interrupted"})
 
-    async def handle_permission_response(self, req_id: int, params: dict) -> None:
-        """Forward permission response to codex."""
+    async def _handle_permission_response(self, req_id, params: dict) -> None:
+        """Override BaseBridge: forward permission response to codex (not Future-based)."""
         perm_id = params.get("id")
         allow = params.get("allow", False)
 
@@ -335,16 +320,12 @@ class CodexBridge:
             send_result(req_id, {"ok": False, "error": "No pending approval"})
             return
 
-        if allow:
-            decision = "accept"
-        else:
-            decision = "decline"
-
+        decision = "accept" if allow else "decline"
         await self.codex_respond(codex_req_id, {"decision": decision})
         send_result(req_id, {"ok": True})
 
-    async def handle_question_response(self, req_id: int, params: dict) -> None:
-        """Forward question response to codex."""
+    async def _handle_question_response(self, req_id, params: dict) -> None:
+        """Override BaseBridge: forward question response to codex (not Future-based)."""
         q_id = params.get("id")
         answers = params.get("answers", {})
 
@@ -354,14 +335,11 @@ class CodexBridge:
             return
 
         # Translate to codex format: {questionId: {answers: [str]}}
-        codex_answers = {}
-        for k, v in answers.items():
-            codex_answers[k] = {"answers": [v] if isinstance(v, str) else v}
-
+        codex_answers = {k: {"answers": [v] if isinstance(v, str) else v} for k, v in answers.items()}
         await self.codex_respond(codex_req_id, {"answers": codex_answers})
         send_result(req_id, {"ok": True})
 
-    async def handle_shutdown(self, req_id: int) -> None:
+    async def handle_shutdown(self, req_id, params=None) -> None:
         """Shut down codex process."""
         self.running = False
         if self.codex_proc:
@@ -677,7 +655,7 @@ class CodexBridge:
                 if not line:
                     break
                 req = json.loads(line.decode())
-                asyncio.create_task(self.handle_sublime_request(req))
+                asyncio.create_task(self.handle_request(req))
             except json.JSONDecodeError as e:
                 send_error(None, -32700, f"Parse error: {e}")
             except Exception as e:
