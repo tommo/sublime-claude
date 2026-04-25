@@ -35,8 +35,9 @@ DEFAULT_MODELS = {
         ["o3", "O3"],
     ],
     "deepseek": [
-        ["deepseek-v4-pro", "DeepSeek V4 Pro"],
-        ["deepseek-v4-flash", "DeepSeek V4 Flash"],
+        ["opus", "Opus → V4 Pro (1M)"],
+        ["sonnet", "Sonnet → V4 Pro"],
+        ["haiku", "Haiku → V4 Flash"],
     ],
 }
 
@@ -937,11 +938,11 @@ class ClaudeCodeViewHistoryCommand(sublime_plugin.WindowCommand):
         # Build quick panel items
         items = []
         for s in sessions:
-            name = s.get("name", "Unnamed")[:40]
-            sid = s.get("session_id", "")[:8]
-            cost = s.get("total_cost", 0)
-            queries = s.get("query_count", 0)
-            project = os.path.basename(s.get("project", ""))
+            name = (s.get("name") or "Unnamed")[:40]
+            sid = (s.get("session_id") or "")[:8]
+            cost = s.get("total_cost") or 0
+            queries = s.get("query_count") or 0
+            project = os.path.basename(s.get("project") or "")
             items.append([f"{name}", f"{project} | {queries} queries | ${cost:.2f} | {sid}..."])
 
         def on_select(idx: int) -> None:

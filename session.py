@@ -149,7 +149,7 @@ class Session:
 
         # Resolve virtual model ID (e.g. @400k suffix) → real model + context limit
         default_models = settings.get("default_models", {})
-        _backend_fallback_models = {"deepseek": "deepseek-v4-pro", "codex": "gpt-5.5"}
+        _backend_fallback_models = {"deepseek": "opus", "codex": "gpt-5.5"}
         default_model = default_models.get(self.backend) or _backend_fallback_models.get(self.backend) or settings.get("default_model")
         model_for_env = (self.profile.get("model") if self.profile else None) or default_model
         if model_for_env:
@@ -160,12 +160,16 @@ class Session:
         # Sync sublime project retain content to file for hook
         self._sync_project_retain()
 
-        # DeepSeek uses the Claude bridge with Anthropic-compatible endpoint
+        # DeepSeek uses the Claude bridge with Anthropic-compatible endpoint.
+        # Claude model IDs (opus/sonnet/haiku) are mapped server-side via env vars.
         if self.backend == "deepseek":
             ds_key = settings.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY", "")
             env["ANTHROPIC_BASE_URL"] = "https://api.deepseek.com/anthropic"
             if ds_key:
                 env["ANTHROPIC_AUTH_TOKEN"] = ds_key
+            env.setdefault("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro[1m]")
+            env.setdefault("ANTHROPIC_DEFAULT_SONNET_MODEL", "deepseek-v4-pro")
+            env.setdefault("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-v4-flash")
             env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
             env.setdefault("CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK", "1")
 
