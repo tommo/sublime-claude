@@ -590,8 +590,13 @@ class OutputView:
                 self.current.working = False
                 self._render_current()
             self.conversations.append(self.current)
-            if len(self.conversations) > 20:
-                self.conversations = self.conversations[-20:]
+            # Cap conversation history (memory bound). Print a hint when truncating
+            # so users know history is being dropped (was previously silent).
+            HISTORY_CAP = 20
+            if len(self.conversations) > HISTORY_CAP:
+                dropped = len(self.conversations) - HISTORY_CAP
+                print(f"[Claude] conversation history capped: dropped {dropped} oldest turn(s)")
+                self.conversations = self.conversations[-HISTORY_CAP:]
             # Carry todos forward only if not all completed
             if not self.current.todos_all_done:
                 prev_todos = self.current.todos
