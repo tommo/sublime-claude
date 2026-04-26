@@ -114,7 +114,9 @@ BACKENDS: Dict[str, BackendSpec] = {
         theme="Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
         default_models=[
             ("claude-sonnet-4-6", "Sonnet 4.6"),
-            ("claude-opus-4-6", "Opus 4.6"),
+            ("claude-opus-4-7", "Opus 4.7"),
+            ("gpt-5.5", "GPT-5.5"),
+            ("gpt-5.4", "GPT-5.4"),
             ("gpt-5.3-codex", "GPT-5.3 Codex"),
             ("gpt-5-mini", "GPT-5 Mini (free)"),
         ],

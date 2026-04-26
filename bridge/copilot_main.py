@@ -68,7 +68,7 @@ class CopilotBridge(BaseBridge):
         resume_id = params.get("resume")
 
         # Map Claude model names to Copilot models
-        model_map = {"opus": "claude-opus-4-6", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5"}
+        model_map = {"opus": "claude-opus-4-7", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5"}
         model = model_map.get(model, model)
 
         self.client = CopilotClient()
