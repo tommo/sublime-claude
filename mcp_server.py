@@ -837,6 +837,15 @@ class MCPSocketServer:
                 caller_session = get_active_session(window)
             current_session = caller_session
             if current_session and current_session.session_id:
+                # Session IDs aren't portable across backends — codex thread IDs
+                # can't be resumed by the Claude bridge, etc. Only allow fork
+                # within the same backend family (claude+deepseek share the Claude
+                # bridge's local storage, but codex/copilot live in their own).
+                same_family = current_session.backend == backend or (
+                    current_session.backend in ("claude", "deepseek") and backend in ("claude", "deepseek")
+                )
+                if not same_family:
+                    return {"error": f"Cannot fork {current_session.backend!r} session into {backend!r} backend; session IDs are not portable. Spawn fresh (fork_current=False)."}
                 resume_id = current_session.session_id
                 fork = True
             else:
