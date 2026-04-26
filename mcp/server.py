@@ -174,7 +174,7 @@ def handle_request(request: dict) -> dict:
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
                             "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
-                            "backend": {"type": "string", "enum": ["claude", "codex", "copilot"], "description": "Optional: backend to use (default: claude)"},
+                            "backend": {"type": "string", "enum": ["claude", "codex", "copilot", "deepseek"], "description": "Optional: backend to use (default: claude)"},
                             "fork_current": {"type": "boolean", "description": "Optional: fork from the current session (preserves conversation history). Default: false"},
                             "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },
