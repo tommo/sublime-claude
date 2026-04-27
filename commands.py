@@ -480,6 +480,12 @@ class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
         s = get_active_session(self.window)
         if s:
             s.output.clear()
+            # Refresh status bar so loop banner / context tokens remain visible
+            s._update_status_bar()
+            # Re-render the pending-context indicator if any (Session-level state
+            # survives clear, but the view region was reset and needs re-write)
+            if s.context.items:
+                s.output.set_pending_context(s.context.items)
 
 
 class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
