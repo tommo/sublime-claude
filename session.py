@@ -155,6 +155,13 @@ class Session:
             if ctx:
                 env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx)
 
+        # Diagnostic: log resolved spawn config (subsession-vs-standalone matters here)
+        _is_subsession = bool(getattr(self, "subsession_id", None))
+        print(f"[Claude session] backend={self.backend} bridge={spec.bridge_script} "
+              f"subsession={'yes' if _is_subsession else 'no'} "
+              f"resume={self.resume_id!r} fork={self.fork} "
+              f"default_model={default_model!r} model_for_env={model_for_env!r}")
+
         # Sync sublime project retain content to file for hook
         self._sync_project_retain()
 
@@ -168,6 +175,13 @@ class Session:
             env.update(overwrite)
             for k, v in defaults.items():
                 env.setdefault(k, v)
+            # Diagnostic: which env vars the bridge will receive (mask secrets)
+            def _mask(k, v):
+                if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                    return f"<set:{len(str(v))}b>" if v else "<empty>"
+                return v
+            shown = {k: _mask(k, v) for k, v in env.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "DEEPSEEK_"))}
+            print(f"[Claude session] env (masked) for {self.backend}: {shown}")
 
         bridge_script = os.path.join(os.path.dirname(__file__), "bridge", spec.bridge_script)
         self.client = JsonRpcClient(self._on_notification)

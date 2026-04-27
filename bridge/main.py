@@ -188,6 +188,20 @@ class Bridge:
         _logger.info(f"  mcp_servers={list(mcp_servers.keys()) if mcp_servers else None}")
         _logger.info(f"  agents={list(agents.keys()) if agents else None}")
         _logger.info(f"  plugins={plugins}")
+        _logger.info(f"  subsession_id={params.get('subsession_id')}")
+        # Diagnostic: log relevant env (masked) so we know what the bridge subprocess
+        # actually inherited. Helps diagnose deepseek subsession issues.
+        def _mask_env(k, v):
+            if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                return f"<set:{len(v)}b>" if v else "<empty>"
+            return v
+        env_view = {k: _mask_env(k, os.environ.get(k, "")) for k in
+                    ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                     "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                     "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK")}
+        _logger.info(f"  env (masked) = {env_view}")
 
         # Build system prompt with project addon
         system_prompt = params.get("system_prompt", "")
@@ -277,9 +291,14 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         self.client = ClaudeSDKClient(options=self.options)
 
         try:
+            _logger.info(f"  connecting SDK with model={options_dict.get('model')!r} "
+                         f"resume={options_dict.get('resume')!r} "
+                         f"extra_args={options_dict.get('extra_args')}")
             await self.client.connect()
+            _logger.info("  SDK connect OK")
         except Exception as e:
             error_msg = str(e)
+            _logger.error(f"SDK connect FAILED: {type(e).__name__}: {error_msg}")
 
             # If session not found or command failed during resume, retry without resume
             # The SDK wraps the actual error, so we check for common patterns
