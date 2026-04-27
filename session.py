@@ -1093,17 +1093,32 @@ class Session:
         base = re.sub(r'^(?:CX|DS|CP)(?:>|:)\s*', '', base) or "Claude"
         return base
 
-    def sleep(self) -> None:
-        """Put session to sleep — kill bridge, keep view."""
+    def sleep(self, force: bool = False) -> bool:
+        """Put session to sleep — kill bridge, keep view.
+
+        Returns True if the session was put to sleep, False if refused.
+        Refuses (returns False) when background tools are running unless
+        force=True. Caller can re-invoke with force=True to abort + sleep.
+        """
         if not self.session_id:
-            return
+            return False
         if self.working:
             self.interrupt()
             sublime.set_timeout(self.sleep, 500)
-            return
+            return False
+        # Refuse to sleep if background processes are alive — they'd be killed
+        # silently with the bridge subprocess. force=True overrides.
+        if not force and self.output:
+            bg = self.output.active_background_tools()
+            if bg:
+                names = ", ".join(t.name for t in bg[:3])
+                more = f" (+{len(bg) - 3} more)" if len(bg) > 3 else ""
+                msg = f"refusing to sleep: {len(bg)} background tool(s) running: {names}{more}"
+                print(f"[Claude] {msg}")
+                sublime.status_message(f"Claude: {msg}")
+                return False
         self.stop_loop(silent=True)
-        # Background tools live in the bridge subprocess; killing it orphans them.
-        # Mark them as error in the UI so they don't display as still-running zombies.
+        # If we got here with force=True and bg tools, abort their UI state.
         self._abort_background_tools(reason="session slept")
         # Clear pending background-task ID map; bridge restart loses these mappings.
         self._task_tool_map.clear()
@@ -1114,6 +1129,7 @@ class Session:
         self.initialized = False
         self._persist_state("sleeping")
         self._apply_sleep_ui()
+        return True
 
     def _abort_background_tools(self, reason: str) -> None:
         """Mark all in-flight background tools as errored (their subprocess is gone)."""
@@ -1188,12 +1204,16 @@ class Session:
         self._show_overlay_phantom("◎ Connecting...")
 
     def restart(self) -> None:
-        """Restart session — sleep then immediately wake."""
+        """Restart session — sleep then immediately wake.
+
+        Restart is an explicit user action (typically used to fix a stuck
+        session), so background tools are aborted via force=True.
+        """
         def do_wake():
             if self.output and self.output.view and self.output.view.settings().get("claude_sleeping"):
                 self.wake()
-        self.sleep()
-        sublime.set_timeout(do_wake, 600)
+        if self.sleep(force=True):
+            sublime.set_timeout(do_wake, 600)
 
     def wake(self) -> None:
         """Wake a sleeping session — re-spawn bridge with resume."""
