@@ -40,11 +40,24 @@ def _deepseek_dynamic_env(settings: dict) -> Tuple[Dict[str, str], Dict[str, str
     Returns (overwrite_env, default_env). The endpoint and auth token MUST point
     to DeepSeek for this backend to work, so they're in overwrite. Model aliases
     and disable-nonessential are defaults so users can override in settings.
+
+    Also forcibly clears ANTHROPIC_API_KEY in overwrite — if it leaked from the
+    parent process (e.g. a developer who exports their Anthropic key in shell rc),
+    the SDK would prefer it over ANTHROPIC_AUTH_TOKEN and send Anthropic creds to
+    api.deepseek.com, which DeepSeek would reject with 401.
     """
     api_key = settings.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY", "")
-    overwrite = {"ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic"}
+    overwrite = {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        # Empty string explicitly unsets it for the child process
+        "ANTHROPIC_API_KEY": "",
+    }
     if api_key:
         overwrite["ANTHROPIC_AUTH_TOKEN"] = api_key
+    else:
+        print("[Claude] WARNING: deepseek backend has no API key set "
+              "(settings.deepseek_api_key or DEEPSEEK_API_KEY env var). "
+              "Requests will likely fail with 401.")
     defaults = {
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
         "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro",
