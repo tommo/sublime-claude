@@ -1052,6 +1052,8 @@ class Session:
     def stop(self) -> None:
         # Persist closed state before cleanup
         self.stop_loop(silent=True)
+        self._abort_background_tools(reason="session stopped")
+        self._task_tool_map.clear()
         self._persist_state("closed")
 
         # Clean up terminal mode if active
@@ -1100,6 +1102,11 @@ class Session:
             sublime.set_timeout(self.sleep, 500)
             return
         self.stop_loop(silent=True)
+        # Background tools live in the bridge subprocess; killing it orphans them.
+        # Mark them as error in the UI so they don't display as still-running zombies.
+        self._abort_background_tools(reason="session slept")
+        # Clear pending background-task ID map; bridge restart loses these mappings.
+        self._task_tool_map.clear()
         if self.client:
             client = self.client
             self.client = None
@@ -1107,6 +1114,23 @@ class Session:
         self.initialized = False
         self._persist_state("sleeping")
         self._apply_sleep_ui()
+
+    def _abort_background_tools(self, reason: str) -> None:
+        """Mark all in-flight background tools as errored (their subprocess is gone)."""
+        if not self.output:
+            return
+        try:
+            from .output import BACKGROUND, ERROR
+            bg = self.output.active_background_tools()
+            for tool in bg:
+                old_status = tool.status
+                tool.status = ERROR
+                tool.result = f"(aborted: {reason})"
+                self.output._patch_tool_symbol(tool, old_status)
+            if bg:
+                print(f"[Claude] aborted {len(bg)} background tool(s): {reason}")
+        except Exception as e:
+            print(f"[Claude] _abort_background_tools error: {e}")
 
     def _apply_sleep_ui(self) -> None:
         """Apply sleeping state to view UI."""
