@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>name</key>
+    <string>Symbol List: Claude Prompt</string>
+    <key>scope</key>
+    <string>text.claude claude.prompt</string>
+    <key>settings</key>
+    <dict>
+        <!-- Show prompts in Goto Symbol (Cmd+R) for the session output view. -->
+        <key>showInSymbolList</key>
+        <integer>1</integer>
+        <!-- Display transform: keep first line only, strip trailing " ▶",
+             prefix with "◎ " so the symbol panel shows the prompt as the
+             user typed it. Sed-like substitutions, run in order. -->
+        <key>symbolTransformation</key>
+        <string>s/\n.*//g; s/ ▶$//g; s/^/◎ /g</string>
+    </dict>
+    <key>uuid</key>
+    <string>3a7f1c2e-8b4d-4f10-9bc1-claudeprompts</string>
+</dict>
+</plist>
