@@ -271,7 +271,9 @@ class CodexBridge(BaseBridge):
     async def handle_query(self, req_id: int, params: dict) -> None:
         """Start a turn with the given prompt."""
         prompt = params.get("prompt", "")
+        log(f"handle_query: req_id={req_id} prompt={prompt[:80]!r} thread_id={self.thread_id}")
         if not self.thread_id:
+            log("handle_query: NO ACTIVE THREAD — sending error back")
             send_error(req_id, -32000, "No active thread")
             return
 

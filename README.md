@@ -480,3 +480,5 @@ Both bridges emit identical JSON-RPC notifications to Sublime, so the output vie
 ## License
 
 VCL (Vibe-Coded License) - see LICENSE
+
+The embedded terminal (`terminal/`) is adapted from [Terminus](https://github.com/randy3k/Terminus) by Randy Lai, used under the MIT License — see `terminal/LICENSE_TERMINUS`.

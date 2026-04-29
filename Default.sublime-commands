@@ -201,5 +201,9 @@
     {
         "caption": "Claude: Wake Session",
         "command": "claude_wake_session"
+    },
+    {
+        "caption": "Claude: Open Terminal",
+        "command": "claude_terminal_open"
     }
 ]

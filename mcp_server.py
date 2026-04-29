@@ -169,18 +169,34 @@ class MCPSocketServer:
                 eval_result.pop("_wait_for_init")
 
                 # Wait for initialization (in this background thread, not main thread)
-                import time
                 max_wait = 30
                 start = time.time()
+                vid = session.output.view.id() if session.output and session.output.view else "?"
+                print(f"[MCP spawn:{vid}] waiting for init (backend={session.backend})...")
                 while not session.initialized and time.time() - start < max_wait:
                     time.sleep(0.1)
 
                 if not session.initialized:
+                    elapsed = time.time() - start
+                    print(f"[MCP spawn:{vid}] INIT TIMEOUT after {elapsed:.1f}s — prompt will be DROPPED. "
+                          f"client_alive={session.client.is_alive() if session.client else False} "
+                          f"session_id={session.session_id!r}")
                     eval_result["error"] = "Session failed to initialize within 30 seconds"
                 else:
+                    elapsed = time.time() - start
+                    print(f"[MCP spawn:{vid}] init OK in {elapsed:.1f}s — scheduling initial prompt "
+                          f"(working={session.working}, client_alive={session.client.is_alive() if session.client else False})")
                     # Send the prompt from main thread
-                    def send_prompt():
-                        session.query(prompt)
+                    def send_prompt(_vid=vid, _prompt=prompt, _session=session):
+                        try:
+                            print(f"[MCP spawn:{_vid}] firing initial prompt "
+                                  f"(working={_session.working}, initialized={_session.initialized}, "
+                                  f"client_alive={_session.client.is_alive() if _session.client else False}): "
+                                  f"{_prompt[:80]!r}")
+                            _session.query(_prompt)
+                            print(f"[MCP spawn:{_vid}] query() returned (working now={_session.working})")
+                        except Exception as e:
+                            print(f"[MCP spawn:{_vid}] query() RAISED: {type(e).__name__}: {e}")
                     sublime.set_timeout(send_prompt, 0)
 
                     # Optionally wait for completion
@@ -194,77 +210,54 @@ class MCPSocketServer:
                     eval_result["working"] = session.working
                     eval_result["initialized"] = True
 
-            # Handle terminus_run wait - poll for completion marker
+            # Handle terminal_run blocking wait — event-based, no view polling
             eval_result = result.get("result")
-            if isinstance(eval_result, dict) and eval_result.get("_wait_requested"):
-                wait_secs = eval_result.pop("_wait_requested")
-                wait_tag = eval_result.pop("_wait_tag")
-                opened_new = eval_result.pop("_wait_opened_new", False)
-                markers = eval_result.pop("_wait_markers", {})
+            if isinstance(eval_result, dict) and eval_result.get("_wait_terminal"):
+                from .terminal.terminal import Terminal
+                _tag = eval_result.pop("_wait_tag")
+                _cmd = eval_result.pop("_wait_cmd")
+                _secs = eval_result.pop("_wait_secs")
+                _wid = eval_result.pop("_wait_window_id", None)
+                eval_result.pop("_wait_terminal")
 
-                # Initial delay for terminal to start
-                # New terminals need more time: open view + start shell + post_hooks + command start
-                startup_delay_ms = 3000 if opened_new else 200
+                # Get terminal or open a new one
+                _terminal = Terminal.from_tag(_tag)
+                _opened_new = _terminal is None
+                if _opened_new:
+                    def _do_open():
+                        for _w in sublime.windows():
+                            if _w.id() == _wid:
+                                _w.run_command("claude_terminal_open", {"tag": _tag})
+                                return
+                        sublime.active_window().run_command("claude_terminal_open", {"tag": _tag})
+                    sublime.set_timeout(_do_open, 0)
 
-                # Unique markers for this command
-                start_marker = markers.get("start", ":::CLAUDE_CMD_START:::")
-                end_marker = markers.get("end", ":::CLAUDE_CMD_DONE:::")
+                    _dl = time.time() + 5.0
+                    while time.time() < _dl:
+                        _terminal = Terminal.from_tag(_tag)
+                        if _terminal:
+                            break
+                        time.sleep(0.2)
 
-                read_result = {"result": None}
-                read_done = threading.Event()
-                poll_count = [0]
-                max_polls = int(wait_secs * 4)  # Poll every 250ms
-
-                def extract_output(content):
-                    """Extract only the output between start and end markers."""
-                    # Find last occurrence of start marker (in case of multiple commands)
-                    start_idx = content.rfind(start_marker)
-                    if start_idx != -1:
-                        content = content[start_idx + len(start_marker):]
-                    # Remove end marker
-                    content = content.replace(end_marker, "")
-                    return content.strip()
-
-                def do_poll():
-                    try:
-                        data = self._terminus_read(wait_tag, 200)  # Read more lines
-                        content = data.get("content", "")
-                        poll_count[0] += 1
-
-                        # Check for our completion marker
-                        if end_marker in content or poll_count[0] >= max_polls:
-                            # Wait a bit more for buffer to settle, then read final output
-                            def do_final_read():
-                                final_data = self._terminus_read(wait_tag, 200)
-                                final_content = final_data.get("content", "")
-                                # Extract only output between markers
-                                clean_content = extract_output(final_content)
-                                final_data["content"] = clean_content
-                                read_result["result"] = final_data
-                                read_done.set()
-                            sublime.set_timeout(do_final_read, 100)  # 100ms settle time
-                        else:
-                            # Poll again in 250ms
-                            sublime.set_timeout(do_poll, 250)
-                    except Exception as e:
-                        read_result["result"] = {"error": str(e)}
-                        read_done.set()
-
-                # Start polling after startup delay
-                sublime.set_timeout(do_poll, startup_delay_ms)
-                # Wait for completion (with buffer)
-                read_done.wait(timeout=wait_secs + 5)
-
-                read_data = read_result.get("result", {})
-                if read_data.get("error"):
-                    eval_result["read_error"] = read_data["error"]
+                if not _terminal:
+                    eval_result["error"] = "Terminal failed to open"
                 else:
-                    eval_result["output"] = read_data.get("content", "")
-                    eval_result["total_lines"] = read_data.get("total_lines", 0)
+                    if _opened_new:
+                        time.sleep(3.5)  # shell startup
+
+                    _terminal.start_capture()
+                    _terminal.send_string(_cmd)
+                    _timed_out = not _terminal._capture_event.wait(timeout=_secs)
+                    _output, _timed_out = _terminal.stop_capture()
+                    eval_result["output"] = _output
+                    if _timed_out:
+                        eval_result["timed_out"] = True
 
             conn.sendall((json.dumps(result) + "\n").encode())
 
         except Exception as e:
+            import traceback
+            print(f"[Claude MCP] _handle_connection error: {e}\n{traceback.format_exc()}")
             try:
                 conn.sendall((json.dumps({"error": str(e)}) + "\n").encode())
             except:
@@ -321,7 +314,7 @@ class MCPSocketServer:
             "get_symbols": self._get_symbols,
             "goto_symbol": self._goto_symbol,
             "read_view": self._read_view,
-            "terminus_run": self._terminus_run,
+            "terminal_run": self._terminal_run,
             "list_tools": self._list_tools,
             # Session tools
             "list_profiles": self._list_profiles,
@@ -332,11 +325,11 @@ class MCPSocketServer:
             "read_session_output": self._read_session_output,
             "list_profile_docs": self._list_profile_docs,
             "read_profile_doc": self._read_profile_doc,
-            # Terminus tools
-            "terminus_list": self._terminus_list,
-            "terminus_send": self._terminus_send,
-            "terminus_read": self._terminus_read,
-            "terminus_close": self._terminus_close,
+            # Terminal tools (our own PTY terminal)
+            "terminal_list": self._terminal_list,
+            "terminal_send": self._terminal_send,
+            "terminal_read": self._terminal_read,
+            "terminal_close": self._terminal_close,
             # Notification tools (notalone2)
             "register_notification": self._register_notification,
             "subscribe_to_service": self._subscribe_to_service,
@@ -1086,260 +1079,98 @@ class MCPSocketServer:
         except Exception as e:
             return {"error": f"Failed to read {path}: {str(e)}"}
 
-    # ─── Terminus Tools ───────────────────────────────────────────────────
+    # ─── Terminal Tools (embedded PTY terminal) ───────────────────────────
 
-    def _terminus_list(self) -> list:
-        """List all Terminus terminal views in the current window."""
+    def _resolve_terminal_tag(self, tag: str = None, target_id: str = None) -> str:
+        if target_id:
+            return f"claude-agent-{target_id}"
+        if tag:
+            return tag
         window = self._get_window()
-        if not window:
-            return []
+        active_view_id = window.settings().get("claude_active_view") if window else None
+        if active_view_id and active_view_id in sublime._claude_sessions:
+            return f"claude-agent-{active_view_id}"
+        return f"claude-agent-{window.id() if window else 0}"
 
+    def _terminal_list(self) -> list:
+        from .terminal.terminal import Terminal
+        import re
         result = []
-        for view in window.views():
-            if view.settings().get("terminus_view"):
-                tag = view.settings().get("terminus_view.tag", "")
-                title = view.name() or "(unnamed)"
-                result.append({
-                    "view_id": view.id(),
-                    "tag": tag,
-                    "title": title,
-                })
+        for t in Terminal.list_all():
+            alive = t.is_alive()
+            state = "exited"
+            if alive:
+                content = "".join(
+                    "".join(t.screen.buffer[row][col].data
+                            for col in sorted(t.screen.buffer[row].keys()))
+                    for row in range(t.screen.lines)
+                )
+                last = next((l for l in reversed(content.splitlines()) if l.strip()), "")
+                state = "idle" if re.search(r'[$%#>❯]\s*$', last) else "running"
+            result.append({
+                "tag": t.tag,
+                "view_id": t.view.id() if t.view else None,
+                "title": t.view.name() if t.view else "(unnamed)",
+                "state": state,
+            })
         return result
 
-    def _terminus_run(self, command: str, tag: str = None, wait: float = 30, target_id: str = None) -> dict:
-        """Run command in terminal, block until done and return output.
-
-        Args:
-            command: Command to run (newline appended if missing)
-            tag: Terminal tag (default: claude-agent)
-            wait: Max seconds to wait for output (default 30, 0 = fire and forget)
-            target_id: Optional terminal ID for sharing across sessions
-        """
-        # Priority: target_id > tag > session-specific default
-        if target_id:
-            tag = f"claude-agent-{target_id}"
-        elif not tag:
-            # Default tag uses active Claude session's view ID for isolation
-            # Each session gets its own terminal to avoid state pollution
-            from . import core
-            window = self._get_window()
-            # Find active session via window's active view setting
-            active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in sublime._claude_sessions:
-                session = sublime._claude_sessions[active_view_id]
-                tag = f"claude-agent-{active_view_id}"
-            else:
-                # Fallback to window ID if no session
-                window_id = window.id() if window else 0
-                tag = f"claude-agent-{window_id}"
-
-        # If wait requested, wrap command with unique start/end markers
-        # Unique ID prevents collision when multiple commands run in same terminal
-        import uuid
-        cmd_id = uuid.uuid4().hex[:8]
-        start_marker = f":::CLAUDE_CMD_START_{cmd_id}:::"
-        end_marker = f":::CLAUDE_CMD_DONE_{cmd_id}:::"
-        if wait and wait > 0:
-            # Echo start marker, run in subshell, echo end marker
-            cmd = command.rstrip('\n')
-            command = f"echo '{start_marker}'; ( {cmd} ); echo '{end_marker}'\n"
-            # Store markers for polling
-            result_markers = {"start": start_marker, "end": end_marker}
-
-        # Send the command (tag already resolved, don't pass target_id again)
-        result = self._terminus_send(command, tag)
-
-        if result.get("error"):
-            return result
-
-        # If we opened a new terminal, we need extra startup time
-        opened_new = result.get("opened_new", False)
-
-        # Flag for caller to handle wait on background thread
-        if wait and wait > 0:
-            result["_wait_requested"] = wait
-            result["_wait_tag"] = tag
-            result["_wait_opened_new"] = opened_new
-            result["_wait_markers"] = result_markers
-
-        return result
-
-    def _terminus_send(self, text: str, tag: str = None, target_id: str = None) -> dict:
-        """Send text/command to a Terminus terminal.
-
-        If no tag specified, uses "claude-agent-{window_id}" tag to keep agent commands
-        in a dedicated terminal per window (won't hijack user's terminals).
-        """
+    def _terminal_run(self, command: str, tag: str = None, wait: float = 30, target_id: str = None) -> dict:
+        tag = self._resolve_terminal_tag(tag, target_id)
+        cmd = command.rstrip('\n') + '\n'
         window = self._get_window()
-        if not window:
-            return {"error": "No window"}
 
-        # Priority: target_id > tag > session-specific default
-        if target_id:
-            tag = f"claude-agent-{target_id}"
-        elif not tag:
-            # Default tag uses active Claude session's view ID for isolation
-            from . import core
-            active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in sublime._claude_sessions:
-                tag = f"claude-agent-{active_view_id}"
-            else:
-                tag = f"claude-agent-{window.id()}"
-
-        def find_terminal():
-            for view in window.views():
-                if view.settings().get("terminus_view"):
-                    if view.settings().get("terminus_view.tag") == tag:
-                        # Check if terminal is still alive (not orphaned after restart)
-                        # Terminus sets terminus_view.finished when terminal exits
-                        if not view.settings().get("terminus_view.finished"):
-                            return view
-            return None
-
-        target = find_terminal()
-
-        # Open terminal if not found
-        if not target:
-            # Check if Terminus is available
-            if not hasattr(sublime, 'find_resources') or not sublime.find_resources("Terminus.sublime-settings"):
-                return {"error": "Terminus plugin not installed"}
-
-            cwd = window.folders()[0] if window.folders() else None
-            open_args = {
-                "tag": tag,
-                "title": "Claude Agent",
-                "post_window_hooks": [
-                    # Send the command after terminal is ready
-                    ["terminus_send_string", {"string": text, "tag": tag}]
-                ],
-                # Set env var so scripts can detect they're running under Claude agent
-                "env": {"CLAUDE_AGENT": "1"},
-            }
-            if cwd:
-                open_args["cwd"] = cwd
-            # Don't auto-focus terminal - let it open in background
-            open_args["focus"] = False
-            print(f"[Claude] terminus_send: opening terminal with args={open_args}")
-
-            # Schedule terminus_open to run after current call stack clears
-            # This ensures the command actually executes
-            # Capture window_id to find correct window even if focus changed
-            window_id = window.id()
-            def do_open():
-                # Find window by ID in case focus changed
-                target_window = None
-                for w in sublime.windows():
-                    if w.id() == window_id:
-                        target_window = w
-                        break
-                if target_window:
-                    print(f"[Claude] terminus_send: do_open executing in window {window_id}")
-                    target_window.run_command("terminus_open", open_args)
-                else:
-                    print(f"[Claude] terminus_send: window {window_id} not found")
-            sublime.set_timeout(do_open, 10)
-
-            return {
-                "sent": True,
-                "opened_new": True,
-                "tag": tag,
-            }
-
-        # Terminal exists - send command directly
-        print(f"[Claude] terminus_send: sending to terminal {target.id()}")
-        window.run_command("terminus_send_string", {"string": text, "tag": tag})
+        if not wait or wait <= 0:
+            from .terminal.terminal import Terminal
+            t = Terminal.from_tag(tag)
+            if not t:
+                if window:
+                    window.run_command("claude_terminal_open", {"tag": tag})
+                return {"sent": False, "info": "Terminal opening, retry in a moment"}
+            t.send_string(cmd)
+            return {"sent": True, "tag": tag}
 
         return {
-            "sent": True,
-            "view_id": target.id(),
-            "tag": tag,
+            "_wait_terminal": True,
+            "_wait_tag": tag,
+            "_wait_cmd": cmd,
+            "_wait_secs": float(wait),
+            "_wait_window_id": window.id() if window else None,
         }
 
-    def _terminus_read(self, tag: str = None, lines: int = 100, target_id: str = None) -> dict:
-        """Read output from a Terminus terminal."""
-        # Priority: target_id > tag > session-specific default
-        if target_id:
-            tag = f"claude-agent-{target_id}"
-        elif not tag:
-            # Default tag uses active Claude session's view ID for isolation
-            from . import core
-            window = self._get_window()
-            active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in sublime._claude_sessions:
-                tag = f"claude-agent-{active_view_id}"
-            else:
-                window_id = window.id() if window else 0
-                tag = f"claude-agent-{window_id}"
+    def _terminal_send(self, text: str, tag: str = None, target_id: str = None) -> dict:
+        from .terminal.terminal import Terminal
+        tag = self._resolve_terminal_tag(tag, target_id)
+        t = Terminal.from_tag(tag)
+        if not t:
+            return {"error": f"No terminal with tag '{tag}'"}
+        t.send_string(text)
+        return {"sent": True, "tag": tag}
 
-        # Find matching terminal across ALL windows (might be in different window)
-        target = None
-        for window in sublime.windows():
-            for view in window.views():
-                if view.settings().get("terminus_view"):
-                    if view.settings().get("terminus_view.tag") == tag:
-                        if not view.settings().get("terminus_view.finished"):
-                            target = view
-                            break
-            if target:
-                break
-
-        if not target:
-            return {"error": f"No terminal found with tag '{tag}'"}
-
-        # Read last N lines
-        content = target.substr(sublime.Region(0, target.size()))
-        content_lines = content.split("\n")
+    def _terminal_read(self, tag: str = None, lines: int = 100, target_id: str = None) -> dict:
+        from .terminal.terminal import Terminal
+        tag = self._resolve_terminal_tag(tag, target_id)
+        t = Terminal.from_tag(tag)
+        if not t:
+            return {"error": f"No terminal with tag '{tag}'"}
+        screen = t.screen
+        content_lines = []
+        for row in range(screen.lines):
+            line_buf = screen.buffer.get(row, {})
+            text = "".join(line_buf[col].data for col in sorted(line_buf.keys()))
+            content_lines.append(text.rstrip())
         if lines and len(content_lines) > lines:
             content_lines = content_lines[-lines:]
+        return {"tag": tag, "content": "\n".join(content_lines)}
 
-        return {
-            "view_id": target.id(),
-            "tag": target.settings().get("terminus_view.tag", ""),
-            "content": "\n".join(content_lines),
-            "total_lines": len(content.split("\n")),
-        }
-
-    def _terminus_close(self, tag: str = None, target_id: str = None) -> dict:
-        """Close a Terminus terminal."""
-        # Priority: target_id > tag > session-specific default
-        if target_id:
-            tag = f"claude-agent-{target_id}"
-        elif not tag:
-            # Default tag uses active Claude session's view ID for isolation
-            from . import core
-            window = self._get_window()
-            active_view_id = window.settings().get("claude_active_view") if window else None
-            if active_view_id and active_view_id in sublime._claude_sessions:
-                tag = f"claude-agent-{active_view_id}"
-            else:
-                window_id = window.id() if window else 0
-                tag = f"claude-agent-{window_id}"
-
-        # Find matching terminal across ALL windows
-        target = None
-        for window in sublime.windows():
-            for view in window.views():
-                if view.settings().get("terminus_view"):
-                    if view.settings().get("terminus_view.tag") == tag:
-                        target = view
-                        break
-            if target:
-                break
-
-        if not target:
-            return {"error": f"No terminal found with tag '{tag}'"}
-
-        view_id = target.id()
-        tag_val = target.settings().get("terminus_view.tag", "")
-
-        # Close the terminal
-        target.close()
-
-        return {
-            "closed": True,
-            "view_id": view_id,
-            "tag": tag_val,
-        }
+    def _terminal_close(self, tag: str = None, target_id: str = None) -> dict:
+        from .terminal.terminal import Terminal
+        tag = self._resolve_terminal_tag(tag, target_id)
+        t = Terminal.from_tag(tag)
+        if not t:
+            return {"error": f"No terminal with tag '{tag}'"}
+        t.close()
+        return {"closed": True, "tag": tag}
 
     # ─── LSP Tools ────────────────────────────────────────────────────────
 
