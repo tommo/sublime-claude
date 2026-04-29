@@ -164,8 +164,8 @@ def _check_auto_sleep():
         if (session.initialized
                 and not session.working
                 and not session.is_sleeping
-                and session.last_activity > 0
-                and session.last_activity < threshold):
+                and session.last_idle_at > 0
+                and session.last_idle_at < threshold):
             print(f"[Claude] auto-sleep: {session.name} idle for >{timeout_min}m")
             session.sleep()
 

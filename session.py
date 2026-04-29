@@ -117,6 +117,7 @@ class Session:
 
         # Activity tracking for auto-sleep
         self.last_activity: float = time.time()
+        self.last_idle_at: float = 0  # set when session enters input mode (truly idle)
 
         # Terminal mode state
         self.terminal_mode: bool = False
@@ -982,6 +983,7 @@ class Session:
             return
 
         self._input_mode_entered = True
+        self.last_idle_at = time.time()
 
         if self.draft_prompt and self.output.view:
             self.output.view.run_command("append", {"characters": self.draft_prompt})
