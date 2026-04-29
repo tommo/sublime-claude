@@ -1300,7 +1300,15 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                     sublime.set_timeout(lambda: self.run(backend=data), 0)
                     return
                 if action == "undo_message" and data:
-                    data.undo_message()
+                    turns = data.get_turns_for_undo()
+                    if not turns:
+                        return
+                    labels = [t[0] for t in turns]
+                    def _on_undo(uidx, _turns=turns, _s=data):
+                        if uidx >= 0:
+                            _, rewind_id, draft_prompt = _turns[uidx]
+                            _s._apply_undo(rewind_id, draft_prompt)
+                    self.window.show_quick_panel(labels, _on_undo, placeholder="Undo to before…")
                 elif action == "restart" and data:
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)
@@ -1987,28 +1995,11 @@ class ClaudePermissionDenyCommand(sublime_plugin.TextCommand):
 
 
 class ClaudeUndoMessageCommand(sublime_plugin.TextCommand):
-    """Show quick panel to select how far to undo in the conversation."""
+    """Undo last conversation turn."""
     def run(self, edit):
         s = get_session_for_view(self.view)
-        if not s:
-            return
-        if s.working and s.current_tool != "rewinding...":
-            return
-        turns = s.get_turns_for_undo()
-        if not turns:
-            return
-        labels = [t[0] for t in turns]
-        window = self.view.window()
-        if not window:
-            return
-
-        def on_done(idx):
-            if idx < 0:
-                return
-            _, rewind_id, draft_prompt = turns[idx]
-            s._apply_undo(rewind_id, draft_prompt)
-
-        window.show_quick_panel(labels, on_done, placeholder="Undo to before…")
+        if s:
+            s.undo_message()
 
 
 class ClaudeClearNotificationsCommand(sublime_plugin.WindowCommand):
