@@ -629,67 +629,68 @@ class Session:
         """Undo last conversation turn by rewinding the CLI session."""
         if not self.session_id:
             return
-        # Allow undo even while "working" (bridge reconnecting from previous undo)
         if self.working and self.current_tool != "rewinding...":
             return
         rewind_id, undone_prompt = self._find_rewind_point()
         if not rewind_id:
             print(f"[Claude] undo_message: no rewind point found")
             return
+        self._apply_undo(rewind_id, undone_prompt)
+
+    def _apply_undo(self, rewind_id: str, undone_prompt: str) -> None:
+        """Execute the rewind to rewind_id, restoring undone_prompt as draft."""
         saved_id = self.session_id
-        print(f"[Claude] undo_message: rewinding {saved_id} to {rewind_id}")
-        # Exit input mode
+        print(f"[Claude] undo: rewinding {saved_id} to {rewind_id}")
         if self.output._input_mode:
             self.output.exit_input_mode(keep_text=False)
-        # Erase last prompt turn from view (prompt = "◎ ... ▶", not input marker "◎ ")
         view = self.output.view
         content = view.substr(sublime.Region(0, view.size()))
-        # Find last prompt line (contains " ▶")
         import re as _re
         last_prompt = None
         for m in _re.finditer(r'\n◎ .+? ▶', content):
             last_prompt = m
         if not last_prompt and content.startswith("◎ ") and " ▶" in content.split("\n")[0]:
-            print(f"[Claude] undo: erasing entire view (first turn)")
             self.output._replace(0, view.size(), "")
         elif last_prompt:
-            erase_from = last_prompt.start()
-            print(f"[Claude] undo: erasing from {erase_from} to {view.size()}, matched={last_prompt.group()[:40]!r}")
-            self.output._replace(erase_from, view.size(), "")
-        else:
-            print(f"[Claude] undo: no prompt found to erase")
-        # Update conversation state
+            self.output._replace(last_prompt.start(), view.size(), "")
         if self.output.current:
             self.output.current = None
         view.erase_regions("claude_conversation")
-        # Kill bridge synchronously (may already be dead from previous undo)
         if self.client:
             self.client.stop()
             self.client = None
         self.initialized = False
-        # Restart bridge with rewind
         self.session_id = saved_id
         self.resume_id = saved_id
         self.fork = False
         self.draft_prompt = undone_prompt
-        self._input_mode_entered = True  # Block auto input mode until bridge ready
+        self._input_mode_entered = True
         self._pending_resume_at = rewind_id
-        self._save_session()  # Persist rewind point for restart survival
+        self._save_session()
         self.working = True
         self.current_tool = "rewinding..."
         self._animate()
         self.start(resume_session_at=rewind_id)
-        # _on_init will reset _input_mode_entered and call _enter_input_with_draft
 
-    def _find_rewind_point(self) -> tuple:
-        """Find the assistant entry uuid to rewind to (before last visible turn).
-        Respects current _pending_resume_at to support consecutive undos.
-        Returns (uuid, undone_prompt) or (None, "") if can't rewind."""
+    def get_turns_for_undo(self) -> list:
+        """Return [(label, rewind_id, draft_prompt)] for all undoable turns, newest first."""
+        turns = self._read_turns()
+        result = []
+        for i, (prompt, prev_asst_uuid) in enumerate(turns):
+            if not prev_asst_uuid:
+                continue  # first turn with no prior assistant — can't rewind here
+            first_line = prompt.split("\n")[0][:72]
+            label = f"{i + 1} — {first_line}" if first_line else f"{i + 1} — (empty)"
+            result.append((label, prev_asst_uuid, prompt))
+        result.reverse()
+        return result
+
+    def _read_turns(self) -> list:
+        """Read JSONL and return [(prompt, prev_assistant_uuid)] for each user turn."""
         jsonl_path = self._find_jsonl_path()
         if not jsonl_path:
-            return None, ""
-        # Collect user prompt turns and their preceding assistant uuid
-        turns = []  # [(prompt, prev_assistant_uuid)]
+            return []
+        turns = []
         last_assistant_uuid = None
         try:
             with open(jsonl_path, "r") as f:
@@ -723,26 +724,27 @@ class Session:
                                     prompt += block.get("text", "")
                         turns.append((prompt, last_assistant_uuid))
         except Exception as e:
-            print(f"[Claude] _find_rewind_point error: {e}")
+            print(f"[Claude] _read_turns error: {e}")
+        return turns
+
+    def _find_rewind_point(self) -> tuple:
+        """Find the assistant entry uuid to rewind to (before last visible turn).
+        Respects current _pending_resume_at to support consecutive undos.
+        Returns (uuid, undone_prompt) or (None, "") if can't rewind."""
+        turns = self._read_turns()
+        if not turns:
             return None, ""
-        # If already rewound, find the turn whose prev_assistant_uuid == current rewind point
-        # and rewind one step further back
         if self._pending_resume_at:
-            # Find which turn we're currently rewound to
             for i, (prompt, asst_uuid) in enumerate(turns):
                 if asst_uuid == self._pending_resume_at:
-                    # This turn starts after the current rewind point
-                    # We want to undo the turn BEFORE this one
                     if i < 2:
-                        return None, ""  # Can't undo further
+                        return None, ""
                     undone_prompt = turns[i - 1][0]
                     rewind_to = turns[i - 1][1]
                     if not rewind_to:
                         return None, ""
                     return rewind_to, undone_prompt
-            # Fallback: current rewind point not found in turns
             return None, ""
-        # Normal case: undo the last turn
         if len(turns) < 2:
             return None, ""
         undone_prompt = turns[-1][0]

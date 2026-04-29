@@ -1987,11 +1987,28 @@ class ClaudePermissionDenyCommand(sublime_plugin.TextCommand):
 
 
 class ClaudeUndoMessageCommand(sublime_plugin.TextCommand):
-    """Undo last conversation turn."""
+    """Show quick panel to select how far to undo in the conversation."""
     def run(self, edit):
         s = get_session_for_view(self.view)
-        if s:
-            s.undo_message()
+        if not s:
+            return
+        if s.working and s.current_tool != "rewinding...":
+            return
+        turns = s.get_turns_for_undo()
+        if not turns:
+            return
+        labels = [t[0] for t in turns]
+        window = self.view.window()
+        if not window:
+            return
+
+        def on_done(idx):
+            if idx < 0:
+                return
+            _, rewind_id, draft_prompt = turns[idx]
+            s._apply_undo(rewind_id, draft_prompt)
+
+        window.show_quick_panel(labels, on_done, placeholder="Undo to before…")
 
 
 class ClaudeClearNotificationsCommand(sublime_plugin.WindowCommand):
