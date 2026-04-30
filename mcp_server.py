@@ -240,7 +240,7 @@ class MCPSocketServer:
                         time.sleep(0.2)
 
                 if not _terminal:
-                    eval_result["error"] = "Terminal failed to open"
+                    result["result"] = {"error": "Terminal failed to open"}
                 else:
                     if _opened_new:
                         time.sleep(3.5)  # shell startup
@@ -249,9 +249,8 @@ class MCPSocketServer:
                     _terminal.send_string(_cmd)
                     _timed_out = not _terminal._capture_event.wait(timeout=_secs)
                     _output, _timed_out = _terminal.stop_capture()
-                    eval_result["output"] = _output
-                    if _timed_out:
-                        eval_result["timed_out"] = True
+                    _suffix = "\n[timed out]" if _timed_out else ""
+                    result["result"] = _output.strip() + _suffix if _output.strip() else "(no output)" + _suffix
 
             conn.sendall((json.dumps(result) + "\n").encode())
 
@@ -1081,7 +1080,12 @@ class MCPSocketServer:
 
     # ─── Terminal Tools (embedded PTY terminal) ───────────────────────────
 
-    def _resolve_terminal_tag(self, tag: str = None, target_id: str = None) -> str:
+    def _resolve_terminal_tag(self, tag: str = None, target_id: str = None, index: int = None) -> str:
+        if index is not None:
+            from .terminal.terminal import Terminal
+            for t in Terminal.list_all():
+                if getattr(t, 'index', None) == index:
+                    return t.tag
         if target_id:
             return f"claude-agent-{target_id}"
         if tag:
@@ -1108,6 +1112,7 @@ class MCPSocketServer:
                 last = next((l for l in reversed(content.splitlines()) if l.strip()), "")
                 state = "idle" if re.search(r'[$%#>❯]\s*$', last) else "running"
             result.append({
+                "index": getattr(t, 'index', None),
                 "tag": t.tag,
                 "view_id": t.view.id() if t.view else None,
                 "title": t.view.name() if t.view else "(unnamed)",
@@ -1115,8 +1120,8 @@ class MCPSocketServer:
             })
         return result
 
-    def _terminal_run(self, command: str, tag: str = None, wait: float = 30, target_id: str = None) -> dict:
-        tag = self._resolve_terminal_tag(tag, target_id)
+    def _terminal_run(self, command: str, tag: str = None, wait: float = 30, target_id: str = None, index: int = None) -> dict:
+        tag = self._resolve_terminal_tag(tag, target_id, index)
         cmd = command.rstrip('\n') + '\n'
         window = self._get_window()
 
@@ -1138,18 +1143,18 @@ class MCPSocketServer:
             "_wait_window_id": window.id() if window else None,
         }
 
-    def _terminal_send(self, text: str, tag: str = None, target_id: str = None) -> dict:
+    def _terminal_send(self, text: str, tag: str = None, target_id: str = None, index: int = None) -> dict:
         from .terminal.terminal import Terminal
-        tag = self._resolve_terminal_tag(tag, target_id)
+        tag = self._resolve_terminal_tag(tag, target_id, index)
         t = Terminal.from_tag(tag)
         if not t:
             return {"error": f"No terminal with tag '{tag}'"}
         t.send_string(text)
         return {"sent": True, "tag": tag}
 
-    def _terminal_read(self, tag: str = None, lines: int = 100, target_id: str = None) -> dict:
+    def _terminal_read(self, tag: str = None, lines: int = 100, target_id: str = None, index: int = None) -> dict:
         from .terminal.terminal import Terminal
-        tag = self._resolve_terminal_tag(tag, target_id)
+        tag = self._resolve_terminal_tag(tag, target_id, index)
         t = Terminal.from_tag(tag)
         if not t:
             return {"error": f"No terminal with tag '{tag}'"}
@@ -1159,13 +1164,16 @@ class MCPSocketServer:
             line_buf = screen.buffer.get(row, {})
             text = "".join(line_buf[col].data for col in sorted(line_buf.keys()))
             content_lines.append(text.rstrip())
+        # drop trailing blank lines
+        while content_lines and not content_lines[-1]:
+            content_lines.pop()
         if lines and len(content_lines) > lines:
             content_lines = content_lines[-lines:]
-        return {"tag": tag, "content": "\n".join(content_lines)}
+        return "\n".join(content_lines) or "(empty)"
 
-    def _terminal_close(self, tag: str = None, target_id: str = None) -> dict:
+    def _terminal_close(self, tag: str = None, target_id: str = None, index: int = None) -> dict:
         from .terminal.terminal import Terminal
-        tag = self._resolve_terminal_tag(tag, target_id)
+        tag = self._resolve_terminal_tag(tag, target_id, index)
         t = Terminal.from_tag(tag)
         if not t:
             return {"error": f"No terminal with tag '{tag}'"}

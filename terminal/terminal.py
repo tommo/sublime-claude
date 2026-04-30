@@ -2,6 +2,8 @@ import sublime
 
 import os
 import re
+import shutil
+import textwrap
 import time
 import base64
 import logging
@@ -15,8 +17,84 @@ from .view import get_panel_window, view_size
 from .key import get_key_code
 from .image import get_image_info, image_resize
 
-_STRIP_ANSI = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\r')
+_KNOWN_SHELLS = {"bash", "zsh", "fish", "sh", "ksh", "ksh93", "mksh", "tcsh", "csh", "dash"}
+
+_STRIP_ANSI = re.compile(
+    r'\x1b\[[0-9;?]*[ -/]*[@-~]'          # CSI: covers \x1b[?25l, \x1b[1;32m, etc.
+    r'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)' # OSC: BEL or ST terminator
+    r'|\x1b[PX^_][^\x1b]*\x1b\\'          # DCS/SOS/PM/APC
+    r'|\x1b[^[\]PX^_]'                    # other 2-char ESC sequences
+    r'|\r'
+    r'|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]'  # control chars (keep \t \n \x1b)
+)
+_STRIP_BS = re.compile(r'[^\n]\x08')       # char + backspace = erase
+
 _PROMPT_RE = re.compile(r'[$%#>❯]\s*$', re.MULTILINE)
+_OSC133_PROMPT = '\x1b]133;A\x07'
+_OSC7_RE = re.compile(r'\x1b\]7;file://[^\x07/]*(\/[^\x07]*)\x07')
+
+
+def _setup_shell_integration(cmd, env):
+    """
+    Inject OSC 133;A shell integration so the reader thread can detect prompts
+    reliably regardless of prompt appearance. Returns (cmd, env, tmpdir_or_None).
+    tmpdir must be deleted by caller when terminal closes.
+    """
+    shell = os.path.basename(cmd[0]) if cmd else ""
+    home = env.get("HOME", os.path.expanduser("~"))
+
+    if shell == "zsh":
+        tmpdir = tempfile.mkdtemp(prefix="ct_zdotdir_")
+        orig_zdotdir = env.get("ZDOTDIR", home)
+        zshrc = textwrap.dedent("""\
+            ZDOTDIR={orig}
+            [ -f {orig}/.zshrc ] && source {orig}/.zshrc
+            _ct_precmd() {{
+              printf '\\e]133;A\\a'
+              printf '\\e]7;file://%s%s\\a' "$(hostname -s 2>/dev/null || echo localhost)" "$PWD"
+            }}
+            autoload -Uz add-zsh-hook 2>/dev/null \\
+              && add-zsh-hook precmd _ct_precmd \\
+              || precmd_functions+=(_ct_precmd)
+            PS2=$'\\e]133;A\\a> '
+        """).format(orig=orig_zdotdir)
+        with open(os.path.join(tmpdir, ".zshrc"), "w") as f:
+            f.write(zshrc)
+        env = dict(env, ZDOTDIR=tmpdir)
+        return cmd, env, tmpdir
+
+    elif shell == "bash":
+        tmpdir = tempfile.mkdtemp(prefix="ct_bash_")
+        rc = os.path.join(tmpdir, ".bashrc")
+        bashrc = textwrap.dedent("""\
+            [ -f {home}/.bash_profile ] && source {home}/.bash_profile \\
+              || [ -f {home}/.bashrc ] && source {home}/.bashrc
+            _ct_prompt_cmd() {{
+              printf '\\e]133;A\\a'
+              printf '\\e]7;file://%s%s\\a' "${{HOSTNAME:-localhost}}" "$PWD"
+            }}
+            PROMPT_COMMAND="${{PROMPT_COMMAND:+$PROMPT_COMMAND; }}_ct_prompt_cmd"
+            PS2=$'\\e]133;A\\a> '
+        """).format(home=home)
+        with open(rc, "w") as f:
+            f.write(bashrc)
+        new_cmd = [cmd[0], "--rcfile", rc, "-i"] + \
+                  [a for a in cmd[1:] if a not in ("-i", "-l", "--login")]
+        return new_cmd, env, tmpdir
+
+    elif shell == "fish":
+        init = (
+            "functions --copy fish_prompt __ct_orig_fish_prompt 2>/dev/null; "
+            "function fish_prompt; "
+            "  printf '\\e]133;A\\a'; "
+            "  printf '\\e]7;file://%s%s\\a' (hostname -s 2>/dev/null; or echo localhost) $PWD; "
+            "  __ct_orig_fish_prompt; "
+            "end"
+        )
+        new_cmd = [cmd[0], "--init-command", init] + cmd[1:]
+        return new_cmd, env, None
+
+    return cmd, env, None
 
 
 IMAGE = """
@@ -34,6 +112,7 @@ logger = logging.getLogger('Terminus')
 class Terminal:
     _terminals = {}
     _detached_terminals = []
+    _next_index = 1
 
     def __init__(self, view=None):
         self.view = view
@@ -148,13 +227,29 @@ class Terminal:
                 with self.lock:
                     data[0] += temp
 
+                    if self._use_osc133 and _OSC133_PROMPT in temp:
+                        self._update_title(busy=False)
+
+                    m = _OSC7_RE.search(temp)
+                    if m:
+                        cwd = m.group(1)
+                        if self.view:
+                            args = self.view.settings().get("claude_terminal.args", {})
+                            args["cwd"] = cwd
+                            self.view.settings().set("claude_terminal.args", args)
+
                     if getattr(self, '_capturing', False):
                         self._capture_raw += temp
                         self._capture_buf.append(temp)
-                        stripped = _STRIP_ANSI.sub('', self._capture_raw)
-                        lines = [l for l in stripped.splitlines() if l.strip()]
-                        if lines and _PROMPT_RE.search(lines[-1]):
-                            self._capture_event.set()
+                        self._capture_last_data_time = time.time()
+                        if self._use_osc133:
+                            if _OSC133_PROMPT in self._capture_raw:
+                                self._capture_event.set()
+                        else:
+                            s = _STRIP_ANSI.sub('', self._capture_raw)
+                            lines = [l for l in s.splitlines() if l.strip()]
+                            if lines and _PROMPT_RE.search(lines[-1]):
+                                self._capture_event.set()
 
                     if done[0] or not self.is_hosted():
                         logger.debug("reader breaks")
@@ -243,7 +338,32 @@ class Terminal:
         _env = os.environ.copy()
         _env["TERM"] = "xterm-256color"
         _env.update(env)
+        saved_index = view.settings().get("claude_terminal.index") if view else None
+        if saved_index:
+            self.index = saved_index
+            if saved_index >= Terminal._next_index:
+                Terminal._next_index = saved_index + 1
+        else:
+            self.index = Terminal._next_index
+            Terminal._next_index += 1
+
+        _orig_cmd = list(cmd)
+        cmd, _env, self._integration_dir = _setup_shell_integration(cmd, _env)
+        self._use_osc133 = self._integration_dir is not None or \
+                           os.path.basename(cmd[0]) == "fish"
+        self._is_shell = os.path.basename(_orig_cmd[0]) in _KNOWN_SHELLS if _orig_cmd else False
         self.process = TerminalPtyProcess.spawn(cmd, cwd=cwd, env=_env, dimensions=size)
+        self._update_title(busy=False)
+
+        if view:
+            view.settings().set("claude_terminal.args", {
+                "cmd": _orig_cmd,
+                "cwd": cwd or "",
+                "tag": tag or "",
+                "env": env or {},
+            })
+            view.settings().set("claude_terminal.index", self.index)
+            view.settings().set("claude_terminal.reactivable", True)
         self.screen = TerminalScreen(
             size[1], size[0], process=self.process, history=10000,
             clear_callback=self.clear_callback, reset_callback=self.reset_callback)
@@ -265,17 +385,81 @@ class Terminal:
             vid = self.view.id()
             if vid in self._terminals:
                 del self._terminals[vid]
+        self._cleanup_integration()
+
+    def _cleanup_integration(self):
+        d = getattr(self, "_integration_dir", None)
+        if d:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+            self._integration_dir = None
+
+    def _update_title(self, busy):
+        idx = getattr(self, 'index', '?')
+        prefix = "▶ " if busy else "▫ "
+        name = "#{} {}".format(idx, self.default_title) if self.default_title else "#{}".format(idx)
+        view = self.view
+        if view:
+            sublime.set_timeout(lambda: view.set_name(prefix + name) if view.is_valid() else None)
 
     def start_capture(self):
         self._capture_buf = []
         self._capture_raw = ""
         self._capture_event = threading.Event()
+        self._capture_last_data_time = time.time()
         self._capturing = True
+        self._update_title(busy=True)
+        threading.Thread(target=self._capture_pgid_watcher, daemon=True).start()
+
+    def _capture_pgid_watcher(self):
+        is_shell = getattr(self, '_is_shell', False)
+        try:
+            fd = self.process.fd
+            shell_pgrp = os.getpgid(self.process.pid)
+        except Exception:
+            return
+        idle_streak = 0
+        while getattr(self, '_capturing', False):
+            time.sleep(0.05)
+            silence = time.time() - getattr(self, '_capture_last_data_time', 0)
+            if not is_shell:
+                # SSH / direct programs: PGID stays at our process's own PGRP
+                # regardless of what's happening remotely/inside — only quiescence works.
+                if silence >= 0.3:
+                    if getattr(self, '_capturing', False):
+                        self._capture_event.set()
+                    return
+                continue
+            try:
+                fg_pgrp = os.tcgetpgrp(fd)
+            except Exception:
+                return
+            if fg_pgrp == shell_pgrp:
+                idle_streak += 1
+                if idle_streak >= 2:  # 100ms stable idle → local shell at prompt
+                    if getattr(self, '_capturing', False):
+                        self._capture_event.set()
+                    return
+            else:
+                idle_streak = 0
+                # Local subprocess in foreground; fire on 300ms quiescence
+                # (handles interactive REPLs: lua, python, node, etc.)
+                if silence >= 0.3 and getattr(self, '_capturing', False):
+                    self._capture_event.set()
+                    return
 
     def stop_capture(self):
         self._capturing = False
         timed_out = not self._capture_event.is_set()
-        output = _STRIP_ANSI.sub('', "".join(self._capture_buf))
+        raw = "".join(self._capture_buf)
+        output = _STRIP_ANSI.sub('', raw)
+        # collapse backspace sequences until none remain
+        while '\x08' in output:
+            output = _STRIP_BS.sub('', output)
+            output = output.replace('\x08', '')
+        self._update_title(busy=False)
         return output, timed_out
 
     @classmethod
@@ -422,6 +606,7 @@ class Terminal:
                     del self.images[pid]
 
     def __del__(self):
+        self._cleanup_integration()
         # make sure the process is terminated
         self.process.terminate(force=True)
 

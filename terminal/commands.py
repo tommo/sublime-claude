@@ -20,8 +20,9 @@ class ClaudeTerminalOpenCommand(sublime_plugin.WindowCommand):
             self.window.focus_view(t.view)
             return
 
+        session_name = tag or "Terminal"
         view = self.window.new_file()
-        view.set_name("Claude Terminal")
+        view.set_name(session_name)
         view.set_scratch(True)
         view.settings().set("claude_terminal", True)
         view.settings().set("claude_terminal_tag", tag or "")
@@ -46,7 +47,7 @@ class ClaudeTerminalOpenCommand(sublime_plugin.WindowCommand):
         env = dict(os.environ, **(env or {}))
 
         terminal = Terminal(view)
-        terminal.start(cmd=cmd, cwd=cwd, env=env, tag=tag or "", default_title="Claude Terminal")
+        terminal.start(cmd=cmd, cwd=cwd, env=env, tag=tag or "", default_title=session_name)
 
 
 class ClaudeTerminalKeypressCommand(sublime_plugin.TextCommand):
@@ -117,6 +118,19 @@ class ClaudeTerminalClearUndoStackCommand(sublime_plugin.TextCommand):
 class NoopCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         pass
+
+
+class ClaudeTerminalActivateCommand(sublime_plugin.TextCommand):
+    """Reattach a terminal session after Sublime restarts (hot-exit restore)."""
+    def run(self, edit, cmd=None, cwd=None, tag=None, env=None):
+        if Terminal.from_id(self.view.id()):
+            return
+        session_name = tag or "Terminal"
+        self.view.set_scratch(True)
+        env = dict(os.environ, **(env or {}))
+        terminal = Terminal(self.view)
+        terminal.start(cmd=cmd, cwd=cwd or None, env=env,
+                       tag=tag or "", default_title=session_name)
 
 
 class ClaudeTerminalResetCommand(sublime_plugin.TextCommand):
