@@ -32,6 +32,47 @@ def _resolve_model_id(model_id: str):
     return model_id, None
 
 
+def _bookmarks_path(project_path: str = None) -> str:
+    if project_path:
+        return os.path.join(project_path, ".claude", "bookmarks.json")
+    return os.path.expanduser("~/.claude/bookmarks.json")
+
+
+def load_bookmarks(project_path: str = None) -> set:
+    """Load starred session IDs for a project."""
+    path = _bookmarks_path(project_path)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                return set(json.load(f).get("starred", []))
+        except Exception:
+            pass
+    return set()
+
+
+def save_bookmarks(starred: set, project_path: str = None) -> None:
+    path = _bookmarks_path(project_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w") as f:
+            json.dump({"starred": list(starred)}, f, indent=2)
+    except Exception as e:
+        print(f"[Claude] Failed to save bookmarks: {e}")
+
+
+def toggle_bookmark(session_id: str, project_path: str = None) -> bool:
+    """Toggle star for a session. Returns True if now starred."""
+    starred = load_bookmarks(project_path)
+    if session_id in starred:
+        starred.discard(session_id)
+        now_starred = False
+    else:
+        starred.add(session_id)
+        now_starred = True
+    save_bookmarks(starred, project_path)
+    return now_starred
+
+
 def load_saved_sessions() -> List[Dict]:
     """Load saved sessions from disk."""
     if os.path.exists(SESSIONS_FILE):

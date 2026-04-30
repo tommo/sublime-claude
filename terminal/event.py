@@ -34,23 +34,16 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
             recency_manager.set_recent_terminal(view)
             return
 
-        settings = view.settings()
-        if not settings.has("claude_terminal.args"):
+        reactivable = view.settings().get("claude_terminal.reactivable", False)
+        finished = view.settings().get("claude_terminal.finished", False)
+        kwargs = view.settings().get("claude_terminal.args", {})
+        if not reactivable:
             return
-
-        if settings.get("claude_terminal.finished", False):
+        if finished:
             return
-
-        kwargs = settings.get("claude_terminal.args")
         if "cmd" not in kwargs:
             return
-
-        settings = sublime.load_settings("Terminus.sublime-settings")
-        if settings.get("reactivate_terminals", True) is not True:
-            return
-
-        if view.settings().get("claude_terminal.reactivable", False):
-            sublime.set_timeout(lambda: view.run_command("claude_terminal_activate", kwargs), 100)
+        sublime.set_timeout(lambda: view.run_command("claude_terminal_activate", kwargs), 100)
 
     def on_pre_close(self, view):
         # panel doesn't trigger on_pre_close
@@ -61,7 +54,7 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
     def on_modified(self, view):
         # to catch unicode input
         terminal = Terminal.from_id(view.id())
-        if not terminal or not terminal.process.isalive():
+        if not terminal or not getattr(terminal, 'process', None) or not terminal.process.isalive():
             return
         command, args, _ = view.command_history(0)
         if command.startswith("claude_terminal"):
@@ -75,6 +68,7 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
             text = view.substr(region)
             self._cursor = current_cursor
             logger.debug("text {} detected".format(text))
+            terminal._track_char(text)
             view.run_command("claude_terminal_paste_text", {"text": text, "bracketed": False})
         elif command:
             logger.debug("undo {}".format(command))
@@ -82,7 +76,7 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
 
     def on_selection_modified(self, view):
         terminal = Terminal.from_id(view.id())
-        if not terminal or not terminal.process.isalive():
+        if not terminal or not getattr(terminal, 'process', None) or not terminal.process.isalive():
             return
         if len(view.sel()) != 1 or not view.sel()[0].empty():
             return

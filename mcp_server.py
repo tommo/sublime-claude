@@ -1153,11 +1153,23 @@ class MCPSocketServer:
         return {"sent": True, "tag": tag}
 
     def _terminal_read(self, tag: str = None, lines: int = 100, target_id: str = None, index: int = None) -> dict:
+        import datetime
         from .terminal.terminal import Terminal
         tag = self._resolve_terminal_tag(tag, target_id, index)
         t = Terminal.from_tag(tag)
         if not t:
             return {"error": f"No terminal with tag '{tag}'"}
+
+        # User input history prefix
+        history = getattr(t, '_user_history', [])
+        parts = []
+        if history:
+            parts.append("## User input history")
+            for entry in history[-20:]:
+                ts = datetime.datetime.fromtimestamp(entry["time"]).strftime("%H:%M:%S")
+                parts.append(f"[{ts}] {entry['line']}")
+            parts.append("## Terminal screen")
+
         screen = t.screen
         content_lines = []
         for row in range(screen.lines):
@@ -1169,7 +1181,8 @@ class MCPSocketServer:
             content_lines.pop()
         if lines and len(content_lines) > lines:
             content_lines = content_lines[-lines:]
-        return "\n".join(content_lines) or "(empty)"
+        parts.append("\n".join(content_lines) or "(empty)")
+        return "\n".join(parts)
 
     def _terminal_close(self, tag: str = None, target_id: str = None, index: int = None) -> dict:
         from .terminal.terminal import Terminal

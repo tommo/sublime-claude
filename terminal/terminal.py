@@ -126,6 +126,70 @@ class Terminal:
         self._pending_to_clear_scrollback = [False]
         self._pending_to_reset = [None]
         self.lock = threading.Lock()
+        self._user_history = []   # [{"time": float, "line": str}]
+        self._input_buf = ""      # chars typed since last Enter
+        self._input_navigating = False  # True after up/down (shell history mode)
+
+    # ─── User input tracking ───────────────────────────────────────────────
+
+    def _track_char(self, text: str):
+        self._input_buf += text
+        self._input_navigating = False
+
+    def _track_key(self, key: str, ctrl: bool = False, **_):
+        if key == "enter":
+            self._flush_input()
+        elif key == "backspace":
+            self._input_buf = self._input_buf[:-1]
+        elif key in ("up", "down"):
+            self._input_buf = ""
+            self._input_navigating = True
+        elif ctrl and key == "c":
+            self._record_input("^C")
+            self._input_buf = ""
+            self._input_navigating = False
+        elif ctrl and key == "d":
+            self._record_input("^D")
+            self._input_buf = ""
+        elif ctrl and key in ("u", "k"):
+            self._input_buf = ""
+        elif ctrl and key == "w":
+            parts = self._input_buf.rsplit(None, 1)
+            self._input_buf = parts[0] + " " if len(parts) > 1 else ""
+
+    def _flush_input(self):
+        line = self._input_buf.strip()
+        if not line and self._input_navigating:
+            # User pressed up/down to select shell history then Enter —
+            # read the echoed command from the screen cursor line.
+            try:
+                row = self.screen.cursor.y
+                row_buf = self.screen.buffer.get(row, {})
+                raw = "".join(row_buf[c].data for c in sorted(row_buf.keys())).strip()
+                m = re.search(r'[$%#>❯]\s+(.*)', raw)
+                line = m.group(1).strip() if m else raw
+            except Exception:
+                line = ""
+        if line:
+            self._record_input(line)
+        self._input_buf = ""
+        self._input_navigating = False
+
+    def _record_input(self, line: str):
+        self._user_history.append({"time": time.time(), "line": line})
+        if len(self._user_history) > 100:
+            self._user_history = self._user_history[-100:]
+
+    def _track_paste(self, text: str):
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return
+        self._input_buf += lines[0]
+        for extra in lines[1:]:
+            self._flush_input()
+            self._input_buf = extra
+        if len(lines) > 1:
+            self._flush_input()
 
     @classmethod
     def from_id(cls, vid):
@@ -408,7 +472,7 @@ class Terminal:
         self._capture_buf = []
         self._capture_raw = ""
         self._capture_event = threading.Event()
-        self._capture_last_data_time = time.time()
+        self._capture_last_data_time = None  # set on first byte; quiescence only counts from there
         self._capturing = True
         self._update_title(busy=True)
         threading.Thread(target=self._capture_pgid_watcher, daemon=True).start()
@@ -423,11 +487,13 @@ class Terminal:
         idle_streak = 0
         while getattr(self, '_capturing', False):
             time.sleep(0.05)
-            silence = time.time() - getattr(self, '_capture_last_data_time', 0)
+            last_data = getattr(self, '_capture_last_data_time', None)
             if not is_shell:
-                # SSH / direct programs: PGID stays at our process's own PGRP
-                # regardless of what's happening remotely/inside — only quiescence works.
-                if silence >= 0.3:
+                # SSH / direct programs: wait for first byte, then 300ms quiescence.
+                # Initializing from capture-start time would fire before SSH responds.
+                if last_data is None:
+                    continue
+                if time.time() - last_data >= 0.3:
                     if getattr(self, '_capturing', False):
                         self._capture_event.set()
                     return
@@ -444,10 +510,10 @@ class Terminal:
                     return
             else:
                 idle_streak = 0
-                # Local subprocess in foreground; fire on 300ms quiescence
-                # (handles interactive REPLs: lua, python, node, etc.)
-                if silence >= 0.3 and getattr(self, '_capturing', False):
-                    self._capture_event.set()
+                # Local subprocess (REPL, ssh, etc.) — quiescence after first data
+                if last_data is not None and time.time() - last_data >= 0.3:
+                    if getattr(self, '_capturing', False):
+                        self._capture_event.set()
                     return
 
     def stop_capture(self):

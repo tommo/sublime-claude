@@ -54,6 +54,7 @@ class ClaudeTerminalKeypressCommand(sublime_plugin.TextCommand):
     def run(self, edit, **kwargs):
         terminal = Terminal.from_id(self.view.id())
         if terminal:
+            terminal._track_key(**kwargs)
             terminal.send_key(**kwargs)
 
 
@@ -64,6 +65,7 @@ class ClaudeTerminalPasteCommand(sublime_plugin.TextCommand):
             return
         if text is None:
             text = sublime.get_clipboard()
+        terminal._track_paste(text)
         if bracketed and terminal.bracketed_paste_mode_enabled():
             terminal.send_key(key="bracketed_paste_mode_start")
             terminal.send_string(text)

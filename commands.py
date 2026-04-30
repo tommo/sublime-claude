@@ -4,7 +4,7 @@ import sublime_plugin
 import platform
 
 from .core import get_active_session, get_session_for_view, create_session
-from .session import Session, load_saved_sessions
+from .session import Session, load_saved_sessions, load_bookmarks, toggle_bookmark
 from .prompt_builder import PromptBuilder
 from .command_parser import CommandParser
 from . import backends
@@ -1097,18 +1097,24 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
             sublime.status_message("No saved sessions to resume")
             return
 
+        starred = load_bookmarks(cwd or None)
+        # Starred sessions first, then others (both groups keep recent-first order)
+        sessions = sorted(sessions, key=lambda s: s.get("session_id") not in starred)
+
         # Build quick panel items
         items = []
         for s in sessions:
+            sid = s.get("session_id", "")
             name = s.get("name") or "(unnamed)"
             backend = s.get("backend", "claude")
+            star = "★ " if sid in starred else ""
             prefix = f"[{backend}] " if backend != "claude" else ""
             project = s.get("project", "")
             if project:
                 project = "  " + project.split("/")[-1]
             cost = s.get("total_cost", 0)
             cost_str = f"  ${cost:.4f}" if cost else ""
-            items.append([f"{prefix}{name}", f"{project}{cost_str}"])
+            items.append([f"{star}{prefix}{name}", f"{project}{cost_str}"])
 
         def on_select(idx):
             if idx >= 0:
@@ -1137,6 +1143,9 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         has_codex = backends.is_available("codex")
         has_copilot = backends.is_available("copilot")
         has_deepseek = backends.is_available("deepseek")
+
+        project_path = self.window.folders()[0] if self.window.folders() else None
+        starred = load_bookmarks(project_path)
 
         # Get all sessions in this window
         sessions_in_window = []
@@ -1169,6 +1178,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         if active_session and not in_output_view:
             name = active_session.name or "(unnamed)"
+            star = "★ " if active_session.session_id in starred else ""
             if active_session.is_sleeping:
                 status = "sleeping"
                 prefix = "⏸ "
@@ -1180,22 +1190,24 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 prefix = "Active: "
             cost = f"${active_session.total_cost:.4f}" if active_session.total_cost > 0 else ""
             detail = f"{status}  {cost}  {active_session.query_count}q" if cost else f"{status}  {active_session.query_count}q"
-            items.append([f"{prefix}{name}", detail])
+            items.append([f"{prefix}{star}{name}", detail])
             actions.append(("focus", active_session))
 
-        # Add other sessions (not the active one)
-        for view_id, s in sessions_in_window:
-            if view_id == active_view_id:
-                continue  # Already shown at top
+        # Add other sessions (not the active one) — starred float to top
+        other_in_window = [(v, s) for v, s in sessions_in_window if v != active_view_id]
+        starred_sessions = [(v, s) for v, s in other_in_window if s.session_id in starred]
+        plain_sessions = [(v, s) for v, s in other_in_window if s.session_id not in starred]
+        for view_id, s in starred_sessions + plain_sessions:
             name = s.name or "(unnamed)"
+            is_starred = s.session_id in starred
             if s.is_sleeping:
-                marker = "⏸ "
+                marker = "⏸ " + ("★ " if is_starred else "")
                 status = "sleeping"
             elif s.working:
-                marker = "\u2022 "
+                marker = "\u2022 " + ("★ " if is_starred else "")
                 status = "working..."
             else:
-                marker = "  "
+                marker = "★ " if is_starred else "  "
                 status = "ready"
             cost = f"${s.total_cost:.4f}" if s.total_cost > 0 else ""
             detail = f"{status}  {cost}  {s.query_count}q" if cost else f"{status}  {s.query_count}q"
@@ -1204,6 +1216,12 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         # Add session actions when in a session output view
         if in_output_view and active_session:
+            if active_session.session_id:
+                is_starred = active_session.session_id in starred
+                star_label = "★ Unstar Session" if is_starred else "☆ Star Session"
+                star_detail = "Remove from pinned sessions" if is_starred else "Pin to top of session list"
+                items.append([star_label, star_detail])
+                actions.append(("toggle_star", active_session))
             if not active_session.working and active_session.session_id:
                 items.append(["↩ Undo Message", "Rewind session to previous turn"])
                 actions.append(("undo_message", active_session))
@@ -1219,12 +1237,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         # Add profiles and checkpoints
         from .settings import load_profiles_and_checkpoints
 
-        # Get project profiles path
-        project_path = None
-        if self.window.folders():
-            project_path = os.path.join(self.window.folders()[0], ".claude", "profiles.json")
-
-        profiles, checkpoints = load_profiles_and_checkpoints(project_path)
+        profiles_path = os.path.join(project_path, ".claude", "profiles.json") if project_path else None
+        profiles, checkpoints = load_profiles_and_checkpoints(profiles_path)
 
         for name, config in profiles.items():
             desc = config.get("description", f"{config.get('model', 'default')} model")
@@ -1298,6 +1312,11 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 if action == "switch_backend":
                     # Re-open panel with new backend
                     sublime.set_timeout(lambda: self.run(backend=data), 0)
+                    return
+                if action == "toggle_star" and data and data.session_id:
+                    now_starred = toggle_bookmark(data.session_id, project_path)
+                    msg = f"★ Starred: {data.name or data.session_id}" if now_starred else f"☆ Unstarred: {data.name or data.session_id}"
+                    sublime.status_message(msg)
                     return
                 if action == "undo_message" and data:
                     turns = data.get_turns_for_undo()
