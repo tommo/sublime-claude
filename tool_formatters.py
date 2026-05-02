@@ -113,6 +113,25 @@ def _exit_plan_mode(view: "OutputView", tool: "ToolCall") -> str:
 
 # Registry — one place to add a tool formatter.
 # Required: a callable (view, tool) -> str returning the detail string.
+def _terminal_run(view: "OutputView", tool: "ToolCall") -> str:
+    cmd = tool.tool_input.get("command", "").strip()
+    idx = tool.tool_input.get("index")
+    target = f" #{idx}" if idx else ""
+    detail = f"{target}: {cmd[:60]}{'…' if len(cmd) > 60 else ''}"
+    if tool.status == "done" and tool.result and "[timed out]" in tool.result:
+        detail += " (timed out)"
+    return detail
+
+
+def _terminal_read(view: "OutputView", tool: "ToolCall") -> str:
+    idx = tool.tool_input.get("index")
+    return f" #{idx}" if idx else ""
+
+
+def _terminal_list(view: "OutputView", tool: "ToolCall") -> str:
+    return ""
+
+
 TOOL_FORMATTERS: Dict[str, Callable] = {
     "Bash": _bash,
     "Read": _read,
@@ -127,6 +146,10 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "TodoWrite": _todo_write,
     "ask_user": _ask_user,
     "mcp__sublime__ask_user": _ask_user,
+    "mcp__sublime__terminal_run": _terminal_run,
+    "mcp__sublime__terminal_read": _terminal_read,
+    "mcp__sublime__terminal_list": _terminal_list,
+    "mcp__sublime__terminal_send": _terminal_read,
     "Skill": _skill,
     "EnterPlanMode": _enter_plan_mode,
     "ExitPlanMode": _exit_plan_mode,

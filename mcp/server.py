@@ -298,14 +298,14 @@ For simple operations, prefer the dedicated tools above.""",
                     "name": "terminal_run",
                     "description": """Run a command in a persistent terminal. Only use for interactive CLI sessions (e.g. dev servers, REPLs, watch modes, build monitors) where you need a live terminal. For normal one-shot commands, use Bash instead.
 
-Your session has a dedicated terminal reused across calls. Do not specify tag or target_id unless sharing with other sessions.""",
+Your session has a dedicated terminal reused across calls. Use index to target a specific terminal the user has open (visible as #N in the tab title).""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "command": {"type": "string", "description": "Command to run"},
                             "wait": {"type": "number", "description": "Max seconds to wait for command to finish (default 30). Blocks until output is available. Set 0 for fire-and-forget (use terminal_read later).", "default": 30},
-                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use to share terminal with other sessions. Omit to use your session's dedicated terminal."},
-                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to use your session's dedicated terminal."}
+                            "index": {"type": "integer", "description": "Target a specific user terminal by its tab number (#N). Omit to use your session's dedicated terminal."},
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use to share terminal with other sessions."}
                         },
                         "required": ["command"]
                     }
@@ -316,8 +316,8 @@ Your session has a dedicated terminal reused across calls. Do not specify tag or
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if reading from a shared terminal. Omit to read your session's terminal."},
-                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to read your session's terminal."},
+                            "index": {"type": "integer", "description": "Target a specific user terminal by its tab number (#N). Omit to read your session's terminal."},
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if reading from a shared terminal."},
                             "lines": {"type": "integer", "description": "Lines to read from end (default 100)"}
                         }
                     }
@@ -328,8 +328,8 @@ Your session has a dedicated terminal reused across calls. Do not specify tag or
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if closing a shared terminal. Omit to close your session's terminal."},
-                            "tag": {"type": "string", "description": "RARELY NEEDED: Advanced use only. Omit to close your session's terminal."}
+                            "index": {"type": "integer", "description": "Target a specific user terminal by its tab number (#N). Omit to close your session's terminal."},
+                            "target_id": {"type": "string", "description": "RARELY NEEDED: Only use if closing a shared terminal."}
                         }
                     }
                 },

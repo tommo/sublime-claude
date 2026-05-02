@@ -17,6 +17,7 @@ from .terminal.commands import (  # noqa: F401
     ClaudeTerminalSendStringCommand,
     ClaudeTerminalCloseCommand,
     ClaudeTerminalResetCommand,
+    ClaudeTerminalActivateCommand,
     ClaudeTerminalPasteTextCommand,
     ClaudeTerminalClearUndoStackCommand,
     NoopCommand,

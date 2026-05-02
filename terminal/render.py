@@ -122,6 +122,7 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         settings = sublime.load_settings("ClaudeTerminal.sublime-settings")
         self.scrollback_history_size = settings.get("scrollback_history_size", 10000)
         self.brighten_bold_text = settings.get("brighten_bold_text", False)
+        self.dynamic_title = settings.get("dynamic_title", False)
 
     def run(self, edit):
         view = self.view
@@ -153,17 +154,18 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
             self.trim_history(edit, terminal)
             view.run_command("claude_terminal_show_cursor")
 
-        current_title = view.name()
-        if terminal.title:
-            if current_title != terminal.title:
-                view.set_name(terminal.title)
-        else:
-            if screen.title:
-                if current_title != screen.title:
-                    view.set_name(screen.title)
+        if self.dynamic_title:
+            current_title = view.name()
+            if terminal.title:
+                if current_title != terminal.title:
+                    view.set_name(terminal.title)
             else:
-                if current_title != terminal.default_title:
-                    view.set_name(terminal.default_title)
+                if screen.title:
+                    if current_title != screen.title:
+                        view.set_name(screen.title)
+                else:
+                    if current_title != terminal.default_title:
+                        view.set_name(terminal.default_title)
 
         # we should not clear dirty lines here, it shoud be done in the eventloop
         # screen.dirty.clear()

@@ -123,7 +123,7 @@ class OutputView:
         self._permission_queue: List[PermissionRequest] = []  # Queue for multiple requests
         self.pending_plan: Optional[PlanApproval] = None
         self.pending_question: Optional[QuestionRequest] = None
-        self.auto_allow_tools: set = set()  # Tools auto-allowed for this session
+        self.auto_allow_tools: set = self._load_persisted_auto_allow()  # Tools auto-allowed for this session
         self._last_allowed_tool: Optional[str] = None  # Track last tool we allowed
         self._last_allowed_time: float = 0  # Timestamp of last allow
         self._pending_context_region: tuple = (0, 0)  # Region for context display
@@ -1338,6 +1338,17 @@ class OutputView:
         # Process next queued permission if any
         self._process_permission_queue()
 
+    def _load_persisted_auto_allow(self) -> set:
+        """Load autoAllowedMcpTools from project settings at session start."""
+        try:
+            from .settings import load_project_settings
+            folders = self.window.folders()
+            project_dir = folders[0] if folders else None
+            settings = load_project_settings(project_dir)
+            return set(settings.get("autoAllowedMcpTools", []))
+        except Exception:
+            return set()
+
     def _save_auto_allowed_tool(self, tool: str) -> None:
         """Save a tool to the auto-allowed list in project settings."""
         import os
@@ -1724,6 +1735,7 @@ class OutputView:
         options = q.get("options", [])
         multi = q.get("multiSelect", False)
         header = q.get("header", f"Q{q_req.current_idx + 1}")
+        question_text = q.get("question", str(q_req.current_idx))
         key = key.lower()
 
         # Number keys 1-4
@@ -1747,7 +1759,7 @@ class OutputView:
                 self._scroll_to_end()
             else:
                 # Single select - record and advance
-                q_req.answers[str(q_req.current_idx)] = label
+                q_req.answers[question_text] = label
                 self._clear_question(f"{header} → {label}")
                 self._advance_question()
             return True
@@ -1766,7 +1778,7 @@ class OutputView:
                     label = opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
                     selected_labels.append(label)
                 answer = ", ".join(selected_labels) if selected_labels else "(none)"
-                q_req.answers[str(q_req.current_idx)] = answer
+                q_req.answers[question_text] = answer
                 self._clear_question(f"{header} → {answer}")
                 self._advance_question()
                 return True
@@ -1826,7 +1838,7 @@ class OutputView:
             q_req = self.pending_question
             q = q_req.questions[q_req.current_idx]
             header = q.get("header", f"Q{q_req.current_idx + 1}")
-            q_req.answers[str(q_req.current_idx)] = text
+            q_req.answers[q.get("question", str(q_req.current_idx))] = text
             self._clear_question(f"{header} → {text}")
             self._advance_question()
 

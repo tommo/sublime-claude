@@ -118,19 +118,20 @@ def create_sublime_router() -> ToolRouter:
     router.register("terminal_list", simple_call_handler("terminal_list"))
 
     router.register("terminal_run", lambda args:
-        f"return terminal_run({args.get('command', '')!r}, tag={args.get('tag')!r}, "
-        f"wait={args.get('wait', 30)}, target_id={args.get('target_id')!r})")
-
-    router.register("terminal_send", lambda args:
-        f"return terminal_send({args.get('text', '')!r}, tag={args.get('tag')!r}, "
+        f"return terminal_run({args.get('command', '')!r}, "
+        f"index={args.get('index')!r}, wait={args.get('wait', 30)}, "
         f"target_id={args.get('target_id')!r})")
 
+    router.register("terminal_send", lambda args:
+        f"return terminal_send({args.get('text', '')!r}, "
+        f"index={args.get('index')!r}, target_id={args.get('target_id')!r})")
+
     router.register("terminal_read", lambda args:
-        f"return terminal_read(tag={args.get('tag')!r}, lines={args.get('lines', 100)}, "
+        f"return terminal_read(index={args.get('index')!r}, lines={args.get('lines', 100)}, "
         f"target_id={args.get('target_id')!r})")
 
     router.register("terminal_close", lambda args:
-        f"return terminal_close(tag={args.get('tag')!r}, target_id={args.get('target_id')!r})")
+        f"return terminal_close(index={args.get('index')!r}, target_id={args.get('target_id')!r})")
 
     # ask_user removed — Claude's native AskUserQuestion shows inline in session view
 
