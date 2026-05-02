@@ -6,5 +6,6 @@
     "margin": 4,
     "draw_indent_guides": false,
     "highlight_line": true,
-    "fold_buttons": true
+    "fold_buttons": true,
+    "fade_fold_buttons": true
 }

@@ -205,5 +205,13 @@
     {
         "caption": "Claude: Open Terminal",
         "command": "claude_terminal_open"
+    },
+    {
+        "caption": "Claude: Output Settings",
+        "command": "edit_settings",
+        "args": {
+            "base_file": "${packages}/ClaudeCode/ClaudeOutput.sublime-settings",
+            "default": "// Claude Output View Settings\n// See default settings on the left for available options\n{\n}\n"
+        }
     }
 ]

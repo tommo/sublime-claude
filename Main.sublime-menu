@@ -43,6 +43,14 @@
                             "base_file": "${packages}/ClaudeCode/ClaudeCode.sublime-settings",
                             "default": "// Claude Code Settings\n// See default settings on the left for available options\n{\n}\n"
                         }
+                    },
+                    {
+                        "caption": "Output Settings...",
+                        "command": "edit_settings",
+                        "args": {
+                            "base_file": "${packages}/ClaudeCode/ClaudeOutput.sublime-settings",
+                            "default": "// Claude Output View Settings\n// See default settings on the left for available options\n{\n}\n"
+                        }
                     }
                 ]
             }

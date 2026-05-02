@@ -126,8 +126,17 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
 
             sublime.set_timeout(refocus, 100)
 
+    def on_post_save(self, view: sublime.View) -> None:
+        fname = view.file_name() or ""
+        if os.path.basename(fname) == "ClaudeOutput.sublime-settings":
+            for session in getattr(sublime, "_claude_sessions", {}).values():
+                if session.output:
+                    session.output._apply_output_settings()
 
     def on_close(self, view: sublime.View) -> None:
+        sublime.load_settings("ClaudeOutput.sublime-settings").clear_on_change(
+            f"claude_output_{view.id()}"
+        )
         # Clean up session when output view is closed
         if view.id() in sublime._claude_sessions:
             sublime._claude_sessions[view.id()].stop()

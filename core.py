@@ -72,6 +72,10 @@ def plugin_loaded() -> None:
                 session = Session(window, resume_id=resume_id, backend=backend)
                 session.name = session_name
                 session.output.view = view
+                session.output._apply_output_settings()
+                sublime.load_settings("ClaudeOutput.sublime-settings").add_on_change(
+                    f"claude_output_{view.id()}", session.output._apply_output_settings
+                )
                 session.draft_prompt = ""
                 sublime._claude_sessions[view.id()] = session
                 session._apply_sleep_ui()
