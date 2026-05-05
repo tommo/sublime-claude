@@ -1800,12 +1800,23 @@ class OutputView:
         if not self.view or not self.pending_question:
             return
 
-        # Append input prompt after question block
+        # Append input prompt after question block, prefixed with newline so it
+        # sits on its own line and can be cleanly removed via named region.
         self.view.set_read_only(False)
-        marker = "    ▸ "
-        self.view.run_command("append", {"characters": marker})
-        self._question_input_start = self.view.size()
+        marker_text = "\n    ▸ "
+        marker_start = self.view.size()
+        self.view.run_command("append", {"characters": marker_text})
+        marker_end = self.view.size()
+        self._question_input_start = marker_end
         self._question_input_mode = True
+
+        # Track the entire input line as a named region so we can erase it
+        # robustly later regardless of how much text the user types.
+        self.view.add_regions(
+            "claude_question_input_marker",
+            [sublime.Region(marker_start, marker_end)],
+            "", "", sublime.HIDDEN,
+        )
 
         # Set standard input mode so keyboard/selection handling works
         self._input_start = self._question_input_start
@@ -1825,22 +1836,27 @@ class OutputView:
             self._question_input_mode = False
             return False
 
-        # Get typed text
+        # Get typed text (region from marker_end to current view end)
         text = self.view.substr(sublime.Region(self._question_input_start, self.view.size())).strip()
         self._question_input_mode = False
         self._input_mode = False
         self.view.settings().set("claude_input_mode", False)
-        self.view.set_read_only(True)
 
-        # Remove the input line
-        marker_start = self._question_input_start - len("    ▸ ")
+        # Remove the entire input line: marker region + any typed text after it.
+        # Use the tracked region for robustness; fall back to position math.
+        regions = self.view.get_regions("claude_question_input_marker")
+        if regions:
+            erase_start = regions[0].begin()
+        else:
+            erase_start = max(0, self._question_input_start - len("\n    ▸ "))
         self.view.set_read_only(False)
         self.view.run_command("claude_replace", {
-            "start": max(0, marker_start),
+            "start": erase_start,
             "end": self.view.size(),
-            "text": ""
+            "text": "",
         })
         self.view.set_read_only(True)
+        self.view.erase_regions("claude_question_input_marker")
 
         if text:
             q_req = self.pending_question
