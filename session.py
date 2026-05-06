@@ -1020,8 +1020,16 @@ class Session:
         # 5. Process queued prompts (keep working=True, animation continues)
         if self._queued_prompts:
             prompt = self._queued_prompts.pop(0)
-            self.output.text(f"\n**[queued]** {prompt}\n\n")
-            self.query(prompt)
+            # Synthetic prompts (bg-task wakes, retain injects, etc.) should
+            # never be rendered as user input — fire them silently with a
+            # short status-bar/background hint.
+            if self._is_synthetic_turn(prompt):
+                first = prompt.lstrip().split("\n", 1)[0][:60]
+                display = f"{BACKGROUND_PREFIX}{first}"
+                self.query(prompt, display_prompt=display, silent=True)
+            else:
+                self.output.text(f"\n**[queued]** {prompt}\n\n")
+                self.query(prompt)
             return
 
         # 6. Clear inject_pending - if inject was mid-query, it's done now
@@ -1730,24 +1738,22 @@ class Session:
         tool_use_id = self._task_tool_map.pop(task_id, None)
         if not status:
             return
+        tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
+        # Only backgrounded tools should generate a wake. Foreground tools
+        # (regular Bash/Task/etc.) deliver their result via tool_result and
+        # don't need a synthetic <task-notification> user-message.
+        is_background = tool is not None and tool.status == "background"
+        if not is_background:
+            return
+        # Update tool UI from BACKGROUND → DONE/ERROR.
+        from .output import DONE, ERROR
+        old_status = tool.status
+        tool.status = DONE if status == "completed" else ERROR
+        self.output._patch_tool_symbol(tool, old_status)
         # User-initiated kills don't need a wake — agent already knows it
         # interrupted, and waking just spams the conversation.
         if status in ("stopped", "killed"):
-            tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
-            if tool and tool.status == "background":
-                from .output import ERROR
-                old_status = tool.status
-                tool.status = ERROR
-                self.output._patch_tool_symbol(tool, old_status)
             return
-        # Update tool UI from BACKGROUND → DONE/ERROR if we can find it. The
-        # notification still fires even if tool tracking is lost.
-        tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
-        if tool and tool.status == "background":
-            from .output import DONE, ERROR
-            old_status = tool.status
-            tool.status = DONE if status == "completed" else ERROR
-            self.output._patch_tool_symbol(tool, old_status)
         # Build the notification block
         output = ""
         output_file = data.get("output_file", "")
