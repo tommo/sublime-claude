@@ -127,6 +127,11 @@ class Session:
         self._pending_resume_at: Optional[str] = None  # Set by undo, consumed by next query
         # Background task tracking: task_id → tool_use_id
         self._task_tool_map: Dict[str, str] = {}
+        # Tool-use IDs we know were started with run_in_background=true.
+        # Authoritative for "should this task_notification fire a wake?" —
+        # survives conversation-history truncation (HISTORY_CAP), so old bg
+        # tasks still notify the agent when they finally finish.
+        self._bg_tool_use_ids: set = set()
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
@@ -1632,6 +1637,8 @@ class Session:
             return
         if background:
             # Background tools don't take over current_tool (spinner stays on foreground)
+            if tool_id:
+                self._bg_tool_use_ids.add(tool_id)
             self.output.tool(name, tool_input, tool_id=tool_id, background=True)
             self._update_status_bar()
             return
@@ -1740,25 +1747,25 @@ class Session:
     def _on_sys_task_notification(self, data: dict) -> None:
         task_id = data.get("task_id", "")
         status = data.get("status", "")
-        tool_use_id = self._task_tool_map.pop(task_id, None)
-        if not status:
+        # Use tool_use_id from the SDK directly; clean up _task_tool_map.
+        tool_use_id = data.get("tool_use_id") or self._task_tool_map.get(task_id)
+        self._task_tool_map.pop(task_id, None)
+        if not status or not tool_use_id:
             return
-        tool = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
-        # Only backgrounded tools should generate a wake. Foreground tools
-        # (regular Bash/Task/etc.) deliver their result via tool_result and
-        # don't need a synthetic <task-notification> user-message.
-        is_background = tool is not None and tool.status == "background"
-        if not is_background:
+        # Authoritative gate: only fire wake for tools we know were started
+        # with run_in_background=true. Survives conversation-history truncation
+        # so a bg task that finishes much later still notifies the agent.
+        if tool_use_id not in self._bg_tool_use_ids:
             return
-        # Update tool UI from BACKGROUND → DONE/ERROR.
-        from .output import DONE, ERROR
-        old_status = tool.status
-        tool.status = DONE if status == "completed" else ERROR
-        self.output._patch_tool_symbol(tool, old_status)
-        # User-initiated kills don't need a wake — agent already knows it
-        # interrupted, and waking just spams the conversation.
-        if status in ("stopped", "killed"):
-            return
+        self._bg_tool_use_ids.discard(tool_use_id)
+        # Update tool UI from BACKGROUND → DONE/ERROR if the tool object is
+        # still in the (possibly truncated) conversation history.
+        tool = self.output.find_tool_by_id(tool_use_id)
+        if tool and tool.status == "background":
+            from .output import DONE, ERROR
+            old_status = tool.status
+            tool.status = DONE if status == "completed" else ERROR
+            self.output._patch_tool_symbol(tool, old_status)
         # Build the notification block
         output = ""
         output_file = data.get("output_file", "")
