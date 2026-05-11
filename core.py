@@ -164,14 +164,19 @@ def _check_auto_sleep():
 
     threshold = time.time() - (timeout_min * 60)
 
+    force_threshold = time.time() - (timeout_min * 60 * 2)
+
     for view_id, session in list(sublime._claude_sessions.items()):
+        if getattr(session, 'sleep_disabled', False):
+            continue
         if (session.initialized
                 and not session.working
                 and not session.is_sleeping
                 and session.last_idle_at > 0
                 and session.last_idle_at < threshold):
-            print(f"[Claude] auto-sleep: {session.name} idle for >{timeout_min}m")
-            session.sleep()
+            force = session.last_idle_at < force_threshold
+            print(f"[Claude] auto-sleep: {session.name} idle for >{timeout_min}m (force={force})")
+            session.sleep(force=force)
 
     schedule_auto_sleep()
 

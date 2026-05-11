@@ -396,7 +396,10 @@ class NotaloneClient:
         print(f"[Claude] notalone: flushing to session {view_id} (working={session.working}): {display_message}")
 
         try:
-            if session.working:
+            if session.is_sleeping:
+                session._queued_prompts.append(wake_prompt)
+                session.wake()
+            elif session.working:
                 # Inject into running query
                 session.queue_prompt(wake_prompt)
             else:

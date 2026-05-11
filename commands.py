@@ -1088,6 +1088,25 @@ class ClaudeWakeSessionCommand(sublime_plugin.WindowCommand):
         return session is not None and session.is_sleeping
 
 
+class ClaudeToggleAutoSleepCommand(sublime_plugin.WindowCommand):
+    """Toggle auto-sleep for the active session."""
+    def run(self):
+        session = get_active_session(self.window)
+        if not session:
+            return
+        session.sleep_disabled = not session.sleep_disabled
+        state = "disabled" if session.sleep_disabled else "enabled"
+        sublime.status_message(f"Claude: auto-sleep {state} for this session")
+        session.output.set_name(session.name or "Claude")
+
+    def is_enabled(self):
+        return get_active_session(self.window) is not None
+
+    def is_checked(self):
+        session = get_active_session(self.window)
+        return bool(session and session.sleep_disabled)
+
+
 class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
     """Resume a previous session."""
     def run(self) -> None:

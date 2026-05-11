@@ -149,6 +149,7 @@ class Session:
         # spamming the conversation and racing with user input.
         self._pending_bg_notifications: List[str] = []
         self._bg_flush_scheduled: bool = False
+        self._bg_poll_timer = None  # sublime.set_timeout handle for between-query bg task polling
 
         # Extract subsession_id and parent_view_id if provided
         if initial_context:
@@ -171,6 +172,7 @@ class Session:
         # Activity tracking for auto-sleep
         self.last_activity: float = time.time()
         self.last_idle_at: float = 0  # set when session enters input mode (truly idle)
+        self.sleep_disabled: bool = False  # per-session auto-sleep disable toggle
 
         # Terminal mode state
         self.terminal_mode: bool = False
@@ -1093,6 +1095,12 @@ class Session:
         if self._input_mode_entered:
             return
 
+        # Queued prompts (e.g. notalone inject while sleeping) take priority
+        if self._queued_prompts:
+            prompt = self._queued_prompts.pop(0)
+            self.query(prompt)
+            return
+
         self.output.enter_input_mode()
 
         # Check if enter_input_mode actually succeeded (might have deferred)
@@ -1187,6 +1195,7 @@ class Session:
         self.stop_loop(silent=True)
         self._abort_background_tools(reason="session stopped")
         self._task_tool_map.clear()
+        self._bg_poll_timer = None  # cancel pending poll (map cleared → _bg_poll will bail)
         self._persist_state("closed")
 
         # Clean up terminal mode if active
@@ -1255,6 +1264,7 @@ class Session:
         self._abort_background_tools(reason="session slept")
         # Clear pending background-task ID map; bridge restart loses these mappings.
         self._task_tool_map.clear()
+        self._bg_poll_timer = None  # cancel pending poll (map cleared → _bg_poll will bail)
         if self.client:
             client = self.client
             self.client = None
@@ -1754,6 +1764,7 @@ class Session:
         tool_use_id = data.get("tool_use_id", "")
         if task_id and tool_use_id:
             self._task_tool_map[task_id] = tool_use_id
+            self._schedule_bg_poll()
 
     def _on_sys_task_updated(self, data: dict) -> None:
         task_id = data.get("task_id", "")
@@ -1830,6 +1841,31 @@ class Session:
             self._queued_prompts.append(wake_prompt)
         else:
             self.query(wake_prompt, display_prompt=display, silent=True)
+
+    def _schedule_bg_poll(self) -> None:
+        """Start bg-task poll timer if not already running."""
+        if self._bg_poll_timer is not None or not self._task_tool_map:
+            return
+        self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 5000)
+
+    def _bg_poll(self) -> None:
+        """Periodically poll bridge for buffered task_notification messages."""
+        self._bg_poll_timer = None
+        if not self._task_tool_map or not self.client or not self.initialized:
+            return
+        if self.working:
+            # Active query — run_query() handles it; retry after it ends
+            self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 3000)
+            return
+        self.client.send("poll_bg_tasks", {}, self._on_bg_poll_result)
+
+    def _on_bg_poll_result(self, result: dict) -> None:
+        checked = result.get("checked", 0)
+        pending = result.get("pending", 0)
+        if checked:
+            print(f"[Claude] bg_poll: checked={checked} pending_bridge={pending} pending_plugin={len(self._task_tool_map)}")
+        if self._task_tool_map:
+            self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 8000)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""

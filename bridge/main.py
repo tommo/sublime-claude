@@ -144,6 +144,8 @@ class Bridge:
                 if max_ctx:
                     os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_ctx)
                 send_result(id, {"ok": True})
+            elif method == "poll_bg_tasks":
+                await self.poll_bg_tasks(id)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -1128,6 +1130,35 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 f.write(f"  inject failed: {e}, queuing\n")
             self.pending_injects.append(message)
             send_result(id, {"status": "queued"})
+
+    async def poll_bg_tasks(self, rpc_id: int) -> None:
+        """Drain buffered SDK messages to pick up pending task_notification system messages.
+
+        Called periodically by the plugin when background tasks are in-flight and the
+        session is idle (no active query). The Claude Code CLI buffers task_notification
+        messages between queries; this drains that buffer and emits them normally.
+        """
+        if not self._pending_bg_tasks or not self.client:
+            send_result(rpc_id, {"pending": 0, "checked": 0})
+            return
+        checked = 0
+        try:
+            stale_iter = self.client.receive_messages().__aiter__()
+            while True:
+                try:
+                    msg = await asyncio.wait_for(stale_iter.__anext__(), timeout=0.15)
+                    checked += 1
+                    if isinstance(msg, SystemMessage):
+                        data = msg.data or {}
+                        if msg.subtype == "task_notification":
+                            self._pending_bg_tasks.discard(data.get("task_id", ""))
+                        await self.emit_message(msg)
+                except (asyncio.TimeoutError, StopAsyncIteration):
+                    break
+        except Exception as e:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"poll_bg_tasks error: {e}\n")
+        send_result(rpc_id, {"pending": len(self._pending_bg_tasks), "checked": checked})
 
     async def get_history(self, id: int) -> None:
         """Get conversation history from the SDK."""

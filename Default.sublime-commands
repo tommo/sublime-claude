@@ -195,6 +195,10 @@
         "command": "claude_terminal_mode"
     },
     {
+        "caption": "Claude: Toggle Auto-Sleep for This Session",
+        "command": "claude_toggle_auto_sleep"
+    },
+    {
         "caption": "Claude: Sleep Session",
         "command": "claude_sleep_session"
     },
