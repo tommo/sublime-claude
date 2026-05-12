@@ -5,7 +5,7 @@ import sublime
 import sublime_plugin
 from typing import Dict, Optional
 
-from .session import Session, load_saved_sessions, save_sessions
+from .session import Session
 from . import backends
 
 
@@ -26,70 +26,10 @@ def plugin_loaded() -> None:
     from . import notalone
     notalone.start()
 
-    # Register orphaned claude output views as sleeping sessions
-    def register_orphans():
-        import re
-        saved_sessions = load_saved_sessions()
-
-        for window in sublime.windows():
-            for view in window.views():
-                if not view.settings().get("claude_output"):
-                    continue
-                if view.id() in sublime._claude_sessions:
-                    continue
-
-                # Extract session name from view title
-                name = view.name()
-                name = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', name)
-                if name.startswith("Claude: "):
-                    name = name[8:]
-                if name.startswith("[") and "] " in name:
-                    name = name[name.index("] ") + 2:]
-                if name.endswith("\u2026"):
-                    name = name[:-1]
-                session_name = name if name and name != "Claude" else None
-
-                # Find resume_id from saved sessions
-                resume_id = None
-                if session_name:
-                    for saved in saved_sessions:
-                        saved_name = saved.get("name") or ""
-                        if not saved.get("session_id"):
-                            continue
-                        if saved_name == session_name or saved_name.startswith(session_name):
-                            resume_id = saved.get("session_id")
-                            session_name = saved_name
-                            break
-
-                if not resume_id:
-                    continue
-
-                # Ensure scratch is restored (may have been unset by previous buggy code)
-                if not view.is_scratch():
-                    view.set_scratch(True)
-
-                backend = view.settings().get("claude_backend", "claude")
-                session = Session(window, resume_id=resume_id, backend=backend)
-                session.name = session_name
-                session.output.view = view
-                session.output._apply_output_settings()
-                sublime.load_settings("ClaudeOutput.sublime-settings").add_on_change(
-                    f"claude_output_{view.id()}", session.output._apply_output_settings
-                )
-                session.draft_prompt = ""
-                sublime._claude_sessions[view.id()] = session
-                session._apply_sleep_ui()
-        schedule_auto_sleep()
-
-    sublime.set_timeout(register_orphans, 500)
-
-    # Sync order table bookmarks after windows are ready
-    def sync_orders():
-        from .order_table import sync_bookmarks
-        for window in sublime.windows():
-            sync_bookmarks(window)
-
-    sublime.set_timeout(sync_orders, 1000)
+    # Orphaned claude_output views reconnect lazily on first activation via
+    # ClaudeOutputEventListener._reconnect_orphaned_view (listeners.py).
+    # Order bookmarks attach lazily on view load via ClaudeCodeEventListener.on_load.
+    schedule_auto_sleep()
 
 
 def plugin_unloaded() -> None:
@@ -163,7 +103,6 @@ def _check_auto_sleep():
         return
 
     threshold = time.time() - (timeout_min * 60)
-
     force_threshold = time.time() - (timeout_min * 60 * 2)
 
     for view_id, session in list(sublime._claude_sessions.items()):

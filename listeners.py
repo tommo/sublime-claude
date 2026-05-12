@@ -12,6 +12,34 @@ from .context_parser import ContextParser, ContextMenuItem, ContextMenuHandler
 
 _last_copy_meta = None  # {file, regions: [(row_start, row_end), ...], text}
 
+
+def _attach_order_bookmarks(view: sublime.View) -> None:
+    """Add order-region/phantom markers for any pending orders matching this view's file.
+
+    Idempotent (each call erases-then-adds), but guarded by a per-view sentinel so
+    we only walk the order table once per view per plugin lifetime."""
+    if view.settings().get("claude_orders_attached"):
+        return
+    path = view.file_name()
+    if not path:
+        return
+    window = view.window()
+    if not window:
+        return
+    from .order_table import get_table, _add_order_region
+    table = get_table(window)
+    if not table:
+        return
+    for order in table.list("pending"):
+        if order.get("file_path") != path:
+            continue
+        _add_order_region(
+            view, order["id"],
+            order.get("row", 0), order.get("col", 0),
+            order.get("selection_length"), order.get("prompt"),
+        )
+    view.settings().set("claude_orders_attached", True)
+
 class ClaudeCodeEventListener(sublime_plugin.EventListener):
     def on_post_text_command(self, view, command_name, args):
         global _last_copy_meta
@@ -85,6 +113,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         if view.settings().get("claude_output"):
             return
 
+        # Lazily attach order bookmarks (only walks table once per view, no-op if already attached).
+        _attach_order_bookmarks(view)
+
         # Check if we have a pending context session
         session_view_id = window.settings().get("claude_pending_context_session")
         if not session_view_id:
@@ -125,6 +156,10 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                     session.output.view.sel().add(sublime.Region(end, end))
 
             sublime.set_timeout(refocus, 100)
+
+    def on_load(self, view: sublime.View) -> None:
+        # Lazily attach order bookmarks for this file (replaces upfront sync_orders scan).
+        _attach_order_bookmarks(view)
 
     def on_post_save(self, view: sublime.View) -> None:
         fname = view.file_name() or ""
@@ -296,6 +331,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             backend_themes = {
                 "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
                 "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+                "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
             }
             theme = backend_themes.get(backend)
             if theme:
