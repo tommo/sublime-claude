@@ -8,10 +8,10 @@ import sublime
 
 from .rpc import JsonRpcClient
 from .output import OutputView
-from .constants import LOOP_PREFIX, BACKGROUND_PREFIX
+from .constants import BACKGROUND_PREFIX
 from . import backends
-from .loop_controller import LoopController
 from .context_manager import ContextManager, ContextItem  # ContextItem re-exported for back-compat
+from . import cc_launch
 
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
@@ -138,8 +138,6 @@ class Session:
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
         self._response_callback: Optional[Callable[[str], None]] = None
-        # Idle-triggered loop controller (re-fires prompt when session becomes idle)
-        self.loop = LoopController(self)
         # Queue of prompts to send after current query completes
         self._queued_prompts: List[str] = []
         # Track if inject was sent (to skip "done" status until inject query completes)
@@ -331,7 +329,13 @@ class Session:
             if default_model:
                 real_model, _ = _resolve_model_id(default_model)
                 init_params["model"] = real_model
-        self.client.send("initialize", init_params, self._on_init)
+        sent = self.client.send("initialize", init_params, self._on_init)
+        if not sent:
+            # Bridge died before we could send — simulate an error so _on_init cleans up
+            sublime.set_timeout(
+                lambda: self._on_init({"error": {"message": "Bridge process died before initialization. Check that the backend CLI is installed and authenticated."}}),
+                50
+            )
 
     def _cwd(self) -> str:
         if self.window.folders():
@@ -361,6 +365,10 @@ class Session:
                 self.output.text("\n*Session expired or not found.*\n\nUse `Claude: Restart Session` (Cmd+Shift+R) to start fresh.\n")
             else:
                 self.output.text(f"\n*Failed to connect: {error_msg}*\n\nTry `Claude: Restart Session` (Cmd+Shift+R).\n")
+            # Still enter input mode so the user can interact with the error view
+            self.working = False
+            self._input_mode_entered = False
+            sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 200)
             return
         self._clear_overlay_phantom()
         self.initialized = True
@@ -1068,9 +1076,6 @@ class Session:
         self.working = False
         self.last_activity = time.time()
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
-        # Loop hook: re-fire prompt now that we're idle (respecting min interval)
-        if self.loop.is_active:
-            sublime.set_timeout(self.loop.on_idle, 200)
 
     def _clear_deferred_state(self) -> None:
         """Clear deferred action state. Called on error/interrupt."""
@@ -1140,17 +1145,6 @@ class Session:
             # No client - queue locally for later
             self._queued_prompts.append(prompt)
 
-    # ── Loop control delegated to LoopController ────────────────────────
-    # Public surface kept for back-compat with callers (commands.py, etc.):
-    #   session.start_loop(prompt, interval) → session.loop.start(...)
-    #   session.stop_loop(silent=False)      → session.loop.stop(...)
-
-    def start_loop(self, prompt: str, interval_sec: Optional[int] = None) -> None:
-        self.loop.start(prompt, interval_sec)
-
-    def stop_loop(self, silent: bool = False) -> None:
-        self.loop.stop(silent=silent)
-
     def show_queue_input(self) -> None:
         """Show input panel to queue a prompt while session is working."""
         if not self.working:
@@ -1198,7 +1192,6 @@ class Session:
 
     def stop(self) -> None:
         # Persist closed state before cleanup
-        self.stop_loop(silent=True)
         self._abort_background_tools(reason="session stopped")
         self._task_tool_map.clear()
         self._bg_poll_timer = None  # cancel pending poll (map cleared → _bg_poll will bail)
@@ -1238,7 +1231,7 @@ class Session:
         # Strip any stale prefixes from name (status icons + backend abbrevs)
         import re
         base = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', base)
-        base = re.sub(r'^(?:CX|DS|CP)(?:>|:)\s*', '', base) or "Claude"
+        base = re.sub(r'^(?:DSR|CX|DS|CP|Pi)(?:>|:)\s*', '', base) or "Claude"
         return base
 
     def sleep(self, force: bool = False) -> bool:
@@ -1265,7 +1258,6 @@ class Session:
                 print(f"[Claude] {msg}")
                 sublime.status_message(f"Claude: {msg}")
                 return False
-        self.stop_loop(silent=True)
         # If we got here with force=True and bg tools, abort their UI state.
         self._abort_background_tools(reason="session slept")
         # Clear pending background-task ID map; bridge restart loses these mappings.
@@ -1281,13 +1273,15 @@ class Session:
         return True
 
     def _abort_background_tools(self, reason: str) -> None:
-        """Mark all in-flight background tools as errored (their subprocess is gone)."""
+        """Drop all in-flight background tools — their subprocess is gone with the
+        bridge, so their outcome is unknowable and a leftover ✘ line is just
+        noise. Remove the lines rather than mark them errored."""
         if not self.output:
             return
         try:
-            from .output import BACKGROUND, ERROR
+            from .output import BACKGROUND
             # Union of currently-visible bg tools and any we've tracked across
-            # history truncation. Use object identity to avoid double-patching.
+            # history truncation. Use object identity to avoid double-handling.
             seen = set()
             bg = []
             for tool in self.output.active_background_tools():
@@ -1299,15 +1293,12 @@ class Session:
                     seen.add(id(tool))
                     bg.append(tool)
             for tool in bg:
-                old_status = tool.status
-                if old_status != BACKGROUND:
+                if tool.status != BACKGROUND:
                     continue
-                tool.status = ERROR
-                tool.result = f"(aborted: {reason})"
-                self.output._patch_tool_symbol(tool, old_status)
+                self.output.remove_tool(tool)
             self._bg_tools.clear()
             if bg:
-                print(f"[Claude] aborted {len(bg)} background tool(s): {reason}")
+                print(f"[Claude] dropped {len(bg)} aborted background tool(s): {reason}")
         except Exception as e:
             print(f"[Claude] _abort_background_tools error: {e}")
 
@@ -1439,27 +1430,45 @@ class Session:
             return [cli, "resume", self.session_id]
         elif self.backend == "copilot":
             return None  # No CLI available
+        elif self.backend == "pi":
+            return None  # No direct terminal resume for pi RPC
         else:
-            cli = settings.get("claude_cli_path") or shutil.which("claude") or "claude"
-            return [cli, "--resume", self.session_id]
+            cli = (cc_launch.resolve_claude(settings)
+                   or settings.get("claude_cli_path") or "claude")
+            argv = [cli, "--resume", self.session_id]
+            # Same permission posture as the hidden-PTY engine.
+            perm = settings.get("pty_permission_mode", "acceptEdits")
+            argv += ["--permission-mode", perm]
+            return argv
 
     def _open_terminal(self, cli_cmd: list) -> None:
+        """Run the CLI in our embedded terminal view, injecting the sublime MCP
+        server (scoped to the terminal view's id) and the same env as SDK
+        sessions — so the in-terminal Claude has the editor tools."""
+        from .terminal.terminal import Terminal
+        from .terminal.commands import new_terminal_view
         cwd = self._cwd()
         tag = self._terminal_tag
         name = self.display_name
         window_id = self.window.id()
+        backend = self.backend
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        env = cc_launch.load_env(self.window, settings, cwd)
 
         def do_open():
-            for w in sublime.windows():
-                if w.id() == window_id:
-                    w.run_command("terminus_open", {
-                        "tag": tag,
-                        "title": f"CLI: {name}",
-                        "cmd": cli_cmd,
-                        "cwd": cwd,
-                        "focus": True,
-                    })
-                    break
+            win = next((w for w in sublime.windows() if w.id() == window_id), None)
+            if not win:
+                return
+            view = new_terminal_view(win, "CLI: {}".format(name), tag)
+            argv = list(cli_cmd)
+            if backend == "claude":
+                argv += cc_launch.add_dir_args(win)  # extra working dirs
+                mcp_cfg = cc_launch.build_sublime_mcp_config(settings, view.id())
+                if mcp_cfg:
+                    argv += ["--mcp-config", mcp_cfg]
+            Terminal(view).start(cmd=argv, cwd=cwd, env=env, tag=tag,
+                                 default_title="CLI: {}".format(name))
+            win.focus_view(view)
         sublime.set_timeout(do_open, 50)
 
     def _poll_terminal_exit(self) -> None:
@@ -1469,7 +1478,7 @@ class Session:
             if not self.terminal_mode or not self._terminal_poll_active:
                 return
             tv = self._find_terminal_view()
-            if tv is None or tv.settings().get("terminus_view.finished"):
+            if tv is None or tv.settings().get("claude_terminal_view.finished"):
                 self._on_terminal_exit()
                 return
             sublime.set_timeout(check, 500)
@@ -1480,7 +1489,7 @@ class Session:
         if not self._terminal_tag:
             return None
         for view in self.window.views():
-            if view.settings().get("terminus_view.tag") == self._terminal_tag:
+            if view.settings().get("claude_terminal_tag") == self._terminal_tag:
                 return view
         return None
 
@@ -1488,7 +1497,7 @@ class Session:
         self._terminal_poll_active = False
         self.terminal_mode = False
         tv = self._find_terminal_view()
-        if tv and tv.settings().get("terminus_view.finished"):
+        if tv and tv.settings().get("claude_terminal_view.finished"):
             sublime.set_timeout(lambda: tv.close() if tv.is_valid() else None, 200)
         self._terminal_tag = None
         if self.output and self.output.view and self.output.view.is_valid():
@@ -1784,6 +1793,12 @@ class Session:
         if tool and tool.status != "background":
             from .output import BACKGROUND
             tool.status = BACKGROUND
+            # Register so the completion task_notification can flip ⚙ → ✓/✗.
+            # Tools backgrounded *here* (mid-run, via is_backgrounded) — not at
+            # tool_use time — were otherwise missing from _bg_tools, so their
+            # notification hit the `not in _bg_tools` gate and was dropped,
+            # leaving the tool stuck on ⚙ ("live") forever.
+            self._bg_tools[tool_use_id] = tool
             if self.output._is_in_current(tool):
                 self.output._render_current()
             else:
@@ -1805,12 +1820,7 @@ class Session:
         # Pop the ToolCall reference; prefer it over find_tool_by_id, which
         # returns None after HISTORY_CAP drops the owning Conversation.
         tool = self._bg_tools.pop(tool_use_id) or self.output.find_tool_by_id(tool_use_id)
-        if tool and tool.status == "background":
-            from .output import DONE, ERROR
-            old_status = tool.status
-            tool.status = DONE if status == "completed" else ERROR
-            self.output._patch_tool_symbol(tool, old_status)
-        # Build the notification block
+        # Read output first — it decides whether the tool line is worth keeping.
         output = ""
         output_file = data.get("output_file", "")
         if output_file:
@@ -1819,6 +1829,15 @@ class Session:
                     output = f.read().strip()
             except Exception as e:
                 print(f"[Claude] task notification output read failed ({output_file}): {e}")
+        if tool and tool.status == "background":
+            from .output import DONE
+            if status == "completed" and output:
+                old_status = tool.status
+                tool.status = DONE  # ✓ — a real result worth keeping
+                self.output._patch_tool_symbol(tool, old_status)
+            else:
+                # Failed, or completed with no surfaced output → drop the noise.
+                self.output.remove_tool(tool)
         summary = data.get("summary", "")
         header = f"{summary} [{status}]" if status != "completed" else summary
         block = (
@@ -1943,9 +1962,6 @@ class Session:
             ctx_k = self._context_tokens_k()
             if ctx_k is not None:
                 parts.append(f"ctx:{ctx_k}k")
-        loop_label = self.loop.status_label()
-        if loop_label:
-            parts.append(f"{LOOP_PREFIX}{loop_label}")
         self.output.view.set_status("claude", f"{label}: {', '.join(parts)}")
 
     def _update_status_bar(self) -> None:

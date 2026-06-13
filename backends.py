@@ -17,6 +17,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 
+def _pi_available() -> bool:
+    """Check if pi CLI is installed."""
+    # Check bun global install first
+    bun_pi = os.path.expanduser("~/.bun/install/global/node_modules/.bin/pi")
+    if os.path.isfile(bun_pi):
+        return True
+    return bool(shutil.which("pi"))
+
+
 @dataclass
 class BackendSpec:
     name: str                                    # "claude" | "codex" | "copilot" | "deepseek"
@@ -83,7 +92,27 @@ def _copilot_available() -> bool:
     return os.path.exists(os.path.join(plugin_dir, "bridge", "copilot_main.py"))
 
 
+def _dsr_available() -> bool:
+    """Check if dsr CLI is installed (DSR_BIN env var or in PATH)."""
+    return bool(os.environ.get("DSR_BIN") or shutil.which("dsr"))
+
+
 BACKENDS: Dict[str, BackendSpec] = {
+    "pi": BackendSpec(
+        name="pi",
+        label="Pi",
+        abbrev="Pi",
+        bridge_script="pi_main.py",
+        fallback_model="claude-sonnet-4-6",
+        default_models=[
+            ("claude-fable-5", "Claude Fable 5"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-8", "Claude Opus 4.8"),
+            ("claude-haiku-4-5", "Claude Haiku 4.5"),
+            ("gpt-5.5", "GPT-5.5"),
+        ],
+        available=_pi_available,
+    ),
     "claude": BackendSpec(
         name="claude",
         label="Claude",
@@ -91,14 +120,15 @@ BACKENDS: Dict[str, BackendSpec] = {
         bridge_script="main.py",
         fallback_model="opus",
         default_models=[
-            ("opus", "Opus 4.7"),
-            ("opus@400k", "Opus 4.7 (400K context)"),
-            ("claude-opus-4-6[1m]", "Opus 4.6 (1M context)"),
-            ("claude-opus-4-6[1m]@400k", "Opus 4.6 (400K context)"),
-            ("claude-opus-4-6", "Opus 4.6"),
+            ("claude-fable-5", "Fable 5"),
+            ("opus", "Opus 4.8"),
+            ("opus@400k", "Opus 4.8 (400K context)"),
+            ("claude-opus-4-8[1m]", "Opus 4.8 (1M context)"),
+            ("claude-opus-4-8[1m]@400k", "Opus 4.8 (400K context)"),
             ("sonnet", "Sonnet 4.6"),
             ("haiku", "Haiku 4.5"),
-            ("claude-opus-4-5", "Opus 4.5"),
+            ("claude-opus-4-7", "Opus 4.7"),
+            ("claude-opus-4-6", "Opus 4.6"),
             ("claude-sonnet-4-5", "Sonnet 4.5"),
         ],
     ),
@@ -127,7 +157,7 @@ BACKENDS: Dict[str, BackendSpec] = {
         theme="Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
         default_models=[
             ("claude-sonnet-4-6", "Sonnet 4.6"),
-            ("claude-opus-4-7", "Opus 4.7"),
+            ("claude-opus-4-8", "Opus 4.8"),
             ("gpt-5.5", "GPT-5.5"),
             ("gpt-5.4", "GPT-5.4"),
             ("gpt-5.3-codex", "GPT-5.3 Codex"),
@@ -148,6 +178,20 @@ BACKENDS: Dict[str, BackendSpec] = {
         ],
         dynamic_env=_deepseek_dynamic_env,
         available=_deepseek_available,
+    ),
+    "dsr": BackendSpec(
+        name="dsr",
+        label="DSR",
+        abbrev="DSR",
+        bridge_script="dsr_main.py",
+        fallback_model="deepseek-v4-pro",
+        default_models=[
+            ("pro", "V4 Pro (default)"),
+            ("flash", "V4 Flash"),
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
+            ("deepseek-v4-flash", "deepseek-v4-flash"),
+        ],
+        available=_dsr_available,
     ),
 }
 

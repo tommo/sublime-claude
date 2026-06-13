@@ -16,6 +16,10 @@ from .core import (
 # All commands
 from .commands import (
     ClaudeCodeStartCommand,
+    PiStartCommand,
+    DsrStartCommand,
+    ClaudeCodePtyStartCommand,
+    ClaudeRevealCliScreenCommand,
     ClaudeCodeQueryCommand,
     ClaudeCodeRestartCommand,
     ClaudeCodeQuerySelectionCommand,

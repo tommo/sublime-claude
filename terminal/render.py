@@ -119,6 +119,9 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         super().__init__(*args, **kwargs)
         # it keeps all the highlight keys
         self.colored_lines = {}
+        self.region_scopes = {}   # key -> scope, so we can snapshot/restore colors
+        self._alt_active = False  # are we currently showing the alt screen?
+        self._alt_snapshot = None  # saved primary view while on the alt screen
         settings = sublime.load_settings("ClaudeTerminal.sublime-settings")
         self.scrollback_history_size = settings.get("scrollback_history_size", 10000)
         self.brighten_bold_text = settings.get("brighten_bold_text", False)
@@ -132,6 +135,8 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
             return
 
         screen = terminal.screen
+
+        self._handle_alt_transition(edit, view, terminal, screen)
 
         if terminal._pending_to_clear_scrollback[0]:
             view.replace(edit, sublime.Region(0, view.size()), "")  # nuke everything
@@ -147,12 +152,32 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
 
             sublime.set_timeout(_reset)
 
+        # Decide whether to follow the bottom from the *current viewport* before
+        # appending — not from a wheel-driven flag. macOS scrolls the view
+        # natively (trackpad/wheel never reach our wheel command), so a flag
+        # would never flip and every frame would yank back to the bottom. Reading
+        # the position works on every platform and naturally distinguishes "user
+        # scrolled up to read" from "content grew below" (the latter doesn't move
+        # the viewport, so we stay engaged).
+        pin_bottom = view.settings().get("claude_terminal_view.pin_bottom", False)
+        if pin_bottom:
+            view.settings().set("claude_terminal_view.pin_bottom", False)  # one-shot
+        following = (pin_bottom or terminal.alternate_screen_enabled()
+                     or self._user_at_bottom(view))
+        prev_vp = view.viewport_position()
+
         self.update_lines(edit, terminal)
-        viewport_y = view.settings().get("claude_terminal_view.viewport_y", 0)
-        if viewport_y < view.viewport_position()[1] + view.line_height():
+        if following:
             self.trim_trailing_spaces(edit, terminal)
             self.trim_history(edit, terminal)
             view.run_command("claude_terminal_show_cursor")
+        else:
+            # User is reading scrollback — hold their position. Appending text can
+            # make Sublime auto-scroll to reveal the cursor/selection; undo that.
+            # We skip trimming here so layout coords stay stable for prev_vp.
+            if view.viewport_position() != prev_vp:
+                view.set_viewport_position(prev_vp, False)
+                sublime.set_timeout(lambda: view.set_viewport_position(prev_vp, False), 0)
 
         if self.dynamic_title:
             current_title = view.name()
@@ -172,6 +197,21 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         logger.debug("updating lines takes {}s".format(str(time.time() - startt)))
         logger.debug("mode: {}, cursor: {}.{}".format(
             [m >> 5 for m in screen.mode], screen.cursor.x, screen.cursor.y))
+
+    def _user_at_bottom(self, view, slack_lines=2):
+        """True when the viewport sits at (or within a couple lines of) the
+        buffer bottom. Computed from the live viewport so it tracks macOS native
+        scrolling, which never reaches our wheel command."""
+        lh = view.line_height()
+        if lh <= 0:
+            return True
+        last_y = view.text_to_layout(view.size())[1]
+        if last_y is None:
+            return True  # layout transiently unavailable: default to following
+        max_y = last_y - view.viewport_extent()[1] + lh
+        if max_y <= 0:
+            return True  # content shorter than the viewport: always "at bottom"
+        return view.viewport_position()[1] >= max_y - slack_lines * lh
 
     def update_lines(self, edit, terminal):
         # cursor = screen.cursor
@@ -225,30 +265,98 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
                 self.colored_lines[line] = []
         for s in segments:
             fg, bg, bold = s[3:]
+            # foreground-only: a reversed cell already had fg/bg swapped upstream,
+            # so the visible color we care about is fg.
             if not is_supported_color(fg):
                 fg = get_closest_color(fg)
-            if not is_supported_color(bg):
-                bg = get_closest_color(bg)
-            if fg != "default" or bg != "default":
+            if fg != "default":
                 if bold and self.brighten_bold_text:
-                    if fg != "default" and fg != "reverse_default" and not fg.startswith("light_"):
+                    if fg != "reverse_default" and not fg.startswith("light_"):
                         fg = "light_" + fg
-                    if bg != "default" and bg != "reverse_default" and not bg.startswith("light_"):
-                        bg = "light_" + bg
                 a = view.text_point(line, s[1])
                 b = view.text_point(line, s[2])
                 key = get_highlight_key(view)
-                view.add_regions(
-                    key,
-                    [sublime.Region(a, b)],
-                    "claude_terminal.{}.{}".format(fg, bg))
+                scope = "claude_terminal_color.{}".format(fg)
+                view.add_regions(key, [sublime.Region(a, b)], scope)
                 self.colored_lines[line].append(key)
+                self.region_scopes[key] = scope
 
     def decolorize_line(self, line):
         if line in self.colored_lines:
             for key in self.colored_lines[line]:
                 self.view.erase_regions(key)
+                self.region_scopes.pop(key, None)
             del self.colored_lines[line]
+
+    # ─── Alternate-screen view swap ─────────────────────────────────────────
+
+    def _handle_alt_transition(self, edit, view, terminal, screen):
+        """Real-terminal behaviour: on entering the alt screen, hide the primary
+        view (scrollback + last frame) so the Sublime view matches the TUI grid
+        exactly; restore it on exit."""
+        alt = screen.alternate_buffer_mode
+        if alt == self._alt_active:
+            return
+        self._alt_active = alt
+        logger.info("alt-screen %s: %s primary view",
+                    "ENTER" if alt else "EXIT",
+                    "hiding" if alt else "restoring")
+        if alt:
+            self._enter_alt(edit, view, terminal)
+        else:
+            self._leave_alt(edit, view, terminal)
+
+    def _all_region_keys(self):
+        keys = set()
+        for ks in self.colored_lines.values():
+            keys.update(ks)
+        return keys
+
+    def _erase_all_regions(self, view):
+        for key in self._all_region_keys():
+            view.erase_regions(key)
+        self.colored_lines = {}
+        self.region_scopes = {}
+
+    def _enter_alt(self, edit, view, terminal):
+        # snapshot the primary view (text + offset + color regions) then clear it
+        snap_regions = {}
+        for key in self._all_region_keys():
+            snap_regions[key] = (list(view.get_regions(key)), self.region_scopes.get(key, ""))
+        self._alt_snapshot = {
+            "text": view.substr(sublime.Region(0, view.size())),
+            "offset": terminal.offset,
+            "colored_lines": {ln: list(ks) for ln, ks in self.colored_lines.items()},
+            "regions": snap_regions,
+        }
+        self._erase_all_regions(view)
+        view.replace(edit, sublime.Region(0, view.size()), "")
+        view.settings().set("terminus.highlight_counter", 0)
+        terminal.offset = 0
+        terminal.screen.dirty.update(range(terminal.screen.lines))
+
+    def _leave_alt(self, edit, view, terminal):
+        snap = self._alt_snapshot
+        self._alt_snapshot = None
+        self._erase_all_regions(view)
+        view.replace(edit, sublime.Region(0, view.size()), "")
+        if not snap:
+            terminal.offset = 0
+        else:
+            view.insert(edit, 0, snap["text"])
+            terminal.offset = snap["offset"]
+            max_key = 0
+            for key, (regions, scope) in snap["regions"].items():
+                if regions:
+                    view.add_regions(key, regions, scope)
+                    self.region_scopes[key] = scope
+                    try:
+                        max_key = max(max_key, int(key.split("#")[1]))
+                    except (IndexError, ValueError):
+                        pass
+            self.colored_lines = {ln: list(ks) for ln, ks in snap["colored_lines"].items()}
+            view.settings().set("terminus.highlight_counter", max_key)
+        terminal.screen.dirty.update(range(terminal.screen.lines))
 
     def trim_trailing_spaces(self, edit, terminal):
         view = self.view
@@ -369,6 +477,11 @@ class ClaudeTerminalCleanupCommand(sublime_plugin.TextCommand):
         view = self.view
         terminal = Terminal.from_id(view.id())
         if not terminal:
+            return
+
+        # Adopted terminal being handed back to its pty owner: stop quietly,
+        # never kill the borrowed pty or close the view.
+        if getattr(terminal, "_adopted_release", False):
             return
 
         if view.settings().get("claude_terminal_view.finished"):

@@ -1,0 +1,8 @@
+{
+    // Standalone terminal font size (independent of the editor's global font_size).
+    "font_size": 12,
+    // Route the embedded-terminal logger to the Sublime console.
+    "debug": false,
+    // Also emit the verbose per-frame render logs (very noisy).
+    "trace": false
+}

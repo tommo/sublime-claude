@@ -129,6 +129,12 @@ class Terminal:
         self._user_history = []   # [{"time": float, "line": str}]
         self._input_buf = ""      # chars typed since last Enter
         self._input_navigating = False  # True after up/down (shell history mode)
+        # Adopted mode (PtyEngineSession hot-reveal): this Terminal renders a pty
+        # it does NOT own — an external pump feeds _external_q and owns the fd.
+        self._done = [False]            # renderer stop flag (shared w/ reader when spawned)
+        self._external_q = None         # set in adopt(): engine-pump → renderer queue
+        self._adopted = False           # True when bound to a borrowed pty
+        self._adopted_release = False   # True during a hand-back (do NOT kill the pty)
 
     # ─── User input tracking ───────────────────────────────────────────────
 
@@ -272,9 +278,24 @@ class Terminal:
             self._cached_cursor_is_hidden[0] = self.screen.cursor.hidden
         return flag
 
-    def _start_rendering(self):
-        data = [""]
-        done = [False]
+    def _start_rendering(self, adopted=False):
+        # Hand pty bytes from reader -> renderer via a thread-safe queue instead
+        # of a shared buffer guarded by self.lock. The reader must never hold the
+        # render lock: under sustained output it would re-acquire it faster than
+        # the (unfair) lock hands it to the renderer, starving rendering for
+        # seconds (the view freezes mid-burst, then jumps). With the queue the
+        # reader never contends, so the renderer keeps its ~30ms cadence and
+        # streaming TUIs (e.g. Claude Code) update smoothly.
+        #
+        # In adopted mode we do NOT own the pty / spawn a reader: an external
+        # pump (the PtyEngineSession owning the fd) fills self._external_q, and
+        # only the renderer runs here. self._done lets that owner stop us.
+        self._done = [False]
+        done = self._done
+        if adopted:
+            data_q = self._external_q
+        else:
+            data_q = Queue()
 
         @responsive(period=1, default=False)
         def was_resized():
@@ -288,60 +309,71 @@ class Terminal:
                 except EOFError:
                     break
 
-                with self.lock:
-                    data[0] += temp
+                data_q.put(temp)
 
-                    if self._use_osc133 and _OSC133_PROMPT in temp:
-                        self._update_title(busy=False)
+                if self._use_osc133 and _OSC133_PROMPT in temp:
+                    self._update_title(busy=False)
 
-                    m = _OSC7_RE.search(temp)
-                    if m:
-                        cwd = m.group(1)
-                        if self.view:
-                            args = self.view.settings().get("claude_terminal.args", {})
-                            args["cwd"] = cwd
-                            self.view.settings().set("claude_terminal.args", args)
+                m = _OSC7_RE.search(temp)
+                if m:
+                    cwd = m.group(1)
+                    if self.view:
+                        args = self.view.settings().get("claude_terminal.args", {})
+                        args["cwd"] = cwd
+                        self.view.settings().set("claude_terminal.args", args)
 
-                    if getattr(self, '_capturing', False):
-                        self._capture_raw += temp
-                        self._capture_buf.append(temp)
-                        self._capture_last_data_time = time.time()
-                        if self._use_osc133:
-                            if _OSC133_PROMPT in self._capture_raw:
-                                self._capture_event.set()
-                        else:
-                            s = _STRIP_ANSI.sub('', self._capture_raw)
-                            lines = [l for l in s.splitlines() if l.strip()]
-                            if lines and _PROMPT_RE.search(lines[-1]):
-                                self._capture_event.set()
+                if getattr(self, '_capturing', False):
+                    self._capture_raw += temp
+                    self._capture_buf.append(temp)
+                    self._capture_last_data_time = time.time()
+                    if self._use_osc133:
+                        if _OSC133_PROMPT in self._capture_raw:
+                            self._capture_event.set()
+                    else:
+                        s = _STRIP_ANSI.sub('', self._capture_raw)
+                        lines = [l for l in s.splitlines() if l.strip()]
+                        if lines and _PROMPT_RE.search(lines[-1]):
+                            self._capture_event.set()
 
-                    if done[0] or not self.is_hosted():
-                        logger.debug("reader breaks")
-                        break
+                if done[0] or not self.is_hosted():
+                    logger.debug("reader breaks")
+                    break
 
             done[0] = True
 
-        threading.Thread(target=reader).start()
+        if not adopted:
+            threading.Thread(target=reader).start()
 
         def renderer():
 
+            def drain():
+                chunks = []
+                try:
+                    while True:
+                        chunks.append(data_q.get_nowait())
+                except Empty:
+                    pass
+                return "".join(chunks)
+
             def feed_data():
-                if len(data[0]) > 0:
-                    logger.debug("receieved: {}".format(data[0]))
-                    self.stream.feed(data[0])
-                    data[0] = ""
+                buf = drain()  # outside self.lock: no contention with the reader
+                if buf:
+                    logger.debug("receieved: {}".format(buf))
+                    with self.lock:
+                        self.stream.feed(buf)
 
             while True:
-                with intermission(period=0.03), self.lock:
+                with intermission(period=0.03):
                     feed_data()
-                    if not self.detached:
-                        if was_resized():
-                            self.handle_resize()
-                            self.view.run_command("claude_terminal_show_cursor")
+                    with self.lock:
+                        if not self.detached:
+                            if was_resized():
+                                self.handle_resize()
+                                self.view.run_command("claude_terminal_show_cursor")
 
-                        if self._need_to_render():
-                            self.view.run_command("claude_terminal_render")
-                            self.screen.dirty.clear()
+                            if self._need_to_render():
+                                self.view.run_command("claude_terminal_render")
+                                self.screen.dirty.clear()
 
                     if done[0] or not self.is_hosted():
                         logger.debug("renderer breaks")
@@ -401,6 +433,7 @@ class Terminal:
         logger.debug("view size: {}".format(str(size)))
         _env = os.environ.copy()
         _env["TERM"] = "xterm-256color"
+        _env.setdefault("COLORTERM", "truecolor")  # let TUIs emit 24-bit color
         _env.update(env)
         saved_index = view.settings().get("claude_terminal.index") if view else None
         if saved_index:
@@ -434,6 +467,66 @@ class Terminal:
         self.stream = TerminalStream(self.screen)
 
         self._start_rendering()
+
+    def feed_external(self, data):
+        """Deliver pty bytes for rendering (called by the pty-owning pump in
+        adopted mode). Never touches a render lock — just a queue put."""
+        q = self._external_q
+        if q is not None:
+            q.put(data)
+
+    def adopt(self, process, screen_size, tag=None, default_title=None):
+        """Render a pty this Terminal does NOT own (PtyEngineSession hot-reveal).
+
+        The owning session keeps the single fd reader and feeds bytes via
+        feed_external(); we build our own screen/stream sized to the view and run
+        only the renderer. We deliberately do NOT persist reactivable/cc_recipe,
+        so a hot-exit restore won't try to relaunch this borrowed view."""
+        view = self.view
+        self.process = process
+        self._adopted = True
+        self._adopted_release = False
+        self._integration_dir = None
+        self._use_osc133 = False
+        self._is_shell = False
+        self.show_in_panel = None
+        self.panel_name = None
+        self.tag = tag
+        self.auto_close = True
+        self.cancellable = False
+        self.timeit = False
+        self.default_title = default_title
+        self.title = None
+        self._external_q = Queue()
+
+        if view:
+            self.detached = False
+            Terminal._terminals[view.id()] = self
+            self.set_offset()
+        self.index = Terminal._next_index
+        Terminal._next_index += 1
+
+        rows, cols = screen_size
+        self.screen = TerminalScreen(
+            cols, rows, process=process, history=10000,
+            clear_callback=self.clear_callback, reset_callback=self.reset_callback)
+        self.stream = TerminalStream(self.screen)
+        self._update_title(busy=False)
+        self._start_rendering(adopted=True)
+
+    def release(self):
+        """Hand the borrowed pty back to its owner: stop the renderer WITHOUT
+        killing the process, and de-register so input/cleanup stop touching it."""
+        self._adopted_release = True
+        self._done[0] = True
+        view = self.view
+        if view is not None and view.id() in Terminal._terminals:
+            del Terminal._terminals[view.id()]
+
+    def signal_pump_eof(self):
+        """The borrowed pty died (claude exited): stop the renderer and let the
+        normal cleanup/close path run (unlike release(), the process is gone)."""
+        self._done[0] = True
 
     def is_alive(self):
         return self.process is not None and self.process.isalive()
@@ -596,6 +689,51 @@ class Terminal:
 
     def application_mode_enabled(self):
         return (1 << 5) in self.screen.mode
+
+    # ─── Mouse / scroll modes ───────────────────────────────────────────────
+
+    def alternate_screen_enabled(self):
+        return (1049 << 5) in self.screen.mode or self.screen.alternate_buffer_mode
+
+    def mouse_tracking_enabled(self):
+        m = self.screen.mode
+        return (1000 << 5) in m or (1002 << 5) in m or (1003 << 5) in m
+
+    def sgr_mouse_enabled(self):
+        return (1006 << 5) in self.screen.mode
+
+    def alternate_scroll_enabled(self):
+        # DECSET 1007: translate wheel to cursor keys while on the alt screen.
+        return (1007 << 5) in self.screen.mode
+
+    def wants_scroll_capture(self):
+        """True when the wheel should drive the app instead of the ST viewport."""
+        return self.mouse_tracking_enabled() or self.alternate_screen_enabled()
+
+    def scroll(self, direction, lines=3):
+        """Send wheel input to the app: SGR mouse events if it tracks the mouse,
+        else cursor-key presses (alternate-scroll). direction: 'up' | 'down'."""
+        logger.info(
+            "scroll %s x%d | alt_screen=%s mouse_tracking=%s sgr=%s -> %s",
+            direction, lines, self.alternate_screen_enabled(),
+            self.mouse_tracking_enabled(), self.sgr_mouse_enabled(),
+            "sgr-mouse" if self.mouse_tracking_enabled() else "arrow-keys")
+        if self.mouse_tracking_enabled():
+            # SGR (1006) wheel buttons: 64 = up, 65 = down. Fall back to the
+            # legacy X10 encoding when SGR isn't negotiated.
+            cb = 64 if direction == "up" else 65
+            col = min(self.screen.cursor.x + 1, self.screen.columns)
+            row = min(self.screen.cursor.y + 1, self.screen.lines)
+            for _ in range(lines):
+                if self.sgr_mouse_enabled():
+                    self.send_string("\x1b[<{};{};{}M".format(cb, col, row), normalized=False)
+                else:
+                    self.send_string("\x1b[M{}{}{}".format(
+                        chr(32 + cb), chr(32 + col), chr(32 + row)), normalized=False)
+        else:
+            key = "up" if direction == "up" else "down"
+            for _ in range(lines):
+                self.send_key(key)
 
     def find_image(self, pt):
         view = self.view

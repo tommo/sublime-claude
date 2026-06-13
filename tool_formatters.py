@@ -88,6 +88,34 @@ def _todo_write(view: "OutputView", tool: "ToolCall") -> str:
     return f": {count} task{'s' if count != 1 else ''}"
 
 
+def _task_create(view: "OutputView", tool: "ToolCall") -> str:
+    subject = tool.tool_input.get("subject", "") or tool.tool_input.get("description", "")
+    return f": {subject}" if subject else ""
+
+
+def _task_update(view: "OutputView", tool: "ToolCall") -> str:
+    tid = tool.tool_input.get("taskId", "")
+    status = tool.tool_input.get("status")
+    subject = tool.tool_input.get("subject")
+    bits = []
+    if tid:
+        bits.append(f"#{tid}")
+    if status:
+        bits.append(status)
+    if subject:
+        bits.append(subject)
+    return f": {' '.join(bits)}" if bits else ""
+
+
+def _task_list(view: "OutputView", tool: "ToolCall") -> str:
+    return ""
+
+
+def _task_get(view: "OutputView", tool: "ToolCall") -> str:
+    tid = tool.tool_input.get("taskId", "")
+    return f": #{tid}" if tid else ""
+
+
 def _ask_user(view: "OutputView", tool: "ToolCall") -> str:
     question = tool.tool_input.get("question", "")
     out = f": {question}"
@@ -144,6 +172,10 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "Task": _task,
     "NotebookEdit": _notebook_edit,
     "TodoWrite": _todo_write,
+    "TaskCreate": _task_create,
+    "TaskUpdate": _task_update,
+    "TaskList": _task_list,
+    "TaskGet": _task_get,
     "ask_user": _ask_user,
     "mcp__sublime__ask_user": _ask_user,
     "mcp__sublime__terminal_run": _terminal_run,

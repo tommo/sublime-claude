@@ -36,11 +36,16 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
 
         reactivable = view.settings().get("claude_terminal.reactivable", False)
         finished = view.settings().get("claude_terminal.finished", False)
+        if not reactivable or finished:
+            return
+        # A view may specify its own reactivation command (e.g. Claude Code
+        # rebuilds argv to --resume its session + refresh the MCP view scope)
+        # instead of the generic verbatim restore.
+        custom = view.settings().get("claude_terminal.reactivate_command")
+        if custom:
+            sublime.set_timeout(lambda: view.run_command(custom), 100)
+            return
         kwargs = view.settings().get("claude_terminal.args", {})
-        if not reactivable:
-            return
-        if finished:
-            return
         if "cmd" not in kwargs:
             return
         sublime.set_timeout(lambda: view.run_command("claude_terminal_activate", kwargs), 100)
@@ -48,8 +53,18 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
     def on_pre_close(self, view):
         # panel doesn't trigger on_pre_close
         terminal = Terminal.from_id(view.id())
-        if terminal:
-            terminal.kill()
+        if not terminal:
+            return
+        # Revealed PTY-engine session: closing the view must NOT kill the borrowed
+        # pty — hand it back to the engine's native view (view is already closing).
+        if view.settings().get("pty_reveal_owner"):
+            sess = getattr(sublime, "_claude_sessions", {}).get(view.id())
+            if sess is not None and getattr(sess, "terminal_revealed", False):
+                sess.return_to_native(close_view=False)
+            else:
+                terminal.release()
+            return
+        terminal.kill()
 
     def on_modified(self, view):
         # to catch unicode input
@@ -114,6 +129,28 @@ class ClaudeTerminalEventListener(sublime_plugin.EventListener):
             val = view.settings().get("claude_terminal", False)
             result = val == operand if operator == sublime.OP_EQUAL else val != operand if operator == sublime.OP_NOT_EQUAL else bool(val)
             return result
+        if key == "claude_terminal_capture_scroll":
+            # true when the wheel should drive the app (alt-screen / mouse tracking)
+            terminal = Terminal.from_id(view.id())
+            val = bool(terminal and terminal.wants_scroll_capture())
+            logger.info("query claude_terminal_capture_scroll -> %s", val)
+            if operator == sublime.OP_EQUAL:
+                return val == operand
+            if operator == sublime.OP_NOT_EQUAL:
+                return val != operand
+            return val
+        # Catch-all for `claude_terminal_view.*` keys (e.g.
+        # claude_terminal_view.finished), resolved from view settings — like
+        # Terminus. WITHOUT this the escape keybinding's
+        # `claude_terminal_view.finished != true` condition is unresolved, so the
+        # whole binding never matches and Escape isn't forwarded to the pty.
+        if key.startswith("claude_terminal_view"):
+            val = view.settings().get(key, None)
+            if operator == sublime.OP_EQUAL:
+                return val == operand
+            if operator == sublime.OP_NOT_EQUAL:
+                return val != operand
+            return bool(val)
         return None
 
     def on_window_command(self, window, command_name, args):

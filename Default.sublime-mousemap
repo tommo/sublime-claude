@@ -16,5 +16,24 @@
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true }
         ]
+    },
+    // Cmd+click a file path / URL in the terminal -> reveal it (paths resolved
+    // against the session cwd, since CC prints them relative and unlinked).
+    {
+        "button": "button1", "count": 1, "modifiers": ["super"],
+        "command": "claude_terminal_open_link",
+        "context": [{ "key": "claude_terminal" }]
+    },
+    // Terminal wheel: alt-screen/mouse apps -> app; normal buffer -> discrete
+    // line-based scrollback scroll (replaces editor smooth/momentum scrolling).
+    {
+        "button": "scroll_up", "modifiers": [],
+        "command": "claude_terminal_scroll", "args": {"action": "up", "lines": 3},
+        "context": [{ "key": "claude_terminal" }]
+    },
+    {
+        "button": "scroll_down", "modifiers": [],
+        "command": "claude_terminal_scroll", "args": {"action": "down", "lines": 3},
+        "context": [{ "key": "claude_terminal" }]
     }
 ]

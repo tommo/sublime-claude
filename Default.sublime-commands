@@ -16,6 +16,18 @@
         "command": "pi_start"
     },
     {
+        "caption": "DSR: New Session",
+        "command": "dsr_start"
+    },
+    {
+        "caption": "Claude: New CLI Session (PTY, subscription billing)",
+        "command": "claude_code_pty_start"
+    },
+    {
+        "caption": "Claude: Reveal CLI Screen (debug)",
+        "command": "claude_reveal_cli_screen"
+    },
+    {
         "caption": "Claude: Query Selection",
         "command": "claude_code_query_selection"
     },
@@ -197,6 +209,10 @@
     {
         "caption": "Claude: Terminal Mode",
         "command": "claude_terminal_mode"
+    },
+    {
+        "caption": "Claude: Launch Claude Code",
+        "command": "claude_code_terminal"
     },
     {
         "caption": "Claude: Toggle Auto-Sleep for This Session",

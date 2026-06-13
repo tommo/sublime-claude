@@ -74,9 +74,10 @@ class ToolCall:
 
 @dataclass
 class TodoItem:
-    """A todo item from TodoWrite."""
+    """A todo item from TodoWrite or Task* tools."""
     content: str
     status: str  # pending, in_progress, completed
+    id: str = ""  # server-assigned id (set by TaskCreate result / TaskList)
 
 
 @dataclass
@@ -645,12 +646,31 @@ class OutputView:
         tool_call = ToolCall(name=name, tool_input=tool_input, status=status, id=tool_id)
         self.current.events.append(tool_call)
 
-        # Capture TodoWrite state
+        # Capture TodoWrite state (Anthropic stock tool — full snapshot per call)
         if name == "TodoWrite" and "todos" in tool_input:
             self.current.todos = [
                 TodoItem(content=t.get("content", ""), status=t.get("status", "pending"))
                 for t in tool_input["todos"]
             ]
+        # Task* variants (this harness's split API — incremental ops)
+        elif name == "TaskCreate":
+            subject = tool_input.get("subject", "") or tool_input.get("description", "")
+            if subject:
+                # Optimistic add; id resolved when TaskList runs or via tool_result.
+                self.current.todos.append(TodoItem(content=subject, status="pending"))
+                self.current.todos_all_done = False
+        elif name == "TaskUpdate":
+            tid = tool_input.get("taskId", "")
+            new_status = tool_input.get("status")
+            new_subject = tool_input.get("subject")
+            if tid:
+                for todo in self.current.todos:
+                    if todo.id == tid:
+                        if new_status:
+                            todo.status = new_status
+                        if new_subject:
+                            todo.content = new_subject
+                        break
 
         self._render_current()
 
@@ -726,6 +746,49 @@ class OutputView:
         if m is not None:
             self._replace(m.start() + 2, m.start() + 2 + len(old_sym), new_sym)
 
+    def remove_tool(self, target: ToolCall) -> None:
+        """Drop a tool entirely — from its conversation's events and, for an
+        already-rendered past conversation, by erasing its line from the view.
+        Used for background tools aborted by a reconnect or finishing with no
+        surfaced result: leaving a ✘/✓ line is just noise."""
+        in_current = False
+        convs = list(self.conversations)
+        if self.current is not None:
+            convs.append(self.current)
+        for conv in convs:
+            for i, e in enumerate(conv.events):
+                if e is target:  # identity, not dataclass __eq__
+                    del conv.events[i]
+                    in_current = (conv is self.current)
+                    break
+            else:
+                continue
+            break
+        if in_current and self.current is not None:
+            self._render_current()
+            return
+        if not self.view:
+            return
+        content = self.view.substr(sublime.Region(0, self.view.size()))
+        import re
+        sym = self.SYMBOLS.get(target.status, self.SYMBOLS.get(BACKGROUND, "⚙"))
+        snippet = ""
+        for key in ("command", "file_path", "pattern", "url", "task_id", "description"):
+            val = target.tool_input.get(key) if isinstance(target.tool_input, dict) else None
+            if isinstance(val, str) and val.strip():
+                snippet = val.split("\n", 1)[0][:120]
+                break
+        prefix = f"  {sym} {target.name}"
+        pattern = re.escape(prefix) + (r"[^\n]*?" + re.escape(snippet) if snippet else "")
+        m = re.search(pattern, content)
+        if m is None and snippet:
+            m = re.search(re.escape(prefix), content)
+        if m is None:
+            return
+        line_region = self.view.line(m.start())
+        end = min(line_region.end() + 1, self.view.size())  # include trailing newline
+        self._replace(line_region.begin(), end, "")
+
     def tool_done(self, name: str, result: str = None, tool_id: str = None) -> None:
         """Mark tool as done. Prefer tool_id match, fall back to name+PENDING."""
         target = self._find_pending_or_background_by_id(tool_id)
@@ -742,10 +805,80 @@ class OutputView:
         old_status = target.status
         target.status = DONE
         target.result = result
+        # Pull task state from Task* results
+        if name in ("TaskList", "TaskCreate", "TaskGet") and result and self.current is not None:
+            self._sync_todos_from_task_result(name, target, result)
         if self._is_in_current(target):
             self._render_current()
         else:
             self._patch_tool_symbol(target, old_status)
+
+    def _sync_todos_from_task_result(self, name: str, tool: "ToolCall", result: str) -> None:
+        """Parse Task* result text and merge into current.todos.
+
+        Strategy: try JSON first (most robust); fall back to regex sniffing
+        of `id:` / `subject:` / `status:` field markers Claude Code emits.
+        """
+        import re, json
+        parsed_items = []
+        # Try JSON anywhere in the result
+        for match in re.finditer(r'\{[^{}]*"(?:id|subject|status)"[^{}]*\}', result):
+            try:
+                obj = json.loads(match.group(0))
+                if isinstance(obj, dict) and ("id" in obj or "subject" in obj):
+                    parsed_items.append(obj)
+            except Exception:
+                pass
+        if not parsed_items:
+            # Loose text scan: collect lines like "id: 1, subject: ..., status: pending"
+            for line in result.splitlines():
+                m_id = re.search(r'\b(?:id|taskId)["\s:=]+([^\s,"\}]+)', line)
+                m_sub = re.search(r'\bsubject["\s:=]+([^,"\}]+)', line)
+                m_st = re.search(r'\bstatus["\s:=]+([^\s,"\}]+)', line)
+                if m_id or m_sub:
+                    parsed_items.append({
+                        "id": m_id.group(1).strip() if m_id else "",
+                        "subject": (m_sub.group(1).strip() if m_sub else ""),
+                        "status": (m_st.group(1).strip() if m_st else "pending"),
+                    })
+        if not parsed_items:
+            return
+
+        if name == "TaskList":
+            # Authoritative snapshot — replace.
+            self.current.todos = [
+                TodoItem(
+                    content=it.get("subject") or it.get("content") or "",
+                    status=it.get("status") or "pending",
+                    id=str(it.get("id") or ""),
+                )
+                for it in parsed_items if (it.get("subject") or it.get("id"))
+            ]
+            if self.current.todos and all(t.status == "completed" for t in self.current.todos):
+                self.current.todos_all_done = True
+        elif name == "TaskCreate":
+            # Backfill id on the most recently-added pending TodoItem whose subject matches.
+            new = parsed_items[-1]
+            new_id = str(new.get("id") or "")
+            new_subject = (new.get("subject") or tool.tool_input.get("subject") or "").strip()
+            if new_id:
+                for todo in reversed(self.current.todos):
+                    if not todo.id and (not new_subject or todo.content.strip() == new_subject):
+                        todo.id = new_id
+                        if new_subject:
+                            todo.content = new_subject
+                        break
+        elif name == "TaskGet":
+            new = parsed_items[-1]
+            tid = str(new.get("id") or "")
+            if tid:
+                for todo in self.current.todos:
+                    if todo.id == tid:
+                        if new.get("subject"):
+                            todo.content = new["subject"]
+                        if new.get("status"):
+                            todo.status = new["status"]
+                        break
 
     def tool_error(self, name: str, result: str = None, tool_id: str = None) -> None:
         """Mark tool as error. Prefer tool_id match, fall back to name+PENDING."""

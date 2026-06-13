@@ -241,6 +241,59 @@ class PiStartCommand(sublime_plugin.WindowCommand):
         create_session(self.window, backend="pi")
 
 
+class DsrStartCommand(sublime_plugin.WindowCommand):
+    """Start a new DSR (dsr coding agent) session."""
+    def run(self) -> None:
+        import shutil
+        if not os.environ.get("DSR_BIN") and not shutil.which("dsr"):
+            sublime.error_message(
+                "dsr CLI not found.\n\n"
+                "Install dsr and put it in PATH, or set the DSR_BIN environment variable."
+            )
+            return
+        create_session(self.window, backend="dsr")
+
+
+class ClaudeCodePtyStartCommand(sublime_plugin.WindowCommand):
+    """Start a CLI session: real interactive `claude` in a hidden PTY, rendered
+    natively by tailing the session transcript (rides subscription billing)."""
+    def run(self) -> None:
+        from . import cc_pty_session
+        cc_pty_session.create_pty_session(self.window)
+
+
+class ClaudeRevealCliScreenCommand(sublime_plugin.WindowCommand):
+    """Dump the hidden PTY's current rendered screen (debug / escape hatch)."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if not hasattr(s, "dump_screen"):
+            sublime.status_message("No CLI (PTY) session active")
+            return
+        screen = s.dump_screen()
+        print("[ptyengine] ===== CLI SCREEN =====\n" + screen + "\n[ptyengine] =====================")
+        if s.output and s.output.view:
+            s.output.text("\n\n*CLI screen snapshot:*\n```\n" + screen + "\n```\n")
+
+
+class ClaudeCodeToggleTerminalRevealCommand(sublime_plugin.WindowCommand):
+    """Hot-swap the active PTY-engine session between its native transcript view
+    and the raw claude TUI in an embedded terminal (same live process)."""
+    def run(self) -> None:
+        from . import cc_pty_session
+        s = get_active_session(self.window)
+        if not isinstance(s, cc_pty_session.PtyEngineSession):
+            sublime.status_message("Active session is not a CLI (PTY) session")
+            return
+        if s.terminal_revealed:
+            s.return_to_native()
+        else:
+            s.reveal_as_terminal()
+
+    def is_enabled(self) -> bool:
+        from . import cc_pty_session
+        return isinstance(get_active_session(self.window), cc_pty_session.PtyEngineSession)
+
+
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
     """Open input for query (focuses output and enters input mode)."""
     def run(self) -> None:
@@ -695,7 +748,7 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
 class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
     """Set default model per backend in settings."""
     def run(self) -> None:
-        backends = ["claude", "codex", "copilot"]
+        backends = ["claude", "codex", "copilot", "deepseek", "pi", "dsr"]
         items = [[b.title(), f"Set default model for {b}"] for b in backends]
 
         def on_backend(idx):
@@ -1183,17 +1236,25 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
 
 class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
     """Switch between active sessions in this window."""
-    def run(self, backend: str = "claude") -> None:
+    def run(self, backend: str = "claude", transport: str = "bridge", model: str = None) -> None:
         import os
         import shutil
         from .core import create_session
 
-        backend_prefix = f"[{backend}] " if backend != "claude" else ""
+        # transport "terminal" = run the claude CLI in our embedded terminal view
+        # instead of the SDK bridge; New Session commits there.
+        if transport == "terminal":
+            backend = "claude"
+        is_term = transport == "terminal"
+        # `model` is an accumulated option (set via the /model entries, like the
+        # Switch-to backend/transport options) — committed by New Session.
+        backend_prefix = ("⬛ " if is_term else "") + (f"[{backend}] " if backend != "claude" else "")
         # Backend availability flags — sourced from backends registry
         has_codex = backends.is_available("codex")
         has_copilot = backends.is_available("copilot")
         has_deepseek = backends.is_available("deepseek")
         has_pi = backends.is_available("pi")
+        has_dsr = backends.is_available("dsr")
 
         project_path = self.window.folders()[0] if self.window.folders() else None
         starred = load_bookmarks(project_path)
@@ -1216,9 +1277,12 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 active_session = s
                 break
 
-        # Show "Active:" option only when not in a Claude output view (for quick jumping from file view)
+        # Show "Active:" option only when not in a Claude output view (for quick jumping from file view).
+        # A revealed PTY session's current view is a terminal (not claude_output) — treat it as one so
+        # its session actions (incl. "Return to native view") still show.
         current_view = self.window.active_view()
-        in_output_view = current_view and current_view.settings().get("claude_output")
+        in_output_view = current_view and (current_view.settings().get("claude_output")
+                                           or current_view.settings().get("pty_reveal_owner"))
         current_file = current_view.file_name() if current_view else None
 
         # Add "New Session with This File" option when in a non-session file
@@ -1245,7 +1309,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             actions.append(("focus", active_session))
 
         # Add other sessions (not the active one) — starred float to top
-        other_in_window = [(v, s) for v, s in sessions_in_window if v != active_view_id]
+        other_in_window = [(v, s) for v, s in sessions_in_window
+                           if v != active_view_id and s is not active_session]
         starred_sessions = [(v, s) for v, s in other_in_window if s.session_id in starred]
         plain_sessions = [(v, s) for v, s in other_in_window if s.session_id not in starred]
         for view_id, s in starred_sessions + plain_sessions:
@@ -1276,14 +1341,21 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if not active_session.working and active_session.session_id:
                 items.append(["↩ Undo Message", "Rewind session to previous turn"])
                 actions.append(("undo_message", active_session))
-            if active_session and not active_session.is_sleeping and active_session.session_id and active_session.backend != "copilot":
-                items.append(["\u2b1b Terminal Mode", "Switch to CLI in terminal"])
-                actions.append(("terminal_mode", active_session))
             if active_session and not active_session.is_sleeping:
                 items.append(["○ Sleep Session", "Put session to sleep, free resources"])
                 actions.append(("sleep", active_session))
             items.append(["🔄 Restart Session", "Restart current session, keep output"])
             actions.append(("restart", active_session))
+
+            # PTY-engine sessions can hot-swap between the native view and the
+            # raw claude TUI (same live process, no restart).
+            from . import cc_pty_session
+            if isinstance(active_session, cc_pty_session.PtyEngineSession):
+                if active_session.terminal_revealed:
+                    items.append(["⇄ Return to native view", "Hide the raw TUI, show the native transcript"])
+                else:
+                    items.append(["⇄ Reveal as terminal", "Show this session's raw claude TUI in a terminal"])
+                actions.append(("toggle_reveal", active_session))
 
         # Add profiles and checkpoints
         from .settings import load_profiles_and_checkpoints
@@ -1308,9 +1380,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         items.append(["👤 From Persona...", "Acquire a persona identity"])
         actions.append(("persona", persona_url))
 
-        # Add "New Session" option
-        # Add "New Session with Model" option
-        items.append([f"🆕 {backend_prefix}New Session", "Start fresh with default settings"])
+        # Add "New Session" option — commits the accumulated backend/transport/model.
+        _mlabel = f" [{model}]" if model else ""
+        items.append([f"🆕 {backend_prefix}New Session{_mlabel}",
+                      (f"Start fresh with {model}" if model else "Start fresh with default model")])
         actions.append(("new", None))
 
         # Model selection from settings + cached models
@@ -1328,36 +1401,57 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             except Exception:
                 pass
         backend_models = all_models.get(backend, [])
+        if not backend_models:  # fall back to the backend registry's defaults
+            try:
+                backend_models = backends.BACKENDS[backend].default_models
+            except Exception:
+                backend_models = []
         for m in backend_models:
             if isinstance(m, str):
                 model_id, model_name = m, m
-            elif isinstance(m, list) and len(m) >= 2:
+            elif isinstance(m, (list, tuple)) and len(m) >= 2:
                 model_id, model_name = m[0], m[1]
             else:
                 continue
-            items.append([f"🆕 {backend_prefix}{model_name}", f"New session with {model_id}"])
-            actions.append(("new_model", model_id))
+            # Accumulator (like Switch-to): selecting sets the model and re-renders;
+            # the New Session entry commits it. Does NOT launch.
+            sel = "● " if model == model_id else ""
+            items.append([f"/model {sel}{backend_prefix}{model_name}",
+                          f"Select {model_id} for the next session"])
+            actions.append(("set_model", model_id))
 
         # Add "Fork Session" option when in a session window
         if in_output_view and active_session:
             items.append(["🍴 Fork Session", "Create new session with copy of history"])
             actions.append(("fork", active_session))
 
-        # Add "Switch Backend" options
-        other_backends = []
-        if has_codex and backend != "codex":
-            other_backends.append("codex")
-        if has_copilot and backend != "copilot":
-            other_backends.append("copilot")
-        if has_deepseek and backend != "deepseek":
-            other_backends.append("deepseek")
-        if has_pi and backend != "pi":
-            other_backends.append("pi")
-        if backend != "claude":
-            other_backends.append("claude")
-        for other in other_backends:
-            items.append([f"⇄ Switch to {other}", f"Show {other} options"])
-            actions.append(("switch_backend", other))
+        # Transport switch: bridge ⇄ embedded terminal (claude CLI). Mirrors the
+        # backend switcher — re-runs the modal in the chosen transport.
+        if is_term:
+            items.append(["⇄ Switch to bridge", "Back to SDK/bridge sessions"])
+            actions.append(("switch_transport", "bridge"))
+        else:
+            items.append(["⇄ Switch to terminal", "Run Claude Code in the embedded terminal"])
+            actions.append(("switch_transport", "terminal"))
+
+        # Add "Switch Backend" options (bridge transport only — terminal is claude CLI)
+        if not is_term:
+            other_backends = []
+            if has_codex and backend != "codex":
+                other_backends.append("codex")
+            if has_copilot and backend != "copilot":
+                other_backends.append("copilot")
+            if has_deepseek and backend != "deepseek":
+                other_backends.append("deepseek")
+            if has_pi and backend != "pi":
+                other_backends.append("pi")
+            if has_dsr and backend != "dsr":
+                other_backends.append("dsr")
+            if backend != "claude":
+                other_backends.append("claude")
+            for other in other_backends:
+                items.append([f"⇄ Switch to {other}", f"Show {other} options"])
+                actions.append(("switch_backend", other))
 
         def on_select(idx):
             if idx >= 0:
@@ -1365,6 +1459,15 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 if action == "switch_backend":
                     # Re-open panel with new backend
                     sublime.set_timeout(lambda: self.run(backend=data), 0)
+                    return
+                if action == "switch_transport":
+                    # Re-open in the chosen transport, keeping the model if claude.
+                    keep = model if backend == "claude" else None
+                    sublime.set_timeout(lambda: self.run(backend="claude", transport=data, model=keep), 0)
+                    return
+                if action == "set_model":
+                    # Accumulate the model choice and re-render (like Switch-to).
+                    sublime.set_timeout(lambda: self.run(backend=backend, transport=transport, model=data), 0)
                     return
                 if action == "toggle_star" and data and data.session_id:
                     now_starred = toggle_bookmark(data.session_id, project_path)
@@ -1385,21 +1488,32 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)
                 elif action == "new_with_file" and data:
-                    # Create new session with current file as context
-                    s = create_session(self.window, backend=backend)
-                    # Read file content and add to context
-                    try:
-                        with open(data, "r", encoding="utf-8") as f:
-                            content = f.read()
-                        s.add_context_file(data, content)
-                    except Exception as e:
-                        print(f"[Claude] Error adding file context: {e}")
+                    if is_term:
+                        self.window.run_command("claude_code_terminal",
+                                                {"draft": "@{}\n".format(data), "model": model or "default"})
+                    else:
+                        # Create new session with current file as context
+                        s = create_session(self.window,
+                                           profile=({"model": model} if model else None),
+                                           backend=backend)
+                        try:
+                            with open(data, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            s.add_context_file(data, content)
+                        except Exception as e:
+                            print(f"[Claude] Error adding file context: {e}")
                 elif action == "new":
-                    create_session(self.window, backend=backend)
-                elif action == "new_model":
-                    create_session(self.window, profile={"model": data}, backend=backend)
+                    if is_term:
+                        self.window.run_command("claude_code_terminal", {"model": model or "default"})
+                    else:
+                        create_session(self.window,
+                                       profile=({"model": model} if model else None),
+                                       backend=backend)
                 elif action == "profile":
-                    create_session(self.window, profile=data, backend=backend)
+                    if is_term:
+                        self.window.run_command("claude_code_terminal", {"model": data.get("model")})
+                    else:
+                        create_session(self.window, profile=data, backend=backend)
                 elif action == "checkpoint":
                     session_id = data.get("session_id")
                     if session_id:
@@ -1411,14 +1525,23 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 elif action == "persona" and data:
                     # Show persona picker
                     self._show_persona_picker(data, backend=backend)
-                elif action == "terminal_mode" and data:
-                    data.enter_terminal_mode()
                 elif action == "sleep" and data:
                     data.sleep()
+                elif action == "toggle_reveal" and data:
+                    if data.terminal_revealed:
+                        data.return_to_native()
+                    else:
+                        data.reveal_as_terminal()
                 elif action == "focus" and data:
                     data.output.show()
 
-        self.window.show_quick_panel(items, on_select)
+        _ph = []
+        if is_term:
+            _ph.append("⬛ terminal")
+        if model:
+            _ph.append(f"model: {model}")
+        self.window.show_quick_panel(
+            items, on_select, placeholder=(" · ".join(_ph) if _ph else None))
 
     def _show_persona_picker(self, persona_url: str, backend: str = "claude") -> None:
         """Show list of personas to pick from."""
@@ -1920,18 +2043,6 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if not text:
             return
 
-        # Check for loop:[duration] prompt or loop:cancel
-        from .command_parser import parse_loop
-        loop_cmd = parse_loop(text)
-        if loop_cmd:
-            s.output.exit_input_mode(keep_text=False)
-            s.draft_prompt = ""
-            if loop_cmd.cancel:
-                s.stop_loop()
-            elif loop_cmd.prompt:
-                s.start_loop(loop_cmd.prompt, loop_cmd.interval_sec)
-            return
-
         # Check for slash commands
         cmd = CommandParser.parse(text)
         if cmd:
@@ -1951,10 +2062,6 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
     def _handle_command(self, session, cmd):
         """Handle a slash command."""
-        # /loop syntax: name may be "loop" or "loop:<duration>" or "loop:cancel"
-        if cmd.name == "loop" or cmd.name.startswith("loop:"):
-            self._cmd_loop(session, cmd.name, cmd.args)
-            return
         if cmd.name == "clear":
             self._cmd_clear(session)
         elif cmd.name == "compact":
@@ -1962,39 +2069,11 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         elif cmd.name == "context":
             self._cmd_context(session)
         else:
-            # Unknown command - send as regular prompt to Claude
+            # Unknown command — send as regular prompt to Claude (the CLI's own
+            # slash commands like /loop are handled by the engine forwarding
+            # the slash to the TUI; for SDK-bridge sessions this hits the
+            # bridge query path).
             session.query(cmd.raw)
-
-    def _cmd_loop(self, session, name, args):
-        """Handle /loop <prompt> (no duration) or /loop:<duration> <prompt> or /loop:cancel."""
-        from .command_parser import _parse_duration
-
-        def _err(msg):
-            session.output.text(f"\n*{msg}*\n")
-            session.resume_input_mode()  # let user retry — restore the input area
-
-        # Parse the suffix after "loop"
-        if name == "loop":
-            # No duration — args is the entire prompt
-            if not args.strip():
-                _err("Usage: /loop <prompt> | /loop:<duration> <prompt> | /loop:cancel")
-                return
-            session.start_loop(args.strip(), None)
-            return
-        # name starts with "loop:"
-        suffix = name[5:]  # after "loop:"
-        if suffix in ("cancel", "stop", "off"):
-            session.stop_loop()
-            return
-        # Otherwise suffix is a duration
-        interval = _parse_duration(suffix)
-        if interval is None:
-            _err(f"Invalid duration: {suffix!r}. Try /loop:5m, /loop:30s, /loop:1h")
-            return
-        if not args.strip():
-            _err("Missing prompt after duration")
-            return
-        session.start_loop(args.strip(), interval)
 
     def _cmd_clear(self, session):
         """Clear conversation history."""

@@ -1,66 +1,6 @@
 """Slash command parsing for /command syntax."""
-import re
 from typing import Optional, List, Callable
 from dataclasses import dataclass
-
-
-@dataclass
-class LoopCommand:
-    """A parsed loop:[duration] prompt command."""
-    interval_sec: Optional[int]  # None = use default
-    prompt: str
-    cancel: bool = False  # True if "loop:cancel"
-
-
-_DURATION_RE = re.compile(r'^(\d+)\s*([a-z]*)$', re.IGNORECASE)
-
-# Map every accepted unit alias to its base-second multiplier.
-# Empty string defaults to seconds, matching the legacy "5" → 5s case.
-_DURATION_UNITS = {
-    "":  1,
-    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
-    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
-    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
-    "d": 86400, "day": 86400, "days": 86400,
-}
-
-
-def _parse_duration(s: str) -> Optional[int]:
-    """Parse "5m", "30s", "1h", "2d", "10 minutes", "2 hours". Returns seconds or None."""
-    m = _DURATION_RE.match(s.strip())
-    if not m:
-        return None
-    n = int(m.group(1))
-    unit = m.group(2).lower()
-    mult = _DURATION_UNITS.get(unit)
-    if mult is None:
-        return None
-    return n * mult
-
-
-def parse_loop(text: str) -> Optional[LoopCommand]:
-    """Parse loop:[duration] prompt or loop:cancel.
-
-    Examples:
-        loop:5m fix lint errors    → interval=300, prompt="fix lint errors"
-        loop: monitor build        → interval=None, prompt="monitor build"
-        loop:cancel                → cancel=True
-    """
-    text = text.strip()
-    if not text.lower().startswith("loop:"):
-        return None
-    rest = text[5:].strip()
-    if rest.lower() in ("cancel", "stop", "off"):
-        return LoopCommand(interval_sec=None, prompt="", cancel=True)
-    # Try parsing first token as duration
-    parts = rest.split(None, 1)
-    if not parts:
-        return None
-    interval = _parse_duration(parts[0])
-    if interval is not None and len(parts) > 1:
-        return LoopCommand(interval_sec=interval, prompt=parts[1].strip())
-    # No duration → entire rest is the prompt
-    return LoopCommand(interval_sec=None, prompt=rest)
 
 
 @dataclass

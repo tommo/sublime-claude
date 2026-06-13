@@ -48,13 +48,12 @@ SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 INPUT_MARKER = "◎ "
 
 # ─── UI Markers ───────────────────────────────────────────────────────────────
-LOOP_PREFIX = "↻ "             # Loop banner prefix
 CONTEXT_PREFIX = "📎 "          # Pending context indicator
 BACKGROUND_PREFIX = "⚙ "       # Background tool indicator
 
 # ─── Backend Display ──────────────────────────────────────────────────────────
-BACKEND_ABBREV = {"codex": "CX", "deepseek": "DS", "copilot": "CP"}
-BACKEND_LABELS = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek", "copilot": "Copilot"}
+BACKEND_ABBREV = {"codex": "CX", "deepseek": "DS", "copilot": "CP", "pi": "Pi", "dsr": "DSR"}
+BACKEND_LABELS = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek", "copilot": "Copilot", "pi": "Pi", "dsr": "DSR"}
 
 # ─── Timing ───────────────────────────────────────────────────────────────────
 CONTEXT_DEBOUNCE_MS = 300  # Debounce for context menu after goto

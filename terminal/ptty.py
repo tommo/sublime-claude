@@ -1,3 +1,4 @@
+import codecs
 import re
 import sys
 import logging
@@ -101,7 +102,14 @@ class TerminalPtyProcess(PtyProcess):
 
     def read(self, size):
         b = super().read(size)
-        return b.decode("utf-8", "ignore")
+        # Decode incrementally: a multibyte char (emoji/CJK/box-drawing — which
+        # TUIs like Claude Code emit constantly) can straddle a read boundary.
+        # A per-chunk b.decode(..., "ignore") drops the partial tail and corrupts
+        # the glyph; the incremental decoder holds the tail until the next read.
+        dec = self.__dict__.get("_utf8_decoder")
+        if dec is None:
+            dec = self._utf8_decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        return dec.decode(b)
 
     def write(self, s):
         b = s.encode("utf-8", "backslashreplace")
