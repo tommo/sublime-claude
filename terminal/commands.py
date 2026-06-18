@@ -80,10 +80,17 @@ class ClaudeTerminalOpenCommand(sublime_plugin.WindowCommand):
             return
 
         session_name = tag or "Terminal"
-        view = new_terminal_view(self.window, session_name, tag)
 
-        if not cwd and self.window.folders():
-            cwd = self.window.folders()[0]
+        # Expand Sublime variables (e.g. keymap cwd "${file_path:${folder}}") —
+        # Sublime does NOT auto-expand command args, so resolve them here as
+        # Terminus does, then fall back to the project folder / home.
+        if cwd and "${" in cwd:
+            cwd = sublime.expand_variables(cwd, self.window.extract_variables()) or ""
+        if not cwd or not os.path.isdir(cwd):
+            folders = self.window.folders()
+            cwd = folders[0] if folders else os.path.expanduser("~")
+
+        view = new_terminal_view(self.window, session_name, tag)
 
         if not cmd:
             cmd = [os.environ.get("SHELL", "/bin/bash"), "-i", "-l"]

@@ -4,9 +4,12 @@ Bridge process between Sublime Text (Python 3.8) and Claude Agent SDK (Python 3.
 Communicates via JSON-RPC over stdio.
 """
 import asyncio
+import datetime
 import json
 import os
+import re
 import sys
+import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -32,6 +35,61 @@ os.environ["CLAUDE_AGENT"] = "1"
 # the old `is_backgrounded` patch flag for a {status, end_time} patch.)
 _TASK_TERMINAL = ("completed", "failed", "cancelled", "canceled",
                   "error", "errored", "aborted", "timeout", "crashed")
+
+
+# ── cron: the agent's built-in CronCreate is inert under the SDK (no REPL idle
+# loop fires it), so the bridge shadows those jobs and fires them itself. ──────
+def _cron_field_match(value: int, field: str, vmin: int, vmax: int) -> bool:
+    """Match one cron field (supports *, lists, ranges, and */step or a-b/step)."""
+    if field == "*":
+        return True
+    for part in field.split(","):
+        part = part.strip()
+        step = 1
+        base = part
+        if "/" in part:
+            base, step_s = part.split("/", 1)
+            try:
+                step = int(step_s)
+            except ValueError:
+                continue
+        if base == "*":
+            lo, hi = vmin, vmax
+        elif "-" in base:
+            a, b = base.split("-", 1)
+            lo, hi = int(a), int(b)
+        else:
+            lo = hi = int(base)
+        if lo <= value <= hi and (value - lo) % max(step, 1) == 0:
+            return True
+    return False
+
+
+def _cron_next_fire(expr: str, after_ts: float):
+    """Next wall-clock time (epoch secs) the 5-field local-time cron matches
+    strictly after `after_ts`, or None if malformed / no match within a year."""
+    parts = expr.split()
+    if len(parts) != 5:
+        return None
+    fmin, fhour, fdom, fmon, fdow = parts
+    try:
+        dt = (datetime.datetime.fromtimestamp(after_ts)
+              .replace(second=0, microsecond=0) + datetime.timedelta(minutes=1))
+        for _ in range(366 * 24 * 60):
+            dow = dt.isoweekday() % 7  # cron: 0=Sun .. 6=Sat
+            dom_ok = _cron_field_match(dt.day, fdom, 1, 31)
+            dow_ok = _cron_field_match(dow, fdow, 0, 6)
+            # standard cron quirk: restricted DoM *and* DoW → OR them
+            day_ok = (dom_ok or dow_ok) if (fdom != "*" and fdow != "*") else (dom_ok and dow_ok)
+            if (day_ok
+                    and _cron_field_match(dt.minute, fmin, 0, 59)
+                    and _cron_field_match(dt.hour, fhour, 0, 23)
+                    and _cron_field_match(dt.month, fmon, 1, 12)):
+                return dt.timestamp()
+            dt += datetime.timedelta(minutes=1)
+    except (ValueError, OverflowError):
+        return None
+    return None
 
 from claude_agent_sdk import (
     ClaudeSDKClient,
@@ -86,6 +144,12 @@ class Bridge:
         # Track active background tasks
         self._pending_bg_tasks: set[str] = set()
         self._bg_tool_use_ids: set[str] = set()
+
+        # Cron jobs the agent scheduled via CronCreate (inert under the SDK), which
+        # we shadow + fire ourselves. job_id -> {cron, prompt, recurring, next_fire}.
+        self._crons: dict[str, dict] = {}
+        self._pending_cron: dict[str, dict] = {}  # tool_use_id -> job, until its result lands the CLI id
+        self._cron_monitor_task: Optional[asyncio.Task] = None
 
         # Notification system (notalone2)
         # notalone handled by global client in plugin
@@ -1023,6 +1087,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                     # Text was already streamed via StreamEvent text_deltas — skip
                     pass
                 elif isinstance(block, ToolUseBlock):
+                    if block.name in ("CronCreate", "CronDelete"):
+                        self._handle_cron_tooluse(block)
                     tool_input = block.input or {}
                     is_bg = bool(tool_input.get("run_in_background") if isinstance(tool_input, dict) else False)
                     if is_bg:
@@ -1035,6 +1101,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                         "background": is_bg,
                     })
                 elif isinstance(block, ToolResultBlock):
+                    if block.tool_use_id in self._pending_cron:
+                        self._finalize_cron_from_result(block)
                     with open("/tmp/claude_bridge.log", "a") as f:
                         f.write(f"tool_result: id={block.tool_use_id}, is_error={block.is_error}, content={str(block.content)[:200]}\n")
                     send_notification("message", {
@@ -1169,6 +1237,75 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 f.write(f"  inject failed: {e}, queuing\n")
             self.pending_injects.append(message)
             send_result(id, {"status": "queued"})
+
+    # ── cron (bridge-owned; agent's CronCreate is inert under the SDK) ───────
+    def _handle_cron_tooluse(self, block) -> None:
+        inp = block.input or {}
+        if block.name == "CronCreate":
+            expr = (inp.get("cron") or "").strip()
+            prompt = inp.get("prompt") or ""
+            if expr and prompt:
+                # Finalize once the tool_result lands so we can key on the CLI's
+                # own job id (what the agent will pass to CronDelete).
+                self._pending_cron[block.id] = {
+                    "cron": expr, "prompt": prompt,
+                    "recurring": bool(inp.get("recurring", True)),
+                }
+        elif block.name == "CronDelete":
+            jid = inp.get("id")
+            if jid and self._crons.pop(jid, None) is not None:
+                with open("/tmp/claude_bridge.log", "a") as f:
+                    f.write(f"[cron] deleted {jid}\n")
+
+    def _finalize_cron_from_result(self, block) -> None:
+        pend = self._pending_cron.pop(block.tool_use_id, None)
+        if not pend:
+            return
+        text = block.content if isinstance(block.content, str) else str(block.content)
+        m = re.search(r"\bjob\s+([0-9a-fA-F]{6,})", text)
+        jid = m.group(1) if m else uuid.uuid4().hex[:8]
+        nxt = _cron_next_fire(pend["cron"], time.time())
+        if nxt is None:
+            with open("/tmp/claude_bridge.log", "a") as f:
+                f.write(f"[cron] bad expr, not scheduled: {pend['cron']!r}\n")
+            return
+        pend["next_fire"] = nxt
+        self._crons[jid] = pend
+        self._ensure_cron_monitor()
+        with open("/tmp/claude_bridge.log", "a") as f:
+            f.write(f"[cron] registered {jid} cron={pend['cron']!r} recurring={pend['recurring']} "
+                    f"next={datetime.datetime.fromtimestamp(nxt).isoformat()}\n")
+
+    def _ensure_cron_monitor(self) -> None:
+        if self._cron_monitor_task is None or self._cron_monitor_task.done():
+            self._cron_monitor_task = asyncio.create_task(self._cron_monitor())
+
+    async def _cron_monitor(self) -> None:
+        """Tick while jobs exist; on a due job, wake the agent via the same
+        notification_wake the plugin already turns into a real query turn."""
+        try:
+            while self.running and self._crons:
+                await asyncio.sleep(15)
+                now = time.time()
+                for jid, job in list(self._crons.items()):
+                    if now < job["next_fire"]:
+                        continue
+                    with open("/tmp/claude_bridge.log", "a") as f:
+                        f.write(f"[cron] fire {jid} -> wake: {job['prompt'][:60]!r}\n")
+                    send_notification("notification_wake", {
+                        "wake_prompt": job["prompt"],
+                        "display_message": "⏰ " + job["prompt"].split("\n", 1)[0][:60],
+                    })
+                    if job["recurring"]:
+                        nxt = _cron_next_fire(job["cron"], now)
+                        if nxt:
+                            job["next_fire"] = nxt
+                        else:
+                            self._crons.pop(jid, None)
+                    else:
+                        self._crons.pop(jid, None)
+        finally:
+            self._cron_monitor_task = None
 
     async def poll_bg_tasks(self, rpc_id: int) -> None:
         """Drain buffered SDK messages to pick up pending task_notification system messages.

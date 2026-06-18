@@ -834,8 +834,29 @@ class OutputView:
             except Exception:
                 pass
         if not parsed_items:
-            # Loose text scan: collect lines like "id: 1, subject: ..., status: pending"
             for line in result.splitlines():
+                # The plugin's own Task* tools print "#<id> [<status>] <subject>"
+                # (e.g. "#19 [completed] Fix …") — match that first.
+                m = re.match(r'\s*#(\d+)\s+\[(\w+)\]\s+(.+)', line)
+                if m:
+                    parsed_items.append({
+                        "id": m.group(1), "status": m.group(2),
+                        "subject": m.group(3).strip(),
+                    })
+                    continue
+                # Create/update results: "Task #4 created successfully: <subject>",
+                # "Updated task #4 status". Capture the id (+ subject after a colon)
+                # so the new todo gets an id and later TaskUpdate(status) can match.
+                m_t = re.search(r'[Tt]ask\s+#(\d+)', line)
+                if m_t:
+                    sub_m = re.search(r':\s*(.+?)\s*$', line)
+                    parsed_items.append({
+                        "id": m_t.group(1),
+                        "subject": sub_m.group(1).strip() if sub_m else "",
+                        "status": "pending",
+                    })
+                    continue
+                # Fallback: "id: 1, subject: ..., status: pending" field markers.
                 m_id = re.search(r'\b(?:id|taskId)["\s:=]+([^\s,"\}]+)', line)
                 m_sub = re.search(r'\bsubject["\s:=]+([^,"\}]+)', line)
                 m_st = re.search(r'\bstatus["\s:=]+([^\s,"\}]+)', line)
@@ -863,17 +884,21 @@ class OutputView:
             if self.current.todos and all(t.status == "completed" for t in self.current.todos):
                 self.current.todos_all_done = True
         elif name == "TaskCreate":
-            # Backfill id on the most recently-added pending TodoItem whose subject matches.
+            # Backfill id on the todo we just appended (the result is for it), so a
+            # later TaskUpdate(taskId=…) can match and flip its rendered status.
             new = parsed_items[-1]
             new_id = str(new.get("id") or "")
             new_subject = (new.get("subject") or tool.tool_input.get("subject") or "").strip()
             if new_id:
-                for todo in reversed(self.current.todos):
-                    if not todo.id and (not new_subject or todo.content.strip() == new_subject):
-                        todo.id = new_id
-                        if new_subject:
-                            todo.content = new_subject
-                        break
+                idless = [t for t in self.current.todos if not t.id]
+                target = next((t for t in idless
+                               if new_subject and t.content.strip() == new_subject), None)
+                if target is None and idless:
+                    target = idless[-1]  # most-recently appended
+                if target is not None:
+                    target.id = new_id
+                    if new_subject:
+                        target.content = new_subject
         elif name == "TaskGet":
             new = parsed_items[-1]
             tid = str(new.get("id") or "")
