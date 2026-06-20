@@ -110,6 +110,10 @@ class MCPSocketServer:
 
     def _run(self):
         """Server main loop."""
+        if not hasattr(socket, 'AF_UNIX'):
+            print("[Claude MCP] AF_UNIX not available on Windows, MCP socket server disabled")
+            return
+
         try:
             os.unlink(SOCKET_PATH)
         except FileNotFoundError:

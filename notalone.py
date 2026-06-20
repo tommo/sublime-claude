@@ -57,6 +57,10 @@ class NotaloneClient:
         import time
         reconnect_delay = 2
 
+        if not hasattr(socket, 'AF_UNIX'):
+            logger.debug("notalone: AF_UNIX not available on this platform, skipping")
+            return
+
         while self._running:
             sock = None
             try:
