@@ -79,7 +79,7 @@ _bridge_logger: Optional[Logger] = None
 _plugin_logger: Optional[Logger] = None
 
 
-def get_bridge_logger(log_path: str = "/tmp/claude_bridge.log") -> Logger:
+def get_bridge_logger(log_path: str = os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log")) -> Logger:
     """Get or create the bridge logger singleton."""
     global _bridge_logger
     if _bridge_logger is None:

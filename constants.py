@@ -1,4 +1,5 @@
 """Constants and configuration values for Claude Code plugin."""
+import os
 from pathlib import Path
 
 # ─── Application ──────────────────────────────────────────────────────────────
@@ -26,7 +27,7 @@ MCP_CONFIG_FILE = ".mcp.json"
 MCP_SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-BRIDGE_LOG_PATH = "/tmp/claude_bridge.log"
+BRIDGE_LOG_PATH = os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log")
 LOG_PREFIX_INFO = "  "
 LOG_PREFIX_ERROR = "ERROR: "
 
