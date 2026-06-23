@@ -402,12 +402,22 @@ class OutputView:
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
         self.view.show(self._input_start)
 
+        # Pin the permission-mode banner at the fresh input area (non-baseline modes only)
+        if session:
+            session._update_permission_banner(show=True)
+
         # print(f"[Claude] enter_input_mode: COMPLETED, view_size={self.view.size()}, _input_mode={self._input_mode}, final_content={repr(self.view.substr(sublime.Region(0, self.view.size())))}")
 
     def exit_input_mode(self, keep_text: bool = False) -> str:
         """Exit input mode and return the input text."""
         if not self.view or not self._input_mode:
             return ""
+
+        # Drop the permission-mode banner before the input area is removed.
+        from . import claude_code
+        _sess = claude_code.get_session_for_view(self.view)
+        if _sess:
+            _sess._update_permission_banner(show=False)
 
         # Get the input text
         input_text = self.get_input_text()

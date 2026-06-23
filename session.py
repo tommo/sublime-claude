@@ -257,6 +257,7 @@ class Session:
         self._status("connecting...")
 
         permission_mode = settings.get("permission_mode", "acceptEdits")
+        self.permission_mode = permission_mode
         # In default mode, don't auto-allow any tools - prompt for all
         if permission_mode == "default":
             allowed_tools = []
@@ -1368,6 +1369,39 @@ class Session:
         ps = self._get_overlay_phantom_set()
         if ps:
             ps.update([])
+
+    # Permission-mode banner: a persistent, color-coded line pinned at the input
+    # area whenever the agent runs more autonomously than baseline, so "it's
+    # acting without asking" is visible right where you type. default/acceptEdits
+    # are the baseline and intentionally get no banner.
+    _PERMMODE_BANNER = {
+        "auto": ("⏵ auto · runs safe actions without asking, prompts on risky", "var(--yellowish)"),
+        "dontAsk": ("⏵ don't-ask · never prompts; denies anything not pre-approved", "var(--orangish)"),
+        "bypassPermissions": ("⏵ bypass · ALL actions run without asking — caution", "var(--redish)"),
+    }
+
+    def _get_permmode_phantom_set(self):
+        if not hasattr(self, '_permmode_phantom_set') or self._permmode_phantom_set is None:
+            if self.output and self.output.view:
+                self._permmode_phantom_set = sublime.PhantomSet(self.output.view, "claude_permmode")
+        return self._permmode_phantom_set
+
+    def _update_permission_banner(self, show: bool = True) -> None:
+        ps = self._get_permmode_phantom_set()
+        if not ps or not self.output or not self.output.view:
+            return
+        in_input = getattr(self.output, '_input_mode', False)
+        info = self._PERMMODE_BANNER.get(getattr(self, 'permission_mode', None)) if (show and in_input) else None
+        if not info:
+            ps.update([])
+            return
+        label, color = info
+        view = self.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+        last_nl = content.rfind("\n")
+        pt = last_nl if last_nl >= 0 else 0
+        html = f'<body style="margin: 4px 0; color: {color};">{label}</body>'
+        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
 
     def _show_connecting_phantom(self) -> None:
         self._show_overlay_phantom("◎ Connecting...")

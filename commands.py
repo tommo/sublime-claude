@@ -1973,11 +1973,13 @@ return {
 class ClaudeCodeTogglePermissionModeCommand(sublime_plugin.WindowCommand):
     """Toggle between permission modes."""
 
-    MODES = ["default", "acceptEdits", "bypassPermissions"]
+    MODES = ["default", "acceptEdits", "auto", "dontAsk", "bypassPermissions"]
     MODE_LABELS = {
         "default": "Default (prompt for all)",
         "acceptEdits": "Accept Edits (auto-approve file ops)",
-        "bypassPermissions": "Bypass (allow all - use with caution)",
+        "auto": "Auto (classifier: run safe ops, ask on risky, block exfil)",
+        "dontAsk": "Don't Ask (never prompt; deny if not pre-approved)",
+        "bypassPermissions": "Bypass (allow ALL - use with caution)",
     }
 
     def run(self):
@@ -2003,8 +2005,12 @@ class ClaudeCodeTogglePermissionModeCommand(sublime_plugin.WindowCommand):
                 sublime.status_message(f"Claude: permission mode = {new_mode}")
 
                 s = get_active_session(self.window)
-                if s and s.client:
-                    s.client.send("set_permission_mode", {"mode": new_mode})
+                if s:
+                    s.permission_mode = new_mode
+                    if s.client:
+                        s.client.send("set_permission_mode", {"mode": new_mode})
+                    if hasattr(s, "_update_permission_banner"):
+                        s._update_permission_banner(show=True)
 
         self.window.show_quick_panel(items, on_select, selected_index=current_idx)
 

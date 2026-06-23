@@ -213,6 +213,11 @@ class Bridge:
                 if max_ctx:
                     os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(max_ctx)
                 send_result(id, {"ok": True})
+            elif method == "set_permission_mode":
+                mode = params.get("mode")
+                if mode and self.client:
+                    await self.client.set_permission_mode(mode)
+                send_result(id, {"ok": True})
             elif method == "poll_bg_tasks":
                 await self.poll_bg_tasks(id)
             else:
