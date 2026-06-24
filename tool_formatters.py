@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 
 def _bash(view: "OutputView", tool: "ToolCall") -> str:
     cmd = tool.tool_input.get("command", "")
+    # The agent emits multi-line bash; the tool line is a single-line syntax
+    # scope (^\s*☐ .+$), so flatten newlines or they spill below it unscoped.
+    if "\n" in cmd:
+        cmd = " ⏎ ".join(s.strip() for s in cmd.splitlines() if s.strip())
     out = f": {cmd}"
     if tool.result and tool.status in ("done", "error"):
         out += view._format_bash_result(tool.result)
