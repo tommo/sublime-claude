@@ -35,6 +35,9 @@ def _read(view: "OutputView", tool: "ToolCall") -> str:
 
 def _edit(view: "OutputView", tool: "ToolCall") -> str:
     file_path = tool.tool_input.get("file_path", "")
+    # A failed edit never applied — its diff is misleading noise, so hide it.
+    if tool.status == "error":
+        return f": {file_path}"
     old = tool.tool_input.get("old_string", "")
     new = tool.tool_input.get("new_string", "")
     unified = tool.tool_input.get("unified_diff", "")
