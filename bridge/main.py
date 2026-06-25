@@ -1174,6 +1174,19 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 if not future.done():
                     future.set_result(False)  # Deny pending permissions
             self.pending_permissions.clear()
+            # Also release pending question / plan-approval futures. Their tool
+            # handlers (AskUserQuestion, ExitPlanMode) are awaiting these plain
+            # asyncio futures, which the SDK interrupt can't unblock — so without
+            # this the task sits blocked and interrupt stalls the full 5s drain
+            # timeout before cancelling (the "halt during a question").
+            for qid, future in list(self.pending_questions.items()):
+                if not future.done():
+                    future.set_result(None)  # → handler returns "User cancelled"
+            self.pending_questions.clear()
+            for pid, future in list(self.pending_plan_approvals.items()):
+                if not future.done():
+                    future.set_result(False)
+            self.pending_plan_approvals.clear()
             # Don't cancel task - let it drain naturally after interrupt
             # Wait for the task to complete (it should finish quickly after interrupt)
             with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
