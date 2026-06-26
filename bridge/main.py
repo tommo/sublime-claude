@@ -150,6 +150,7 @@ class Bridge:
         self._crons: dict[str, dict] = {}
         self._pending_cron: dict[str, dict] = {}  # tool_use_id -> job, until its result lands the CLI id
         self._cron_monitor_task: Optional[asyncio.Task] = None
+        self._wake_tasks: set = set()  # one-shot ScheduleWakeup timers (/loop dynamic)
 
         # Notification system (notalone2)
         # notalone handled by global client in plugin
@@ -1094,6 +1095,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 elif isinstance(block, ToolUseBlock):
                     if block.name in ("CronCreate", "CronDelete"):
                         self._handle_cron_tooluse(block)
+                    elif block.name == "ScheduleWakeup":
+                        self._handle_schedule_wakeup(block)
                     tool_input = block.input or {}
                     is_bg = bool(tool_input.get("run_in_background") if isinstance(tool_input, dict) else False)
                     if is_bg:
@@ -1324,6 +1327,39 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                         self._crons.pop(jid, None)
         finally:
             self._cron_monitor_task = None
+
+    def _handle_schedule_wakeup(self, block) -> None:
+        """ScheduleWakeup is a harness /loop-dynamic tool — inert under the SDK
+        (no idle loop re-invokes it). Shadow it with a one-shot timer that fires
+        the same notification_wake the cron path uses, so self-paced loops continue."""
+        inp = block.input or {}
+        prompt = inp.get("prompt") or ""
+        try:
+            delay = float(inp.get("delaySeconds") or 0)
+        except (TypeError, ValueError):
+            delay = 0
+        if not prompt or delay <= 0:
+            return
+        delay = max(60.0, min(delay, 3600.0))  # runtime clamp, matches the tool spec
+        task = asyncio.create_task(self._fire_wake_after(delay, prompt))
+        self._wake_tasks.add(task)
+        task.add_done_callback(self._wake_tasks.discard)
+        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+            f.write(f"[wake] scheduled in {delay:.0f}s -> {prompt[:60]!r}\n")
+
+    async def _fire_wake_after(self, delay: float, prompt: str) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if not self.running:
+            return
+        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+            f.write(f"[wake] fire -> {prompt[:60]!r}\n")
+        send_notification("notification_wake", {
+            "wake_prompt": prompt,
+            "display_message": "⏰ " + prompt.split("\n", 1)[0][:60],
+        })
 
     async def poll_bg_tasks(self, rpc_id: int) -> None:
         """Drain buffered SDK messages to pick up pending task_notification system messages.
