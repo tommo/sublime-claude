@@ -1341,6 +1341,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if not prompt or delay <= 0:
             return
         delay = max(60.0, min(delay, 3600.0))  # runtime clamp, matches the tool spec
+        # Only one pending wake may be live. The agent re-arms each turn and may
+        # call ScheduleWakeup several times in quick succession; without this,
+        # the timers pile up — each fires, re-invokes, re-arms → a wake storm.
+        for t in list(self._wake_tasks):
+            t.cancel()
+        self._wake_tasks.clear()
         task = asyncio.create_task(self._fire_wake_after(delay, prompt))
         self._wake_tasks.add(task)
         task.add_done_callback(self._wake_tasks.discard)
