@@ -1248,7 +1248,7 @@ class Session:
         base = self.name or "Claude"
         # Strip any stale prefixes from name (status icons + backend abbrevs)
         import re
-        base = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', base)
+        base = re.sub(r'^(?:[◉◇•❓⏸↻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', base)
         base = re.sub(r'^(?:DSR|CX|DS|CP|Pi)(?:>|:)\s*', '', base) or "Claude"
         return base
 

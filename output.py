@@ -174,6 +174,10 @@ class OutputView:
 
     def set_name(self, name: str) -> None:
         """Update the output view title."""
+        # Strip any leading status glyphs so they never accumulate in the stored
+        # base name (e.g. a ↻/◇ prefix leaking back in → "◇ ↻ name").
+        import re
+        name = re.sub(r'^(?:[◉◇•❓⏸↻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', name or "") or "Claude"
         self._name = name  # Store for refresh_title
         self._update_title()
 
