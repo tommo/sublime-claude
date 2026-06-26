@@ -1705,6 +1705,7 @@ class Session:
             "plan_response": lambda _p: None,  # handled via pending_plan_approvals in bridge
             "queued_inject": self._on_queued_inject,
             "notification_wake": self._on_notification_wake,
+            "loop_scheduled": self._on_loop_scheduled,
         }
 
     def _notification_message_handlers(self):
@@ -1726,6 +1727,16 @@ class Session:
             self._inject_pending = False
             self.working = True
             self.query(message)
+
+    def _on_loop_scheduled(self, params: dict) -> None:
+        """Bridge reports the exact next self-wake time (cron or ScheduleWakeup)
+        so the wakeup hint is accurate for both paths. fire_at None = cleared."""
+        self.next_wake_at = params.get("fire_at")
+        if self.next_wake_at:
+            self.is_looping = True
+        if self.output:
+            self.output._update_title()
+            self._update_wakeup_banner(show=True)
 
     def _on_notification_wake(self, params: dict) -> None:
         """Fire a new query from a notification wake event (timer, channel, etc)."""

@@ -1297,6 +1297,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         pend["next_fire"] = nxt
         self._crons[jid] = pend
         self._ensure_cron_monitor()
+        send_notification("loop_scheduled", {"fire_at": nxt})  # plugin wakeup hint
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[cron] registered {jid} cron={pend['cron']!r} recurring={pend['recurring']} "
                     f"next={datetime.datetime.fromtimestamp(nxt).isoformat()}\n")
@@ -1325,6 +1326,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                         nxt = _cron_next_fire(job["cron"], now)
                         if nxt:
                             job["next_fire"] = nxt
+                            send_notification("loop_scheduled", {"fire_at": nxt})  # next-wakeup hint
                         else:
                             self._crons.pop(jid, None)
                     else:
@@ -1356,6 +1358,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         task.add_done_callback(self._wake_tasks.discard)
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[wake] scheduled in {delay:.0f}s -> {prompt[:60]!r}\n")
+        # Tell the plugin the exact fire time so it can show the wakeup hint.
+        send_notification("loop_scheduled", {"fire_at": time.time() + delay})
 
     async def _fire_wake_after(self, delay: float, prompt: str) -> None:
         try:
@@ -1366,6 +1370,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             return
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[wake] fire -> {prompt[:60]!r}\n")
+        send_notification("loop_scheduled", {"fire_at": None})  # one-shot done; agent re-arms
         send_notification("notification_wake", {
             "wake_prompt": prompt,
             "display_message": "⏰ " + prompt.split("\n", 1)[0][:60],
