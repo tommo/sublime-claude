@@ -1132,6 +1132,10 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                     f.write(f"  UserMessage blocks: {[type(b).__name__ for b in content]}\n")
                 for block in content:
                     if isinstance(block, ToolResultBlock):
+                        # Tool results arrive here (UserMessage), NOT via the
+                        # AssistantMessage path — finalize a pending cron now.
+                        if block.tool_use_id in self._pending_cron:
+                            self._finalize_cron_from_result(block)
                         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
                             f.write(f"tool_result: id={block.tool_use_id}, is_error={block.is_error}\n")
                         send_notification("message", {
