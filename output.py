@@ -205,7 +205,11 @@ class OutputView:
             (session and session.working)
             or (self.current and self.current.working)
         )
-        is_looping = bool(session and getattr(session, "is_looping", False))
+        # ↻ reflects a *confirmed pending* wake (next_wake_at in the future), not a
+        # sticky flag — so it self-clears once the wake fires or its time passes.
+        import time as _t
+        _nxt = getattr(session, "next_wake_at", None) if session else None
+        is_looping = bool(_nxt and _nxt > _t.time())
         if is_sleeping:
             prefix = "⏸ "
         elif is_questioning:

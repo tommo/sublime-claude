@@ -151,6 +151,7 @@ class Bridge:
         self._pending_cron: dict[str, dict] = {}  # tool_use_id -> job, until its result lands the CLI id
         self._cron_monitor_task: Optional[asyncio.Task] = None
         self._wake_tasks: set = set()  # one-shot ScheduleWakeup timers (/loop dynamic)
+        self._pending_wake: Optional[dict] = None  # {prompt, fire_at} mirror of the live wake, for persistence
 
         # Notification system (notalone2)
         # notalone handled by global client in plugin
@@ -435,6 +436,9 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "mcp_servers": list(mcp_servers.keys()) if mcp_servers else [],
             "agents": list(agents.keys()) if agents else [],
         })
+
+        # Re-arm any wake/crons this session had pending before a restart.
+        self._restore_loop_state()
 
 
     def _load_mcp_servers(self, cwd: str) -> dict:
@@ -1279,6 +1283,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         elif block.name == "CronDelete":
             jid = inp.get("id")
             if jid and self._crons.pop(jid, None) is not None:
+                self._save_loop_state()
                 with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
                     f.write(f"[cron] deleted {jid}\n")
 
@@ -1297,6 +1302,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         pend["next_fire"] = nxt
         self._crons[jid] = pend
         self._ensure_cron_monitor()
+        self._save_loop_state()
         send_notification("loop_scheduled", {"fire_at": nxt})  # plugin wakeup hint
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[cron] registered {jid} cron={pend['cron']!r} recurring={pend['recurring']} "
@@ -1331,6 +1337,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                             self._crons.pop(jid, None)
                     else:
                         self._crons.pop(jid, None)
+                    self._save_loop_state()
         finally:
             self._cron_monitor_task = None
 
@@ -1356,10 +1363,13 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         task = asyncio.create_task(self._fire_wake_after(delay, prompt))
         self._wake_tasks.add(task)
         task.add_done_callback(self._wake_tasks.discard)
+        fire_at = time.time() + delay
+        self._pending_wake = {"prompt": prompt, "fire_at": fire_at}
+        self._save_loop_state()
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[wake] scheduled in {delay:.0f}s -> {prompt[:60]!r}\n")
         # Tell the plugin the exact fire time so it can show the wakeup hint.
-        send_notification("loop_scheduled", {"fire_at": time.time() + delay})
+        send_notification("loop_scheduled", {"fire_at": fire_at})
 
     async def _fire_wake_after(self, delay: float, prompt: str) -> None:
         try:
@@ -1370,11 +1380,74 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             return
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
             f.write(f"[wake] fire -> {prompt[:60]!r}\n")
+        self._pending_wake = None
+        self._save_loop_state()
         send_notification("loop_scheduled", {"fire_at": None})  # one-shot done; agent re-arms
         send_notification("notification_wake", {
             "wake_prompt": prompt,
             "display_message": "⏰ " + prompt.split("\n", 1)[0][:60],
         })
+
+    # ── loop persistence: survive bridge/Sublime restarts ─────────────────────
+    def _loop_state_path(self) -> str:
+        d = os.path.expanduser("~/.claude/sublime_claude_loops")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{self._session_id}.json")
+
+    def _save_loop_state(self) -> None:
+        """Persist pending wake + crons so a restarted bridge can re-arm them."""
+        try:
+            crons = {jid: {k: j[k] for k in ("cron", "prompt", "recurring", "next_fire")}
+                     for jid, j in self._crons.items()}
+            if not self._pending_wake and not crons:
+                self._clear_loop_state()
+                return
+            with open(self._loop_state_path(), "w") as f:
+                json.dump({"wake": self._pending_wake, "crons": crons}, f)
+        except Exception as e:
+            _logger.warning(f"loop persist failed: {e}")
+
+    def _clear_loop_state(self) -> None:
+        try:
+            p = self._loop_state_path()
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    def _restore_loop_state(self) -> None:
+        """On startup, re-arm any persisted wake/crons (survives restarts)."""
+        try:
+            p = self._loop_state_path()
+            if not os.path.exists(p):
+                return
+            with open(p) as f:
+                state = json.load(f)
+        except Exception:
+            return
+        now = time.time()
+        for jid, j in (state.get("crons") or {}).items():
+            nxt = _cron_next_fire(j["cron"], now)
+            if nxt is None:
+                continue
+            self._crons[jid] = {"cron": j["cron"], "prompt": j["prompt"],
+                                "recurring": j.get("recurring", True), "next_fire": nxt}
+        if self._crons:
+            self._ensure_cron_monitor()
+        w = state.get("wake")
+        if w and w.get("prompt"):
+            delay = max(2.0, (w.get("fire_at") or now) - now)  # missed during downtime → fire shortly
+            self._pending_wake = {"prompt": w["prompt"], "fire_at": now + delay}
+            task = asyncio.create_task(self._fire_wake_after(delay, w["prompt"]))
+            self._wake_tasks.add(task)
+            task.add_done_callback(self._wake_tasks.discard)
+        fires = [j["next_fire"] for j in self._crons.values()]
+        if self._pending_wake:
+            fires.append(self._pending_wake["fire_at"])
+        if fires:
+            send_notification("loop_scheduled", {"fire_at": min(fires)})
+        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+            f.write(f"[loop] restored {len(self._crons)} cron(s), wake={bool(self._pending_wake)}\n")
 
     async def poll_bg_tasks(self, rpc_id: int) -> None:
         """Drain buffered SDK messages to pick up pending task_notification system messages.
