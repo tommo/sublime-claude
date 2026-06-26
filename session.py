@@ -1,4 +1,5 @@
 """Claude Code session management."""
+import datetime
 import json
 import os
 import time
@@ -105,6 +106,7 @@ class Session:
         self.initialized = False
         self.working = False
         self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
+        self.next_wake_at: Optional[float] = None  # epoch of the pending self-wake (for the wakeup banner)
         self.current_tool: Optional[str] = None
         self.spinner_frame = 0
         # Session identity
@@ -1404,6 +1406,34 @@ class Session:
         html = f'<body style="margin: 4px 0; color: {color};">{label}</body>'
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
 
+    def _get_wakeup_phantom_set(self):
+        if not hasattr(self, '_wakeup_phantom_set') or self._wakeup_phantom_set is None:
+            if self.output and self.output.view:
+                self._wakeup_phantom_set = sublime.PhantomSet(self.output.view, "claude_wakeup")
+        return self._wakeup_phantom_set
+
+    def _update_wakeup_banner(self, show: bool = True) -> None:
+        """Pin '⏰ next wakeup at HH:MM' at the input area while a self-paced loop
+        waits for its next scheduled wake. Plugin-side: time derived from the
+        ScheduleWakeup delay (mirrors the bridge clamp)."""
+        ps = self._get_wakeup_phantom_set()
+        if not ps or not self.output or not self.output.view:
+            return
+        nxt = getattr(self, 'next_wake_at', None)
+        in_input = getattr(self.output, '_input_mode', False)
+        if not (show and in_input and nxt and nxt > time.time()):
+            ps.update([])
+            return
+        when = datetime.datetime.fromtimestamp(nxt).strftime("%H:%M")
+        mins = int((nxt - time.time()) / 60)
+        label = f"↻ next wakeup at {when}" + (f" · ~{mins}m" if mins else "")
+        view = self.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+        last_nl = content.rfind("\n")
+        pt = last_nl if last_nl >= 0 else 0
+        html = f'<body style="margin: 4px 0; color: var(--bluish);">{label}</body>'
+        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
+
     def _show_connecting_phantom(self) -> None:
         self._show_overlay_phantom("◎ Connecting...")
 
@@ -1737,6 +1767,13 @@ class Session:
         # Agent armed a self-wake / cron → this is now a looping session.
         if name in ("ScheduleWakeup", "CronCreate"):
             self.is_looping = True
+            if name == "ScheduleWakeup":
+                try:
+                    d = float(tool_input.get("delaySeconds") or 0)
+                except (TypeError, ValueError):
+                    d = 0
+                # mirror the bridge clamp so the displayed time matches the timer
+                self.next_wake_at = time.time() + max(60.0, min(d, 3600.0)) if d > 0 else None
             self.output._update_title()
         if background:
             # Background tools don't take over current_tool (spinner stays on foreground)
