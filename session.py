@@ -104,6 +104,7 @@ class Session:
         self.output = OutputView(window)
         self.initialized = False
         self.working = False
+        self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
         self.current_tool: Optional[str] = None
         self.spinner_frame = 0
         # Session identity
@@ -1733,6 +1734,10 @@ class Session:
         tool_id = params.get("id")
         if not name or not name.strip():
             return
+        # Agent armed a self-wake / cron → this is now a looping session.
+        if name in ("ScheduleWakeup", "CronCreate"):
+            self.is_looping = True
+            self.output._update_title()
         if background:
             # Background tools don't take over current_tool (spinner stays on foreground)
             self.output.tool(name, tool_input, tool_id=tool_id, background=True)

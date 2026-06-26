@@ -201,10 +201,13 @@ class OutputView:
             (session and session.working)
             or (self.current and self.current.working)
         )
+        is_looping = bool(session and getattr(session, "is_looping", False))
         if is_sleeping:
             prefix = "⏸ "
         elif is_questioning:
             prefix = "❓"
+        elif is_looping:
+            prefix = "↻ "  # self-paced loop (scheduled wake / cron armed)
         elif is_active:
             prefix = "◉ " if is_working else "◇ "
         else:

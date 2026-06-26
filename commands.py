@@ -2049,6 +2049,10 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if not text:
             return
 
+        # Manual submit = user takeover; drop the loop indicator. If the agent
+        # re-arms a wake this turn, _on_msg_tool_use flips it back on.
+        s.is_looping = False
+
         # Check for slash commands
         cmd = CommandParser.parse(text)
         if cmd:
