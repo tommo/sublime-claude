@@ -333,6 +333,24 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
         sublime.status_message("Session restarted")
 
 
+class ClaudeCodeCopySessionIdCommand(sublime_plugin.WindowCommand):
+    """Copy the Claude session ID of the active view to the clipboard."""
+    def run(self) -> None:
+        view = self.window.active_view()
+        s = (get_session_for_view(view) if view else None) or get_active_session(self.window)
+        sid = getattr(s, "session_id", None) if s else None
+        if not sid:
+            sublime.status_message("Claude: no session id for this view")
+            return
+        sublime.set_clipboard(sid)
+        sublime.status_message(f"Claude: session id copied — {sid}")
+
+    def is_enabled(self) -> bool:
+        view = self.window.active_view()
+        s = (get_session_for_view(view) if view else None) or get_active_session(self.window)
+        return bool(getattr(s, "session_id", None)) if s else False
+
+
 class ClaudeCodeQuerySelectionCommand(sublime_plugin.TextCommand):
     def run(self, edit: sublime.Edit) -> None:
         sel = self.view.sel()

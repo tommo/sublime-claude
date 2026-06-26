@@ -4,6 +4,10 @@
         "command": "claude_code_query"
     },
     {
+        "caption": "Claude: Copy Session ID",
+        "command": "claude_code_copy_session_id"
+    },
+    {
         "caption": "Codex: New Session",
         "command": "codex_start"
     },
