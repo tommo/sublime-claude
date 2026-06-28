@@ -54,7 +54,14 @@ def _edit(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _write(view: "OutputView", tool: "ToolCall") -> str:
-    return f": {tool.tool_input.get('file_path', '')}"
+    out = f": {tool.tool_input.get('file_path', '')}"
+    content = tool.tool_input.get("content") or ""
+    if content:
+        lines = len(content.splitlines())
+        nbytes = len(content.encode("utf-8", "replace"))
+        size = f"{nbytes / 1024:.1f} KB" if nbytes >= 1024 else f"{nbytes} B"
+        out += f" → {lines} lines, {size}"
+    return out
 
 
 def _glob(view: "OutputView", tool: "ToolCall") -> str:
