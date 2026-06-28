@@ -418,7 +418,8 @@
             </dict>
         </dict>
 
-        <!-- Diff: context (unchanged) lines — dim like a normal tool result -->
+        <!-- Diff: context (unchanged) lines — between the message text (#cbccc6)
+             and the dim tool result (#707a8c) so changes still stand out -->
         <dict>
             <key>name</key>
             <string>Diff Context</string>
@@ -427,7 +428,7 @@
             <key>settings</key>
             <dict>
                 <key>foreground</key>
-                <string>#707a8c</string>
+                <string>#9aa1ab</string>
             </dict>
         </dict>
 
