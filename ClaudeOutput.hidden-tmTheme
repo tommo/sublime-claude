@@ -418,6 +418,19 @@
             </dict>
         </dict>
 
+        <!-- Diff: context (unchanged) lines — dim like a normal tool result -->
+        <dict>
+            <key>name</key>
+            <string>Diff Context</string>
+            <key>scope</key>
+            <string>claude.diff.context</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#707a8c</string>
+            </dict>
+        </dict>
+
         <!-- Diff: inserted -->
         <dict>
             <key>scope</key>
