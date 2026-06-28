@@ -2125,6 +2125,8 @@ class Session:
         v.set_read_only(True)
         v.set_name(f"⚙ {(wf.get('summary') or 'workflow')[:24]}")
         v.settings().set("claude_workflow_view", task_id)
+        if self.output and self.output.view:
+            v.settings().set("claude_workflow_parent", self.output.view.id())
         # Mirror the session view's chrome so the detail view looks consistent
         # (font size incl. zoom, zero-gutter, no line numbers, color scheme).
         if self.output and self.output.view:

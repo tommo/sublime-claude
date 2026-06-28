@@ -168,6 +168,27 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                 if session.output:
                     session.output._apply_output_settings()
 
+    def on_pre_close(self, view: sublime.View) -> None:
+        # Closing a workflow detail view → drop the session's refs and refocus
+        # the parent session view it was opened from.
+        task_id = view.settings().get("claude_workflow_view")
+        if not task_id:
+            return
+        parent_id = view.settings().get("claude_workflow_parent")
+        win = view.window()
+        sess = sublime._claude_sessions.get(parent_id)
+        if sess:
+            if hasattr(sess, "_workflow_views"):
+                sess._workflow_views.pop(task_id, None)
+            if hasattr(sess, "_workflow_view_ps"):
+                sess._workflow_view_ps.pop(task_id, None)
+        if parent_id is not None and win:
+            def refocus():
+                pv = next((v for v in win.views() if v.id() == parent_id), None)
+                if pv:
+                    win.focus_view(pv)
+            sublime.set_timeout(refocus, 0)
+
     def on_close(self, view: sublime.View) -> None:
         sublime.load_settings("ClaudeOutput.sublime-settings").clear_on_change(
             f"claude_output_{view.id()}"
