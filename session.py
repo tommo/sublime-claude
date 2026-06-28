@@ -2020,19 +2020,38 @@ class Session:
         wp = data.get("workflow_progress") or []
         if not task_id or not wp:
             return
-        agents = [a for a in wp if isinstance(a, dict) and a.get("type") == "workflow_agent"]
-        if not agents:
+        # task_progress ticks are PARTIAL (only the agents that changed this
+        # tick), so accumulate per-agent state keyed by (phaseIndex, index)
+        # rather than treating each tick as the full set — otherwise counts jump
+        # (6→1) and the panel never coheres.
+        wf = self._workflows.get(task_id)
+        if not wf or "agents" not in wf:
+            wf = {"agents": {}, "phases": {}, "summary": "", "sig": None}
+            self._workflows[task_id] = wf
+        wf["summary"] = data.get("summary", "") or wf["summary"]
+        touched = False
+        for e in wp:
+            if not isinstance(e, dict):
+                continue
+            if e.get("type") == "workflow_phase":
+                wf["phases"][e.get("index")] = e.get("title") or wf["phases"].get(e.get("index"), "")
+            elif e.get("type") == "workflow_agent":
+                key = (e.get("phaseIndex"), e.get("index"))
+                wf["agents"][key] = {**wf["agents"].get(key, {}), **e}
+                touched = True
+        if not touched:
             return
-        sig = tuple((a.get("phaseIndex"), a.get("index"), a.get("state"),
-                     a.get("toolCalls"), a.get("lastToolName")) for a in agents)
-        prev = self._workflows.get(task_id)
-        if prev and prev.get("sig") == sig:
-            return  # nothing material changed — let the spinner cover elapsed
-        summary = data.get("summary", "") or (prev or {}).get("summary", "")
-        done = sum(1 for a in agents if a.get("state") in self._WF_DONE)
-        completed = bool(agents) and all(a.get("state") in self._WF_DONE for a in agents)
-        self._workflows[task_id] = {"wp": wp, "summary": summary, "sig": sig,
-                                    "done": done, "total": len(agents), "completed": completed}
+        agents = list(wf["agents"].values())
+        sig = tuple(sorted(
+            (str(a.get("phaseIndex")), a.get("index") or 0, a.get("state"),
+             a.get("toolCalls") or 0, a.get("tokens") or 0, a.get("lastToolName") or "")
+            for a in agents))
+        if wf.get("sig") == sig:
+            return  # truly nothing changed
+        wf["sig"] = sig
+        wf["done"] = sum(1 for a in agents if a.get("state") in self._WF_DONE)
+        wf["total"] = len(agents)
+        wf["completed"] = bool(agents) and all(a.get("state") in self._WF_DONE for a in agents)
         # Clickable redirect in the conversation (persists past turn-end) + live
         # detail in the workflow's own view if the user opened it.
         self._render_workflow_redirect(task_id)
@@ -2058,8 +2077,8 @@ class Session:
         last_nl = content.rfind("\n")
         pt = last_nl if last_nl >= 0 else 0
         esc = lambda s: str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        g = "✓" if wf["completed"] else "⚙"
-        label = (f'{g} workflow: {esc(wf["summary"])[:32]} · {wf["done"]}/{wf["total"]} agents '
+        g = "✓" if wf.get("completed") else "⚙"
+        label = (f'{g} workflow: {esc(wf.get("summary"))[:32]} · {wf.get("done", 0)}/{wf.get("total", 0)} agents '
                  f'· <a href="open">open ↗</a>')
         html = (f'<body style="margin:4px 0; padding:1px 8px; color:color(var(--foreground) alpha(0.65)); '
                 f'background-color:color(var(--background) blend(var(--foreground) 96%));">{label}</body>')
@@ -2106,9 +2125,12 @@ class Session:
             self._workflow_views.pop(task_id, None)
             return
         wf = self._workflows.get(task_id)
-        if not wf:
+        if not wf or "agents" not in wf:
             return
-        text = self._build_workflow_text(wf["wp"], wf["summary"], wf["done"], wf["total"], wf["completed"])
+        # rebuild a wp-shaped list from the accumulated agents + phases
+        synth = [{"type": "workflow_phase", "index": i, "title": t} for i, t in wf["phases"].items()]
+        synth += [{"type": "workflow_agent", **a} for a in wf["agents"].values()]
+        text = self._build_workflow_text(synth, wf["summary"], wf["done"], wf["total"], wf["completed"])
         view.set_read_only(False)
         view.run_command("claude_replace", {"start": 0, "end": view.size(), "text": text})
         view.set_read_only(True)
