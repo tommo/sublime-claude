@@ -152,6 +152,7 @@ class Session:
         self._workflows: Dict[str, Any] = {}
         self._workflow_phantom_set = None
         self._workflow_views: Dict[str, int] = {}  # task_id -> dedicated detail view id
+        self._workflow_view_ps: Dict[str, Any] = {}  # task_id -> PhantomSet for the detail view
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
@@ -2121,68 +2122,137 @@ class Session:
         wf = self._workflows.get(task_id) or {}
         v = self.window.new_file()
         v.set_scratch(True)
+        v.set_read_only(True)
         v.set_name(f"⚙ {(wf.get('summary') or 'workflow')[:24]}")
         v.settings().set("claude_workflow_view", task_id)
+        # Mirror the session view's chrome so the detail view looks consistent
+        # (font size incl. zoom, zero-gutter, no line numbers, color scheme).
+        if self.output and self.output.view:
+            src = self.output.view.settings()
+            dst = v.settings()
+            for key in ("font_size", "line_numbers", "gutter", "margin", "word_wrap",
+                        "draw_indent_guides", "draw_white_space", "highlight_line",
+                        "fold_buttons", "fade_fold_buttons", "rulers", "scroll_past_end",
+                        "color_scheme"):
+                val = src.get(key)
+                if val is not None:
+                    dst.set(key, val)
+        v.settings().set("auto_indent", False)
+        v.settings().set("is_widget", False)
         self._workflow_views[task_id] = v.id()
         self._render_workflow_detail(task_id)
 
     def _render_workflow_detail(self, task_id: str) -> None:
-        """Render the full live panel into the workflow's detail view (if open)."""
+        """Render the rich live panel into the workflow's detail view (if open)."""
         if not hasattr(self, "_workflow_views"):
             self._workflow_views = {}
+        if not hasattr(self, "_workflow_view_ps"):
+            self._workflow_view_ps = {}
         vid = self._workflow_views.get(task_id)
         if not vid:
             return
         view = self._find_view_by_id(vid)
         if view is None:
             self._workflow_views.pop(task_id, None)
+            self._workflow_view_ps.pop(task_id, None)
             return
         wf = self._workflows.get(task_id)
         if not wf or "agents" not in wf:
             return
-        # rebuild a wp-shaped list from the accumulated agents + phases
-        synth = [{"type": "workflow_phase", "index": i, "title": t} for i, t in wf["phases"].items()]
-        synth += [{"type": "workflow_agent", **a} for a in wf["agents"].values()]
-        text = self._build_workflow_text(synth, wf["summary"], wf["done"], wf["total"], wf["completed"])
-        view.set_read_only(False)
-        view.run_command("claude_replace", {"start": 0, "end": view.size(), "text": text})
-        view.set_read_only(True)
+        html = self._build_workflow_html(list(wf["agents"].values()), wf["phases"],
+                                         wf["summary"], wf["done"], wf["total"], wf["completed"])
+        if view.size() == 0:  # anchor for the block phantom
+            view.set_read_only(False)
+            view.run_command("append", {"characters": "\n"})
+            view.set_read_only(True)
+        ps = self._workflow_view_ps.get(task_id)
+        if ps is None:
+            ps = sublime.PhantomSet(view, "wf_detail")
+            self._workflow_view_ps[task_id] = ps
+        ps.update([sublime.Phantom(sublime.Region(0, 0), html, sublime.LAYOUT_BLOCK)])
+
+    # state -> (glyph, minihtml colour)
+    _WF_STATE_STYLE = {
+        "queued":   ("○", "color(var(--foreground) alpha(0.45))"),
+        "start":    ("◔", "color(var(--foreground) alpha(0.65))"),
+        "progress": ("◐", "var(--yellowish)"),
+        "done":     ("✔", "var(--greenish)"),
+        "success":  ("✔", "var(--greenish)"),
+        "error":    ("✘", "var(--redish)"),
+        "failed":   ("✘", "var(--redish)"),
+    }
 
     @classmethod
-    def _build_workflow_text(cls, wp: list, summary: str, done: int, total: int, completed: bool) -> str:
+    def _build_workflow_html(cls, agents: list, phases: dict, summary: str,
+                             done: int, total: int, completed: bool) -> str:
         import time as _t
-        phases, agents = {}, []
-        for e in wp:
-            if not isinstance(e, dict):
-                continue
-            if e.get("type") == "workflow_phase":
-                phases[e.get("index")] = e.get("title") or ""
-            elif e.get("type") == "workflow_agent":
-                agents.append(e)
+        esc = lambda s: str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        dim = "color:color(var(--foreground) alpha(0.5))"
+        now = _t.time() * 1000
+
+        def fmt(ms_start):
+            if not ms_start:
+                return ""
+            s = max(0, int(now - ms_start) // 1000)
+            return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
         tok = sum(int(a.get("tokens") or 0) for a in agents)
         starts = [a.get("startedAt") for a in agents if a.get("startedAt")]
-        elapsed = ""
-        if starts:
-            secs = max(0, int(_t.time() * 1000 - min(starts)) // 1000)
-            elapsed = f" · {secs // 60}m{secs % 60:02d}s" if secs >= 60 else f" · {secs}s"
-        head = "✓" if completed else "▼"
-        lines = [f"{head} {summary[:70]}",
-                 f"  {done}/{total} agents · {cls._wf_tokens(tok)} tok{elapsed}", ""]
+        elapsed = fmt(min(starts)) if starts else ""
+        filled = int(round((done / total) * 12)) if total else 0
+        bar = "▰" * filled + "▱" * (12 - filled)
+        bar_col = "var(--greenish)" if completed else "var(--accent)"
+        hglyph = "✓" if completed else "⚡"
+
+        out = ['<body id="wf" style="margin:0; padding:10px 14px; line-height:1.45;">']
+        out.append(f'<div style="font-size:1.2rem; font-weight:bold;">{hglyph} {esc(summary)[:72]}</div>')
+        out.append(f'<div style="margin:5px 0 12px 0;">'
+                   f'<span style="color:{bar_col}; font-size:1.05rem;">{bar}</span>'
+                   f'&nbsp;&nbsp;<span style="font-weight:bold;">{done}/{total}</span> '
+                   f'<span style="{dim}">agents&nbsp;·&nbsp;{cls._wf_tokens(tok)} tok&nbsp;·&nbsp;{elapsed}</span></div>')
+
         by_phase = {}
         for a in agents:
             by_phase.setdefault(a.get("phaseIndex"), []).append(a)
         for pidx in sorted(by_phase, key=lambda x: (x is None, x)):
-            title = phases.get(pidx, "")
-            if title:
-                lines.append(f"  {title}")
-            for a in sorted(by_phase[pidx], key=lambda x: x.get("index") or 0):
-                g = cls._WF_GLYPH.get(a.get("state"), "?")
-                model = cls._wf_model(a.get("model"))
-                act = "" if a.get("state") in cls._WF_DONE else \
-                    f'{a.get("lastToolName") or ""} {str(a.get("lastToolSummary") or "")[:50]}'.strip()
-                meta = f'{a.get("toolCalls") or 0}t {cls._wf_tokens(a.get("tokens"))}'
-                lines.append(f"    {g} {str(a.get('label') or '')[:28]}  {model}  {act}  {meta}")
-        return "\n".join(lines)
+            pa = by_phase[pidx]
+            pdone = sum(1 for a in pa if a.get("state") in cls._WF_DONE)
+            pg = "✔" if pdone == len(pa) else ("◐" if any(a.get("state") == "progress" for a in pa) else "○")
+            title = phases.get(pidx, "") or (f"Phase {pidx}" if pidx is not None else "")
+            if title or len(by_phase) > 1:
+                out.append(f'<div style="margin:10px 0 3px 0; font-weight:bold; color:var(--bluish);">'
+                           f'{pg}&nbsp;{esc(title)} <span style="{dim}; font-weight:normal;">'
+                           f'({pdone}/{len(pa)})</span></div>')
+            for a in sorted(pa, key=lambda x: x.get("index") or 0):
+                glyph, col = cls._WF_STATE_STYLE.get(a.get("state"), ("·", dim))
+                model = esc(cls._wf_model(a.get("model")))
+                label = esc(a.get("label"))[:30]
+                attempt = a.get("attempt") or 1
+                retry = f' <span style="color:var(--redish);">↻{attempt}</span>' if attempt and attempt > 1 else ""
+                if a.get("durationMs"):
+                    s = int(a["durationMs"]) // 1000
+                    ael = f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+                elif a.get("state") not in cls._WF_DONE:
+                    ael = fmt(a.get("startedAt"))
+                else:
+                    ael = ""
+                if a.get("state") in cls._WF_DONE:
+                    rp = esc(a.get("resultPreview"))[:64]
+                    act = f'<span style="{dim}">{rp}</span>' if rp else ""
+                else:
+                    tn, tsum = esc(a.get("lastToolName")), esc(a.get("lastToolSummary"))[:46]
+                    act = (f'<span style="color:var(--cyanish, var(--bluish));">{tn}</span> '
+                           f'<span style="{dim}">{tsum}</span>') if tn else ""
+                meta = f'{a.get("toolCalls") or 0}t&nbsp;·&nbsp;{cls._wf_tokens(a.get("tokens"))}'
+                if ael:
+                    meta += f'&nbsp;·&nbsp;{ael}'
+                out.append(f'<div style="margin:2px 0 2px 10px;">'
+                           f'<span style="color:{col};">{glyph}</span>&nbsp;'
+                           f'<span style="font-weight:bold;">{label}</span>{retry}&nbsp;'
+                           f'<span style="{dim}">{model}</span>&nbsp;&nbsp;{act}'
+                           f'&nbsp;&nbsp;<span style="{dim}">{meta}</span></div>')
+        out.append('</body>')
+        return "".join(out)
 
     def _schedule_bg_poll(self) -> None:
         """Start bg-task poll timer if not already running."""
