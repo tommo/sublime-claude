@@ -1894,6 +1894,7 @@ class Session:
         from .output import BACKGROUND, DONE
         tool = self._bg_tools.get(tool_use_id) or self.output.find_tool_by_id(tool_use_id)
         if tool is None or tool.status != BACKGROUND:
+            self._bg_tools.pop(tool_use_id, None)  # drop a stale registry entry
             return  # already finalized (or never a live ⚙) — nothing to do
         if keep:
             tool.status = DONE
@@ -1903,6 +1904,15 @@ class Session:
                 self.output._patch_tool_symbol(tool, BACKGROUND)
         else:
             self.output.remove_tool(tool)
+        self._bg_tools.pop(tool_use_id, None)
+        # The input area's ⚙ background hint is static text rendered at
+        # enter_input_mode; re-render it so the now-finished tool drops out
+        # (otherwise a stale ⚙ lingers above the prompt).
+        if not self.working and self.output._input_mode:
+            self.draft_prompt = self.output.get_input_text()
+            self.output.exit_input_mode(keep_text=False)
+            self._input_mode_entered = False
+            self._enter_input_with_draft()
 
     def _on_sys_task_started(self, data: dict) -> None:
         task_id = data.get("task_id", "")
@@ -1920,7 +1930,10 @@ class Session:
         status = (data.get("patch") or {}).get("status", "")
         if not task_id or status not in self._TASK_TERMINAL:
             return
-        tool_use_id = self._task_tool_map.pop(task_id, None)
+        # Read (don't pop) the map: a task_notification may still arrive and
+        # needs it to resolve the id (to wake + discard _bg_task_ids). It pops
+        # the entry; reconcile cleans it if no notification ever comes.
+        tool_use_id = self._task_tool_map.get(task_id)
         if not tool_use_id:
             return
         # No output_file on task_updated → keep a completed line as ✓, drop the
@@ -2218,6 +2231,7 @@ class Session:
             if (tool_use_id in self._bg_task_ids
                     and task_id in self._seen_running and task_id not in live):
                 self._finalize_bg_tool(tool_use_id, keep=False)
+                self._bg_task_ids.discard(tool_use_id)
                 self._task_tool_map.pop(task_id, None)
                 self._bg_task_ids.discard(tool_use_id)
                 self._bg_tools.pop(tool_use_id, None)
