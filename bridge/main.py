@@ -1102,7 +1102,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                     elif block.name == "ScheduleWakeup":
                         self._handle_schedule_wakeup(block)
                     tool_input = block.input or {}
-                    is_bg = bool(tool_input.get("run_in_background") if isinstance(tool_input, dict) else False)
+                    # Workflow runs in the background (returns a task id immediately,
+                    # finishes via a later task-notification) — treat it like an
+                    # explicit run_in_background tool so it gets the persistent ⚙
+                    # rendering + completion wake instead of looking foreground.
+                    is_bg = bool(tool_input.get("run_in_background") if isinstance(tool_input, dict) else False) \
+                        or block.name == "Workflow"
                     if is_bg:
                         self._bg_tool_use_ids.add(block.id)
                     send_notification("message", {

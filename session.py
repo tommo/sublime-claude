@@ -151,6 +151,7 @@ class Session:
         # tree; we render it as a live panel.
         self._workflows: Dict[str, Any] = {}
         self._workflow_phantom_set = None
+        self._workflow_views: Dict[str, int] = {}  # task_id -> dedicated detail view id
         # Track if we've entered input mode after last query
         self._input_mode_entered: bool = False
         # Callback for channel mode responses
@@ -1857,8 +1858,8 @@ class Session:
             print(f"[Claude] usage: {usage}")
         self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
-        # A workflow runs within a turn; the live panel is a during-turn overlay.
-        self._clear_workflow_panel()
+        # Workflows run in the background past turn-end — their redirect/detail
+        # are persistent now (no turn-end clear).
 
     def _on_msg_system(self, params: dict) -> None:
         """Dispatch system messages by subtype."""
@@ -2027,17 +2028,94 @@ class Session:
         prev = self._workflows.get(task_id)
         if prev and prev.get("sig") == sig:
             return  # nothing material changed — let the spinner cover elapsed
-        self._workflows[task_id] = {"wp": wp, "summary": data.get("summary", ""), "sig": sig}
-        if all(a.get("state") in self._WF_DONE for a in agents):
-            self._clear_workflow_panel()  # minimal: live panel vanishes on completion
+        summary = data.get("summary", "") or (prev or {}).get("summary", "")
+        done = sum(1 for a in agents if a.get("state") in self._WF_DONE)
+        completed = bool(agents) and all(a.get("state") in self._WF_DONE for a in agents)
+        self._workflows[task_id] = {"wp": wp, "summary": summary, "sig": sig,
+                                    "done": done, "total": len(agents), "completed": completed}
+        # Clickable redirect in the conversation (persists past turn-end) + live
+        # detail in the workflow's own view if the user opened it.
+        self._render_workflow_redirect(task_id)
+        self._render_workflow_detail(task_id)
+
+    def _get_workflow_phantom_set(self):
+        if self._workflow_phantom_set is None and self.output and self.output.view:
+            self._workflow_phantom_set = sublime.PhantomSet(self.output.view, "claude_workflow")
+        return self._workflow_phantom_set
+
+    def _render_workflow_redirect(self, task_id: str) -> None:
+        """Compact clickable line in the conversation → opens the detail view.
+        Persists past turn-end (the workflow runs in the background)."""
+        ps = self._get_workflow_phantom_set()
+        if not ps or not self.output or not self.output.view:
             return
-        self._render_workflow_panel(self._build_workflow_html(wp, data.get("summary", "")))
+        wf = self._workflows.get(task_id)
+        if not wf:
+            ps.update([])
+            return
+        view = self.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+        last_nl = content.rfind("\n")
+        pt = last_nl if last_nl >= 0 else 0
+        esc = lambda s: str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        g = "✓" if wf["completed"] else "⚙"
+        label = (f'{g} workflow: {esc(wf["summary"])[:32]} · {wf["done"]}/{wf["total"]} agents '
+                 f'· <a href="open">open ↗</a>')
+        html = (f'<body style="margin:4px 0; padding:1px 8px; color:color(var(--foreground) alpha(0.65)); '
+                f'background-color:color(var(--background) blend(var(--foreground) 96%));">{label}</body>')
+        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK,
+                                   lambda href, tid=task_id: self._open_workflow_view(tid))])
+
+    def _find_view_by_id(self, vid: int):
+        for w in sublime.windows():
+            for v in w.views():
+                if v.id() == vid:
+                    return v
+        return None
+
+    def _open_workflow_view(self, task_id: str) -> None:
+        """Create or focus the dedicated detail view for a workflow."""
+        if not hasattr(self, "_workflow_views"):
+            self._workflow_views = {}
+        vid = self._workflow_views.get(task_id)
+        if vid:
+            v = self._find_view_by_id(vid)
+            if v:
+                v.window().focus_view(v)
+                return
+            self._workflow_views.pop(task_id, None)
+        if not self.window:
+            return
+        wf = self._workflows.get(task_id) or {}
+        v = self.window.new_file()
+        v.set_scratch(True)
+        v.set_name(f"⚙ {(wf.get('summary') or 'workflow')[:24]}")
+        v.settings().set("claude_workflow_view", task_id)
+        self._workflow_views[task_id] = v.id()
+        self._render_workflow_detail(task_id)
+
+    def _render_workflow_detail(self, task_id: str) -> None:
+        """Render the full live panel into the workflow's detail view (if open)."""
+        if not hasattr(self, "_workflow_views"):
+            self._workflow_views = {}
+        vid = self._workflow_views.get(task_id)
+        if not vid:
+            return
+        view = self._find_view_by_id(vid)
+        if view is None:
+            self._workflow_views.pop(task_id, None)
+            return
+        wf = self._workflows.get(task_id)
+        if not wf:
+            return
+        text = self._build_workflow_text(wf["wp"], wf["summary"], wf["done"], wf["total"], wf["completed"])
+        view.set_read_only(False)
+        view.run_command("claude_replace", {"start": 0, "end": view.size(), "text": text})
+        view.set_read_only(True)
 
     @classmethod
-    def _build_workflow_html(cls, wp: list, summary: str) -> str:
+    def _build_workflow_text(cls, wp: list, summary: str, done: int, total: int, completed: bool) -> str:
         import time as _t
-        def esc(s):
-            return str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         phases, agents = {}, []
         for e in wp:
             if not isinstance(e, dict):
@@ -2046,59 +2124,30 @@ class Session:
                 phases[e.get("index")] = e.get("title") or ""
             elif e.get("type") == "workflow_agent":
                 agents.append(e)
-        total = sum(int(a.get("tokens") or 0) for a in agents)
-        done = sum(1 for a in agents if a.get("state") in cls._WF_DONE)
+        tok = sum(int(a.get("tokens") or 0) for a in agents)
         starts = [a.get("startedAt") for a in agents if a.get("startedAt")]
         elapsed = ""
         if starts:
             secs = max(0, int(_t.time() * 1000 - min(starts)) // 1000)
-            elapsed = f" · {secs//60}m{secs%60:02d}s" if secs >= 60 else f" · {secs}s"
-        dim = "color:color(var(--foreground) alpha(0.55))"
-        head = (f'<div style="font-weight:bold">▼ {esc(summary)[:48]} · '
-                f'{done}/{len(agents)} agents · {cls._wf_tokens(total)} tok{elapsed}</div>')
-        rows = [head]
+            elapsed = f" · {secs // 60}m{secs % 60:02d}s" if secs >= 60 else f" · {secs}s"
+        head = "✓" if completed else "▼"
+        lines = [f"{head} {summary[:70]}",
+                 f"  {done}/{total} agents · {cls._wf_tokens(tok)} tok{elapsed}", ""]
         by_phase = {}
         for a in agents:
             by_phase.setdefault(a.get("phaseIndex"), []).append(a)
         for pidx in sorted(by_phase, key=lambda x: (x is None, x)):
             title = phases.get(pidx, "")
             if title:
-                rows.append(f'<div style="{dim}">{esc(title)}</div>')
+                lines.append(f"  {title}")
             for a in sorted(by_phase[pidx], key=lambda x: x.get("index") or 0):
                 g = cls._WF_GLYPH.get(a.get("state"), "?")
                 model = cls._wf_model(a.get("model"))
-                if a.get("state") in cls._WF_DONE:
-                    act = ""
-                else:
-                    act = f'{esc(a.get("lastToolName"))} {esc(a.get("lastToolSummary"))[:40]}'.strip()
+                act = "" if a.get("state") in cls._WF_DONE else \
+                    f'{a.get("lastToolName") or ""} {str(a.get("lastToolSummary") or "")[:50]}'.strip()
                 meta = f'{a.get("toolCalls") or 0}t {cls._wf_tokens(a.get("tokens"))}'
-                rows.append(
-                    f'<div>&nbsp;&nbsp;{g} {esc(a.get("label"))[:22]} '
-                    f'<i style="{dim}">{model}</i> {esc(act)} '
-                    f'<span style="{dim}">{meta}</span></div>')
-        return "".join(rows)
-
-    def _get_workflow_phantom_set(self):
-        if self._workflow_phantom_set is None and self.output and self.output.view:
-            self._workflow_phantom_set = sublime.PhantomSet(self.output.view, "claude_workflow")
-        return self._workflow_phantom_set
-
-    def _render_workflow_panel(self, html_body: str) -> None:
-        ps = self._get_workflow_phantom_set()
-        if not ps or not self.output or not self.output.view:
-            return
-        view = self.output.view
-        content = view.substr(sublime.Region(0, view.size()))
-        last_nl = content.rfind("\n")
-        pt = last_nl if last_nl >= 0 else 0
-        html = (f'<body style="margin:6px 0; padding:2px 8px; '
-                f'background-color:color(var(--background) blend(var(--foreground) 96%));">{html_body}</body>')
-        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
-
-    def _clear_workflow_panel(self) -> None:
-        ps = self._get_workflow_phantom_set()
-        if ps:
-            ps.update([])
+                lines.append(f"    {g} {str(a.get('label') or '')[:28]}  {model}  {act}  {meta}")
+        return "\n".join(lines)
 
     def _schedule_bg_poll(self) -> None:
         """Start bg-task poll timer if not already running."""
