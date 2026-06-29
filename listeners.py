@@ -529,6 +529,11 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                         self.view.run_command("soft_undo")
                         return
 
+        # Don't capture an AskUserQuestion free-text answer as the prompt draft
+        # (question input reuses _input_mode) — it would reappear next prompt.
+        if getattr(s.output, "_question_input_mode", False):
+            return
+
         # Save draft
         input_text = s.output.get_input_text()
         s.draft_prompt = input_text
