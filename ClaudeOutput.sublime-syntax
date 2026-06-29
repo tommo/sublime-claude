@@ -45,6 +45,10 @@ contexts:
     - match: '^\s*✘ .+$'
       scope: claude.tool.error
 
+    # Answered question — the user's recorded decision
+    - match: '^\s*☑ .+$'
+      scope: claude.question.answered
+
     # Interrupted marker
     - match: '\*\[interrupted\]\*'
       scope: claude.interrupted

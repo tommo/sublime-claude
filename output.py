@@ -1937,7 +1937,8 @@ class OutputView:
         """Remove question block and optionally write compact summary."""
         if not self.pending_question or not self.view:
             return
-        replacement = f"\n  ❓ {summary}\n" if summary else ""
+        # ☑ (not ❓) so an answered question reads as a recorded decision.
+        replacement = f"\n  ☑ {summary}\n" if summary else ""
         # No fallback when writing a summary — only the tracked region applies
         fallback = (self.current.region[1] if self.current and not summary else None)
         clear_pending_block(

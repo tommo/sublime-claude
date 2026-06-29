@@ -124,6 +124,21 @@
             </dict>
         </dict>
 
+        <!-- Claude-specific: Answered question (user's recorded decision) -->
+        <dict>
+            <key>name</key>
+            <string>Question Answered</string>
+            <key>scope</key>
+            <string>claude.question.answered</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#95e6cb</string>
+                <key>fontStyle</key>
+                <string>bold</string>
+            </dict>
+        </dict>
+
         <!-- Claude-specific: Tool output -->
         <dict>
             <key>name</key>
