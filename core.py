@@ -64,8 +64,11 @@ def get_active_session(window: sublime.Window) -> Optional[Session]:
     return None
 
 
-def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: str = "claude") -> Session:
+def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: Optional[str] = None) -> Session:
     """Create a new session (always creates new, doesn't reuse)."""
+    if backend is None:
+        backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
+
     # Clear active marker from previous active session
     old_active = window.settings().get("claude_active_view")
     if old_active and old_active in sublime._claude_sessions:

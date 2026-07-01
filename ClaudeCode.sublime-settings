@@ -7,6 +7,12 @@
     // Options: "opus", "sonnet", "haiku"
     "default_model": "opus",
 
+    // Default provider (backend) for a bare "New Session". Defaults to "claude"
+    // (official Anthropic). Set to a built-in (codex/copilot/pi/dsr) or a custom
+    // Anthropic-compatible provider key from custom_providers below.
+    // Set via "Claude: Set Default Provider".
+    // "default_backend": "claude",
+
     // Tools Claude is allowed to use
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
@@ -21,8 +27,135 @@
     // Reasoning effort level: "low", "high", "max"
     "effort": "high",
 
-    // DeepSeek API key (for deepseek backend)
-    // Get one at https://platform.deepseek.com
+    // Custom Anthropic-compatible providers.
+    // Each entry points the Claude bridge at a third-party Anthropic-compat
+    // endpoint (base_url + auth + model aliases) — same env surface as the ccm
+    // model-switcher. Manage via "Claude: Manage Anthropic Providers".
+    //
+    // Fields per provider:
+    //   label        optional display label (defaults to the key)
+    //   abbrev       tab abbreviation (defaults to first 2 chars uppercased)
+    //   base_url     Anthropic-compatible endpoint (required)
+    //   auth_token   inline token (blank → read from auth_env_var)
+    //   auth_env_var      env var to read the token from, e.g. DEEPSEEK_API_KEY
+    //   opus_model   / sonnet_model / haiku_model  → model id each alias maps to
+    //   auth_via_api_key  true → auth via ANTHROPIC_API_KEY instead of AUTH_TOKEN
+    //   extra_env    optional dict of extra env vars (added as defaults)
+    //
+    // "deepseek" is seeded here so the built-in "DeepSeek" start command and
+    // existing key bindings keep working. Replace the token / models as needed.
+    "custom_providers": {
+        "deepseek": {
+            "label": "DeepSeek",
+            "abbrev": "DS",
+            "base_url": "https://api.deepseek.com/anthropic",
+            "auth_env_var": "DEEPSEEK_API_KEY",
+            "opus_model": "deepseek-v4-pro[1m]",
+            "sonnet_model": "deepseek-v4-pro[1m]",
+            "haiku_model": "deepseek-v4-flash",
+            "subagent_model": "deepseek-v4-flash",
+            "extra_env": {
+                "CLAUDE_CODE_EFFORT_LEVEL": "max"
+            }
+        },
+        // Astron (讯飞 Coding Plan) — copied from ccm. Token read from env
+        // ($ASTRON_API_KEY, set in ~/.ccm_config) — never stored inline.
+        "astron": {
+            "label": "Astron",
+            "abbrev": "As",
+            "base_url": "https://maas-coding-api.cn-huabei-1.xf-yun.com/anthropic",
+            "auth_env_var": "ASTRON_API_KEY",
+            "opus_model": "astron-code-latest",
+            "sonnet_model": "astron-code-latest",
+            "haiku_model": "astron-code-latest",
+            "extra_env": {
+                "API_TIMEOUT_MS": "600000"
+            }
+        },
+        // GLM (智谱清言). China endpoint; global is https://api.z.ai/api/anthropic
+        "glm": {
+            "label": "GLM",
+            "abbrev": "GM",
+            "base_url": "https://open.bigmodel.cn/api/anthropic",
+            "auth_env_var": "GLM_API_KEY",
+            "opus_model": "glm-5.2[1m]",
+            "sonnet_model": "glm-5.2[1m]",
+            "haiku_model": "glm-4.7"
+        },
+        // Kimi (月之暗面). China endpoint; global is https://api.moonshot.ai/anthropic
+        "kimi": {
+            "label": "Kimi",
+            "abbrev": "Km",
+            "base_url": "https://api.moonshot.cn/anthropic",
+            "auth_env_var": "KIMI_API_KEY",
+            "opus_model": "kimi-k2.5",
+            "sonnet_model": "kimi-k2.5",
+            "haiku_model": "kimi-k2.5"
+        },
+        // Qwen (阿里云 DashScope). China endpoint; global is …intl.dashscope.aliyuncs.com/apps/anthropic
+        "qwen": {
+            "label": "Qwen",
+            "abbrev": "Qw",
+            "base_url": "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+            "auth_env_var": "QWEN_API_KEY",
+            "opus_model": "qwen3-max-2026-01-23",
+            "sonnet_model": "qwen3-max-2026-01-23",
+            "haiku_model": "qwen3-coder-plus"
+        },
+        // MiniMax. China endpoint; global is https://api.minimax.io/anthropic
+        "minimax": {
+            "label": "MiniMax",
+            "abbrev": "MM",
+            "base_url": "https://api.minimaxi.com/anthropic",
+            "auth_env_var": "MINIMAX_API_KEY",
+            "opus_model": "MiniMax-M2.5",
+            "sonnet_model": "MiniMax-M2.5",
+            "haiku_model": "MiniMax-M2.5"
+        },
+        // 豆包 Seed-Code (字节跳动, via Volces Ark)
+        "seed": {
+            "label": "Seed",
+            "abbrev": "Sd",
+            "base_url": "https://ark.cn-beijing.volces.com/api/coding",
+            "auth_env_var": "ARK_API_KEY",
+            "opus_model": "ark-code-latest",
+            "sonnet_model": "ark-code-latest",
+            "haiku_model": "ark-code-latest"
+        },
+        // StepFun
+        "stepfun": {
+            "label": "StepFun",
+            "abbrev": "SF",
+            "base_url": "https://api.stepfun.ai/v1/anthropic",
+            "auth_env_var": "STEPFUN_API_KEY",
+            "opus_model": "step-3.5-flash",
+            "sonnet_model": "step-3.5-flash",
+            "haiku_model": "step-3.5-flash"
+        },
+        // Bailian 百炼 Token Plan (阿里云, independent endpoint)
+        "bailian": {
+            "label": "Bailian",
+            "abbrev": "BL",
+            "base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic",
+            "auth_env_var": "BAILIAN_API_KEY",
+            "opus_model": "qwen3.7-plus",
+            "sonnet_model": "qwen3.7-plus",
+            "haiku_model": "qwen3.7-plus"
+        },
+        // OpenRouter (multi-model gateway). Model ids are provider-qualified.
+        "openrouter": {
+            "label": "OpenRouter",
+            "abbrev": "OR",
+            "base_url": "https://openrouter.ai/api",
+            "auth_env_var": "OPENROUTER_API_KEY",
+            "opus_model": "anthropic/claude-opus-4-6",
+            "sonnet_model": "anthropic/claude-sonnet-4-5-20250929",
+            "haiku_model": "anthropic/claude-haiku-4-5-20251001"
+        }
+    },
+
+    // DeepSeek API key (legacy: read by the seeded deepseek custom provider's
+    // auth_env_var above). Get one at https://platform.deepseek.com
     // "deepseek_api_key": "",
 
     // Default models per backend (overrides built-in defaults)

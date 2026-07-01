@@ -15,6 +15,7 @@ class JsonRpcClient:
         self.on_notification = on_notification
         self.reader_thread: Optional[threading.Thread] = None
         self.running = False
+        self.stderr_thread: Optional[threading.Thread] = None
 
     def start(self, cmd: list, env: Dict[str, str] = None) -> None:
         # Merge custom env with current environment
@@ -114,13 +115,47 @@ class JsonRpcClient:
             try:
                 line = self.proc.stdout.readline()
                 if not line:
-                    print("[Claude RPC] read_loop: got empty line, breaking")
+                    self._handle_stdout_closed()
                     break
-                msg = json.loads(line.decode())
+
+                text = line.decode(errors="replace")
+                if not text.strip():
+                    continue
+
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError as e:
+                    snippet = text.strip().replace("\n", "\\n")[:200]
+                    print(f"[Claude RPC] read_loop: invalid JSON line: {e}: {snippet!r}")
+                    continue
+
                 sublime.set_timeout(lambda m=msg: self._handle(m), 0)
             except Exception as e:
                 print(f"[Claude RPC] read_loop error: {e}")
                 continue
+
+    def _handle_stdout_closed(self) -> None:
+        """Bridge stdout reached EOF; fail pending RPC requests promptly."""
+        import sublime
+
+        proc = self.proc
+        returncode = proc.poll() if proc else None
+        if returncode is None:
+            detail = "Bridge stdout closed while process is still running"
+        else:
+            detail = f"Bridge process exited with code {returncode}"
+
+        print(f"[Claude RPC] read_loop: {detail}")
+        self.running = False
+
+        pending = list(self.pending.items())
+        self.pending.clear()
+        if not pending:
+            return
+
+        response = {"error": {"message": detail}}
+        for _, callback in pending:
+            sublime.set_timeout(lambda cb=callback, r=response: cb(r), 0)
 
     def _handle(self, msg: dict) -> None:
         if "id" in msg and msg["id"] in self.pending:

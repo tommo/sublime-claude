@@ -53,8 +53,11 @@ CONTEXT_PREFIX = "📎 "          # Pending context indicator
 BACKGROUND_PREFIX = "⚙ "       # Background tool indicator
 
 # ─── Backend Display ──────────────────────────────────────────────────────────
-BACKEND_ABBREV = {"codex": "CX", "deepseek": "DS", "copilot": "CP", "pi": "Pi", "dsr": "DSR"}
-BACKEND_LABELS = {"claude": "Claude", "codex": "Codex", "deepseek": "DeepSeek", "copilot": "Copilot", "pi": "Pi", "dsr": "DSR"}
+# Static abbrev/label fallbacks for built-in backends only. Custom Anthropic-
+# compatible providers carry their own abbrev/label in settings.custom_providers
+# (looked up via backends.get(name)); these maps are just a last-resort fallback.
+BACKEND_ABBREV = {"codex": "CX", "copilot": "CP", "pi": "Pi", "dsr": "DSR"}
+BACKEND_LABELS = {"claude": "Claude", "codex": "Codex", "copilot": "Copilot", "pi": "Pi", "dsr": "DSR"}
 
 # ─── Timing ───────────────────────────────────────────────────────────────────
 CONTEXT_DEBOUNCE_MS = 300  # Debounce for context menu after goto

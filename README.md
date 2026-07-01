@@ -322,7 +322,7 @@ Claude gets two MCP tools:
 ```python
 # Available helpers:
 get_open_files()                    # List open file paths
-get_symbols(query, file_path=None)  # Search project symbol index
+get_symbols(query, file_path=None)  # Search project symbols by exact or partial name
 goto_symbol(query)                  # Navigate to symbol definition
 list_tools()                        # List saved tools
 

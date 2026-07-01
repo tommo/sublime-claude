@@ -18,8 +18,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))  # repo root
 import cc_transcript as ct  # noqa
 
 SNAP = "/tmp/snap.jsonl"
-SAMPLE_PROJECT_DIR = "/Users/tommo/.claude/projects/-Volumes-prj-ai-sublime-claude"
-
 results = []
 
 def check(name, cond, detail=""):
@@ -34,16 +32,16 @@ def test_slug():
     s = ct.project_slug("/tmp/whatever")
     check("slug realpath /tmp → /private/tmp",
           s == "-private-tmp-whatever", "got %r" % s)
-    s = ct.project_slug("/Volumes/prj/ai/sublime-claude")
+    s = ct.project_slug("/opt/projects/sublime-claude")
     check("slug non-alnum → '-'",
-          s == "-Volumes-prj-ai-sublime-claude", "got %r" % s)
+          s == "-opt-projects-sublime-claude", "got %r" % s)
     # Trailing slash + dots are stripped to '-' (no collapsing)
     s = ct.project_slug("/Users/a/.b")
     check("slug preserves doubles (a/.b → -Users-a--b)",
           s == "-Users-a--b", "got %r" % s)
-    p = ct.transcript_path("/Volumes/prj/ai/sublime-claude", "abc-123")
+    p = ct.transcript_path("/opt/projects/sublime-claude", "abc-123")
     check("transcript_path composes",
-          p.endswith("/.claude/projects/-Volumes-prj-ai-sublime-claude/abc-123.jsonl"),
+          p.endswith("/.claude/projects/-opt-projects-sublime-claude/abc-123.jsonl"),
           "got %r" % p)
 
 

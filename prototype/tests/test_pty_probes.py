@@ -59,8 +59,11 @@ sys.path.insert(0, os.path.dirname(HERE))   # prototype/
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))  # repo root
 import cc_transcript as ct  # noqa
 
-CLAUDE = "/Users/tommo/.local/bin/claude"
-CWD = "/Volumes/prj/ai/sublime-claude"  # trusted dir to skip trust prompt
+CLAUDE = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
+CWD = os.environ.get(
+    "CLAUDE_PROBE_CWD",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
 
 results = []
 
@@ -512,7 +515,7 @@ def probe_busy_markers_present_in_blocking_states():
     try:
         p.drain(7)
         p.paste_submit("Read this file and summarize it in one sentence: "
-                       "/Volumes/prj/ai/sublime-claude/CLAUDE.md")
+                       + os.path.join(CWD, "CLAUDE.md"))
         deadline = time.time() + 45
         while time.time() < deadline:
             p.drain(1)

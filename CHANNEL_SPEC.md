@@ -124,4 +124,4 @@ def send_message_with_callback(self, message: str, callback: Callable[[str], Non
 
 ## Protocol Reference
 
-See `/Volumes/prj/ai/notalone2/PROTOCOL.md` - "Channel Mode" section.
+See the notalone2 `PROTOCOL.md` - "Channel Mode" section.

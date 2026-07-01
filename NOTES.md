@@ -227,7 +227,7 @@ Multiple permission requests are queued - only one shown at a time.
 **Editor tools:**
 - `get_window_summary()` - Open files, active file with selection, project folders, layout
 - `find_file(query, pattern?, limit?)` - Fuzzy find by partial name, optional glob filter
-- `get_symbols(query, file_path?, limit?)` - Batch symbol lookup (comma-separated or JSON array)
+- `get_symbols(query, file_path?, limit?)` - Batch exact/partial symbol lookup (comma-separated or JSON array)
 - `read_view(file_path?, view_name?, head?, tail?, grep?, grep_i?)` - Read content from any view with head/tail/grep filtering
 
 **Terminal tools (uses Terminus plugin):**

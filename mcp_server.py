@@ -1,6 +1,7 @@
 """MCP socket server for Sublime Text integration."""
 import json
 import os
+import re
 import socket
 import threading
 import time
@@ -10,6 +11,7 @@ import sublime_plugin
 
 from .settings import load_profiles_and_checkpoints
 from .constants import MCP_SOCKET_PATH, USER_PROFILES_DIR, PROFILES_FILE
+from . import backends
 
 SOCKET_PATH = MCP_SOCKET_PATH
 USER_PROFILES_PATH = str(USER_PROFILES_DIR / PROFILES_FILE)
@@ -138,10 +140,33 @@ class MCPSocketServer:
                     print(f"[Claude MCP] Error: {e}")
 
     def _handle_connection(self, conn: socket.socket):
-        """Handle a single connection."""
+        """Handle a single connection.
+
+        Requests are newline-terminated JSON (the client sends
+        `json.dumps(req) + "\\n"`). A single recv() may return a partial frame
+        — especially for large payloads (big file contents, symbols) that
+        exceed one socket read — so we must loop until the message is complete
+        before parsing, else json.loads raises 'Unterminated string'.
+        """
         try:
-            data = conn.recv(65536).decode()
-            if not data:
+            # Accumulate until we hit a newline (message boundary) or the
+            # connection closes. Cap the buffer to avoid unbounded growth.
+            chunks = []
+            total = 0
+            MAX = 64 * 1024 * 1024  # 64 MiB guard
+            while True:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX:
+                    raise ValueError("request too large (>%d bytes)" % MAX)
+                # Newline = end of a JSON-RPC message (matches client send).
+                if b"\n" in chunk:
+                    break
+            data = b"".join(chunks).decode(errors="replace")
+            if not data.strip():
                 return
 
             request = json.loads(data.strip())
@@ -493,7 +518,7 @@ class MCPSocketServer:
         """Batch lookup symbols in project index.
 
         Args:
-            query: Single symbol (str), comma-separated, or JSON array
+            query: Single symbol/partial symbol (str), comma-separated, or JSON array
             file_path: Optional file to limit search to
             limit: Max results per symbol (default 10)
         """
@@ -530,7 +555,15 @@ class MCPSocketServer:
 
             # Filter by file_path if provided
             if file_path:
-                locations = [loc for loc in locations if loc[0] == file_path]
+                locations = [loc for loc in locations if self._symbol_file_matches(loc[0], file_path)]
+
+            # Sublime's index lookup is fast but often behaves like an exact
+            # lookup. Fill any remaining result slots with a lightweight
+            # project scan for partial symbol-name matches.
+            max_results = limit if limit > 0 else 50
+            if len(locations) < max_results:
+                partials = self._find_partial_symbols(sym, file_path, max_results - len(locations))
+                locations = self._merge_symbol_locations(locations, partials)
 
             if not locations:
                 lines.append(f"'{sym}': not found")
@@ -542,10 +575,153 @@ class MCPSocketServer:
                 lines.append(f"  • {os.path.basename(fp)}:{row}:{col} - {display_name}")
                 all_locations.append({"symbol": sym, "file": fp, "row": row, "col": col})
 
-            if len(locations) > limit:
+            if limit > 0 and len(locations) > limit:
                 lines.append(f"  ... and {len(locations) - limit} more")
 
         return {"summary": "\n".join(lines), "locations": all_locations[:50]}
+
+    def _symbol_file_matches(self, path: str, file_path: str) -> bool:
+        if not file_path:
+            return True
+        if path == file_path:
+            return True
+        try:
+            return os.path.abspath(path) == os.path.abspath(file_path)
+        except Exception:
+            return False
+
+    def _merge_symbol_locations(self, primary, secondary):
+        seen = set()
+        merged = []
+        for loc in list(primary or []) + list(secondary or []):
+            try:
+                fp, name, point = loc[0], loc[1], loc[2]
+                row, col = point
+            except Exception:
+                continue
+            key = (os.path.abspath(fp), row, col)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(loc)
+        return merged
+
+    def _find_partial_symbols(self, query: str, file_path: str = None, limit: int = 10) -> list:
+        """Fallback partial symbol search for names Sublime's index misses."""
+        window = self._get_window()
+        if not window:
+            return []
+
+        q = (query or "").strip().lower()
+        if not q or (len(q) < 2 and not file_path):
+            return []
+
+        roots = window.folders()
+        if not roots:
+            return []
+
+        # This runs inside Sublime's process. Keep the fallback intentionally
+        # bounded so a broad partial query cannot stall the editor.
+        max_files = 1 if file_path else 300
+        max_lines = 5000 if file_path else 30000
+        max_candidates = max(limit * 5, 25)
+        deadline = time.time() + (0.75 if file_path else 0.25)
+
+        candidates = []
+        scanned_files = 0
+        scanned_lines = 0
+        for path in self._iter_symbol_files(roots, file_path):
+            if scanned_files >= max_files or scanned_lines >= max_lines:
+                break
+            if time.time() >= deadline:
+                break
+            try:
+                if os.path.getsize(path) > 1024 * 1024:
+                    continue
+                scanned_files += 1
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for row, line in enumerate(f, 1):
+                        scanned_lines += 1
+                        if scanned_lines >= max_lines:
+                            break
+                        if row % 200 == 0 and time.time() >= deadline:
+                            break
+                        for name, col in self._extract_symbol_names(line):
+                            score = self._score_partial_symbol(q, name)
+                            if score is None:
+                                continue
+                            display = f"{name} (partial)"
+                            candidates.append((score, name.lower(), path, display, (row, col)))
+                            if len(candidates) >= max_candidates:
+                                break
+                        if len(candidates) >= max_candidates:
+                            break
+            except Exception:
+                continue
+            if len(candidates) >= max_candidates:
+                break
+
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[4][0]))
+        return [(path, display, point) for _, _, path, display, point in candidates[:max(limit, 0)]]
+
+    def _iter_symbol_files(self, roots, file_path: str = None):
+        allowed_exts = {
+            ".py", ".pyw", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+            ".nim", ".nims", ".go", ".rs", ".java", ".kt", ".kts", ".swift",
+            ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".php", ".rb",
+            ".lua", ".sh", ".zsh", ".fish",
+        }
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", "venv", ".venv", "env",
+            ".env", "dist", "build", ".cache", ".tox", "target", ".next",
+        }
+
+        if file_path:
+            yield os.path.abspath(file_path)
+            return
+
+        for root in roots:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+                for filename in filenames:
+                    if filename.startswith("."):
+                        continue
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext in allowed_exts:
+                        yield os.path.join(dirpath, filename)
+
+    def _extract_symbol_names(self, line: str) -> list:
+        patterns = (
+            r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:proc|func|iterator|template|macro|method)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:type)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+            r"^\s*(?:export\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)\b",
+            r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=",
+            r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:pub\s+)?(?:struct|enum|trait)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:public|private|protected|internal|static|final|abstract|\s)*\s*(?:class|interface|enum|struct)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+            r"^\s*(?:function|local\s+function)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
+        )
+        names = []
+        for pat in patterns:
+            m = re.search(pat, line)
+            if m:
+                names.append((m.group(1), m.start(1) + 1))
+                break
+        return names
+
+    def _score_partial_symbol(self, query: str, name: str):
+        n = name.lower()
+        if n == query:
+            return 0
+        if n.startswith(query):
+            return 1
+        if query in n:
+            return 2
+        return None
 
     def _list_tools(self) -> list:
         """List available saved tools."""
@@ -835,10 +1011,17 @@ class MCPSocketServer:
             if current_session and current_session.session_id:
                 # Session IDs aren't portable across backends — codex thread IDs
                 # can't be resumed by the Claude bridge, etc. Only allow fork
-                # within the same backend family (claude+deepseek share the Claude
-                # bridge's local storage, but codex/copilot live in their own).
+                # within the same backend family: backends that share the same
+                # bridge_script share session storage (the Claude bridge +
+                # any Anthropic-compatible custom provider use main.py).
+                def _bridge_script(name):
+                    try:
+                        return backends.get(name).bridge_script
+                    except Exception:
+                        return None
                 same_family = current_session.backend == backend or (
-                    current_session.backend in ("claude", "deepseek") and backend in ("claude", "deepseek")
+                    _bridge_script(current_session.backend) is not None
+                    and _bridge_script(current_session.backend) == _bridge_script(backend)
                 )
                 if not same_family:
                     return {"error": f"Cannot fork {current_session.backend!r} session into {backend!r} backend; session IDs are not portable. Spawn fresh (fork_current=False)."}

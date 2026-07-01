@@ -1,15 +1,20 @@
 """Backend registry and per-backend configuration.
 
-Centralizes everything that varies between Claude / Codex / Copilot / DeepSeek:
+Centralizes everything that varies between Claude / Codex / Copilot / custom
+Anthropic-compatible providers:
 - Display label and tab abbreviation
 - Bridge subprocess script
 - Default model fallback
-- Static env var additions (e.g. DeepSeek's Anthropic-compat endpoint)
+- Static env var additions
 - Theme path
 - Model list shown in the picker
-- Availability check (e.g. codex CLI installed, deepseek API key present)
+- Availability check (e.g. codex CLI installed, API key present)
 
-Adding a 5th backend = one entry in BACKENDS plus optional `available()`.
+Built-in backends live in BACKENDS. User-defined Anthropic-compatible providers
+(base URL + auth + model aliases, like ccm's deepseek/glm/kimi/qwen/openrouter)
+live in settings under `custom_providers` and are merged in by all_backends().
+Adding a built-in = one entry in BACKENDS; adding a custom provider = one entry
+in settings.custom_providers (or via the Manage Providers UI).
 """
 import os
 import shutil
@@ -43,44 +48,195 @@ class BackendSpec:
     """Returns True if this backend can be used (CLI installed, API key set, etc)."""
 
 
-def _deepseek_dynamic_env(settings: dict) -> Tuple[Dict[str, str], Dict[str, str]]:
-    """DeepSeek uses the Claude bridge with Anthropic-compat endpoint + API key.
+def _valid_auth_token(token: str) -> bool:
+    """Return True for non-empty tokens that do not look like config templates."""
+    if not token:
+        return False
+    low = str(token).strip().lower()
+    if not low:
+        return False
+    if low == "from_env_var" or low.startswith("sk-your-"):
+        return False
+    if "your" in low and "api" in low and "key" in low:
+        return False
+    return True
 
-    Returns (overwrite_env, default_env). The endpoint and auth token MUST point
-    to DeepSeek for this backend to work, so they're in overwrite. Model aliases
-    and disable-nonessential are defaults so users can override in settings.
 
-    Also forcibly clears ANTHROPIC_API_KEY in overwrite — if it leaked from the
-    parent process (e.g. a developer who exports their Anthropic key in shell rc),
-    the SDK would prefer it over ANTHROPIC_AUTH_TOKEN and send Anthropic creds to
-    api.deepseek.com, which DeepSeek would reject with 401.
+def _custom_anthropic_dynamic_env(settings: dict, name: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Generic dynamic-env builder for a user-defined Anthropic-compatible provider.
+
+    Mirrors what ccm does for deepseek/glm/kimi/qwen/openrouter: point the Claude
+    bridge at a third-party Anthropic-compat endpoint by overriding
+    ANTHROPIC_BASE_URL + an auth var, and mapping the opus/sonnet/haiku aliases
+    to the provider's models.
+
+    Returns (overwrite_env, default_env). The endpoint and auth MUST point at
+    the provider, so they're in overwrite. Model aliases and the nonessential-
+    traffic flags are defaults so users can still override per-session.
+
+    Auth footgun guard: a provider authenticates via exactly one of
+    ANTHROPIC_AUTH_TOKEN (default, ccm-style) or ANTHROPIC_API_KEY. The *other*
+    var is forcibly cleared in overwrite — if it leaked from the parent process
+    (e.g. a developer who exports their Anthropic key in shell rc), the SDK
+    would prefer ANTHROPIC_API_KEY over ANTHROPIC_AUTH_TOKEN and send the wrong
+    creds to the provider, which rejects with 401.
     """
-    api_key = settings.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY", "")
-    overwrite = {
-        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-        # Empty string explicitly unsets it for the child process
-        "ANTHROPIC_API_KEY": "",
-    }
-    if api_key:
-        overwrite["ANTHROPIC_AUTH_TOKEN"] = api_key
+    providers = settings.get("custom_providers", {}) or {}
+    cfg = providers.get(name, {}) or {}
+    base_url = (cfg.get("base_url") or "").strip()
+    auth_token = (cfg.get("auth_token") or "").strip()
+    if not _valid_auth_token(auth_token):
+        auth_token = ""
+    # Read token from an env var if the provider names one (ccm-style: never
+    # store plaintext keys in settings).
+    auth_env_var = (cfg.get("auth_env_var") or "").strip()
+    if not auth_token and auth_env_var:
+        env_token = os.environ.get(auth_env_var, "")
+        if _valid_auth_token(env_token):
+            auth_token = env_token
+    if not auth_token and name == "deepseek":
+        legacy_token = (settings.get("deepseek_api_key") or "").strip()
+        if _valid_auth_token(legacy_token):
+            auth_token = legacy_token
+    auth_via_key = bool(cfg.get("auth_via_api_key", False))
+
+    overwrite: Dict[str, str] = {}
+    if base_url:
+        overwrite["ANTHROPIC_BASE_URL"] = base_url
+    if auth_via_key:
+        if auth_token:
+            overwrite["ANTHROPIC_API_KEY"] = auth_token
+        overwrite["ANTHROPIC_AUTH_TOKEN"] = ""  # clear the sibling so it can't win
     else:
-        print("[Claude] WARNING: deepseek backend has no API key set "
-              "(settings.deepseek_api_key or DEEPSEEK_API_KEY env var). "
-              "Requests will likely fail with 401.")
-    defaults = {
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro[1m]",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek-v4-pro",
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
+        if auth_token:
+            overwrite["ANTHROPIC_AUTH_TOKEN"] = auth_token
+        overwrite["ANTHROPIC_API_KEY"] = ""    # clear the sibling so it can't win
+
+    if not base_url or not auth_token:
+        src = f"settings.custom_providers.{name}.auth_token" if not auth_env_var else f"env ${auth_env_var}"
+        print(f"[Claude] WARNING: custom provider '{name}' has no base_url or auth "
+              f"({src}). Requests will likely fail with 401.")
+
+    opus = (cfg.get("opus_model") or "").strip()
+    sonnet = (cfg.get("sonnet_model") or "").strip()
+    haiku = (cfg.get("haiku_model") or "").strip()
+    subagent = (cfg.get("subagent_model") or "").strip()
+
+    # Alias mappings must point at this provider, but do not force
+    # ANTHROPIC_MODEL. The bridge passes --model opus/sonnet/haiku; Claude Code
+    # then resolves that alias through ANTHROPIC_DEFAULT_*_MODEL. Forcing
+    # ANTHROPIC_MODEL here changes that path and can pin every request to the
+    # provider's heavy model. Still clear leaked single-model vars so a parent
+    # shell's prior ccm selection cannot override the alias mapping.
+    if opus:
+        overwrite["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus
+    if sonnet:
+        overwrite["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet
+    if haiku:
+        overwrite["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku
+    overwrite["ANTHROPIC_MODEL"] = ""
+    overwrite["ANTHROPIC_SMALL_FAST_MODEL"] = ""
+    if subagent:
+        overwrite["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
+    else:
+        overwrite["CLAUDE_CODE_SUBAGENT_MODEL"] = ""
+
+    defaults: Dict[str, str] = {
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK": "1",
     }
+    # User-supplied extra env (e.g. provider-specific headers). Defaults so a
+    # real env var still wins; use overwrite only for vars that must point at
+    # the provider.
+    extra = cfg.get("extra_env") or {}
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            defaults[str(k)] = str(v)
     return overwrite, defaults
 
 
-def _deepseek_available() -> bool:
-    import sublime
-    s = sublime.load_settings("ClaudeCode.sublime-settings")
-    return bool(s.get("deepseek_api_key") or os.environ.get("DEEPSEEK_API_KEY"))
+def _custom_provider_spec(name: str, cfg: dict) -> "BackendSpec":
+    """Build a BackendSpec for a user-defined Anthropic-compatible provider."""
+    label = (cfg.get("label") or name).strip() or name
+    abbrev = (cfg.get("abbrev") or name[:2].upper()).strip() or name[:2].upper()
+    opus = (cfg.get("opus_model") or "").strip()
+    sonnet = (cfg.get("sonnet_model") or "").strip()
+    haiku = (cfg.get("haiku_model") or "").strip()
+    # Model picker: show the alias → real-model mapping (like the old deepseek
+    # picker did). Drop empty aliases.
+    default_models: List[Tuple[str, str]] = []
+    if opus:
+        default_models.append(("opus", f"Opus → {opus}"))
+    if sonnet:
+        default_models.append(("sonnet", f"Sonnet → {sonnet}"))
+    if haiku:
+        default_models.append(("haiku", f"Haiku → {haiku}"))
+    if not default_models:
+        # Fall back to plain aliases so the picker is never empty.
+        default_models = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+
+    auth_env_var = (cfg.get("auth_env_var") or "").strip()
+    auth_token = (cfg.get("auth_token") or "").strip()
+
+    def _available() -> bool:
+        # A provider is usable if its base_url is set AND a token is available
+        # (either inline or via its named env var).
+        if not (cfg.get("base_url") or "").strip():
+            return False
+        if _valid_auth_token(auth_token):
+            return True
+        if auth_env_var and _valid_auth_token(os.environ.get(auth_env_var, "")):
+            return True
+        if name == "deepseek":
+            try:
+                import sublime
+                if _valid_auth_token(sublime.load_settings("ClaudeCode.sublime-settings").get("deepseek_api_key", "")):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # Closure captures `name`; the builder reads the live settings dict at call
+    # time so edits to custom_providers take effect on the next session start.
+    def _dyn(settings: dict):
+        return _custom_anthropic_dynamic_env(settings, name)
+
+    return BackendSpec(
+        name=name,
+        label=label,
+        abbrev=abbrev,
+        bridge_script="main.py",  # shares the Claude bridge, different endpoint
+        fallback_model="opus",
+        default_models=default_models,
+        dynamic_env=_dyn,
+        available=_available,
+    )
+
+
+def _load_custom_providers() -> Dict[str, "BackendSpec"]:
+    """Read custom_providers from settings → {name: BackendSpec}.
+
+    Done fresh on every call so the UI and session start always see the latest
+    config (Sublime's settings cache is the source of truth; we never hold a
+    stale copy).
+    """
+    try:
+        import sublime
+        s = sublime.load_settings("ClaudeCode.sublime-settings")
+        providers = s.get("custom_providers", {}) or {}
+    except Exception:
+        return {}
+    out: Dict[str, "BackendSpec"] = {}
+    if not isinstance(providers, dict):
+        return out
+    for name, cfg in providers.items():
+        if not isinstance(cfg, dict):
+            continue
+        try:
+            out[str(name)] = _custom_provider_spec(str(name), cfg)
+        except Exception as e:
+            print(f"[Claude] skipping malformed custom provider '{name}': {e}")
+    return out
 
 
 def _codex_available() -> bool:
@@ -165,20 +321,9 @@ BACKENDS: Dict[str, BackendSpec] = {
         ],
         available=_copilot_available,
     ),
-    "deepseek": BackendSpec(
-        name="deepseek",
-        label="DeepSeek",
-        abbrev="DS",
-        bridge_script="main.py",  # Same Claude bridge, different endpoint
-        fallback_model="opus",
-        default_models=[
-            ("opus", "Opus → V4 Pro (1M)"),
-            ("sonnet", "Sonnet → V4 Pro"),
-            ("haiku", "Haiku → V4 Flash"),
-        ],
-        dynamic_env=_deepseek_dynamic_env,
-        available=_deepseek_available,
-    ),
+    # Note: DeepSeek is no longer a hardcoded built-in — it ships as a seeded
+    # entry under settings.custom_providers (see ClaudeCode.sublime-settings).
+    # Any Anthropic-compatible provider is added the same way.
     "dsr": BackendSpec(
         name="dsr",
         label="DSR",
@@ -196,14 +341,29 @@ BACKENDS: Dict[str, BackendSpec] = {
 }
 
 
-def get(name: str) -> BackendSpec:
+def all_backends() -> Dict[str, "BackendSpec"]:
+    """All usable backends: built-ins (BACKENDS) + user custom_providers.
+
+    Custom providers override built-ins on name collision (rare; lets a user
+    replace a built-in's config). Fresh-merged on every call so UI and session
+    start always see the latest settings.
+    """
+    merged: Dict[str, "BackendSpec"] = dict(BACKENDS)
+    try:
+        merged.update(_load_custom_providers())
+    except Exception as e:
+        print(f"[Claude] failed to load custom providers: {e}")
+    return merged
+
+
+def get(name: str) -> "BackendSpec":
     """Look up backend spec; falls back to claude if unknown."""
-    return BACKENDS.get(name, BACKENDS["claude"])
+    return all_backends().get(name, BACKENDS["claude"])
 
 
 def is_available(name: str) -> bool:
     """Check whether a backend can currently be used (defaults to True if no check)."""
-    spec = BACKENDS.get(name)
+    spec = all_backends().get(name)
     if spec is None:
         return False
     return spec.available is None or spec.available()
@@ -211,4 +371,4 @@ def is_available(name: str) -> bool:
 
 def default_models_dict() -> Dict[str, List[List[str]]]:
     """Backwards-compat shape for legacy DEFAULT_MODELS consumers (list-of-lists)."""
-    return {name: [list(m) for m in spec.default_models] for name, spec in BACKENDS.items()}
+    return {name: [list(m) for m in spec.default_models] for name, spec in all_backends().items()}

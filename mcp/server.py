@@ -115,11 +115,11 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "get_symbols",
-                    "description": "Fast project-wide symbol search — find classes, functions, methods, variables by name. Use this FIRST to locate definitions before reading files. Accepts single symbol, comma-separated list, or JSON array for batch lookup. Powered by Sublime's index so results are instant even in large codebases.",
+                    "description": "Fast project-wide symbol search — find classes, functions, methods, variables by exact or partial name. Use this FIRST to locate definitions before reading files. Accepts single symbol, comma-separated list, or JSON array for batch lookup. Uses Sublime's index first, then a lightweight partial-match project scan when needed.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "query": {"description": "Symbol name(s) to find: string, comma-separated, or JSON array. Examples: 'MyClass', 'handle_request,process_event', '[\"foo\", \"bar\"]'"},
+                            "query": {"description": "Symbol name(s) or partial name(s) to find: string, comma-separated, or JSON array. Examples: 'MyClass', 'handle_req', 'handle_request,process_event', '[\"foo\", \"bar\"]'"},
                             "file_path": {"type": "string", "description": "Optional: limit search to specific file"},
                             "limit": {"type": "number", "description": "Max results per symbol (default 10)"}
                         },
@@ -174,7 +174,7 @@ def handle_request(request: dict) -> dict:
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
                             "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
-                            "backend": {"type": "string", "enum": ["claude", "codex", "copilot", "deepseek"], "description": "Optional: backend to use (default: claude)"},
+                            "backend": {"type": "string", "description": "Optional: backend to use — a built-in (claude, codex, copilot, pi, dsr) or a custom Anthropic-compatible provider from settings.custom_providers (default: claude)"},
                             "fork_current": {"type": "boolean", "description": "Optional: fork from the current session (preserves conversation history). Default: false"},
                             "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },

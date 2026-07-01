@@ -8,6 +8,11 @@
     // If not set, defaults to SDK default (sonnet)
     "default_model": "opus",
 
+    // Default provider (backend) for a bare "New Session". Defaults to "claude"
+    // (official Anthropic). Set to a built-in (codex/copilot/pi/dsr) or a custom
+    // provider key from custom_providers. Set via "Claude: Set Default Provider".
+    // "default_backend": "claude",
+
     // Tools Claude is allowed to use without confirmation
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
     "allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
@@ -44,5 +49,35 @@
             // Specific unix sockets to allow (e.g., docker socket)
             "allowUnixSockets": ["/var/run/docker.sock"]
         }
-    }
+    },
+
+    // Custom Anthropic-compatible providers — arbitrary endpoints that speak
+    // the Anthropic API (DeepSeek, GLM, Kimi, Qwen, OpenRouter, …). Same env
+    // surface as the ccm model-switcher. Manage via the UI:
+    //   Command Palette → "Claude: Manage Anthropic Providers"
+    //
+    // Fields per provider:
+    //   label / abbrev         display label + tab abbreviation (optional)
+    //   base_url               Anthropic-compatible endpoint (required)
+    //   auth_token             inline token (blank → read from auth_env_var)
+    //   auth_env_var                env var to read the token from
+    //   opus_model / sonnet_model / haiku_model   alias → model id
+    //   auth_via_api_key       true → auth via ANTHROPIC_API_KEY (default: AUTH_TOKEN)
+    //   extra_env              optional extra env vars (dict, added as defaults)
+    //
+    // "custom_providers": {
+    //     "deepseek": {
+    //         "label": "DeepSeek",
+    //         "abbrev": "DS",
+    //         "base_url": "https://api.deepseek.com/anthropic",
+    //         "auth_env_var": "DEEPSEEK_API_KEY",
+    //         "opus_model": "deepseek-v4-pro[1m]",
+    //         "sonnet_model": "deepseek-v4-pro[1m]",
+    //         "haiku_model": "deepseek-v4-flash",
+    //         "subagent_model": "deepseek-v4-flash",
+    //         "extra_env": {
+    //             "CLAUDE_CODE_EFFORT_LEVEL": "max"
+    //         }
+    //     }
+    // }
 }

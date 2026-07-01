@@ -104,7 +104,7 @@ class ClaudeCodeTerminalCommand(sublime_plugin.WindowCommand):
         if not raw:
             try:
                 from . import backends
-                raw = backends.BACKENDS["claude"].default_models
+                raw = backends.get("claude").default_models
             except Exception:
                 raw = []
         out = []

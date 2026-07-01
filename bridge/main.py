@@ -275,6 +275,7 @@ class Bridge:
             return v
         env_view = {k: _mask_env(k, os.environ.get(k, "")) for k in
                     ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                     "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
                      "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
                      "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
                      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
@@ -350,7 +351,7 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             options_dict["model"] = params["model"]
         if params.get("betas"):
             options_dict["betas"] = params["betas"]
-        effort = params.get("effort", "high")
+        effort = params.get("effort")
         if effort:
             options_dict["effort"] = effort
 
@@ -1040,8 +1041,26 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             send_result(id, {"status": "interrupted"})
         except Exception as e:
             error_msg = str(e)
+            # Enrich with exception type + HTTP status code (APIStatusError carries
+            # these on attributes) so provider 401/429/500 errors are diagnosable
+            # from the log/console instead of just a stringified message.
+            exc_type = type(e).__name__
+            status_code = getattr(e, "status_code", None)
+            request_id = getattr(e, "request_id", None) or getattr(getattr(e, "response", None), "headers", None)
+            diag = f"{exc_type}: {error_msg}"
+            if status_code is not None:
+                diag += f" [HTTP {status_code}]"
+            if request_id is not None:
+                # request_id may be a Headers Mapping — best-effort string.
+                try:
+                    diag += f" req_id={str(request_id)[:120]}"
+                except Exception:
+                    pass
             with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                f.write(f"query error: {error_msg}\n")
+                f.write(f"query error: {diag}\n")
+                import traceback as _tb
+                f.write(_tb.format_exc() + "\n")
+            error_msg = diag
             # Check for session-related errors
             is_session_error = (
                 "No conversation found" in error_msg or
@@ -1085,8 +1104,6 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             return
 
         if isinstance(message, AssistantMessage):
-            with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                f.write(f"  blocks: {[type(b).__name__ for b in message.content]}\n")
             if message.usage:
                 send_notification("message", {
                     "type": "turn_usage",
@@ -1120,8 +1137,6 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 elif isinstance(block, ToolResultBlock):
                     if block.tool_use_id in self._pending_cron:
                         self._finalize_cron_from_result(block)
-                    with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                        f.write(f"tool_result: id={block.tool_use_id}, is_error={block.is_error}, content={str(block.content)[:200]}\n")
                     send_notification("message", {
                         "type": "tool_result",
                         "tool_use_id": block.tool_use_id,
@@ -1137,16 +1152,12 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             # UserMessage contains tool results
             content = message.content
             if isinstance(content, list):
-                with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                    f.write(f"  UserMessage blocks: {[type(b).__name__ for b in content]}\n")
                 for block in content:
                     if isinstance(block, ToolResultBlock):
                         # Tool results arrive here (UserMessage), NOT via the
                         # AssistantMessage path — finalize a pending cron now.
                         if block.tool_use_id in self._pending_cron:
                             self._finalize_cron_from_result(block)
-                        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                            f.write(f"tool_result: id={block.tool_use_id}, is_error={block.is_error}\n")
                         send_notification("message", {
                             "type": "tool_result",
                             "tool_use_id": block.tool_use_id,
@@ -1168,8 +1179,9 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 result_params["stop_reason"] = message.stop_reason
             send_notification("message", result_params)
         elif isinstance(message, SystemMessage):
-            with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                f.write(f"SystemMessage: subtype={message.subtype}, data={message.data}\n")
+            if message.subtype not in ("thinking_tokens", "status"):
+                with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+                    f.write(f"SystemMessage: subtype={message.subtype}, data={message.data}\n")
             send_notification("message", {
                 "type": "system",
                 "subtype": message.subtype,

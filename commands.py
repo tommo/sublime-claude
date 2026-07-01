@@ -1,4 +1,5 @@
 """Claude Code commands for Sublime Text."""
+import os
 import sublime
 import sublime_plugin
 import platform
@@ -10,7 +11,8 @@ from .command_parser import CommandParser
 from . import backends
 
 # Fallback model lists per backend (used when no cache/settings available).
-# Sourced from backends.BACKENDS registry — one place to add a backend.
+# Snapshot of built-ins at import time; custom providers are looked up live via
+# backends.get(backend).default_models in ClaudeSelectModelCommand._get_models.
 DEFAULT_MODELS = backends.default_models_dict()
 
 
@@ -20,9 +22,10 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         from .settings import load_profiles_and_checkpoints, load_project_settings
         import os
 
-        # Default to claude — use "codex" backend via explicit arg or separate command
+        # Default backend: official Claude unless the user set a different
+        # default via 'Claude: Set Default Provider'. Explicit arg/command wins.
         if backend is None:
-            backend = "claude"
+            backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
 
         # If persona_id specified, acquire and start
         if persona_id:
@@ -48,8 +51,19 @@ class ClaudeCodeStartCommand(sublime_plugin.WindowCommand):
         # Build options list
         options = []
 
-        # Default option (always available)
-        options.append(("default", None, "🆕 New Session", "Start fresh with default settings"))
+        # Default option (always available). Surface which provider/model the
+        # default resolves to, so 'New Session' isn't a silent surprise when
+        # default_backend is set to a non-Claude provider.
+        _def_spec = backends.get(backend)
+        _def_label = _def_spec.label or backend
+        _def_model = (sublime.load_settings("ClaudeCode.sublime-settings")
+                      .get("default_models", {}) or {}).get(backend) or _def_spec.fallback_model
+        if backend == "claude":
+            _def_detail = "Start fresh with default settings"
+        else:
+            _def_model_str = " · {}".format(_def_model) if _def_model else ""
+            _def_detail = "Default provider: {}{}".format(_def_label, _def_model_str)
+        options.append(("default", None, "🆕 New Session", _def_detail))
 
         # Personas - get URL from sublime settings
         sublime_settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -215,12 +229,17 @@ class CopilotStartCommand(sublime_plugin.WindowCommand):
 
 
 class DeepSeekStartCommand(sublime_plugin.WindowCommand):
-    """Start a new DeepSeek session (Anthropic-compatible endpoint)."""
+    """Start a new DeepSeek session (Anthropic-compatible endpoint).
+
+    DeepSeek ships as a seeded custom_provider (see ClaudeCode.sublime-settings
+    `custom_providers.deepseek`); this command is kept for muscle-memory / existing
+    key bindings. Configure its key/base URL via 'Claude: Manage Anthropic Providers'.
+    """
     def run(self) -> None:
-        import os
-        settings = sublime.load_settings("ClaudeCode.sublime-settings")
-        if not settings.get("deepseek_api_key") and not os.environ.get("DEEPSEEK_API_KEY"):
-            sublime.error_message("DeepSeek API key not set. Add \"deepseek_api_key\" to ClaudeCode settings or set DEEPSEEK_API_KEY env var.")
+        if not backends.is_available("deepseek"):
+            sublime.error_message(
+                "DeepSeek provider not configured. Open 'Claude: Manage Anthropic Providers' "
+                "and set the deepseek entry's base_url + auth_token (or auth_env_var).")
             return
         create_session(self.window, backend="deepseek")
 
@@ -252,6 +271,524 @@ class DsrStartCommand(sublime_plugin.WindowCommand):
             )
             return
         create_session(self.window, backend="dsr")
+
+
+# ─── Custom Anthropic-compatible providers ────────────────────────────────────
+# Manage arbitrary Anthropic-compat endpoints (base URL + auth + model aliases),
+# mirroring the ccm model-switcher's env surface. Config is persisted to
+# settings.custom_providers and picked up live by backends.all_backends().
+
+_SETTINGS_FILE = "ClaudeCode.sublime-settings"
+# Fields collected by the add/edit wizard, in order. Each entry:
+# (key, label, placeholder, required, is_secret, default-from-cfg-flag)
+_PROVIDER_FIELDS = [
+    ("name",        "Provider name (unique key, e.g. deepseek / glm / kimi)", "deepseek", True,  False, False),
+    ("label",       "Display label (blank = use name)",                      "DeepSeek", False, False, True),
+    ("abbrev",      "Tab abbreviation (blank = first 2 chars)",              "DS",       False, False, True),
+    ("base_url",    "Anthropic-compatible base URL",                         "https://api.deepseek.com/anthropic", True, False, True),
+    ("auth_token",    "Auth token (blank to read from auth_env_var)",        "sk-...",   False, True,  True),
+    ("auth_env_var",  "Env var holding the auth token (e.g. DEEPSEEK_API_KEY)", "DEEPSEEK_API_KEY", False, False, True),
+    ("opus_model",  "Opus alias → model id",                                 "deepseek-v4-pro[1m]", False, False, True),
+    ("sonnet_model","Sonnet alias → model id",                               "deepseek-v4-pro",     False, False, True),
+    ("haiku_model", "Haiku alias → model id",                                "deepseek-v4-flash",   False, False, True),
+]
+
+
+def _load_custom_providers() -> dict:
+    s = sublime.load_settings(_SETTINGS_FILE)
+    providers = s.get("custom_providers", {}) or {}
+    return providers if isinstance(providers, dict) else {}
+
+
+def _save_custom_providers(providers: dict) -> None:
+    s = sublime.load_settings(_SETTINGS_FILE)
+    s.set("custom_providers", providers)
+    sublime.save_settings(_SETTINGS_FILE)
+
+
+def _mask_secret(v: str) -> str:
+    if not v:
+        return ""
+    if len(v) <= 6:
+        return "<set>"
+    return v[:3] + "…" + v[-3:]
+
+
+def _provider_summary(name: str, cfg: dict) -> str:
+    base = (cfg.get("base_url") or "").strip()
+    token = (cfg.get("auth_token") or "").strip()
+    auth_env_var = (cfg.get("auth_env_var") or "").strip()
+    if token:
+        cred = _mask_secret(token)
+    elif auth_env_var:
+        cred = f"${auth_env_var}"
+    else:
+        cred = "<no auth>"
+    return f"{base}  •  {cred}"
+
+
+class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
+    """Manage user-defined Anthropic-compatible providers (quick-panel wizard)."""
+
+    def run(self) -> None:
+        self._show_main()
+
+    # ── Main menu ────────────────────────────────────────────────────────────
+    def _show_main(self) -> None:
+        providers = _load_custom_providers()
+        items = []
+        actions = []  # ("edit", name) | ("add",) | ("raw",) | ("delete", name) | ("dup", name) | ("test", name)
+        for name in providers:
+            cfg = providers[name] or {}
+            label = (cfg.get("label") or name)
+            items.append([f"✎  {label}", _provider_summary(name, cfg)])
+            actions.append(("edit", name))
+        items.append(["+  Add Provider…", "Define a new Anthropic-compatible endpoint"])
+        actions.append(("add", None))
+        items.append(["{ }  Edit raw JSON…", "Open custom_providers in the settings file"])
+        actions.append(("raw", None))        # Per-provider delete / duplicate / test surfaced as a second-level menu.
+        if providers:
+            for name in providers:
+                cfg = providers[name] or {}
+                label = (cfg.get("label") or name)
+                items.append([f"📋 Duplicate: {label}", "Copy this provider's config"])
+                actions.append(("dup", name))
+                items.append([f"🎯 Generate model config: {label}", "Fetch live models and set opus/sonnet/haiku aliases"])
+                actions.append(("genmodels", name))
+                items.append([f"🔍 Test config: {label}", "Validate base_url + auth presence"])
+                actions.append(("test", name))
+                items.append([f"🗑 Delete: {label}", "Remove this provider"])
+                actions.append(("delete", name))
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            action, data = actions[idx]
+            if action == "edit":
+                self._run_wizard(existing=data)
+            elif action == "add":
+                self._run_wizard(existing=None)
+            elif action == "raw":
+                self.window.run_command("edit_settings", {
+                    "base_file": "${packages}/ClaudeCode/ClaudeCode.sublime-settings",
+                })
+            elif action == "dup":
+                self._duplicate(data)
+            elif action == "test":
+                self._test(data)
+            elif action == "genmodels":
+                self.window.run_command("claude_generate_provider_models", {"provider": data})
+            elif action == "delete":
+                self._delete(data)
+
+        self.window.show_quick_panel(items, on_select, placeholder="Manage Anthropic providers")
+
+    # ── Add / Edit wizard ────────────────────────────────────────────────────
+    def _run_wizard(self, existing: str = None) -> None:
+        cfg = {}
+        if existing:
+            cfg = dict(_load_custom_providers().get(existing, {}) or {})
+        # Seed name field for "add" with empty so the user types it.
+        self._fields = list(_PROVIDER_FIELDS)
+        self._values = {}
+        self._editing = existing
+        # Pre-fill from existing config.
+        for key, label, placeholder, required, secret, from_cfg in self._fields:
+            if from_cfg and key in cfg:
+                self._values[key] = str(cfg.get(key, ""))
+        self._step = 0
+        self._prompt_field()
+
+    def _prompt_field(self) -> None:
+        if self._step >= len(self._fields):
+            self._commit()
+            return
+        key, label, placeholder, required, secret, from_cfg = self._fields[self._step]
+        current = self._values.get(key, "")
+        # For the name field when editing, show the current (immutable) name.
+        pre = current if current else (self._editing if (key == "name" and self._editing) else "")
+        title = "{}{}".format(label, "  [required]" if required else "")
+        if secret:
+            # show_input_panel doesn't mask; accept plaintext but warn in title.
+            title = "{}  (stored in settings — prefer auth_env_var)".format(label)
+
+        def on_done(value):
+            value = (value or "").strip()
+            if required and not value:
+                sublime.status_message("{} is required".format(label))
+                self.window.show_input_panel(title, pre, on_done, None, None)
+                return
+            # Validate URL for base_url.
+            if key == "base_url" and value:
+                low = value.lower()
+                if not (low.startswith("http://") or low.startswith("https://")):
+                    sublime.status_message("base_url must start with http:// or https://")
+                    self.window.show_input_panel(title, pre, on_done, None, None)
+                    return
+            # Validate unique name for the name field.
+            if key == "name":
+                providers = _load_custom_providers()
+                if value != self._editing and value in providers:
+                    sublime.status_message("A provider named '{}' already exists".format(value))
+                    self.window.show_input_panel(title, pre, on_done, None, None)
+                    return
+            self._values[key] = value
+            self._step += 1
+            self._prompt_field()
+
+        def on_cancel():
+            sublime.status_message("Provider wizard cancelled")
+
+        self.window.show_input_panel(title, pre, on_done, None, on_cancel)
+
+    def _commit(self) -> None:
+        providers = _load_custom_providers()
+        new_name = self._values.get("name") or self._editing
+        if not new_name:
+            sublime.status_message("Provider not saved: no name")
+            return
+        # Build the cfg dict, dropping blank optionals and the name key itself.
+        cfg = {}
+        for key, label, placeholder, required, secret, from_cfg in self._fields:
+            if key == "name":
+                continue
+            v = self._values.get(key, "")
+            if v:
+                cfg[key] = v
+        # If editing under a different name, drop the old key.
+        if self._editing and self._editing != new_name:
+            providers.pop(self._editing, None)
+        # Preserve any extra_env / auth_via_api_key from a prior raw-JSON edit.
+        old = providers.get(new_name, {}) or {}
+        for preserve in ("extra_env", "auth_via_api_key", "subagent_model"):
+            if preserve in old:
+                cfg[preserve] = old[preserve]
+        providers[new_name] = cfg
+        _save_custom_providers(providers)
+        label = cfg.get("label", new_name)
+        sublime.status_message("Saved provider '{}'".format(label))
+        self._show_main()
+
+    # ── Duplicate / Delete / Test ────────────────────────────────────────────
+    def _duplicate(self, name: str) -> None:
+        providers = _load_custom_providers()
+        cfg = dict(providers.get(name, {}) or {})
+        i = 2
+        new_name = "{}_copy".format(name)
+        while new_name in providers:
+            new_name = "{}_copy{}".format(name, i)
+            i += 1
+        providers[new_name] = cfg
+        _save_custom_providers(providers)
+        sublime.status_message("Duplicated '{}' → '{}'".format(name, new_name))
+        self._show_main()
+
+    def _delete(self, name: str) -> None:
+        providers = _load_custom_providers()
+        if name not in providers:
+            return
+        # Confirm via a quick panel (yes/no).
+        def on_confirm(idx):
+            if idx == 0:
+                providers.pop(name, None)
+                _save_custom_providers(providers)
+                sublime.status_message("Deleted provider '{}'".format(name))
+            self._show_main()
+        self.window.show_quick_panel(
+            ["Yes, delete", "Cancel"],
+            on_confirm,
+            placeholder="Delete provider '{}'?".format(name),
+        )
+
+    def _test(self, name: str) -> None:
+        """Validate config: base_url is a URL and auth is present (inline or env).
+
+        Does NOT make a network request — just confirms the provider will resolve
+        to a usable env via backends.get(name), which is what session start does.
+        """
+        providers = _load_custom_providers()
+        cfg = providers.get(name, {}) or {}
+        problems = []
+        warnings = []
+        base = (cfg.get("base_url") or "").strip()
+        token = (cfg.get("auth_token") or "").strip()
+        auth_env_var = (cfg.get("auth_env_var") or "").strip()
+        if not base:
+            problems.append("missing base_url")
+        elif not (base.lower().startswith("http://") or base.lower().startswith("https://")):
+            problems.append("base_url is not a valid URL")
+        # Resolve the effective token (inline or env) so we can sanity-check it.
+        eff_token = token
+        if not eff_token and auth_env_var:
+            eff_token = os.environ.get(auth_env_var, "")
+        if not eff_token:
+            problems.append("no auth_token and auth_env_var '{}' is unset".format(auth_env_var or "<blank>"))
+        # Catch the classic ccm footgun: ~/.ccm_config ships placeholder values
+        # like 'sk-your-deepseek-api-key' that leak into the env and silently
+        # 401 at the provider. Flag any token that looks like a template.
+        if eff_token:
+            low = eff_token.lower()
+            if ("your-" in low or "your_" in low or "yourkey" in low
+                    or "sk-your" in low or "replace" in low or "xxxx" in low
+                    or eff_token in ("your-api-key", "your-api_key")):
+                warnings.append(
+                    "resolved token looks like a PLACEHOLDER ('{}…') — likely from "
+                    "~/.ccm_config clobbering the real key. Check `echo ${}` and "
+                    "~/.ccm_config.".format(eff_token[:20], auth_env_var or "<var>"))
+        available = backends.is_available(name)
+        # Build the env the bridge would receive, masked, so the user can confirm.
+        try:
+            spec = backends.get(name)
+            overwrite, defaults = spec.dynamic_env({
+                "custom_providers": providers,
+            }) if spec.dynamic_env else ({}, {})
+
+            def _m(k, v):
+                if any(s in k.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                    return _mask_secret(v) if v else "<empty>"
+                return v
+            env_preview = {k: _m(k, v) for k, v in {**defaults, **overwrite}.items()}
+        except Exception as e:
+            env_preview = {"<error>": str(e)}
+        status = "OK" if (not problems and available and not warnings) else ("PROBLEM" if problems or not available else "WARNING")
+        lines = ["Provider '{}': {}".format(name, status)]
+        if problems:
+            lines.append("  Issues: {}".format("; ".join(problems)))
+        if warnings:
+            for w in warnings:
+                lines.append("  ⚠ {}".format(w))
+        if not available:
+            lines.append("  backends.is_available → False")
+        lines.append("  Resolved env (masked):")
+        for k in sorted(env_preview):
+            lines.append("    {} = {}".format(k, env_preview[k]))
+        sublime.message_dialog("\n".join(lines))
+
+
+class ClaudeStartCustomProviderCommand(sublime_plugin.WindowCommand):
+    """Start a session on a chosen custom Anthropic-compatible provider."""
+
+    def run(self) -> None:
+        providers = _load_custom_providers()
+        if not providers:
+            sublime.error_message(
+                "No custom providers configured.\n\n"
+                "Run 'Claude: Manage Anthropic Providers' to add one.")
+            return
+        items = []
+        names = []
+        for name, cfg in providers.items():
+            cfg = cfg or {}
+            label = cfg.get("label", name)
+            avail = backends.is_available(name)
+            mark = "●" if avail else "○"
+            items.append(["{}  {}".format(mark, label), _provider_summary(name, cfg)])
+            names.append(name)
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            name = names[idx]
+            if not backends.is_available(name):
+                sublime.error_message(
+                    "Provider '{}' is not usable (missing base_url or auth).\n"
+                    "Run 'Claude: Manage Anthropic Providers' → Test config.".format(name))
+                return
+            create_session(self.window, backend=name)
+
+        self.window.show_quick_panel(items, on_select, placeholder="Start session on provider…")
+
+
+class ClaudeGenerateProviderModelsCommand(sublime_plugin.WindowCommand):
+    """Per-provider sub-model picker: fetch a provider's live model list and let
+    the user set the opus/sonnet/haiku alias → model-id mappings via quick panel.
+
+    'generate' = the alias config is produced from the provider's real model
+    list rather than typed by hand. OpenRouter uses its public models endpoint
+    (no auth); other providers hit {base_url}/v1/models with the resolved auth.
+    Falls back to manual entry if the fetch fails or returns nothing.
+    """
+
+    ALIASES = [("opus_model", "Opus"), ("sonnet_model", "Sonnet"), ("haiku_model", "Haiku")]
+
+    def run(self, provider: str = None) -> None:
+        providers = _load_custom_providers()
+        if not providers:
+            sublime.error_message(
+                "No custom providers configured.\n\n"
+                "Run 'Claude: Manage Anthropic Providers' to add one first.")
+            return
+        if provider and provider in providers:
+            self._fetch_then_pick(provider)
+            return
+        # No provider arg → quick-panel to choose one.
+        items = []
+        names = []
+        for name, cfg in providers.items():
+            cfg = cfg or {}
+            label = cfg.get("label", name)
+            cur = " / ".join((cfg.get(a) or "—") for a, _ in self.ALIASES)
+            items.append([label, "current: {}".format(cur)])
+            names.append(name)
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            self._fetch_then_pick(names[idx])
+
+        self.window.show_quick_panel(items, on_select, placeholder="Pick provider to configure models…")
+
+    # ── Resolve auth for a provider (mirrors backends._custom_anthropic_dynamic_env) ─
+    def _resolve_auth(self, cfg: dict):
+        """Returns (header_name, header_value) or (None, None) if no auth."""
+        token = (cfg.get("auth_token") or "").strip()
+        auth_env_var = (cfg.get("auth_env_var") or "").strip()
+        if not token and auth_env_var:
+            token = os.environ.get(auth_env_var, "")
+        if not token:
+            return None, None
+        if cfg.get("auth_via_api_key", False):
+            return "x-api-key", token
+        return "Authorization", "Bearer {}".format(token)
+
+    # ── Fetch models in a background thread ────────────────────────────────────
+    def _fetch_then_pick(self, name: str) -> None:
+        providers = _load_custom_providers()
+        cfg = providers.get(name, {}) or {}
+        base_url = (cfg.get("base_url") or "").strip()
+        if not base_url:
+            sublime.error_message("Provider '{}' has no base_url.".format(name))
+            return
+
+        sublime.status_message("Fetching models for '{}'…".format(name))
+        import threading
+
+        def work():
+            models = self._fetch_models(name, cfg, base_url)
+            sublime.set_timeout(lambda: self._pick_aliases(name, models), 0)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fetch_models(self, name: str, cfg: dict, base_url: str):
+        """Return a list of [id, label] model entries. Empty list on failure."""
+        import json as _json
+        import urllib.request
+
+        # OpenRouter: public models endpoint, no auth, returns data[].id.
+        if "openrouter.ai" in base_url.lower():
+            try:
+                req = urllib.request.Request("https://openrouter.ai/api/v1/models")
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = _json.loads(resp.read().decode())
+                out = []
+                for m in data.get("data", []):
+                    mid = m.get("id", "")
+                    if not mid:
+                        continue
+                    # OpenRouter ids are provider-qualified (e.g. anthropic/claude-sonnet-4.5)
+                    out.append([mid, mid])
+                if out:
+                    out.sort(key=lambda x: x[0])
+                    return out
+            except Exception as e:
+                print("[Claude] fetch openrouter models error: {}".format(e))
+
+        # Generic Anthropic-compat: GET {base_url}/v1/models with resolved auth.
+        auth_h, auth_v = self._resolve_auth(cfg)
+        url = base_url.rstrip("/") + "/v1/models"
+        try:
+            headers = {"anthropic-version": "2023-06-01"}
+            if auth_h:
+                headers[auth_h] = auth_v
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode())
+            out = []
+            for m in data.get("data", []):
+                mid = m.get("id", "")
+                if not mid:
+                    continue
+                mname = m.get("display_name") or m.get("name") or mid
+                out.append([mid, mname])
+            if out:
+                out.sort(key=lambda x: x[0])
+                return out
+        except Exception as e:
+            print("[Claude] fetch {} models error: {}".format(name, e))
+
+        return []  # caller falls back to manual entry
+
+    # ── Alias picker ───────────────────────────────────────────────────────────
+    def _pick_aliases(self, name: str, models: list) -> None:
+        """For each alias, show a quick panel of fetched models (pre-selecting
+        the current value) plus a manual-entry option. Persist at the end."""
+        providers = _load_custom_providers()
+        cfg = providers.get(name, {}) or {}
+        self._new_cfg = dict(cfg)
+        self._models = models  # [[id, label], ...]
+        self._alias_idx = 0
+        self._pick_one_alias(name)
+
+    def _pick_one_alias(self, name: str) -> None:
+        if self._alias_idx >= len(self.ALIASES):
+            self._commit(name)
+            return
+        key, label = self.ALIASES[self._alias_idx]
+        current = (self._new_cfg.get(key) or "").strip()
+
+        items = []
+        actions = []  # ("model", id) | ("manual",)
+        # Pre-select current by listing it first with a marker.
+        if current:
+            items.append(["● {}  (current)".format(current), "keep current {}".format(label)])
+            actions.append(("model", current))
+        for mid, mname in self._models:
+            mark = "● " if mid == current else "  "
+            # Keep the id visible (it's what gets stored) alongside the label.
+            items.append(["{}{}".format(mark, mname), mid])
+            actions.append(("model", mid))
+        items.append(["✎  Type a model id manually…", "enter an arbitrary model id"])
+        actions.append(("manual", None))
+
+        def on_select(idx):
+            if idx < 0:
+                # Cancelled mid-way: abort without saving.
+                sublime.status_message("Model config cancelled (nothing saved)")
+                return
+            action, data = actions[idx]
+            if action == "model":
+                self._new_cfg[key] = data
+                self._alias_idx += 1
+                self._pick_one_alias(name)
+            elif action == "manual":
+                def on_done(value):
+                    value = (value or "").strip()
+                    if not value:
+                        # Empty manual entry: re-open this alias.
+                        sublime.status_message("Empty model id; {} not changed".format(label))
+                        self._pick_one_alias(name)
+                        return
+                    self._new_cfg[key] = value
+                    self._alias_idx += 1
+                    self._pick_one_alias(name)
+                self.window.show_input_panel(
+                    "{} alias → model id".format(label), current, on_done, None, None)
+
+        if self._models:
+            placeholder = "{} alias ({} models fetched)".format(label, len(self._models))
+        else:
+            placeholder = "{} alias (no models fetched — type manually)".format(label)
+        self.window.show_quick_panel(items, on_select, placeholder=placeholder)
+
+    def _commit(self, name: str) -> None:
+        providers = _load_custom_providers()
+        providers[name] = self._new_cfg
+        _save_custom_providers(providers)
+        summary = " / ".join("{}={}".format(l, self._new_cfg.get(k, "—"))
+                             for k, l in self.ALIASES)
+        sublime.status_message("Saved {} models: {}".format(name, summary))
+
+
 
 
 class ClaudeCodePtyStartCommand(sublime_plugin.WindowCommand):
@@ -308,15 +845,21 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
 
         old_session = get_active_session(self.window)
         old_view = None
+        backend = None
+        profile = None
 
         if old_session:
             old_view = old_session.output.view
+            backend = old_session.backend
+            profile = old_session.profile
             old_session.stop()
             if old_view and old_view.id() in sublime._claude_sessions:
                 del sublime._claude_sessions[old_view.id()]
 
         # Create new session
-        new_session = Session(self.window)
+        if backend is None:
+            backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
+        new_session = Session(self.window, profile=profile, backend=backend)
 
         # Reuse existing view if available
         if old_view and old_view.is_valid():
@@ -326,7 +869,14 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
 
         new_session.start()
         if new_session.output.view:
-            new_session.output.view.set_name("Claude")
+            if backend != "claude":
+                spec = backends.get(backend)
+                new_session.output.view.settings().set("claude_backend", backend)
+                new_session.output.set_name(spec.label)
+                if spec.theme:
+                    new_session.output.view.settings().set("color_scheme", spec.theme)
+            else:
+                new_session.output.view.set_name("Claude")
             if new_session.output.view.id() not in sublime._claude_sessions:
                 sublime._claude_sessions[new_session.output.view.id()] = new_session
         new_session.output.show()
@@ -759,20 +1309,38 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
             except Exception:
                 pass
         if backend not in all_models:
-            all_models[backend] = DEFAULT_MODELS.get(backend, [])
+            # Live lookup so custom providers (added via the UI after plugin
+            # load) are picked up; DEFAULT_MODELS is just the built-in snapshot.
+            try:
+                all_models[backend] = [list(m) for m in backends.get(backend).default_models]
+            except Exception:
+                all_models[backend] = DEFAULT_MODELS.get(backend, [])
         return all_models.get(backend, [])
 
 
 class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
     """Set default model per backend in settings."""
     def run(self) -> None:
-        backends = ["claude", "codex", "copilot", "deepseek", "pi", "dsr"]
-        items = [[b.title(), f"Set default model for {b}"] for b in backends]
+        # Built-ins + user custom providers, in a stable order: built-ins first
+        # (claude, codex, copilot, pi, dsr) then any custom providers not yet
+        # listed. Excludes claude from the per-backend picker (it's the default
+        # and has its own legacy default_model key handled below).
+        seen = set()
+        backends_list = []
+        for name in ("claude", "codex", "copilot", "pi", "dsr"):
+            if backends.is_available(name) or name == "claude":
+                backends_list.append(name)
+                seen.add(name)
+        for name, spec in backends.all_backends().items():
+            if name not in seen and (spec.available is None or spec.available()):
+                backends_list.append(name)
+                seen.add(name)
+        items = [[b.title(), f"Set default model for {b}"] for b in backends_list]
 
         def on_backend(idx):
             if idx < 0:
                 return
-            backend = backends[idx]
+            backend = backends_list[idx]
             models = ClaudeSelectModelCommand._get_models(None, backend)
             if not models:
                 sublime.status_message(f"No models for {backend}. Run Claude: Refresh Models first.")
@@ -806,6 +1374,69 @@ class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
             self.window.show_quick_panel(model_items, on_model)
 
         self.window.show_quick_panel(items, on_backend)
+
+
+class ClaudeSetDefaultProviderCommand(sublime_plugin.WindowCommand):
+    """Set the default provider (backend) used by a plain "New Session".
+
+    The plugin's default is official Claude (backend 'claude'). This command
+    lets the user point it at any available backend — a built-in (codex,
+    copilot, pi, dsr) or a custom Anthropic-compatible provider — in a single
+    quick-panel step. Selecting a provider sets `default_backend` and uses the
+    backend's fallback model (it does NOT write a per-backend model override;
+    use 'Claude: Set Default Model' for that).
+    """
+
+    def run(self) -> None:
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        current_backend = settings.get("default_backend", "claude")
+        default_models = settings.get("default_models", {}) or {}
+
+        # Build the backend list: built-ins first (claude always present), then
+        # available custom providers. Same ordering as ClaudeSetDefaultModelCommand.
+        seen = set()
+        backends_list = []
+        for name in ("claude", "codex", "copilot", "pi", "dsr"):
+            if name == "claude" or backends.is_available(name):
+                backends_list.append(name)
+                seen.add(name)
+        for name, spec in backends.all_backends().items():
+            if name not in seen and (spec.available is None or spec.available()):
+                backends_list.append(name)
+                seen.add(name)
+
+        items = []
+        for name in backends_list:
+            spec = backends.get(name)
+            label = spec.label or name
+            is_current = (name == current_backend)
+            # Effective model = per-backend override if any, else the spec's fallback.
+            effective = default_models.get(name) or spec.fallback_model or "—"
+            mark = "● " if is_current else "  "
+            detail = "current default · model: {}".format(effective) if is_current \
+                else "model: {}".format(effective)
+            items.append(["{}{}".format(mark, label), detail])
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            self._save(backends_list[idx])
+
+        placeholder = "Set default provider"
+        cur_label = backends.get(current_backend).label or current_backend
+        cur_model = default_models.get(current_backend) or backends.get(current_backend).fallback_model
+        placeholder += "  →  {} / {}".format(cur_label, cur_model or "—")
+        self.window.show_quick_panel(items, on_select, placeholder=placeholder)
+
+    def _save(self, backend):
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        settings.set("default_backend", backend)
+        # Don't write a per-backend model override — let Session.start fall back
+        # to the spec's fallback_model. (Use 'Set Default Model' to override.)
+        sublime.save_settings("ClaudeCode.sublime-settings")
+        spec = backends.get(backend)
+        label = spec.label or backend
+        sublime.status_message("Default provider: {} (model: {})".format(label, spec.fallback_model or "—"))
 
 
 class ClaudeRefreshModelsCommand(sublime_plugin.WindowCommand):
@@ -1254,10 +1885,13 @@ class ClaudeCodeResumeCommand(sublime_plugin.WindowCommand):
 
 class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
     """Switch between active sessions in this window."""
-    def run(self, backend: str = "claude", transport: str = "bridge", model: str = None) -> None:
+    def run(self, backend: str = None, transport: str = "bridge", model: str = None) -> None:
         import os
         import shutil
         from .core import create_session
+
+        if backend is None:
+            backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
 
         # transport "terminal" = run the claude CLI in our embedded terminal view
         # instead of the SDK bridge; New Session commits there.
@@ -1267,12 +1901,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         # `model` is an accumulated option (set via the /model entries, like the
         # Switch-to backend/transport options) — committed by New Session.
         backend_prefix = ("⬛ " if is_term else "") + (f"[{backend}] " if backend != "claude" else "")
-        # Backend availability flags — sourced from backends registry
-        has_codex = backends.is_available("codex")
-        has_copilot = backends.is_available("copilot")
-        has_deepseek = backends.is_available("deepseek")
-        has_pi = backends.is_available("pi")
-        has_dsr = backends.is_available("dsr")
+        # Backend availability flags — sourced from backends registry. Custom
+        # Anthropic-compatible providers are included dynamically.
+        available_backends = [name for name, spec in backends.all_backends().items()
+                              if spec.available is None or spec.available()]
 
         project_path = self.window.folders()[0] if self.window.folders() else None
         starred = load_bookmarks(project_path)
@@ -1421,7 +2053,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         backend_models = all_models.get(backend, [])
         if not backend_models:  # fall back to the backend registry's defaults
             try:
-                backend_models = backends.BACKENDS[backend].default_models
+                backend_models = backends.get(backend).default_models
             except Exception:
                 backend_models = []
         for m in backend_models:
@@ -1452,23 +2084,21 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             items.append(["⇄ Switch to terminal", "Run Claude Code in the embedded terminal"])
             actions.append(("switch_transport", "terminal"))
 
-        # Add "Switch Backend" options (bridge transport only — terminal is claude CLI)
+        # Add "Switch Backend" options (bridge transport only — terminal is claude CLI).
+        # Built-ins in a stable order first, then any custom providers not yet listed.
         if not is_term:
-            other_backends = []
-            if has_codex and backend != "codex":
-                other_backends.append("codex")
-            if has_copilot and backend != "copilot":
-                other_backends.append("copilot")
-            if has_deepseek and backend != "deepseek":
-                other_backends.append("deepseek")
-            if has_pi and backend != "pi":
-                other_backends.append("pi")
-            if has_dsr and backend != "dsr":
-                other_backends.append("dsr")
+            ordered = []
+            for name in ("codex", "copilot", "pi", "dsr"):
+                if name in available_backends and name != backend:
+                    ordered.append(name)
+            for name in available_backends:
+                if name not in ordered and name not in ("claude", backend) and name not in ("codex", "copilot", "pi", "dsr"):
+                    ordered.append(name)
             if backend != "claude":
-                other_backends.append("claude")
-            for other in other_backends:
-                items.append([f"⇄ Switch to {other}", f"Show {other} options"])
+                ordered.append("claude")
+            for other in ordered:
+                label = backends.get(other).label
+                items.append([f"⇄ Switch to {label}", f"Show {other} options"])
                 actions.append(("switch_backend", other))
 
         def on_select(idx):
@@ -3370,5 +4000,3 @@ class ClaudeProjectRetainCommand(sublime_plugin.WindowCommand):
                 f.write("")
 
         self.window.open_file(retain_path)
-
-

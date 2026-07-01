@@ -228,6 +228,14 @@ class Session:
             if ctx:
                 env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(ctx)
 
+        # Stash provider label + resolved model on the view so the output renderer
+        # can show them on the @done(…) meta line without reaching into the session.
+        if self.output and self.output.view:
+            self.output.view.settings().set("claude_backend", self.backend)
+            self.output.view.settings().set("claude_provider_label", spec.label or self.backend)
+            if model_for_env:
+                self.output.view.settings().set("claude_model", model_for_env)
+
         # Diagnostic: log resolved spawn config (subsession-vs-standalone matters here)
         _is_subsession = bool(getattr(self, "subsession_id", None))
         print(f"[Claude session] backend={self.backend} bridge={spec.bridge_script} "
@@ -243,7 +251,13 @@ class Session:
         for k, v in spec.static_env.items():
             env.setdefault(k, v)
         if spec.dynamic_env is not None:
-            settings_dict = {"deepseek_api_key": settings.get("deepseek_api_key")}
+            # Pass a full settings snapshot so custom providers can read their
+            # own config (custom_providers[name]); deepseek_api_key kept for
+            # back-compat with any dynamic_env that still reads it.
+            settings_dict = {
+                "custom_providers": settings.get("custom_providers", {}) or {},
+                "deepseek_api_key": settings.get("deepseek_api_key"),
+            }
             overwrite, defaults = spec.dynamic_env(settings_dict)
             env.update(overwrite)
             for k, v in defaults.items():
@@ -320,9 +334,10 @@ class Session:
             init_params["subsession_id"] = self.subsession_id
         # Effort setting — only apply on fresh session (resume keeps CLI's saved value)
         if not self.resume_id:
-            effort = settings.get("effort", "high")
             if self.profile and self.profile.get("effort"):
                 effort = self.profile["effort"]
+            else:
+                effort = env.get("CLAUDE_CODE_EFFORT_LEVEL") or settings.get("effort", "high")
             init_params["effort"] = effort
         elif self.profile and self.profile.get("effort"):
             # Profile explicitly sets effort — honor it even on resume
@@ -1025,6 +1040,10 @@ class Session:
         # 2. Handle UI for each completion type
         if completion == "error":
             error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
+            # Print to the Sublime console (with backend context) so provider API
+            # errors are diagnosable at a glance — the chat view text alone is hard
+            # to copy/inspect, and transient providers (e.g. Astron) hit these often.
+            print(f"[Claude] query error [backend={self.backend}]: {error_msg}")
             self._status("error")
             self.output.text(f"\n\n*Error: {error_msg}*\n")
             if self.output.current:

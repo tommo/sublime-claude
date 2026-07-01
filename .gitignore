@@ -2,6 +2,9 @@
 *.pyc
 __pycache__/
 .sessions.json
+.claude/settings.json
+.claude/settings.local.json
+.claude/sessions/
 /tmp/
 *.log
 *.sublime-project

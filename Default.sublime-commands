@@ -24,6 +24,10 @@
         "command": "dsr_start"
     },
     {
+        "caption": "DeepSeek: New Session",
+        "command": "deep_seek_start"
+    },
+    {
         "caption": "Claude: New CLI Session (PTY, subscription billing)",
         "command": "claude_code_pty_start"
     },
@@ -126,6 +130,22 @@
     {
         "caption": "Claude: Refresh Models",
         "command": "claude_refresh_models"
+    },
+    {
+        "caption": "Claude: Manage Anthropic Providers",
+        "command": "claude_manage_providers"
+    },
+    {
+        "caption": "Claude: Start Custom Provider Session",
+        "command": "claude_start_custom_provider"
+    },
+    {
+        "caption": "Claude: Generate Provider Model Config",
+        "command": "claude_generate_provider_models"
+    },
+    {
+        "caption": "Claude: Set Default Provider",
+        "command": "claude_set_default_provider"
     },
     {
         "caption": "Claude: Copy Conversation",

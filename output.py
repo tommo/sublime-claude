@@ -223,7 +223,13 @@ class OutputView:
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
-            abbr = BACKEND_ABBREV.get(backend, backend[:2].upper())
+            # Prefer the registry's abbrev (covers custom providers); fall back
+            # to the static constants map, then to a 2-char upper of the name.
+            try:
+                from . import backends as _backends
+                abbr = _backends.get(backend).abbrev or BACKEND_ABBREV.get(backend, backend[:2].upper())
+            except Exception:
+                abbr = BACKEND_ABBREV.get(backend, backend[:2].upper())
             name = f"{abbr}> {name}"
         # Truncate to keep tab bar usable
         if len(name) > 24:
@@ -2240,6 +2246,21 @@ class OutputView:
                         meta_parts.append(f"{input_t // 1000}k ctx")
                     else:
                         meta_parts.append(f"{input_t} ctx")
+            # Append current provider + resolved model so it's visible per-turn
+            # (read from view settings set at session start in Session.start).
+            _vs = self.view.settings() if self.view else None
+            if _vs is not None:
+                _label = _vs.get("claude_provider_label")
+                _model = _vs.get("claude_model")
+                if _model:
+                    # "Claude/opus" is verbose; show just the model for the
+                    # default backend, full label/model otherwise.
+                    if _label and _label != "Claude":
+                        meta_parts.append(f"{_label}/{_model}")
+                    else:
+                        meta_parts.append(_model)
+                elif _label and _label != "Claude":
+                    meta_parts.append(_label)
             lines.append(f"\n  @done({', '.join(meta_parts)})\n")
 
         text = "".join(lines)

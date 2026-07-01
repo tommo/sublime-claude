@@ -51,6 +51,15 @@
                             "base_file": "${packages}/ClaudeCode/ClaudeOutput.sublime-settings",
                             "default": "// Claude Output View Settings\n// See default settings on the left for available options\n{\n}\n"
                         }
+                    },
+                    { "caption": "-" },
+                    {
+                        "caption": "Manage Anthropic Providers…",
+                        "command": "claude_manage_providers"
+                    },
+                    {
+                        "caption": "Set Default Provider…",
+                        "command": "claude_set_default_provider"
                     }
                 ]
             }
