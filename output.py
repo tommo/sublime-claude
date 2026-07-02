@@ -8,6 +8,59 @@ from .constants import SPINNER_FRAMES, BACKEND_ABBREV, CONTEXT_PREFIX, BACKGROUN
 from .output_pending import clear_pending_block
 from .tool_formatters import format_tool_detail
 
+import re as _re
+
+# Status-icon chars that prefix a tab title (see ClaudeOutput._update_title).
+_TITLE_ICON_RE = _re.compile(r'^(?:[◉◇•❓⏸↻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+')
+
+
+def _title_abbrev_tokens():
+    """The set of backend abbrev tokens _update_title can emit as `ABBR> `,
+    resolved the same way (registry abbrev → static map → name[:2]). Used by
+    strip_title_decoration so the strip stays in sync with the decoration and
+    covers custom providers (As / GM / Km / …), not just the built-ins."""
+    toks = set()
+    try:
+        from . import backends as _b
+        for name, spec in _b.all_backends().items():
+            tok = spec.abbrev or BACKEND_ABBREV.get(name) or name[:2].upper()
+            if tok:
+                toks.add(tok)
+    except Exception:
+        pass
+    for tok in BACKEND_ABBREV.values():
+        if tok:
+            toks.add(tok)
+    return toks
+
+
+def strip_title_decoration(title):
+    """Inverse of ClaudeOutput._update_title: peel status icons and any number
+    of stacked `ABBR> ` prefixes (+ legacy "[x] " / "Claude: " forms) so that
+    re-decorating across reconnects can't accumulate prefixes. Returns the
+    clean base name (empty string if nothing left). Does NOT touch a trailing
+    truncation ellipsis — callers that need it handle it themselves."""
+    if not title:
+        return ""
+    name = title
+    # Legacy forms first.
+    if name.startswith("[") and "] " in name:
+        name = name[name.index("] ") + 2:]
+    if name.startswith("Claude: "):
+        name = name[8:]
+    toks = sorted(_title_abbrev_tokens(), key=len, reverse=True)  # DSR before DS
+    abbr_re = _re.compile(r'^(?:%s)>\s*' % "|".join(_re.escape(t) for t in toks)) if toks else None
+    # Loop so any interleaved icon/abbrev stacking from prior reconnects
+    # collapses completely in one call.
+    while True:
+        new = _TITLE_ICON_RE.sub('', name)
+        if abbr_re:
+            new = abbr_re.sub('', new)
+        if new == name:
+            break
+        name = new
+    return name.strip()
+
 
 # Status constants
 PENDING = "pending"

@@ -271,23 +271,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         name = view.name()
         session_name = None
 
-        # Strip status prefixes (new format: ◉/◇/•/❓/💤 + space, old: spinner)
-        import re
-        name = re.sub(r'^[◉◇•❓⏸⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*', '', name)
-
-        # Strip old "Claude: " prefix
-        if name.startswith("Claude: "):
-            name = name[8:]
-
-        # Strip backend prefix like "[codex] " (legacy) or "CX> " (current)
-        if name.startswith("[") and "] " in name:
-            name = name[name.index("] ") + 2:]
-        name = re.sub(r'^(?:DSR|CX|DS|CP|Pi)(?:>|:)\s*', '', name)
-
-        # Strip trailing ellipsis from truncation
+        # Strip trailing ellipsis from truncation (captured before prefix-stripping
+        # so prefix-match logic below still knows the name was truncated).
         name_was_truncated = name.endswith("…")
         if name_was_truncated:
             name = name[:-1]
+
+        # Peel status icons + any stacked backend `ABBR> ` prefixes (covers
+        # custom providers too) so reconnect can't accumulate them.
+        from .output import strip_title_decoration
+        name = strip_title_decoration(name)
 
         # Extract session name (before " - " suffix if present)
         if " - " in name:

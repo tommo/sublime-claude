@@ -46,6 +46,10 @@ class BackendSpec:
     Called once per session start. Overwrite entries always replace; defaults use setdefault."""
     available: Optional[Callable[[], bool]] = None
     """Returns True if this backend can be used (CLI installed, API key set, etc)."""
+    pinned: bool = True
+    """If True the provider is eligible for the quick panels (Start Custom
+    Provider / Set Default). Built-ins default True; custom providers default
+    False (opt-in) so the seeds don't bloat the picker — pin the ones you use."""
 
 
 def _valid_auth_token(token: str) -> bool:
@@ -60,6 +64,41 @@ def _valid_auth_token(token: str) -> bool:
     if "your" in low and "api" in low and "key" in low:
         return False
     return True
+
+
+def resolve_auth_token(cfg: dict, name: str = None, settings: dict = None) -> str:
+    """Resolve the effective auth token for a custom-provider cfg.
+
+    Single source of truth shared by dynamic_env, the availability check, the
+    Manage-Providers test action, and the generate-models fetcher. Order:
+    inline auth_token → named auth_env_var → (deepseek legacy setting).
+    Returns '' when no usable token is found.
+    """
+    cfg = cfg or {}
+    token = (cfg.get("auth_token") or "").strip()
+    if not _valid_auth_token(token):
+        token = ""
+    auth_env_var = (cfg.get("auth_env_var") or "").strip()
+    if not token and auth_env_var:
+        env_token = os.environ.get(auth_env_var, "")
+        if _valid_auth_token(env_token):
+            token = env_token
+    if not token and name == "deepseek":
+        # Legacy: old configs stored the key under top-level deepseek_api_key
+        # instead of custom_providers.deepseek.auth_env_var.
+        legacy = ""
+        if isinstance(settings, dict):
+            legacy = (settings.get("deepseek_api_key") or "").strip()
+        else:
+            try:
+                import sublime
+                legacy = (sublime.load_settings("ClaudeCode.sublime-settings")
+                          .get("deepseek_api_key", "") or "").strip()
+            except Exception:
+                legacy = ""
+        if _valid_auth_token(legacy):
+            token = legacy
+    return token
 
 
 def _custom_anthropic_dynamic_env(settings: dict, name: str) -> Tuple[Dict[str, str], Dict[str, str]]:
@@ -84,20 +123,8 @@ def _custom_anthropic_dynamic_env(settings: dict, name: str) -> Tuple[Dict[str, 
     providers = settings.get("custom_providers", {}) or {}
     cfg = providers.get(name, {}) or {}
     base_url = (cfg.get("base_url") or "").strip()
-    auth_token = (cfg.get("auth_token") or "").strip()
-    if not _valid_auth_token(auth_token):
-        auth_token = ""
-    # Read token from an env var if the provider names one (ccm-style: never
-    # store plaintext keys in settings).
     auth_env_var = (cfg.get("auth_env_var") or "").strip()
-    if not auth_token and auth_env_var:
-        env_token = os.environ.get(auth_env_var, "")
-        if _valid_auth_token(env_token):
-            auth_token = env_token
-    if not auth_token and name == "deepseek":
-        legacy_token = (settings.get("deepseek_api_key") or "").strip()
-        if _valid_auth_token(legacy_token):
-            auth_token = legacy_token
+    auth_token = resolve_auth_token(cfg, name, settings)
     auth_via_key = bool(cfg.get("auth_via_api_key", False))
 
     overwrite: Dict[str, str] = {}
@@ -175,26 +202,12 @@ def _custom_provider_spec(name: str, cfg: dict) -> "BackendSpec":
         # Fall back to plain aliases so the picker is never empty.
         default_models = [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
 
-    auth_env_var = (cfg.get("auth_env_var") or "").strip()
-    auth_token = (cfg.get("auth_token") or "").strip()
-
     def _available() -> bool:
-        # A provider is usable if its base_url is set AND a token is available
-        # (either inline or via its named env var).
+        # A provider is usable if its base_url is set AND a token resolves
+        # (inline, via its named env var, or the deepseek legacy setting).
         if not (cfg.get("base_url") or "").strip():
             return False
-        if _valid_auth_token(auth_token):
-            return True
-        if auth_env_var and _valid_auth_token(os.environ.get(auth_env_var, "")):
-            return True
-        if name == "deepseek":
-            try:
-                import sublime
-                if _valid_auth_token(sublime.load_settings("ClaudeCode.sublime-settings").get("deepseek_api_key", "")):
-                    return True
-            except Exception:
-                pass
-        return False
+        return bool(resolve_auth_token(cfg, name))
 
     # Closure captures `name`; the builder reads the live settings dict at call
     # time so edits to custom_providers take effect on the next session start.
@@ -210,6 +223,7 @@ def _custom_provider_spec(name: str, cfg: dict) -> "BackendSpec":
         default_models=default_models,
         dynamic_env=_dyn,
         available=_available,
+        pinned=bool(cfg.get("pinned", False)),  # opt-in for the quick panels
     )
 
 

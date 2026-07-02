@@ -280,17 +280,20 @@ class DsrStartCommand(sublime_plugin.WindowCommand):
 
 _SETTINGS_FILE = "ClaudeCode.sublime-settings"
 # Fields collected by the add/edit wizard, in order. Each entry:
-# (key, label, placeholder, required, is_secret, default-from-cfg-flag)
+# (key, label, example, required, is_secret)
+#   example  — prefilled on Add so the user edits instead of typing from blank;
+#              also shown in the input title as a format hint. Never prefilled
+#              for the name field or secret fields (auth_token).
 _PROVIDER_FIELDS = [
-    ("name",        "Provider name (unique key, e.g. deepseek / glm / kimi)", "deepseek", True,  False, False),
-    ("label",       "Display label (blank = use name)",                      "DeepSeek", False, False, True),
-    ("abbrev",      "Tab abbreviation (blank = first 2 chars)",              "DS",       False, False, True),
-    ("base_url",    "Anthropic-compatible base URL",                         "https://api.deepseek.com/anthropic", True, False, True),
-    ("auth_token",    "Auth token (blank to read from auth_env_var)",        "sk-...",   False, True,  True),
-    ("auth_env_var",  "Env var holding the auth token (e.g. DEEPSEEK_API_KEY)", "DEEPSEEK_API_KEY", False, False, True),
-    ("opus_model",  "Opus alias → model id",                                 "deepseek-v4-pro[1m]", False, False, True),
-    ("sonnet_model","Sonnet alias → model id",                               "deepseek-v4-pro",     False, False, True),
-    ("haiku_model", "Haiku alias → model id",                                "deepseek-v4-flash",   False, False, True),
+    ("name",         "Provider name (unique key)",                 "deepseek",   True,  False),
+    ("label",        "Display label (blank = use name)",           "DeepSeek",   False, False),
+    ("abbrev",       "Tab abbreviation (blank = first 2 chars)",   "DS",         False, False),
+    ("base_url",     "Anthropic-compatible base URL",              "https://api.deepseek.com/anthropic", True, False),
+    ("auth_token",   "Auth token (blank → read from auth_env_var)", "sk-...",    False, True),
+    ("auth_env_var", "Env var holding the auth token",             "DEEPSEEK_API_KEY", False, False),
+    ("opus_model",   "Opus alias → model id",                      "deepseek-v4-pro[1m]", False, False),
+    ("sonnet_model", "Sonnet alias → model id",                    "deepseek-v4-pro",     False, False),
+    ("haiku_model",  "Haiku alias → model id",                     "deepseek-v4-flash",   False, False),
 ]
 
 
@@ -337,20 +340,29 @@ class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
     def _show_main(self) -> None:
         providers = _load_custom_providers()
         items = []
-        actions = []  # ("edit", name) | ("add",) | ("raw",) | ("delete", name) | ("dup", name) | ("test", name)
-        for name in providers:
-            cfg = providers[name] or {}
+        actions = []  # ("edit", name) | ("add",) | ("raw",) | ("delete", name) | ("dup", name) | ("test", name) | ("pin", name)
+        # Pinned providers first (the ones that surface in the quick panels),
+        # then the rest. 📌 marks pinned entries.
+        ordered = sorted(providers.items(), key=lambda kv: not bool((kv[1] or {}).get("pinned", False)))
+        for name, cfg in ordered:
+            cfg = cfg or {}
             label = (cfg.get("label") or name)
-            items.append([f"✎  {label}", _provider_summary(name, cfg)])
+            pin = "📌 " if cfg.get("pinned") else "    "
+            note = "pinned → shows in quick panel" if cfg.get("pinned") else "not pinned"
+            items.append([f"✎  {pin}{label}", "{}  •  {}".format(_provider_summary(name, cfg), note)])
             actions.append(("edit", name))
         items.append(["+  Add Provider…", "Define a new Anthropic-compatible endpoint"])
         actions.append(("add", None))
         items.append(["{ }  Edit raw JSON…", "Open custom_providers in the settings file"])
-        actions.append(("raw", None))        # Per-provider delete / duplicate / test surfaced as a second-level menu.
+        actions.append(("raw", None))        # Per-provider actions surfaced as a second-level region.
         if providers:
-            for name in providers:
-                cfg = providers[name] or {}
+            for name, cfg in ordered:
+                cfg = cfg or {}
                 label = (cfg.get("label") or name)
+                pin_label = "Unpin" if cfg.get("pinned") else "Pin"
+                items.append([f"{'📌' if cfg.get('pinned') else '📍'}  {pin_label}: {label}",
+                              "Toggle whether it shows in the quick panels"])
+                actions.append(("pin", name))
                 items.append([f"📋 Duplicate: {label}", "Copy this provider's config"])
                 actions.append(("dup", name))
                 items.append([f"🎯 Generate model config: {label}", "Fetch live models and set opus/sonnet/haiku aliases"])
@@ -380,92 +392,190 @@ class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
                 self.window.run_command("claude_generate_provider_models", {"provider": data})
             elif action == "delete":
                 self._delete(data)
+            elif action == "pin":
+                self._toggle_pin(data)
 
         self.window.show_quick_panel(items, on_select, placeholder="Manage Anthropic providers")
 
+    def _toggle_pin(self, name: str) -> None:
+        providers = _load_custom_providers()
+        cfg = providers.get(name) or {}
+        cfg["pinned"] = not bool(cfg.get("pinned", False))
+        providers[name] = cfg
+        _save_custom_providers(providers)
+        state = "pinned → shows in quick panel" if cfg["pinned"] else "unpinned"
+        sublime.status_message("'{}' {}".format(name, state))
+        self._show_main()
+
     # ── Add / Edit wizard ────────────────────────────────────────────────────
     def _run_wizard(self, existing: str = None) -> None:
-        cfg = {}
-        if existing:
-            cfg = dict(_load_custom_providers().get(existing, {}) or {})
-        # Seed name field for "add" with empty so the user types it.
+        cfg = dict(_load_custom_providers().get(existing, {}) or {}) if existing else {}
         self._fields = list(_PROVIDER_FIELDS)
-        self._values = {}
         self._editing = existing
-        # Pre-fill from existing config.
-        for key, label, placeholder, required, secret, from_cfg in self._fields:
-            if from_cfg and key in cfg:
+        self._values = {}
+        # Seed values: edit → from existing cfg; add → from the field's example.
+        # The name key (chosen by the user) and secret fields are left blank on
+        # add — their examples still show in the input title as format hints.
+        for key, label, example, required, secret in self._fields:
+            if key == "name":
+                self._values[key] = existing or ""
+            elif existing and key in cfg:
                 self._values[key] = str(cfg.get(key, ""))
+            elif secret:
+                self._values[key] = ""
+            else:
+                self._values[key] = example
         self._step = 0
+        self._return_to_review = False
         self._prompt_field()
 
-    def _prompt_field(self) -> None:
+    def _prompt_field(self, return_to_review: bool = False) -> None:
+        # return_to_review: invoked from the review screen to edit one field;
+        # after the field is entered we go back to the review instead of the
+        # next field in the chain.
+        self._return_to_review = return_to_review
         if self._step >= len(self._fields):
-            self._commit()
+            self._review()
             return
-        key, label, placeholder, required, secret, from_cfg = self._fields[self._step]
+        key, label, example, required, secret = self._fields[self._step]
         current = self._values.get(key, "")
-        # For the name field when editing, show the current (immutable) name.
-        pre = current if current else (self._editing if (key == "name" and self._editing) else "")
-        title = "{}{}".format(label, "  [required]" if required else "")
+        title = label
+        if example and not current:
+            title += "   e.g. {}".format(example)
+        if required:
+            title += "  [required]"
         if secret:
-            # show_input_panel doesn't mask; accept plaintext but warn in title.
-            title = "{}  (stored in settings — prefer auth_env_var)".format(label)
+            # show_input_panel can't mask; accept plaintext but steer to env var.
+            title += "  (stored in settings — prefer auth_env_var)"
+
+        def reopen(attempt):
+            self.window.show_input_panel(title, attempt, on_done, None, on_cancel)
 
         def on_done(value):
             value = (value or "").strip()
             if required and not value:
                 sublime.status_message("{} is required".format(label))
-                self.window.show_input_panel(title, pre, on_done, None, None)
+                reopen(value)
                 return
-            # Validate URL for base_url.
             if key == "base_url" and value:
                 low = value.lower()
                 if not (low.startswith("http://") or low.startswith("https://")):
                     sublime.status_message("base_url must start with http:// or https://")
-                    self.window.show_input_panel(title, pre, on_done, None, None)
+                    reopen(value)
                     return
-            # Validate unique name for the name field.
             if key == "name":
                 providers = _load_custom_providers()
                 if value != self._editing and value in providers:
                     sublime.status_message("A provider named '{}' already exists".format(value))
-                    self.window.show_input_panel(title, pre, on_done, None, None)
+                    reopen(value)
                     return
             self._values[key] = value
+            if self._return_to_review:
+                self._review()
+                return
             self._step += 1
             self._prompt_field()
 
         def on_cancel():
-            sublime.status_message("Provider wizard cancelled")
+            # Drop back to the review if mid-edit-from-review, else main menu.
+            if self._return_to_review:
+                self._review()
+            else:
+                sublime.status_message("Provider wizard cancelled")
 
-        self.window.show_input_panel(title, pre, on_done, None, on_cancel)
+        reopen(current)
 
-    def _commit(self) -> None:
-        providers = _load_custom_providers()
-        new_name = self._values.get("name") or self._editing
-        if not new_name:
-            sublime.status_message("Provider not saved: no name")
-            return
-        # Build the cfg dict, dropping blank optionals and the name key itself.
+    # ── Review / confirm before commit ───────────────────────────────────────
+    def _assembled_cfg(self) -> dict:
+        """Build the cfg dict (everything except the name key) from _values,
+        dropping blanks. Preserves raw-JSON-only keys (extra_env /
+        auth_via_api_key / subagent_model) from the existing entry on edit."""
         cfg = {}
-        for key, label, placeholder, required, secret, from_cfg in self._fields:
+        for key, label, example, required, secret in self._fields:
             if key == "name":
                 continue
-            v = self._values.get(key, "")
+            v = (self._values.get(key) or "").strip()
             if v:
                 cfg[key] = v
-        # If editing under a different name, drop the old key.
-        if self._editing and self._editing != new_name:
+        if self._editing:
+            old = _load_custom_providers().get(self._editing, {}) or {}
+            for preserve in ("extra_env", "auth_via_api_key", "subagent_model", "pinned"):
+                if preserve in old and preserve not in cfg:
+                    cfg[preserve] = old[preserve]
+        return cfg
+
+    def _auth_display(self, cfg: dict, name: str) -> str:
+        if (cfg.get("auth_token") or "").strip():
+            return "token " + _mask_secret(cfg["auth_token"])
+        env = (cfg.get("auth_env_var") or "").strip()
+        if env:
+            resolved = backends.resolve_auth_token(cfg, name)
+            return "${} {}".format(env, "✓ set" if resolved else "⚠ UNSET")
+        return "⚠ no auth"
+
+    def _review(self) -> None:
+        name = self._values.get("name") or self._editing
+        if not name:
+            sublime.status_message("Provider not saved: no name")
+            return
+        cfg = self._assembled_cfg()
+        label = cfg.get("label") or name
+        auth = self._auth_display(cfg, name)
+        model_parts = []
+        for key, human in (("opus_model", "opus"), ("sonnet_model", "sonnet"), ("haiku_model", "haiku")):
+            v = cfg.get(key)
+            if v:
+                model_parts.append("{}: {}".format(human, v))
+        models = "  ".join(model_parts) if model_parts else "(no aliases — picker falls back to opus/sonnet/haiku)"
+
+        items = [
+            ["✓  Save '{}'".format(label),
+             "{}  •  {}  •  {}".format(cfg.get("base_url", "<no base_url>"), auth, models)],
+            ["✎  Edit a field…", "Re-prompt any field, then return here"],
+            ["✗  Cancel", "Discard — nothing saved"],
+        ]
+        actions = [("save", None), ("edit", None), ("cancel", None)]
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            action, _ = actions[idx]
+            if action == "save":
+                self._commit()
+            elif action == "edit":
+                self._pick_field_to_edit()
+            # cancel: drop silently
+
+        self.window.show_quick_panel(items, on_select,
+                                     placeholder="Review provider '{}'".format(name))
+
+    def _pick_field_to_edit(self) -> None:
+        items = []
+        for key, label, example, required, secret in self._fields:
+            v = self._values.get(key, "")
+            shown = _mask_secret(v) if secret else (v or "(blank)")
+            items.append(["{}".format(label), shown])
+        def on_select(idx):
+            if idx < 0:
+                self._review()
+                return
+            self._step = idx
+            self._prompt_field(return_to_review=True)
+        self.window.show_quick_panel(items, on_select, placeholder="Edit which field?")
+
+    def _commit(self) -> None:
+        name = self._values.get("name") or self._editing
+        if not name:
+            sublime.status_message("Provider not saved: no name")
+            return
+        cfg = self._assembled_cfg()
+        providers = _load_custom_providers()
+        # Rename: editing under a different name drops the old key.
+        if self._editing and self._editing != name:
             providers.pop(self._editing, None)
-        # Preserve any extra_env / auth_via_api_key from a prior raw-JSON edit.
-        old = providers.get(new_name, {}) or {}
-        for preserve in ("extra_env", "auth_via_api_key", "subagent_model"):
-            if preserve in old:
-                cfg[preserve] = old[preserve]
-        providers[new_name] = cfg
+        providers[name] = cfg
         _save_custom_providers(providers)
-        label = cfg.get("label", new_name)
+        label = cfg.get("label", name)
         sublime.status_message("Saved provider '{}'".format(label))
         self._show_main()
 
@@ -511,16 +621,14 @@ class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
         problems = []
         warnings = []
         base = (cfg.get("base_url") or "").strip()
-        token = (cfg.get("auth_token") or "").strip()
         auth_env_var = (cfg.get("auth_env_var") or "").strip()
         if not base:
             problems.append("missing base_url")
         elif not (base.lower().startswith("http://") or base.lower().startswith("https://")):
             problems.append("base_url is not a valid URL")
-        # Resolve the effective token (inline or env) so we can sanity-check it.
-        eff_token = token
-        if not eff_token and auth_env_var:
-            eff_token = os.environ.get(auth_env_var, "")
+        # Resolve the effective token (inline, env, or deepseek legacy) via the
+        # shared helper so this stays in lockstep with session start.
+        eff_token = backends.resolve_auth_token(cfg, name)
         if not eff_token:
             problems.append("no auth_token and auth_env_var '{}' is unset".format(auth_env_var or "<blank>"))
         # Catch the classic ccm footgun: ~/.ccm_config ships placeholder values
@@ -570,14 +678,18 @@ class ClaudeStartCustomProviderCommand(sublime_plugin.WindowCommand):
 
     def run(self) -> None:
         providers = _load_custom_providers()
-        if not providers:
+        # Only pinned providers surface here — pinning is the opt-in that keeps
+        # the picker from bloating with every seeded endpoint. Manage Providers
+        # lists all of them (pinned or not) for configuration.
+        pinned = {n: c for n, c in providers.items() if (c or {}).get("pinned")}
+        if not pinned:
             sublime.error_message(
-                "No custom providers configured.\n\n"
-                "Run 'Claude: Manage Anthropic Providers' to add one.")
+                "No providers are pinned to the quick panel.\n\n"
+                "Run 'Claude: Manage Anthropic Providers' → Pin a provider.")
             return
         items = []
         names = []
-        for name, cfg in providers.items():
+        for name, cfg in pinned.items():
             cfg = cfg or {}
             label = cfg.get("label", name)
             avail = backends.is_available(name)
@@ -638,13 +750,10 @@ class ClaudeGenerateProviderModelsCommand(sublime_plugin.WindowCommand):
 
         self.window.show_quick_panel(items, on_select, placeholder="Pick provider to configure models…")
 
-    # ── Resolve auth for a provider (mirrors backends._custom_anthropic_dynamic_env) ─
-    def _resolve_auth(self, cfg: dict):
+    # ── Resolve auth for a provider (shared helper in backends) ──────────────────
+    def _resolve_auth(self, cfg: dict, name: str = None):
         """Returns (header_name, header_value) or (None, None) if no auth."""
-        token = (cfg.get("auth_token") or "").strip()
-        auth_env_var = (cfg.get("auth_env_var") or "").strip()
-        if not token and auth_env_var:
-            token = os.environ.get(auth_env_var, "")
+        token = backends.resolve_auth_token(cfg, name)
         if not token:
             return None, None
         if cfg.get("auth_via_api_key", False):
@@ -694,7 +803,7 @@ class ClaudeGenerateProviderModelsCommand(sublime_plugin.WindowCommand):
                 print("[Claude] fetch openrouter models error: {}".format(e))
 
         # Generic Anthropic-compat: GET {base_url}/v1/models with resolved auth.
-        auth_h, auth_v = self._resolve_auth(cfg)
+        auth_h, auth_v = self._resolve_auth(cfg, name)
         url = base_url.rstrip("/") + "/v1/models"
         try:
             headers = {"anthropic-version": "2023-06-01"}
@@ -1332,7 +1441,13 @@ class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
                 backends_list.append(name)
                 seen.add(name)
         for name, spec in backends.all_backends().items():
-            if name not in seen and (spec.available is None or spec.available()):
+            if name in seen:
+                continue
+            # Custom providers are opt-in via the pin flag; built-ins (pinned
+            # default True) are unaffected.
+            if not spec.pinned:
+                continue
+            if spec.available is None or spec.available():
                 backends_list.append(name)
                 seen.add(name)
         items = [[b.title(), f"Set default model for {b}"] for b in backends_list]
@@ -1401,7 +1516,13 @@ class ClaudeSetDefaultProviderCommand(sublime_plugin.WindowCommand):
                 backends_list.append(name)
                 seen.add(name)
         for name, spec in backends.all_backends().items():
-            if name not in seen and (spec.available is None or spec.available()):
+            if name in seen:
+                continue
+            # Custom providers are opt-in via the pin flag; built-ins (pinned
+            # default True) are unaffected.
+            if not spec.pinned:
+                continue
+            if spec.available is None or spec.available():
                 backends_list.append(name)
                 seen.add(name)
 
@@ -2086,18 +2207,20 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
 
         # Add "Switch Backend" options (bridge transport only — terminal is claude CLI).
         # Built-ins in a stable order first, then any custom providers not yet listed.
+        # Include current backend with "(current)" marker so users can see what's active.
         if not is_term:
             ordered = []
-            for name in ("codex", "copilot", "pi", "dsr"):
-                if name in available_backends and name != backend:
+            for name in ("claude", "codex", "copilot", "pi", "dsr"):
+                if name in available_backends and name not in ordered:
                     ordered.append(name)
             for name in available_backends:
-                if name not in ordered and name not in ("claude", backend) and name not in ("codex", "copilot", "pi", "dsr"):
+                if name not in ordered:
                     ordered.append(name)
-            if backend != "claude":
-                ordered.append("claude")
             for other in ordered:
-                label = backends.get(other).label
+                spec = backends.get(other)
+                label = spec.label
+                if other == backend:
+                    label = f"{label} (current)"
                 items.append([f"⇄ Switch to {label}", f"Show {other} options"])
                 actions.append(("switch_backend", other))
 

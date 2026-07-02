@@ -1266,12 +1266,9 @@ class Session:
 
     @property
     def display_name(self) -> str:
-        base = self.name or "Claude"
-        # Strip any stale prefixes from name (status icons + backend abbrevs)
-        import re
-        base = re.sub(r'^(?:[◉◇•❓⏸↻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', base)
-        base = re.sub(r'^(?:DSR|CX|DS|CP|Pi)(?:>|:)\s*', '', base) or "Claude"
-        return base
+        from .output import strip_title_decoration
+        base = strip_title_decoration(self.name or "Claude")
+        return base or "Claude"
 
     def sleep(self, force: bool = False) -> bool:
         """Put session to sleep — kill bridge, keep view.
