@@ -8,6 +8,10 @@
         "command": "claude_code_interrupt"
     },
     {
+        "keys": ["super+ctrl+alt+p"],
+        "command": "claude_change_provider"
+    },
+    {
         "keys": ["super+ctrl+alt+c"],
         "command": "claude_code_clear"
     },

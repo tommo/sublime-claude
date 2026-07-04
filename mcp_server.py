@@ -345,6 +345,7 @@ class MCPSocketServer:
             "terminal_run": self._terminal_run,
             "list_tools": self._list_tools,
             # Session tools
+            "list_backends": self._list_backends,
             "list_profiles": self._list_profiles,
             "list_personas": self._list_personas,
             "spawn_session": self._spawn_session,
@@ -900,6 +901,35 @@ class MCPSocketServer:
         return result
 
     # ─── Session Spawn ────────────────────────────────────────────────────
+
+    def _list_backends(self) -> dict:
+        """List backends usable as spawn_session's `backend` argument, with live
+        availability. Lets the agent pick a valid backend instead of guessing."""
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        default = settings.get("default_backend", "claude") or "claude"
+        rows = []
+        summary = ["Backends (● available, ○ not):"]
+        for name, spec in backends.all_backends().items():
+            avail = spec.available is None or bool(spec.available())
+            kind = "builtin" if name in backends.BACKENDS else "custom"
+            rows.append({
+                "name": name,
+                "label": spec.label or name,
+                "available": avail,
+                "kind": kind,
+                "pinned": spec.pinned,
+                "bridge": spec.bridge_script,  # fork portability: same bridge = same family
+                "fallback_model": spec.fallback_model,
+                "models": [[mid, mlabel] for mid, mlabel in spec.default_models],
+            })
+            mark = "●" if avail else "○"
+            pin = " 📌" if spec.pinned else ""
+            summary.append(f"  {mark} {name} → {spec.label or name}{pin}  [{kind}, bridge={spec.bridge_script}]")
+        summary.append("")
+        summary.append(f"default backend: {default}")
+        summary.append("Spawn via spawn_session(backend=<name>). fork_current=true only "
+                       "works within the same bridge family (same bridge_script).")
+        return {"summary": "\n".join(summary), "default": default, "backends": rows}
 
     def _list_profiles(self) -> dict:
         """List available profiles and checkpoints (formatted)."""

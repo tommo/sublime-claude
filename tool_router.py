@@ -90,6 +90,7 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('head')}, {args.get('tail')}, {args.get('grep')!r}, {args.get('grep_i')!r})")
 
     # Session tools
+    router.register("list_backends", simple_call_handler("list_backends"))
     router.register("list_profiles", simple_call_handler("list_profiles"))
     router.register("list_personas", simple_call_handler("list_personas"))
     router.register("list_sessions", simple_call_handler("list_sessions"))

@@ -1493,6 +1493,58 @@ class Session:
         if self.output and self.output.view:
             self.output.set_name(self.display_name)
 
+    def change_backend(self, new_backend: str) -> bool:
+        """Change this session's provider on the fly to a different Claude-bridge
+        backend, resuming the same session so history is preserved.
+
+        Only backends sharing the Claude bridge (main.py) are eligible: the
+        built-in 'claude' plus any custom Anthropic-compatible provider. Codex /
+        Copilot / Pi / DSR use their own bridges and can't be reached this way.
+
+        History is preserved by resuming the existing session_id: Claude Code
+        stores the transcript locally (~/.claude/projects/<cwd>/<id>.jsonl) and
+        the Anthropic API is stateless, so the id ports across Anthropic-
+        compatible endpoints — the new provider just receives the full context
+        each turn. This is exactly what `--resume <id>` does.
+        """
+        from . import backends
+        if new_backend == self.backend:
+            sublime.status_message("Already on provider '{}'".format(self.backend))
+            return False
+        cur_spec = backends.get(self.backend)
+        new_spec = backends.get(new_backend)
+        # Claude-bridge family only.
+        if cur_spec.bridge_script != "main.py" or new_spec.bridge_script != "main.py":
+            sublime.error_message(
+                "Can't change provider: '{}' ↔ '{}' crosses bridge families. Changing "
+                "only works between Claude-bridge backends (claude + custom Anthropic-"
+                "compatible providers).".format(self.backend, new_backend))
+            return False
+        if not backends.is_available(new_backend):
+            sublime.error_message(
+                "Provider '{}' is not usable (missing base_url or auth).\n"
+                "Run 'Claude: Manage Anthropic Providers' → Test config.".format(new_backend))
+            return False
+        if self.working:
+            sublime.status_message("Interrupt the current task before changing provider")
+            return False
+        if not self.session_id:
+            sublime.status_message("Nothing to change — session not started")
+            return False
+
+        # Swap the backend before restart so wake()'s start() rebuilds env for
+        # the new provider. resume_id = session_id makes the bridge resume the
+        # local transcript on the new endpoint (see start → init_params resume).
+        self.backend = new_backend
+        if self.output and self.output.view:
+            self.output.view.settings().set("claude_backend", new_backend)
+            self.output.view.settings().set("claude_provider_label", new_spec.label or new_backend)
+            # Refresh the title now so the new provider's abbrev shows immediately.
+            self.output.set_name(self.display_name)
+        sublime.status_message("Changing provider to '{}'…".format(new_backend))
+        self.restart()  # sleep(force=True) → wake() resumes session_id on new backend
+        return True
+
     # ─── Terminal Mode ─────────────────────────────────────────────────
 
     def enter_terminal_mode(self) -> bool:

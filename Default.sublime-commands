@@ -84,6 +84,10 @@
         "command": "claude_code_restart"
     },
     {
+        "caption": "Claude: Change Provider for Current Session…",
+        "command": "claude_change_provider"
+    },
+    {
         "caption": "Claude: Resume Session...",
         "command": "claude_code_resume"
     },

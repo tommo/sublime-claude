@@ -154,6 +154,11 @@ def handle_request(request: dict) -> dict:
                 },
                 # ─── Session Tools ────────────────────────────────────────
                 {
+                    "name": "list_backends",
+                    "description": "List backends available for spawn_session's `backend` argument — built-ins (claude, codex, copilot, pi, dsr) plus any custom Anthropic-compatible providers, each with live availability (auth/CLI resolved), kind, bridge family, and models. Call this before spawn_session to pick a valid backend instead of guessing. Also reports the default backend and the fork-family rule (fork_current only works within the same bridge family).",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
                     "name": "list_profiles",
                     "description": f"List available session profiles and checkpoints. Profiles configure model/context for different use cases. Setup guide: {PROFILES_GUIDE}",
                     "inputSchema": {"type": "object", "properties": {}}

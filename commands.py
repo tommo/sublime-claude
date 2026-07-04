@@ -992,6 +992,45 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
         sublime.status_message("Session restarted")
 
 
+class ClaudeChangeProviderCommand(sublime_plugin.WindowCommand):
+    """Change the active session's provider on the fly to a different Claude-
+    bridge backend, carrying the conversation over. Claude-bridge family only
+    (claude + custom Anthropic-compatible providers)."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if not s:
+            sublime.error_message("No active session to change.")
+            return
+        items, names = [], []
+        for name, spec in backends.all_backends().items():
+            if spec.bridge_script != "main.py":
+                continue  # only Claude-bridge backends are eligible
+            label = spec.label or name
+            avail = backends.is_available(name)
+            cur = "   (current)" if name == s.backend else ""
+            avail_tag = "" if avail else "   (unavailable)"
+            detail = "backend: {}".format(name) + ("" if avail else " — missing base_url/auth")
+            # "with X…" reads as "continue this conversation WITH X" — clearer
+            # about the contextual (carry-over) nature of the change than a bare
+            # provider name or "switch to X".
+            items.append(["with {}…{}{}".format(label, cur, avail_tag), detail])
+            names.append(name)
+        if not items:
+            sublime.error_message("No Claude-bridge providers configured.")
+            return
+
+        def on_select(idx):
+            if idx < 0:
+                return
+            s.change_backend(names[idx])
+
+        self.window.show_quick_panel(items, on_select,
+                                     placeholder="Change provider for current session…")
+
+    def is_enabled(self) -> bool:
+        return get_active_session(self.window) is not None
+
+
 class ClaudeCodeCopySessionIdCommand(sublime_plugin.WindowCommand):
     """Copy the Claude session ID of the active view to the clipboard."""
     def run(self) -> None:
@@ -2221,7 +2260,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 label = spec.label
                 if other == backend:
                     label = f"{label} (current)"
-                items.append([f"⇄ Switch to {label}", f"Show {other} options"])
+                items.append([f"with {label}…", f"Show {other} options"])
                 actions.append(("switch_backend", other))
 
         def on_select(idx):
