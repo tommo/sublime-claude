@@ -1172,6 +1172,11 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
                 "is_error": message.is_error,
                 "num_turns": message.num_turns,
                 "total_cost_usd": message.total_cost_usd,
+                # Distinguish a manual interrupt from a real error: the SDK still
+                # emits a ResultMessage (is_error=True) on interrupt, so without
+                # this the plugin's _on_msg_result would print a "turn failed"
+                # hint for a user-initiated interrupt.
+                "status": "interrupted" if self.interrupted else "complete",
             }
             if message.usage:
                 result_params["usage"] = message.usage

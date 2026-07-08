@@ -1955,6 +1955,13 @@ class Session:
         print(f"[Claude] [{dur:.1f}s, ${cost:.4f}]" if cost else f"[Claude] [{dur:.1f}s]")
         if usage:
             print(f"[Claude] usage: {usage}")
+        if params.get("status") == "interrupted":
+            # Manual interrupt — the SDK still emits a ResultMessage here, but
+            # _on_done's interrupt path renders the *[interrupted]* marker.
+            # Skip both @done and the "turn failed" hint (and auto-retry).
+            if self.output.current:
+                self.output.current.working = False
+            return
         if params.get("is_error"):
             # Turn ended in error (e.g. provider 503 retries exhausted). Don't
             # write the normal @done meta — that falsely signals success. Mark
