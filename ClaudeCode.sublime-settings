@@ -27,6 +27,14 @@
     // Reasoning effort level: "low", "high", "max"
     "effort": "high",
 
+    // Auto-retry a turn that ends in error (e.g. provider 503/429 retries
+    // exhausted). 0 = off (default). N = re-issue the turn up to N times,
+    // waiting auto_retry_backoff_seconds between attempts so the provider
+    // recovers / the rate limit resets. Only fires on is_error results (not
+    // interrupts or cancellations).
+    // "auto_retry_turns": 0,
+    // "auto_retry_backoff_seconds": 20,
+
     // Custom Anthropic-compatible providers.
     // Each entry points the Claude bridge at a third-party Anthropic-compat
     // endpoint (base_url + auth + model aliases) — same env surface as the ccm

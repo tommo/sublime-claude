@@ -1993,22 +1993,28 @@ class OutputView:
             )
 
     def _clear_question(self, summary: str = "") -> None:
-        """Remove question block and optionally write compact summary."""
+        """Remove question block. If summary, record the answer as a persistent
+        ☑ decision line in the conversation (a real event) so it survives later
+        re-renders — writing it as trailing UI got eaten by the next _do_render's
+        end-extension when the AskUserQuestion tool completed."""
         if not self.pending_question or not self.view:
             return
-        # ☑ (not ❓) so an answered question reads as a recorded decision.
-        replacement = f"\n  ☑ {summary}\n" if summary else ""
-        # No fallback when writing a summary — only the tracked region applies
-        fallback = (self.current.region[1] if self.current and not summary else None)
+        if summary and self.current is not None:
+            # ☑ (not ❓) so an answered question reads as a recorded decision.
+            # Appended to events → rendered inline (scoped claude.question.answered)
+            # and preserved across renders, instead of living as eatable trailing UI.
+            self.current.events.append(f"  ☑ {summary}\n")
         clear_pending_block(
             self.view,
             block_region_key="claude_question_block",
             button_prefix="claude_question_btn_",  # questions don't actually use this prefix
             button_keys={},  # questions don't have per-button hit-box regions
-            fallback_region_end=fallback,
-            replacement=replacement,
+            fallback_region_end=(self.current.region[1] if self.current else None),
+            replacement="",
             extra_region_keys=("claude_question_keys",),
         )
+        if summary:
+            self._render_current()
 
     def _advance_question(self) -> None:
         """Advance to next question or fire callback."""
@@ -2509,30 +2515,14 @@ class OutputView:
             return ""
 
     def _format_ask_user_result(self, result: str, question: str) -> str:
-        """Format ask_user Q&A result."""
+        """Format ask_user Q&A result. The answer is already recorded as a ☑
+        decision line at submit time (see _clear_question), so we don't echo it
+        again under the tool line — only surface a cancellation."""
         try:
-            import re
-            import codecs
-            # Extract answer from various formats
-            # Format: {'type': 'text', 'text': '{\n  "answer": "...",\n  "cancelled": false\n}'}
-
-            # Look for "answer": "..." pattern - allow escaped chars inside
-            match = re.search(r'"answer":\s*"((?:[^"\\]|\\.)*)"', result)
-            if match:
-                answer = match.group(1)
-                # Decode unicode escapes (e.g., \\u4e2d -> 中)
-                # Handle double-escaped: \\\\u -> \\u first
-                answer = answer.replace('\\\\u', '\\u')
-                answer = codecs.decode(answer, 'unicode_escape')
-                return f"\n    → {answer}"
-
-            # Check for cancelled
             if '"cancelled": true' in result or '"cancelled":true' in result:
                 return "\n    → (cancelled)"
-
             return ""
-        except Exception as e:
-            print(f"[Claude] _format_ask_user_result error: {e}, result={result[:50]}")
+        except Exception:
             return ""
 
     def _find_line_number(self, file_path: str, old: str, new: str) -> int:

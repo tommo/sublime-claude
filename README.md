@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), and [DeepSeek](https://api-docs.deepseek.com/) integration.
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), and any **Anthropic-compatible** provider (DeepSeek, GLM, Kimi, Qwen, OpenRouter, …).
 
 ## Requirements
 
@@ -10,7 +10,7 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex C
   - Claude Code CLI + `claude-agent-sdk`
   - Codex CLI
   - GitHub Copilot CLI via `github-copilot-sdk`
-  - DeepSeek API key (uses Claude bridge with Anthropic-compatible endpoint)
+  - Custom Anthropic-compatible provider — base URL + API key (uses the Claude bridge)
 
 ```bash
 # Claude Code
@@ -25,8 +25,8 @@ codex  # Follow prompts to authenticate
 # GitHub Copilot CLI (optional)
 pip install github-copilot-sdk  # Bundles CLI binary
 
-# DeepSeek (optional) — no extra install, just set API key
-# Get key at https://platform.deepseek.com
+# Custom Anthropic-compatible provider (optional) — no extra install,
+# configure under settings.custom_providers (see Custom Providers below).
 ```
 
 **Note:** Authenticate your chosen CLI before using this plugin. If you see connection errors, run the CLI in terminal to login.
@@ -67,7 +67,12 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 | New Session | - | Start a fresh Claude session |
 | Codex: New Session | - | Start a fresh Codex session |
 | Copilot: New Session | - | Start a fresh GitHub Copilot session |
-| DeepSeek: New Session | - | Start a fresh DeepSeek session |
+| Start Custom Provider Session | - | Start on a pinned Anthropic-compatible provider |
+| Manage Anthropic Providers | - | Add/edit/pin/test providers (wizard) |
+| Set Default Provider | - | Default backend for a plain New Session |
+| Change Provider for Current Session… | `Cmd+Ctrl+Alt+P` | Swap provider mid-session (resumes history) |
+| Generate Provider Model Config | - | Fetch a provider's live models → alias mapping |
+| Toggle Tasks Fold | `Cmd+Alt+T` | Expand/collapse the Tasks list in-view |
 | Undo Message | - | Rewind last conversation turn |
 | Search Sessions | - | Search all sessions by title |
 | Clear Notifications | - | List and clear active notifications |
@@ -141,8 +146,17 @@ Right-click selected text and choose "Ask Claude" to query about the selection.
     // Permission mode: "default", "acceptEdits", "plan", "bypassPermissions"
     "permission_mode": "acceptEdits",
 
-    // DeepSeek API key (for deepseek backend)
-    // "deepseek_api_key": "sk-...",
+    // Default backend for a bare "New Session": "claude" (default), a built-in
+    // (codex/copilot/pi/dsr), or a custom_providers key.
+    // "default_backend": "claude",
+
+    // Reasoning effort for fresh Claude sessions: low/medium/high/max.
+    // Overridable per-provider (custom_providers.<name>.effort).
+    "effort": "high",
+
+    // Custom Anthropic-compatible providers — see "Custom Anthropic-Compatible
+    // Providers" below.
+    "custom_providers": { /* ... */ }
 }
 ```
 
@@ -207,6 +221,38 @@ Supports wildcards (`*`) for pattern matching. User-level settings apply to all 
 - **claude_additional_dirs** — Extra `--add-dir` paths for CLI access
 - **claude_retain** — Content preserved across context compactions
 - **claude_env** — Environment variables passed to bridge
+
+## Custom Anthropic-Compatible Providers
+
+Point the Claude bridge at any third-party Anthropic-compatible endpoint (same env surface as [ccm](https://github.com/nicepkg/ccm) — DeepSeek, GLM, Kimi, Qwen, OpenRouter, …). Each entry lives under `custom_providers` in settings:
+
+```json
+"custom_providers": {
+  "glm": {
+    "label": "GLM",
+    "base_url": "https://open.bigmodel.cn/api/anthropic",
+    "auth_env_var": "GLM_API_KEY",
+    "opus_model": "glm-5.2[1m]",
+    "sonnet_model": "glm-5.2[1m]",
+    "haiku_model": "glm-4.7",
+    "pinned": true,
+    "effort": "high"
+  }
+}
+```
+
+Fields: `base_url` (required), `auth_token` or `auth_env_var` (preferred — never store keys inline), `opus_model`/`sonnet_model`/`haiku_model` alias mappings, `label`/`abbrev`, plus:
+
+- **`pinned`** — opt-in flag controlling whether the provider appears in the **quick panels** (Start Custom Provider / Set Default). Defaults `false`, so having every key configured doesn't bloat the picker — pin only the ones you use. Toggle via **Manage Anthropic Providers**.
+- **`effort`** — per-provider reasoning override (`low`/`medium`/`high`/`max`); blank → global `effort`.
+
+### Manage UI
+
+**Claude: Manage Anthropic Providers** — a quick-panel wizard: add/edit providers field-by-field with a review/confirm step, plus per-provider **Pin/Unpin**, **Test config** (validates base URL + resolved auth, previews the env), **Generate Model Config** (fetches the provider's live `/v1/models` and maps aliases), and **Duplicate/Delete**. "Edit raw JSON" opens the settings file.
+
+### Change provider on the fly
+
+**Claude: Change Provider for Current Session** (`Cmd+Ctrl+Alt+P`) swaps a running session's provider mid-conversation. Claude Code stores transcripts locally and the Anthropic API is stateless, so the session ID ports across endpoints — history is preserved via `--resume`, not lossy replay. Restricted to the Claude-bridge family (claude + custom providers).
 
 ## Context
 
@@ -289,6 +335,8 @@ The output view shows:
 - `✘ Tool` - Tool error
 - Response text with syntax highlighting
 - `@done(Xs)` - Completion time
+- **Tasks block** - `───── Tasks · X done · Y active · Z pending ─────` with per-item `✓ done / ▸ active / ○ pending`. Folded by default (running always shown, pending capped at 3, done hidden); `Cmd+Alt+T` or **super+click** the banner / "+N more" line to expand.
+- **Retry hint** - `⚠ 503 retry 3/10` (muted) appears under the spinner while the provider retries a 429/5xx, and is cleared automatically when content resumes.
 
 View title shows session status:
 - `◉` Active + working
@@ -350,6 +398,7 @@ Add a docstring at the top - it's shown when calling `list_tools()`.
 
 - `spawn_session(prompt, name?, profile?, persona_id?, backend?, fork_current?)` - Spawn a subsession
 - `list_sessions()` - List active sessions in current window
+- `list_backends()` - List backends usable as `spawn_session`'s `backend` arg (built-ins + custom providers), with live availability, bridge family, and models
 - `list_personas()` - List available personas from persona server
 - `list_profiles()` - List profiles and checkpoints
 
@@ -445,7 +494,7 @@ JSON-RPC protocol and the backend CLI:
 - **Claude**: `bridge/main.py` — Claude Agent SDK
 - **Codex**: `bridge/codex_main.py` — Codex app-server protocol
 - **Copilot**: `bridge/copilot_main.py` — GitHub Copilot SDK
-- **DeepSeek**: `bridge/main.py` — Same Claude bridge, Anthropic-compatible endpoint
+- **Custom Anthropic-compatible providers**: `bridge/main.py` — same Claude bridge, pointed at a third-party endpoint via `ANTHROPIC_BASE_URL` + auth (see Custom Providers)
 
 ```
 sublime-claude/

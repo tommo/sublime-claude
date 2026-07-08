@@ -121,6 +121,11 @@ class Session:
         self.total_cost: float = 0.0
         self.query_count: int = 0
         self.context_usage: Optional[Dict] = None  # Latest usage/context stats
+        # Plugin-level auto-retry on is_error turn results (opt-in via
+        # auto_retry_turns). _auto_retry_count resets on each user-submitted
+        # query; _auto_retry_pending lets query() cancel a scheduled retry.
+        self._auto_retry_count: int = 0
+        self._auto_retry_pending: bool = False
         # Pending context for next query (delegated to ContextManager)
         self.context = ContextManager(self)
         # Profile docs available for reading (paths only, not content)
@@ -924,7 +929,8 @@ class Session:
                     return candidate
         return None
 
-    def query(self, prompt: str, display_prompt: str = None, silent: bool = False) -> None:
+    def query(self, prompt: str, display_prompt: str = None, silent: bool = False,
+              _auto_retry: bool = False) -> None:
         """
         Start a new query.
 
@@ -937,9 +943,22 @@ class Session:
             sublime.error_message("Claude not initialized")
             return
 
+        # A user-initiated query (or any non-auto-retry) cancels any pending
+        # auto-retry and resets the retry budget. Auto-retry calls pass
+        # _auto_retry=True to keep the budget counting.
+        if not _auto_retry:
+            self._auto_retry_pending = False
+            self._auto_retry_count = 0
+
         self.working = True
         self.query_count += 1
-        self.draft_prompt = ""  # Clear draft — query submitted
+        # The normal submit path already saved the draft via output.prompt().
+        # A silent wake (background subsession/task completing) bypasses that,
+        # so preserve any in-progress input here rather than discarding it.
+        if silent and self.output and self.output.is_input_mode():
+            self.draft_prompt = self.output.get_input_text().strip()
+        else:
+            self.draft_prompt = ""  # Clear draft — query submitted
         self._pending_resume_at = None  # New query advances past any rewind point
         self._input_mode_entered = False  # Reset so input mode can be entered when query completes
 
@@ -1936,10 +1955,64 @@ class Session:
         print(f"[Claude] [{dur:.1f}s, ${cost:.4f}]" if cost else f"[Claude] [{dur:.1f}s]")
         if usage:
             print(f"[Claude] usage: {usage}")
-        self.output.meta(dur, cost, usage=usage)
+        if params.get("is_error"):
+            # Turn ended in error (e.g. provider 503 retries exhausted). Don't
+            # write the normal @done meta — that falsely signals success. Mark
+            # the turn idle and surface a brief error note; _on_done adds the
+            # detailed message if the bridge also returns an error response.
+            stop = params.get("stop_reason") or "error"
+            if self.output.current:
+                self.output.current.working = False
+            if self._maybe_schedule_auto_retry(stop):
+                return  # retry scheduled; don't finalize as a hard failure yet
+            retries = self._auto_retry_count
+            suffix = f" after {retries} auto-retr{'y' if retries == 1 else 'ies'}" if retries else ""
+            self.output.text(f"\n\n*⚠ turn failed ({stop}){suffix}.*\n")
+            self._status("error")
+        else:
+            self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
         # Workflows run in the background past turn-end — their redirect/detail
         # are persistent now (no turn-end clear).
+
+    def _maybe_schedule_auto_retry(self, stop: str) -> bool:
+        """On a failed turn, optionally schedule a plugin-level re-issue of the
+        same prompt (opt-in via `auto_retry_turns`). The SDK already exhausted
+        its in-request retries; this is one level up, with a backoff so the
+        provider/rate-limit can recover. Returns True if a retry was scheduled."""
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        max_turns = settings.get("auto_retry_turns", 0) or 0
+        if max_turns <= 0:
+            return False
+        if self._auto_retry_count >= max_turns:
+            return False
+        # Capture the prompt to re-issue. self.current is the just-failed turn.
+        prompt = self.current.prompt if self.current and self.current.prompt else None
+        if not prompt or not self.client or not self.initialized:
+            return False
+        self._auto_retry_count += 1
+        backoff = settings.get("auto_retry_backoff_seconds", 20) or 20
+        attempt = self._auto_retry_count
+        self._auto_retry_pending = True
+        self.output.text(
+            f"\n*⚠ turn failed ({stop}) — auto-retry {attempt}/{max_turns} "
+            f"in {backoff}s…*\n")
+        self._status(f"⚠ auto-retry {attempt}/{max_turns} in {backoff}s")
+        sublime.set_timeout(
+            lambda _p=prompt, _a=attempt, _m=max_turns: self._do_auto_retry(_p, _a, _m),
+            int(backoff * 1000))
+        return True
+
+    def _do_auto_retry(self, prompt: str, attempt: int, max_turns: int) -> None:
+        """Fire a scheduled auto-retry (cancels if the user submitted/interrupted
+        in the meantime — query() clears _auto_retry_pending for non-retry calls)."""
+        if not self._auto_retry_pending:
+            return  # cancelled by a user query / interrupt
+        self._auto_retry_pending = False
+        if not self.client or not self.initialized:
+            return
+        print(f"[Claude] auto-retry {attempt}/{max_turns}: re-issuing turn")
+        self.query(prompt, _auto_retry=True)
 
     def _on_msg_system(self, params: dict) -> None:
         """Dispatch system messages by subtype."""
