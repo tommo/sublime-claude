@@ -53,6 +53,10 @@ contexts:
     - match: '\*\[interrupted\]\*'
       scope: claude.interrupted
 
+    # Provider API retry hint (transient, muted) — SDK retrying a 429/5xx.
+    - match: '^\s*⚠ .+retry \d+/\d+.*$'
+      scope: claude.retry
+
     # Tool output lines (│ prefix)
     - match: '^\s*│ .+$'
       scope: claude.tool.output

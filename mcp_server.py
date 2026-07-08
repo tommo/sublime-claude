@@ -920,6 +920,7 @@ class MCPSocketServer:
                 "pinned": spec.pinned,
                 "bridge": spec.bridge_script,  # fork portability: same bridge = same family
                 "fallback_model": spec.fallback_model,
+                "effort": spec.effort,  # per-provider override; null = global
                 "models": [[mid, mlabel] for mid, mlabel in spec.default_models],
             })
             mark = "●" if avail else "○"

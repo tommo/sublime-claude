@@ -88,6 +88,10 @@
         "command": "claude_change_provider"
     },
     {
+        "caption": "Claude: Toggle Tasks Fold",
+        "command": "claude_toggle_tasks_fold"
+    },
+    {
         "caption": "Claude: Resume Session...",
         "command": "claude_code_resume"
     },

@@ -50,6 +50,10 @@ class BackendSpec:
     """If True the provider is eligible for the quick panels (Start Custom
     Provider / Set Default). Built-ins default True; custom providers default
     False (opt-in) so the seeds don't bloat the picker — pin the ones you use."""
+    effort: Optional[str] = None
+    """Per-provider reasoning effort override (low/medium/high/max). None → fall
+    back to the global `effort` setting. Only meaningful for Anthropic-effort
+    backends (claude + custom Anthropic-compatible providers)."""
 
 
 def _valid_auth_token(token: str) -> bool:
@@ -224,6 +228,7 @@ def _custom_provider_spec(name: str, cfg: dict) -> "BackendSpec":
         dynamic_env=_dyn,
         available=_available,
         pinned=bool(cfg.get("pinned", False)),  # opt-in for the quick panels
+        effort=((cfg.get("effort") or "").strip() or None),  # per-provider override
     )
 
 

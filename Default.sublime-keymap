@@ -16,6 +16,13 @@
         "command": "claude_code_clear"
     },
     {
+        "keys": ["super+alt+t"],
+        "command": "claude_toggle_tasks_fold",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+        ]
+    },
+    {
         "keys": ["y"],
         "command": "claude_permission_allow",
         "context": [

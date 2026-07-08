@@ -332,16 +332,24 @@ class Session:
         # Pass subsession_id if this is a subsession
         if hasattr(self, 'subsession_id') and self.subsession_id:
             init_params["subsession_id"] = self.subsession_id
-        # Effort setting — only apply on fresh session (resume keeps CLI's saved value)
+        # Effort resolution (fresh session; resume keeps CLI's saved value unless
+        # a profile pins it). Order: profile → provider (per-backend override) →
+        # CLAUDE_CODE_EFFORT_LEVEL env (e.g. a provider's extra_env) → global.
+        provider_effort = getattr(spec, "effort", None)
         if not self.resume_id:
             if self.profile and self.profile.get("effort"):
                 effort = self.profile["effort"]
+            elif provider_effort:
+                effort = provider_effort
             else:
                 effort = env.get("CLAUDE_CODE_EFFORT_LEVEL") or settings.get("effort", "high")
             init_params["effort"] = effort
         elif self.profile and self.profile.get("effort"):
             # Profile explicitly sets effort — honor it even on resume
             init_params["effort"] = self.profile["effort"]
+        elif provider_effort:
+            # Provider override (e.g. after change_backend) — apply on resume too
+            init_params["effort"] = provider_effort
 
         # Apply profile config or default model
         if self.profile:
@@ -1845,6 +1853,8 @@ class Session:
         tool_id = params.get("id")
         if not name or not name.strip():
             return
+        # A real content event arrived → the retry hint no longer applies.
+        self._clear_api_retry_hint()
         # Agent armed a self-wake / cron → this is now a looping session.
         if name in ("ScheduleWakeup", "CronCreate"):
             self.is_looping = True
@@ -1903,6 +1913,7 @@ class Session:
         self._update_status_bar()
 
     def _on_msg_text(self, params: dict) -> None:
+        self._clear_api_retry_hint()
         self.output.text(params.get("text", ""))
 
     def _on_msg_turn_usage(self, params: dict) -> None:
@@ -1938,6 +1949,7 @@ class Session:
             "task_updated": self._on_sys_task_updated,
             "task_notification": self._on_sys_task_notification,
             "task_progress": self._on_sys_task_progress,
+            "api_retry": self._on_sys_api_retry,
         }
         h = handlers.get(params.get("subtype", ""))
         if h is not None:
@@ -1949,6 +1961,33 @@ class Session:
         self.context_usage = None
         self._update_status_bar()
         self._inject_retain_midquery()
+
+    def _on_sys_api_retry(self, data: dict) -> None:
+        """Surface provider API retries (429/5xx) so a busy/failing provider
+        isn't a silent hang. Transient only: the hint lives in the status bar /
+        spinner (current_tool) while retrying and is cleared as soon as content
+        resumes (see _clear_api_retry_hint) — no permanent transcript line.
+        """
+        attempt = data.get("attempt")
+        max_retries = data.get("max_retries")
+        status = data.get("error_status")
+        exhausted = attempt is not None and max_retries and attempt >= max_retries
+        tag = str(status) if status else "error"
+        hint = "⚠ {} retry {}/{}{}".format(
+            tag, attempt, max_retries,
+            " · exhausted" if exhausted else "")
+        self.current_tool = hint
+        self._api_retry_hint = hint  # _clear_api_retry_hint drains this on resume
+        self._status(hint)
+
+    def _clear_api_retry_hint(self) -> None:
+        """Drop the retry hint from current_tool once real content arrives, so it
+        doesn't outlive the retry (and so the tool_use handler's tool_done doesn't
+        fire on the hint string)."""
+        if getattr(self, "_api_retry_hint", None):
+            self._api_retry_hint = None
+            if self.current_tool and self.current_tool.startswith("⚠"):
+                self.current_tool = None
 
     # task_updated.patch.status / task_notification.status values that mean the
     # task is over (the SDK schema dropped the old `is_backgrounded` patch flag
@@ -2019,12 +2058,20 @@ class Session:
         self._task_tool_map.pop(task_id, None)
         if not status or not tool_use_id:
             return
-        # Authoritative gate: only wake for tools we know were run_in_background.
-        # _bg_task_ids (not _bg_tools) survives the task_updated cleanup, so the
-        # wake fires regardless of which terminal event arrives first.
-        if tool_use_id not in self._bg_task_ids:
-            return
+        # Wake gate. run_in_background tools always wake (their tool_result was
+        # just an ack; this notification carries the real result). For anything
+        # else, only wake when the session is IDLE — that's the orphaned-subagent
+        # case: the SDK backgrounded a task without run_in_background (e.g. a
+        # Task/Agent subagent) and the parent turn already ended expecting a
+        # wake that would otherwise never come. When mid-turn (self.working),
+        # skip: the blocking tool_result drives continuation and a wake here
+        # would duplicate it.
+        is_bg = tool_use_id in self._bg_task_ids
         self._bg_task_ids.discard(tool_use_id)
+        if not is_bg and self.working:
+            return
+        if not is_bg:
+            print(f"[Claude] orphan task_notification (idle session) — waking parent: {tool_use_id}")
         # Read output first — it decides whether the tool line is worth keeping.
         output = ""
         output_file = data.get("output_file", "")

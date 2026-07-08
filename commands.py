@@ -294,6 +294,7 @@ _PROVIDER_FIELDS = [
     ("opus_model",   "Opus alias → model id",                      "deepseek-v4-pro[1m]", False, False),
     ("sonnet_model", "Sonnet alias → model id",                    "deepseek-v4-pro",     False, False),
     ("haiku_model",  "Haiku alias → model id",                     "deepseek-v4-flash",   False, False),
+    ("effort",       "Reasoning effort override (low/medium/high/max, blank = global)", "high", False, False),
 ]
 
 
@@ -327,7 +328,9 @@ def _provider_summary(name: str, cfg: dict) -> str:
         cred = f"${auth_env_var}"
     else:
         cred = "<no auth>"
-    return f"{base}  •  {cred}"
+    effort = (cfg.get("effort") or "").strip()
+    effort_tag = f"  •  effort:{effort}" if effort else ""
+    return f"{base}  •  {cred}{effort_tag}"
 
 
 class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
@@ -469,6 +472,10 @@ class ClaudeManageProvidersCommand(sublime_plugin.WindowCommand):
                     sublime.status_message("A provider named '{}' already exists".format(value))
                     reopen(value)
                     return
+            if key == "effort" and value and value not in ("low", "medium", "high", "max"):
+                sublime.status_message("effort must be one of: low, medium, high, max (or blank)")
+                reopen(value)
+                return
             self._values[key] = value
             if self._return_to_review:
                 self._review()
@@ -2924,6 +2931,23 @@ class ClaudeInsertCommand(sublime_plugin.TextCommand):
         self.view.insert(edit, pos, text)
 
 
+class ClaudeToggleTasksFoldCommand(sublime_plugin.TextCommand):
+    """Expand/collapse the Tasks list in a Claude output view.
+
+    Folded (default): running tasks always visible, pending capped at 3 total,
+    completed hidden. Expanded: everything shown."""
+    def run(self, edit):
+        view = self.view
+        expanded = view.settings().get("claude_tasks_expanded", False)
+        view.settings().set("claude_tasks_expanded", not expanded)
+        s = get_session_for_view(view)
+        if s and s.output:
+            s.output._render_current()
+
+    def is_enabled(self):
+        return self.view.settings().get("claude_output", False)
+
+
 class ClaudeReplaceCommand(sublime_plugin.TextCommand):
     """Replace region in Claude output view."""
     def run(self, edit, start, end, text):
@@ -4064,6 +4088,15 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
         line_region = self.view.line(pt)
         line = self.view.substr(line_region)
         col = pt - line_region.begin()
+
+        # Super+click on the Tasks banner or its fold hint toggles the list
+        # (the banner line carries "Tasks", the hint lines carry "super+click").
+        if "Tasks" in line and "done" in line and "active" in line:
+            self.view.run_command("claude_toggle_tasks_fold")
+            return
+        if "super+click to expand" in line or "super+click to collapse" in line:
+            self.view.run_command("claude_toggle_tasks_fold")
+            return
 
         # Try to find URL at position
         url_pattern = r'https?://[^\s\]\)>\'"]+|file://[^\s\]\)>\'"]+'

@@ -43,6 +43,8 @@
     //   pinned       true → show in the quick panels (Start Custom Provider /
     //                Set Default Provider). Defaults false; pin only the ones
     //                you use so the picker stays short. Toggle via Manage UI.
+    //   effort       per-provider reasoning effort (low/medium/high/max).
+    //                Blank → fall back to the global `effort` setting below.
     //   extra_env    optional dict of extra env vars (added as defaults)
     //
     // "deepseek" is seeded here so the built-in "DeepSeek" start command and
@@ -57,9 +59,7 @@
             "sonnet_model": "deepseek-v4-pro[1m]",
             "haiku_model": "deepseek-v4-flash",
             "subagent_model": "deepseek-v4-flash",
-            "extra_env": {
-                "CLAUDE_CODE_EFFORT_LEVEL": "max"
-            }
+            "effort": "max"
         },
         // Astron (讯飞 Coding Plan) — copied from ccm. Token read from env
         // ($ASTRON_API_KEY, set in ~/.ccm_config) — never stored inline.

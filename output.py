@@ -2268,20 +2268,53 @@ class OutputView:
         if self.current.working:
             spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
             lines.append(f"  {spinner}\n")
+            # While the provider is retrying a 429/5xx, surface the hint as its
+            # own line — scoped claude.retry (muted) via the syntax, and dropped
+            # by _clear_api_retry_hint as soon as content resumes.
+            try:
+                from . import claude_code
+                _sess = claude_code.get_session_for_view(self.view)
+                _hint = getattr(_sess, "_api_retry_hint", None)
+            except Exception:
+                _hint = None
+            if _hint:
+                lines.append(f"  {_hint}\n")
 
         # Todo list (if any) — only real, non-deleted items; never an empty block.
+        # Folded by default (super+alt+T to expand): running tasks always shown,
+        # pending capped at 3 total, completed hidden (counted in the banner).
         visible_todos = [t for t in self.current.todos
                          if t.content.strip() and t.status != "deleted"]
         if visible_todos:
-            lines.append("\n  ───── Tasks ─────\n")
-            for todo in visible_todos:
-                if todo.status == "completed":
-                    icon = "✓"
-                elif todo.status == "in_progress":
-                    icon = "▸"
-                else:
-                    icon = "○"
-                lines.append(f"  {icon} {todo.content}\n")
+            done = [t for t in visible_todos if t.status == "completed"]
+            active = [t for t in visible_todos if t.status == "in_progress"]
+            pending = [t for t in visible_todos
+                       if t.status not in ("completed", "in_progress")]
+            expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
+                if self.view else False
+            if expanded:
+                show = visible_todos
+            else:
+                # Running always visible; pending fill the remaining slots up to 3.
+                cap = max(0, 3 - len(active))
+                show = active + pending[:cap]
+            if show:
+                counts = "{} done · {} active · {} pending".format(
+                    len(done), len(active), len(pending))
+                lines.append("\n  ───── Tasks  ·  {}  ─────\n".format(counts))
+                for todo in show:
+                    if todo.status == "completed":
+                        icon = "✓"
+                    elif todo.status == "in_progress":
+                        icon = "▸"
+                    else:
+                        icon = "○"
+                    lines.append("  {} {}\n".format(icon, todo.content))
+                hidden = len(visible_todos) - len(show)
+                if hidden > 0:
+                    lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
+                elif expanded:
+                    lines.append("  (super+click to collapse)\n")
             # Mark as done so next conversation starts fresh
             if all(t.status == "completed" for t in visible_todos):
                 self.current.todos_all_done = True
