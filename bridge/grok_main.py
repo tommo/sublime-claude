@@ -146,6 +146,7 @@ class GrokBridge(AcpBridge):
         return args
 
     def spawn_env(self) -> Optional[Dict[str, str]]:
+        from acp_base import apply_plain_terminal_env
         env = dict(os.environ)
         # Allow MCP read_image screenshot payloads (default ~20KB is too small).
         for key in ("GROK_MAX_MCP_OUTPUT_BYTES", "MAX_MCP_OUTPUT_BYTES"):
@@ -156,6 +157,8 @@ class GrokBridge(AcpBridge):
             except ValueError:
                 pass
             env[key] = _MCP_IMAGE_OUTPUT_BYTES
+        # Prefer monochrome tool output; terminal/create re-forces this too.
+        apply_plain_terminal_env(env)
         return env
 
     def build_session_meta(self, *, system_prompt: str = "",

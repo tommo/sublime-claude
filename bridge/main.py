@@ -30,6 +30,15 @@ _logger = get_bridge_logger()
 
 # Set env var so child processes (bash commands) can detect they're running under Claude agent
 os.environ["CLAUDE_AGENT"] = "1"
+# Tool output is captured as plain text (not a TTY). Force monochrome so
+# CLIs do not emit ESC sequences into Bash tool results.
+os.environ["NO_COLOR"] = "1"
+os.environ["FORCE_COLOR"] = "0"
+os.environ["CLICOLOR"] = "0"
+os.environ["CLICOLOR_FORCE"] = "0"
+if not os.environ.get("TERM") or os.environ.get("TERM", "").startswith("xterm"):
+    os.environ["TERM"] = "dumb"
+os.environ.pop("COLORTERM", None)
 
 # task_updated.patch.status values that mean the task ended. (The SDK dropped
 # the old `is_backgrounded` patch flag for a {status, end_time} patch.)

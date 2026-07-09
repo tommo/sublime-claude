@@ -3427,10 +3427,24 @@ class OutputView:
         elif href.startswith("reveal:"):
             self._reveal_path(href[7:])
 
+    @staticmethod
+    def _strip_ansi(text: str) -> str:
+        """Drop ANSI SGR/OSC so tool lines stay readable in the output view."""
+        if not text or "\x1b" not in text:
+            return text or ""
+        import re
+        return re.sub(
+            r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\))",
+            "",
+            text,
+        )
+
     def _format_bash_result(self, result: str) -> str:
         """Format Bash command output (head + tail if long)."""
         if not result or not result.strip():
             return ""
+        # Safety net when tools ignore NO_COLOR / non-TTY.
+        result = self._strip_ansi(result)
         lines = result.strip().split("\n")
         max_head = 3
         max_tail = 5
