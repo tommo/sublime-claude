@@ -5,9 +5,31 @@ import urllib.parse
 import os
 import platform
 
-from .core import get_session_for_view, get_active_session
+from .core import get_session_for_view, get_active_session, in_startup_quiet
 from .session import Session
 from .context_parser import ContextParser, ContextMenuItem, ContextMenuHandler
+
+
+def settle_active_claude_view(window: sublime.Window) -> None:
+    """Full reconnect + title for the window's active Claude sheet only."""
+    if not window:
+        return
+    view = window.active_view()
+    if not view or not view.settings().get("claude_output"):
+        return
+    # Force a normal on_activated-style settle (quiet period already ended).
+    s = get_session_for_view(view)
+    if not s:
+        # Build a listener instance is awkward; call reconnect helper directly.
+        ClaudeOutputEventListener(view)._reconnect_orphaned_view(window, quiet=False)
+        s = get_session_for_view(view)
+    if s:
+        s._update_status_bar()
+        s.output.set_name(s.display_name)
+        if s.is_sleeping:
+            s._apply_sleep_ui()
+        elif s.initialized and not s.working and not s.output.is_input_mode():
+            s._enter_input_with_draft()
 
 
 _last_copy_meta = None  # {file, regions: [(row_start, row_end), ...], text}
@@ -220,16 +242,28 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not window:
             return
 
-        # Mark this as the "active" session for the window
+        # ST package load / session restore can fire on_activated for every
+        # matching ViewEventListener sheet — even when it is not the real
+        # active_view. Heavy reconnect UI (set_name / phantoms / show) then
+        # makes each tab "raise" in sequence. Stay quiet unless we truly own focus.
+        active = window.active_view()
+        is_real_active = bool(active and active.id() == self.view.id())
+        quiet = in_startup_quiet() or not is_real_active
+
+        # Mark this as the "active" session for the window only when truly focused
         old_active = window.settings().get("claude_active_view")
-        switched = old_active != self.view.id()
-        window.settings().set("claude_active_view", self.view.id())
+        if is_real_active:
+            window.settings().set("claude_active_view", self.view.id())
 
         # Check if this is an orphaned view that needs reconnection
         s = get_session_for_view(self.view)
         if not s:
-            self._reconnect_orphaned_view(window)
+            self._reconnect_orphaned_view(window, quiet=quiet)
             s = get_session_for_view(self.view)
+
+        if quiet:
+            # Registry only — no title churn, no input mode, no focus.
+            return
 
         # Update this session's status and title
         if s:
@@ -255,8 +289,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             old_session = sublime._claude_sessions[old_active]
             old_session.output.set_name(old_session.display_name)
 
-    def _reconnect_orphaned_view(self, window):
-        """Reconnect an orphaned Claude output view on focus."""
+    def _reconnect_orphaned_view(self, window, quiet: bool = False):
+        """Reconnect an orphaned Claude output view on focus.
+
+        quiet=True: register session only (no set_name / phantoms / show / start).
+        Used during ST startup so restoring many claude_output sheets does not
+        raise each tab.
+        """
         from .session import Session, load_saved_sessions
 
         view = self.view
@@ -324,7 +363,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     resume_session_at = saved.get("resume_session_at")
                     break
 
-        print(f"[Claude] reconnect: view={view.name()!r}, session={session_name!r}, resume_id={resume_id}")
+        print(f"[Claude] reconnect: view={view.name()!r}, session={session_name!r}, "
+              f"resume_id={resume_id}, quiet={quiet}")
 
         # Create session in sleeping state — user wakes with Enter or Wake command
         saved_backend = view.settings().get("claude_backend", "claude")
@@ -338,6 +378,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         # Reset active states
         session.output.reset_active_states()
+
+        # Quiet path: registry + sleeping flag only — no tab rename / phantom /
+        # view.show (those make sheets look "raised" during multi-tab restore).
+        # is_sleeping is derived (session_id + no client + not initialized).
+        if quiet:
+            if resume_id and not session.session_id:
+                session.session_id = resume_id
+            view.settings().set("claude_sleeping", True)
+            view.settings().erase("claude_reconnecting")
+            return
 
         # Re-apply backend-specific background color
         backend = view.settings().get("claude_backend")

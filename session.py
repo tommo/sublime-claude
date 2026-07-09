@@ -1503,7 +1503,11 @@ class Session:
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
         view.sel().clear()
         view.sel().add(sublime.Region(view.size(), view.size()))
-        view.show(view.size())
+        # Only scroll if this sheet is already focused — show() on inactive
+        # views can still jostle the UI during multi-tab restore.
+        win = view.window()
+        if win and win.active_view() and win.active_view().id() == view.id():
+            view.show(view.size())
 
     def _clear_overlay_phantom(self) -> None:
         ps = self._get_overlay_phantom_set()

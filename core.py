@@ -10,10 +10,25 @@ from . import backends
 
 
 _auto_sleep_timer = None
+# Wall-clock when plugin_loaded ran. Used to suppress focus/UI churn while ST
+# restores sheets and re-attaches ViewEventListeners (each matching view can
+# get a spurious on_activated during that window).
+_PLUGIN_LOADED_AT: float = 0.0
+_STARTUP_QUIET_S = 3.0
+
+
+def in_startup_quiet() -> bool:
+    """True for a few seconds after plugin load / package reload."""
+    if _PLUGIN_LOADED_AT <= 0:
+        return False
+    return (time.time() - _PLUGIN_LOADED_AT) < _STARTUP_QUIET_S
 
 
 def plugin_loaded() -> None:
     """Called when plugin is loaded. Start MCP server and notalone client."""
+    global _PLUGIN_LOADED_AT
+    _PLUGIN_LOADED_AT = time.time()
+
     # Initialize session registry on sublime module (singleton)
     if not hasattr(sublime, '_claude_sessions'):
         sublime._claude_sessions = {}
@@ -29,7 +44,19 @@ def plugin_loaded() -> None:
     # Orphaned claude_output views reconnect lazily on first activation via
     # ClaudeOutputEventListener._reconnect_orphaned_view (listeners.py).
     # Order bookmarks attach lazily on view load via ClaudeCodeEventListener.on_load.
+    # After quiet period, settle the *currently active* Claude sheet only.
     schedule_auto_sleep()
+    sublime.set_timeout(_startup_settle_active, int(_STARTUP_QUIET_S * 1000) + 50)
+
+
+def _startup_settle_active() -> None:
+    """After session restore, fully reconnect only the active Claude view."""
+    try:
+        from .listeners import settle_active_claude_view
+        for w in sublime.windows():
+            settle_active_claude_view(w)
+    except Exception as e:
+        print(f"[Claude] startup settle: {e}")
 
 
 def plugin_unloaded() -> None:
