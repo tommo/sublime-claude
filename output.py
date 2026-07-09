@@ -253,6 +253,10 @@ class OutputView:
                 self.window.focus_view(self.view)
             return
 
+        # new_file() always focuses the new sheet — remember prior active view
+        # so focus=False can restore it (session start / background create).
+        prev = self.window.active_view()
+
         # Create new view
         self.view = self.window.new_file()
         self.view.set_name("Claude")
@@ -280,6 +284,9 @@ class OutputView:
 
         if focus:
             self.window.focus_view(self.view)
+        elif prev and prev.is_valid() and prev.id() != self.view.id():
+            # Undo new_file()'s implicit focus steal
+            self.window.focus_view(prev)
 
     def set_name(self, name: str) -> None:
         """Update the output view title."""

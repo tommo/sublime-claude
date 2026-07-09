@@ -76,7 +76,8 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         old_session.output.set_name(old_session.name or "Claude")
 
     s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend)
-    s.output.show()  # Create view first
+    # Create the sheet without stealing focus (new_file focuses; show restores).
+    s.output.show(focus=False)
     if s.output.view and backend != "claude":
         spec = backends.get(backend)
         s.output.view.settings().set("claude_backend", backend)
@@ -84,7 +85,7 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         if spec.theme:
             s.output.view.settings().set("color_scheme", spec.theme)
     s.start()
-    # Register by view id and mark as active
+    # Register by view id and mark as active session (registry only — not focus)
     if s.output.view:
         view_id = s.output.view.id()
         sublime._claude_sessions[view_id] = s
