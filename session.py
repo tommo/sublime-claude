@@ -745,6 +745,10 @@ class Session:
     def add_context_folder(self, path: str) -> None:
         self.context.add_folder(path)
 
+    def add_context_path(self, path: str) -> None:
+        """Paste/attach a filesystem path (image → path ref, code → content)."""
+        self.context.add_path(path)
+
     def add_context_image(self, image_data: bytes, mime_type: str) -> None:
         self.context.add_image(image_data, mime_type)
 

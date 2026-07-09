@@ -363,7 +363,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
     def on_text_command(self, command_name, args):
         """Intercept text commands to restrict edits in input mode."""
         s = get_session_for_view(self.view)
-        if not s or not s.output.is_input_mode():
+        if not s:
+            return None
+
+        # Paste always routes through claude_paste_image — even when not yet
+        # in input mode (otherwise ST paste hits a read-only history region
+        # and image clipboards are dropped).
+        if command_name in ("paste", "paste_and_indent"):
+            return ("claude_paste_image", {})
+
+        if not s.output.is_input_mode():
             return None
 
         # Commands that are always safe (read-only, navigation, selection)
@@ -377,10 +386,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         if command_name in safe_commands:
             return None
-
-        # For paste, delegate to claude_paste_image which handles images
-        if command_name == "paste":
-            return ("claude_paste_image", {})
 
         # All other commands are potentially destructive - check if cursor is in input region
         input_start = s.output._input_start

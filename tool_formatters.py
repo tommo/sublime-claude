@@ -224,6 +224,17 @@ def _read(view: "OutputView", tool: "ToolCall") -> str:
     return out
 
 
+def _read_image(view: "OutputView", tool: "ToolCall") -> str:
+    ti = tool.tool_input or {}
+    path = ti.get("path") or ti.get("file_path") or ti.get("target_file") or ""
+    out = f": {path}" if path else ""
+    if tool.status == "error" and tool.result:
+        out += f" ✗ {_clip(str(tool.result), 60)}"
+    elif tool.status == "done":
+        out += " ✓ vision"
+    return out
+
+
 def _edit(view: "OutputView", tool: "ToolCall") -> str:
     file_path = tool.tool_input.get("file_path", "")
     # A failed edit never applied — its diff is misleading noise, so hide it.
@@ -390,6 +401,8 @@ def _terminal_list(view: "OutputView", tool: "ToolCall") -> str:
 TOOL_FORMATTERS: Dict[str, Callable] = {
     "Bash": _bash,
     "Read": _read,
+    "read_image": _read_image,
+    "mcp__sublime__read_image": _read_image,
     "Edit": _edit,
     "Write": _write,
     "Glob": _glob,

@@ -3,11 +3,15 @@
 MCP server for Sublime Text integration.
 Provides sublime_eval tool to execute Python in Sublime's context.
 """
+import base64
 import json
 import os
 import socket
+import struct
+import subprocess
 import sys
-from typing import Any
+import tempfile
+from typing import Any, Optional, Tuple
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,6 +20,16 @@ from tool_router import create_sublime_router, parse_tool_call
 SOCKET_PATH = "/tmp/sublime_claude_mcp.sock"
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILES_GUIDE = os.path.join(PLUGIN_DIR, "docs", "profiles.md")
+
+# Vision tool: agent-captured screenshots / UI renders as MCP image blocks.
+# Grok's built-in read_file → fs/read_text_file rejects binary ("Cannot read
+# binary file"); this tool returns real image content for vision.
+_IMAGE_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    ".tif", ".tiff", ".heic", ".heif", ".ico",
+)
+_READ_IMAGE_MAX_BYTES = 4 * 1024 * 1024  # raw payload after optional shrink
+_READ_IMAGE_MAX_EDGE = 1600  # long edge for resize
 
 # Parse --view-id from command line args (passed by bridge)
 CALLER_VIEW_ID = None
@@ -73,6 +87,149 @@ def make_response(id: Any, result: Any = None, error: Any = None) -> dict:
     else:
         resp["result"] = result
     return resp
+
+
+def _image_mime(path: str, head: bytes = b"") -> str:
+    if len(head) >= 8 and head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(head) >= 3 and head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(head) >= 6 and head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    low = path.lower()
+    for ext, mime in (
+        (".png", "image/png"), (".jpg", "image/jpeg"), (".jpeg", "image/jpeg"),
+        (".gif", "image/gif"), (".webp", "image/webp"), (".bmp", "image/bmp"),
+        (".tif", "image/tiff"), (".tiff", "image/tiff"),
+        (".heic", "image/heic"), (".heif", "image/heif"), (".ico", "image/x-icon"),
+    ):
+        if low.endswith(ext):
+            return mime
+    return "image/png"
+
+
+def _png_size(raw: bytes) -> Tuple[int, int]:
+    if len(raw) >= 24 and raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", raw[16:24])
+    return 0, 0
+
+
+def _shrink_image(path: str, max_edge: int, max_bytes: int) -> Tuple[bytes, str, str]:
+    """Return (bytes, mime, note). Prefer sips/PIL shrink when large."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    mime = _image_mime(path, raw[:64])
+    w, h = _png_size(raw)
+    note_bits = [f"path={path}", f"bytes={len(raw)}"]
+    if w and h:
+        note_bits.append(f"dim={w}x{h}")
+
+    need_resize = (w and h and max(w, h) > max_edge) or len(raw) > max_bytes
+    if not need_resize:
+        if len(raw) > max_bytes:
+            raise ValueError(
+                f"image {path!r} is {len(raw)} bytes (max {max_bytes}); "
+                f"resize/compress the screenshot and retry")
+        return raw, mime, ", ".join(note_bits)
+
+    # macOS sips → JPEG (good for screenshots, smaller than PNG)
+    try:
+        with tempfile.TemporaryDirectory(prefix="sc-read-image-") as td:
+            out = os.path.join(td, "out.jpg")
+            cmd = ["sips", "-Z", str(max_edge), "-s", "format", "jpeg",
+                   path, "--out", out]
+            r = subprocess.run(cmd, capture_output=True, timeout=30)
+            if r.returncode == 0 and os.path.isfile(out):
+                shrunk = open(out, "rb").read()
+                if shrunk and len(shrunk) <= max_bytes:
+                    note_bits.append(f"shrunk_via=sips edge≤{max_edge}")
+                    note_bits.append(f"out_bytes={len(shrunk)}")
+                    return shrunk, "image/jpeg", ", ".join(note_bits)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Pillow fallback
+    try:
+        from PIL import Image  # type: ignore
+        import io
+        im = Image.open(path)
+        im = im.convert("RGB") if im.mode not in ("RGB", "L") else im
+        im.thumbnail((max_edge, max_edge))
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG", quality=85, optimize=True)
+        shrunk = buf.getvalue()
+        if shrunk and len(shrunk) <= max_bytes:
+            note_bits.append(f"shrunk_via=pillow edge≤{max_edge}")
+            note_bits.append(f"out_bytes={len(shrunk)}")
+            return shrunk, "image/jpeg", ", ".join(note_bits)
+    except Exception:
+        pass
+
+    if len(raw) > max_bytes:
+        raise ValueError(
+            f"image {path!r} is {len(raw)} bytes after failed shrink "
+            f"(max {max_bytes})")
+    return raw, mime, ", ".join(note_bits)
+
+
+def handle_read_image(args: dict) -> dict:
+    """Read an image file and return MCP image content for vision."""
+    path = (args.get("path") or args.get("file_path") or args.get("target_file")
+            or "").strip()
+    if not path:
+        return {
+            "content": [{"type": "text", "text": "Error: path is required"}],
+            "isError": True,
+        }
+    if not os.path.isabs(path):
+        # resolve relative to CWD (agent session cwd)
+        path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        return {
+            "content": [{"type": "text",
+                         "text": f"Error: file not found: {path}"}],
+            "isError": True,
+        }
+
+    low = path.lower()
+    with open(path, "rb") as f:
+        head = f.read(16)
+    by_ext = any(low.endswith(e) for e in _IMAGE_EXTS)
+    by_magic = (
+        head[:8] == b"\x89PNG\r\n\x1a\n"
+        or head[:3] == b"\xff\xd8\xff"
+        or head[:6] in (b"GIF87a", b"GIF89a")
+        or (len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+        or head[:2] == b"BM"
+    )
+    if not by_ext and not by_magic:
+        return {
+            "content": [{"type": "text",
+                         "text": f"Error: not an image file: {path}"}],
+            "isError": True,
+        }
+
+    try:
+        max_edge = int(args.get("max_edge") or _READ_IMAGE_MAX_EDGE)
+        max_bytes = int(args.get("max_bytes") or _READ_IMAGE_MAX_BYTES)
+        max_edge = max(256, min(max_edge, 4096))
+        max_bytes = max(64 * 1024, min(max_bytes, 8 * 1024 * 1024))
+        raw, mime, note = _shrink_image(path, max_edge, max_bytes)
+    except Exception as e:
+        return {
+            "content": [{"type": "text", "text": f"Error: {e}"}],
+            "isError": True,
+        }
+
+    b64 = base64.b64encode(raw).decode("ascii")
+    return {
+        "content": [
+            {"type": "text", "text": f"Image loaded ({note}, mime={mime})"},
+            {"type": "image", "mimeType": mime, "data": b64},
+        ]
+    }
 
 
 def handle_request(request: dict) -> dict:
@@ -150,6 +307,39 @@ def handle_request(request: dict) -> dict:
                             "grep": {"type": "string", "description": "Filter lines matching regex pattern (case-sensitive)"},
                             "grep_i": {"type": "string", "description": "Filter lines matching regex pattern (case-insensitive)"}
                         }
+                    }
+                },
+                {
+                    "name": "read_image",
+                    "description": (
+                        "VISION: load a local image file (PNG/JPEG/WebP/GIF "
+                        "screenshots, UI renders, app captures) so the model can "
+                        "see pixels. Grok: call via use_tool tool_name="
+                        "\"sublime__read_image\" tool_input={\"path\":\"/abs/file.png\"}; "
+                        "if unknown, search_tool query=\"read_image\" first. "
+                        "Never use read_file on images (ACP text FS → "
+                        "'Cannot read binary file')."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute path to the image file"
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Alias for path"
+                            },
+                            "max_edge": {
+                                "type": "number",
+                                "description": (
+                                    "Optional max long-edge pixels before shrink "
+                                    f"(default {_READ_IMAGE_MAX_EDGE})"
+                                )
+                            }
+                        },
+                        "required": ["path"]
                     }
                 },
                 # ─── Session Tools ────────────────────────────────────────
@@ -595,6 +785,10 @@ Examples:
             # Inject caller view_id for spawn_session (so subsession knows parent)
             if tool_name == "spawn_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
                 args["_caller_view_id"] = CALLER_VIEW_ID
+
+            # Local tools (no Sublime socket)
+            if tool_name == "read_image":
+                return make_response(id, handle_read_image(args))
 
             # Route the tool call to get executable code
             # Pass CALLER_VIEW_ID with every request so Sublime knows the session context

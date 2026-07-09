@@ -3979,35 +3979,46 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
 
         image_data, mime_type, file_paths_from_clip = self._get_clipboard_image()
 
-        # File/dir paths from Finder copy — use full paths from pasteboard
+        def _ensure_input():
+            try:
+                if session.output and not session.output.is_input_mode():
+                    session.output.enter_input_mode()
+            except Exception:
+                pass
+
+        # File/dir paths from Finder — context chips (path ref / file content)
         if file_paths_from_clip:
             valid_paths = [p for p in file_paths_from_clip if os.path.exists(p)]
             if valid_paths:
-                # Paste paths as text into the input
-                path_text = "\n".join(valid_paths)
-                self.view.run_command("insert", {"characters": path_text})
-                sublime.status_message(f"Pasted {len(valid_paths)} path(s)")
+                for p in valid_paths:
+                    session.add_context_path(p)
+                _ensure_input()
+                sublime.status_message(
+                    f"Added {len(valid_paths)} path(s) to context")
                 return
 
         if image_data:
             session.add_context_image(image_data, mime_type)
-            sublime.status_message(f"Image added to context ({len(image_data)} bytes)")
+            _ensure_input()
+            sublime.status_message(
+                f"Image added to context ({len(image_data)} bytes) — send prompt to attach")
             return
 
         # No image or file paths from pasteboard, check text clipboard
         text = sublime.get_clipboard()
         if text:
             lines = [line.strip() for line in text.split('\n') if line.strip()]
-            file_paths = [line for line in lines if os.path.isfile(line)]
-            if file_paths:
-                for path in file_paths:
-                    try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            content = f.read()
-                        session.add_context_file(path, content)
-                    except Exception as e:
-                        print(f"[Claude] Failed to add file {path}: {e}")
-                sublime.status_message(f"Added {len(file_paths)} file(s) to context")
+            # Absolute-looking paths that exist as file or directory
+            path_lines = [
+                line for line in lines
+                if os.path.isfile(line) or os.path.isdir(line)
+            ]
+            if path_lines and len(path_lines) == len(lines):
+                for p in path_lines:
+                    session.add_context_path(p)
+                _ensure_input()
+                sublime.status_message(
+                    f"Added {len(path_lines)} path(s) to context")
                 return
 
             print(f"[Claude] paste: trying context paste...")
@@ -4039,7 +4050,10 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
         return True
 
     def _get_clipboard_image(self):
-        """Check if clipboard contains image data using platform-specific helper."""
+        """Check if clipboard contains image data using platform-specific helper.
+
+        Always returns (image_bytes|None, mime|None, file_paths|None).
+        """
         import os
         import platform
         import subprocess
@@ -4050,26 +4064,35 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
             system = platform.system()
 
             if system == "Darwin":
-                cmd = ["osascript", "-l", "JavaScript", os.path.join(helpers_dir, "clipboard_image.js")]
+                cmd = ["osascript", "-l", "JavaScript",
+                       os.path.join(helpers_dir, "clipboard_image.js")]
             elif system == "Linux":
                 cmd = ["bash", os.path.join(helpers_dir, "clipboard_image_linux.sh")]
             elif system == "Windows":
-                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", os.path.join(helpers_dir, "clipboard_image_windows.ps1")]
+                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File",
+                       os.path.join(helpers_dir, "clipboard_image_windows.ps1")]
             else:
-                return None, None
+                return None, None, None
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            output = result.stdout.strip()
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15)
+            if result.returncode != 0 and result.stderr:
+                print(f"[Claude] clipboard helper stderr: {result.stderr[:300]}")
+            output = (result.stdout or "").strip()
+            if not output:
+                return None, None, None
 
             if output.startswith("file_paths"):
-                paths = output.split("\n")[1:]
-                paths = [p.strip() for p in paths if p.strip()]
+                # Finder/file copy → paths only (including .png). Agent can
+                # read_image the path; do not embed as multimodal image data.
+                paths = [p.strip() for p in output.split("\n")[1:] if p.strip()]
                 return None, None, paths
 
             if output.startswith("image/"):
                 lines = output.split("\n")
-                mime_type = lines[0]
-                b64_data = lines[1] if len(lines) > 1 else ""
+                mime_type = lines[0].strip()
+                # base64 may be multi-line; join remainder
+                b64_data = "".join(lines[1:]).strip()
                 if b64_data:
                     return base64.b64decode(b64_data), mime_type, None
 

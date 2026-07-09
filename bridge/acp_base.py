@@ -151,6 +151,7 @@ class AcpBridge(BaseBridge):
     ACCEPT_EDITS_TOOLS = frozenset({
         "Read", "Write", "Edit", "Glob", "Grep", "TodoWrite", "NotebookEdit",
         "WebSearch", "WebFetch", "search_tool", "update_goal",
+        "read_image", "mcp__sublime__read_image",
         "x_keyword_search", "x_semantic_search", "x_user_search",
         "x_thread_fetch",
     })
@@ -158,6 +159,7 @@ class AcpBridge(BaseBridge):
     PLAN_READONLY_TOOLS = frozenset({
         "Read", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite",
         "search_tool", "update_goal",
+        "read_image", "mcp__sublime__read_image",
         "x_keyword_search", "x_semantic_search", "x_user_search",
         "x_thread_fetch",
     })
@@ -496,11 +498,20 @@ class AcpBridge(BaseBridge):
                         "input": payload,
                     })
                 text = self._extract_tool_content(upd, tool_name)
+                is_error = status == "failed"
+                # Grok read_file marks images failed ("Cannot read binary file")
+                # even after a successful fs/read — pixels need read_image, not
+                # text FS. Don't paint a red FAILED when path is an image; the
+                # agent can still use the path (image_edit) or read_image.
+                if is_error:
+                    soft = self._soften_image_read_fail(text, enriched, tool_name)
+                    if soft is not None:
+                        text, is_error = soft
                 send_notification("message", {
                     "type": "tool_result",
                     "tool_use_id": tid,
                     "content": text,
-                    "is_error": (status == "failed"),
+                    "is_error": is_error,
                 })
                 self._tool_ids_emitted.discard(tid)
         elif kind == "user_message_chunk":
@@ -735,6 +746,55 @@ class AcpBridge(BaseBridge):
             except Exception:
                 return str(raw)
         return str(raw)
+
+    def _soften_image_read_fail(
+            self, text: str, tool_input: Optional[dict],
+            tool_name: str) -> Optional[tuple]:
+        """Rewrite Grok image read_file fails so UI is not red FAILED.
+
+        Returns (new_text, is_error) or None if not this case.
+        """
+        t = (text or "").strip()
+        low = t.lower()
+        if "cannot read binary" not in low and "binary file" not in low:
+            return None
+        path = ""
+        if isinstance(tool_input, dict):
+            path = (
+                tool_input.get("file_path")
+                or tool_input.get("target_file")
+                or tool_input.get("path")
+                or ""
+            )
+        if not path and ":" in t:
+            # "Cannot read binary file: /abs/path.png"
+            path = t.split(":", 1)[-1].strip()
+        path_l = (path or "").lower()
+        is_img = any(path_l.endswith(e) for e in self._IMAGE_EXTS)
+        if not is_img and tool_name not in ("Read", "read_file", "ReadFile"):
+            return None
+        if not is_img and "cannot read binary" not in low:
+            return None
+        # Still soften when path missing but message is the binary-file stock error
+        # on a Read tool (Grok image reads).
+        if not is_img and tool_name not in ("Read", "read_file", "ReadFile", ""):
+            return None
+        if not is_img and not path:
+            # generic binary fail — leave as error
+            return None
+        if not is_img:
+            return None
+        note = (
+            f"Image on disk: {path}\n"
+            f"read_file cannot load pixels over ACP. For vision call "
+            f"use_tool with tool_name=\"sublime__read_image\" and "
+            f"tool_input={{\"path\": {path!r}}} "
+            f"(search_tool query=\"read_image\" if needed). "
+            f"image_edit/image_gen can take this path directly."
+        )
+        self.file_log(
+            f"soften image read fail → non-error UI for {path!r}")
+        return note, False
 
     @staticmethod
     def _extract_diff_input(upd: dict) -> Optional[dict]:
@@ -971,10 +1031,10 @@ class AcpBridge(BaseBridge):
             self.file_log(
                 f"query: superseding in-flight req {self._query_req_id}")
         prompt = params.get("prompt") or params.get("text") or ""
-        if isinstance(prompt, str):
-            prompt_blocks = [{"type": "text", "text": prompt}]
-        else:
-            prompt_blocks = prompt
+        images = params.get("images") or []
+        if not isinstance(images, list):
+            images = []
+        prompt_blocks = self._build_prompt_blocks(prompt, images)
         self._query_req_id = req_id
         self._prompt_cancelled = False
         try:
@@ -1027,6 +1087,90 @@ class AcpBridge(BaseBridge):
             self._prompt_fut = None
             self._prompt_acp_id = None
 
+    def _prompt_caps(self) -> dict:
+        return (self.agent_capabilities or {}).get("promptCapabilities") or {}
+
+    def _prompt_supports_images(self) -> bool:
+        return bool(self._prompt_caps().get("image"))
+
+    def _prompt_supports_embedded(self) -> bool:
+        return bool(self._prompt_caps().get("embeddedContext"))
+
+    def _image_b64(self, img: dict) -> tuple:
+        """Return (mime, base64_data) only — never put a filesystem path on the wire."""
+        import base64 as _b64
+        mime = (img.get("mime_type") or img.get("mimeType") or "image/png")
+        data = img.get("data") or ""
+        if data:
+            return mime, data
+        # Optional: load bytes from a local path the *plugin* already has, but
+        # still only emit base64 (no uri/path in the ACP prompt).
+        path = (img.get("path") or "").strip()
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    data = _b64.b64encode(f.read()).decode("ascii")
+                if not mime or mime == "image/png":
+                    low = path.lower()
+                    if low.endswith((".jpg", ".jpeg")):
+                        mime = "image/jpeg"
+                    elif low.endswith(".gif"):
+                        mime = "image/gif"
+                    elif low.endswith(".webp"):
+                        mime = "image/webp"
+                return mime, data
+            except OSError as e:
+                self.file_log(f"image load failed: {e}")
+        return mime, ""
+
+    def _build_prompt_blocks(self, prompt, images: list) -> list:
+        """Build ACP ContentBlock[] — images as base64 only, never file paths.
+
+        Grok will otherwise invent an assets/ path and call read_file on the
+        PNG (text fs API) → FAILED. Vision is one multimodal image block.
+        https://agentclientprotocol.com/protocol/v1/content
+        """
+        if isinstance(prompt, list):
+            blocks = [b for b in prompt if isinstance(b, dict)]
+            text = ""
+        else:
+            text = prompt if isinstance(prompt, str) else str(prompt or "")
+            blocks = []
+
+        if not images:
+            if not blocks:
+                blocks = [{"type": "text", "text": text}]
+            elif text:
+                blocks.append({"type": "text", "text": text})
+            return blocks
+
+        caps = self._prompt_caps()
+        use_image_cap = bool(caps.get("image"))
+        n_img = 0
+
+        for img in images:
+            if not isinstance(img, dict):
+                continue
+            mime, data = self._image_b64(img)
+            if not data:
+                self.file_log("query: skipped image with no base64 data")
+                continue
+            # Never set uri/path/resource_link for images.
+            blocks.append({
+                "type": "image",
+                "mimeType": mime or "image/png",
+                "data": data,
+            })
+            n_img += 1
+
+        self.file_log(
+            f"query: images→blocks image={n_img} (base64 only, no paths) "
+            f"caps={caps} image_cap={use_image_cap}")
+
+        if text or not any(b.get("type") == "text" for b in blocks):
+            blocks.append({"type": "text", "text": text or ""})
+        return blocks
+
     async def _send_prompt(self, prompt_blocks: list) -> Any:
         """session/prompt with a tracked future so interrupt can unblock us."""
         await self._spawn()
@@ -1037,11 +1181,50 @@ class AcpBridge(BaseBridge):
         self._prompt_fut = fut
         self._prompt_acp_id = rid
         params = {"sessionId": self.session_id, "prompt": prompt_blocks}
+        # Log without dumping multi-MB base64 image payloads
+        def _summarize_block(b: dict) -> dict:
+            t = b.get("type")
+            if t == "text":
+                return {"type": "text", "text": (b.get("text") or "")[:200]}
+            if t == "image":
+                return {
+                    "type": "image",
+                    "mimeType": b.get("mimeType"),
+                    "data_len": len(b.get("data") or ""),
+                    # never log/send path; uri must stay empty
+                    "has_uri": bool(b.get("uri")),
+                }
+            if t == "resource":
+                res = b.get("resource") or {}
+                return {
+                    "type": "resource",
+                    "mimeType": res.get("mimeType"),
+                    "blob_len": len(res.get("blob") or ""),
+                    "uri": res.get("uri"),
+                }
+            if t == "resource_link":
+                return {
+                    "type": "resource_link",
+                    "uri": b.get("uri"),
+                    "name": b.get("name"),
+                    "mimeType": b.get("mimeType"),
+                }
+            return {"type": t}
+        log_params = {
+            "sessionId": self.session_id,
+            "prompt": [
+                _summarize_block(b)
+                for b in (prompt_blocks or [])
+                if isinstance(b, dict)
+            ],
+        }
         line = json.dumps({
             "jsonrpc": "2.0", "id": rid,
             "method": "session/prompt", "params": params,
         })
-        self.file_log(f"→ acp session/prompt (id={rid}): {line[:800]}")
+        self.file_log(
+            f"→ acp session/prompt (id={rid}): "
+            f"{json.dumps(log_params)[:800]} (wire_len={len(line)})")
         async with self._get_acp_write_lock():
             self.proc.stdin.write((line + "\n").encode())
             await self.proc.stdin.drain()
@@ -1692,7 +1875,51 @@ class AcpBridge(BaseBridge):
             "feedback": plan_text if ok and plan_text else ("" if ok else summary),
         }
 
+    _IMAGE_EXTS = (
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+        ".tif", ".tiff", ".heic", ".heif", ".ico",
+    )
+    # Auto-captured screenshots (screencapture, Playwright, etc.) often land
+    # as real files; agent then read_file → fs/read_text_file. ACP has no
+    # binary fs method, so we re-encode pixels as a data URL in the text
+    # response. Cap ≈ xAI vision / common host limits.
+    _IMAGE_READ_MAX_BYTES = 5 * 1024 * 1024
+
+    @staticmethod
+    def _image_mime_from_bytes(head: bytes, path: str = "") -> Optional[str]:
+        """Detect image MIME from magic bytes, else common extensions."""
+        if len(head) >= 8 and head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if len(head) >= 3 and head[:3] == b"\xff\xd8\xff":
+            return "image/jpeg"
+        if len(head) >= 6 and head[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "image/webp"
+        if len(head) >= 2 and head[:2] == b"BM":
+            return "image/bmp"
+        if len(head) >= 4 and head[:4] in (b"II*\x00", b"MM\x00*"):
+            return "image/tiff"
+        low = (path or "").lower()
+        for ext, mime in (
+            (".png", "image/png"), (".jpg", "image/jpeg"),
+            (".jpeg", "image/jpeg"), (".gif", "image/gif"),
+            (".webp", "image/webp"), (".bmp", "image/bmp"),
+            (".tif", "image/tiff"), (".tiff", "image/tiff"),
+            (".ico", "image/x-icon"),
+            (".heic", "image/heic"), (".heif", "image/heif"),
+        ):
+            if low.endswith(ext):
+                return mime
+        return None
+
     async def _acp_fs_read(self, params: dict) -> dict:
+        """fs/read_text_file — UTF-8 text; images as short path metadata.
+
+        Grok's read_file still marks PNGs failed ("Cannot read binary file")
+        and tool_output_error if we dump multi-MB base64 into the text FS
+        result. Real vision is read_image (MCP) or media tools with a path.
+        """
         path = params.get("path") or ""
         if not path or not os.path.isabs(path):
             raise ValueError(
@@ -1702,10 +1929,23 @@ class AcpBridge(BaseBridge):
         max_chars = self.fs_read_max_chars if self.fs_read_max_chars > 0 else (
             2 * 1024 * 1024)
 
+        low = path.lower()
+        by_ext = any(low.endswith(ext) for ext in self._IMAGE_EXTS)
+
         def _read() -> str:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with open(path, "rb") as bf:
+                head = bf.read(512)
+            mime = self._image_mime_from_bytes(head, path)
+            if by_ext or mime:
+                return self._fs_read_image_as_text(path, mime_hint=mime)
+            # NUL ⇒ not text (archives, wasm, …) — don't UTF-8-mangle
+            if b"\x00" in head:
+                size = os.path.getsize(path)
+                raise ValueError(
+                    f"fs/read_text_file: binary file {path!r} ({size} bytes); "
+                    f"not UTF-8 text")
+            with open(path, "r", encoding="utf-8", errors="strict") as f:
                 if line is None and limit is None:
-                    # Whole-file: fail if over gate (agent should page).
                     chunk = f.read(max_chars + 1)
                     if len(chunk) > max_chars:
                         raise ValueError(
@@ -1725,6 +1965,36 @@ class AcpBridge(BaseBridge):
 
         content = await asyncio.to_thread(_read)
         return {"content": content}
+
+    def _fs_read_image_as_text(
+            self, path: str, mime_hint: Optional[str] = None) -> str:
+        """Short image metadata for text FS (no multi-MB base64).
+
+        Grok rejects base64 dumps as tool_output_error / binary. Point the
+        agent at read_image for pixels; keep path for image_edit etc.
+        """
+        import struct
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(64)
+        mime = mime_hint or self._image_mime_from_bytes(head, path) or "image/png"
+        w = h = 0
+        if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
+            w, h = struct.unpack(">II", head[16:24])
+        dim = f"{w}x{h}" if w and h else "unknown"
+        note = (
+            f"Image file ({mime}), {size} bytes, dimensions≈{dim}.\n"
+            f"Path: {path}\n"
+            f"Do not use read_file for pixels. Call use_tool with "
+            f"tool_name=\"sublime__read_image\" and "
+            f"tool_input={{\"path\": {path!r}}} "
+            f"(search_tool query=\"read_image\" first if unknown). "
+            f"Or pass the path to image_edit / image_gen."
+        )
+        self.file_log(
+            f"fs/read_text_file: image {path!r} → path note "
+            f"(mime={mime}, size={size}, no base64)")
+        return note
 
     async def _acp_fs_write(self, params: dict) -> dict:
         path = params.get("path") or ""

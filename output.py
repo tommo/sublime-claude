@@ -244,6 +244,7 @@ class OutputView:
         self._media_phantom_set = None  # inline image previews (minihtml data: URIs)
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
         self._media_anchor: Dict[str, int] = {}  # abs path -> buffer pt for popup
+        self._context_phantom_set = None  # clickable open/reveal chips on 📎 line
 
     def show(self, focus: bool = True) -> None:
         # If we already have a view, optionally focus it
@@ -509,9 +510,11 @@ class OutputView:
             names = [item.name for item in session.pending_context]
             ctx_line = f"{CONTEXT_PREFIX}{', '.join(names)}\n"
             # print(f"[Claude] enter_input_mode: adding context line: {repr(ctx_line)}")
+            ctx_start = self.view.size()
             self.view.run_command("append", {"characters": ctx_line})
-        # else:
-            # print(f"[Claude] enter_input_mode: no pending context to add, session={session is not None}")
+            self._pending_context_region = (ctx_start, self.view.size())
+        else:
+            self._pending_context_region = (0, 0)
 
         self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
@@ -526,6 +529,11 @@ class OutputView:
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
         self.view.show(self._input_start)
+
+        # Clickable open/reveal chips under the 📎 context line
+        items = list(session.pending_context) if session and session.pending_context else []
+        sublime.set_timeout(
+            lambda it=items: self._refresh_context_phantoms(it), 10)
 
         # Pin the permission-mode banner at the fresh input area (non-baseline modes only)
         if session:
@@ -671,6 +679,7 @@ class OutputView:
         if not context_items:
             # print(f"[Claude] set_pending_context: no items, clearing region")
             self._pending_context_region = (0, 0)
+            self._refresh_context_phantoms([])
             return
 
         # Build context display
@@ -684,6 +693,9 @@ class OutputView:
         self._pending_context_region = (start, end)
         # print(f"[Claude] set_pending_context: wrote at ({start}, {end}), view_size now={self.view.size()}")
         self._scroll_to_end()
+        sublime.set_timeout(
+            lambda items=list(context_items): self._refresh_context_phantoms(items),
+            10)
 
     def prompt(self, text: str, context_names: List[str] = None) -> None:
         """Start a new conversation with a prompt."""
@@ -723,6 +735,7 @@ class OutputView:
         if end > start:
             self._replace(start, end, "")
             self._pending_context_region = (0, 0)
+        self._refresh_context_phantoms([])
 
         # Finalize and save previous conversation
         prev_todos = []
@@ -3020,16 +3033,122 @@ class OutputView:
         if not path:
             return
         # reveal in Finder / Explorer / file manager — never open in ST
+        self._reveal_path(path)
+
+    def _reveal_path(self, path: str) -> None:
+        """Reveal a path in the OS file manager."""
+        import subprocess
+        path = os.path.expanduser(path or "")
+        if not path:
+            return
         try:
             if sublime.platform() == "osx":
                 subprocess.Popen(["open", "-R", path])
             elif sublime.platform() == "windows":
                 subprocess.Popen(["explorer", "/select,", path])
             else:
-                subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+                target = path if os.path.isdir(path) else (
+                    os.path.dirname(path) or ".")
+                subprocess.Popen(["xdg-open", target])
             sublime.status_message(f"Revealed {os.path.basename(path)}")
         except Exception as e:
             sublime.status_message(f"Reveal failed: {e}")
+
+    def _open_path(self, path: str) -> None:
+        """Open a code/text file in Sublime."""
+        path = os.path.expanduser(path or "")
+        if not path:
+            return
+        window = self.view.window() if self.view else None
+        if not window:
+            return
+        if os.path.isdir(path):
+            self._reveal_path(path)
+            return
+        window.open_file(path)
+        sublime.status_message(f"Opened {os.path.basename(path)}")
+
+    def _refresh_context_phantoms(self, context_items: list) -> None:
+        """Clickable chips on the 📎 line: open (code) / reveal (non-code)."""
+        import html as _html
+        if not self.view or not self.view.is_valid():
+            return
+        try:
+            if self._context_phantom_set is None:
+                self._context_phantom_set = sublime.PhantomSet(
+                    self.view, "claude_context_chips")
+        except Exception:
+            return
+
+        if not context_items:
+            try:
+                self._context_phantom_set.update([])
+            except Exception:
+                pass
+            return
+
+        start, end = self._pending_context_region
+        if end <= start:
+            # Find last 📎 line in buffer
+            content = self.view.substr(sublime.Region(0, self.view.size()))
+            idx = content.rfind(CONTEXT_PREFIX)
+            if idx < 0:
+                try:
+                    self._context_phantom_set.update([])
+                except Exception:
+                    pass
+                return
+            start = idx
+            nl = content.find("\n", idx)
+            end = nl + 1 if nl >= 0 else self.view.size()
+
+        chips = []
+        for item in context_items:
+            path = getattr(item, "path", "") or ""
+            name = _html.escape(item.name or os.path.basename(path) or "?")
+            try:
+                action = item.open_action  # property: "open" | "reveal"
+            except Exception:
+                action = "reveal"
+            if action not in ("open", "reveal"):
+                action = "reveal"
+            if not path:
+                chips.append(
+                    f'<span style="color:color(var(--foreground) alpha(0.75))">'
+                    f'{name}</span>')
+                continue
+            href = f"{action}:{path}"
+            label = "open" if action == "open" else "reveal"
+            chips.append(
+                f'<a href="{_html.escape(href)}">{name}</a>'
+                f'<span style="color:color(var(--foreground) alpha(0.45))">'
+                f' · {label}</span>'
+            )
+        body = (
+            f'<body id="claude-context-chips" '
+            f'style="margin:0;padding:1px 0;font-size:11px;'
+            f'color:color(var(--foreground) alpha(0.85))">'
+            f'📎 {" · ".join(chips)}</body>'
+        )
+        try:
+            # LAYOUT_BELOW keeps buffer names as fallback; chips are clickable
+            ph = sublime.Phantom(
+                sublime.Region(start, min(start + 1, end)),
+                body,
+                sublime.LAYOUT_BLOCK,
+                on_navigate=self._handle_context_href,
+            )
+            self._context_phantom_set.update([ph])
+        except Exception as e:
+            print(f"[Claude] context phantoms: {e}")
+
+    def _handle_context_href(self, href: str) -> None:
+        if not href:
+            return
+        if href.startswith("open:"):
+            self._open_path(href[5:])
+        elif href.startswith("reveal:"):
+            self._reveal_path(href[7:])
 
     def _format_bash_result(self, result: str) -> str:
         """Format Bash command output (head + tail if long)."""

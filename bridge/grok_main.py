@@ -9,6 +9,10 @@ import shutil
 import sys
 from typing import Dict, List, Optional
 
+# MCP read_image returns base64 image blocks; default Grok MCP cap is ~20KB
+# which truncates screenshots. Raise for vision tool results.
+_MCP_IMAGE_OUTPUT_BYTES = str(8 * 1024 * 1024)
+
 _BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _PLUGIN_DIR = os.path.dirname(_BRIDGE_DIR)
 sys.path.insert(0, _BRIDGE_DIR)
@@ -99,6 +103,10 @@ class GrokBridge(AcpBridge):
         "ReferenceToVideo": "reference_to_video",
         "video_gen": "video_gen",
         "VideoGen": "video_gen",
+        # Vision read of on-disk screenshots (MCP sublime.read_image).
+        "read_image": "read_image",
+        "ReadImage": "read_image",
+        "mcp__sublime__read_image": "read_image",
         # X / Twitter search tools.
         "x_keyword_search": "x_keyword_search",
         "x_semantic_search": "x_semantic_search",
@@ -126,6 +134,38 @@ class GrokBridge(AcpBridge):
             args.append("--always-approve")
         args.append("stdio")
         return args
+
+    def spawn_env(self) -> Optional[Dict[str, str]]:
+        env = dict(os.environ)
+        # Allow MCP read_image screenshot payloads (default ~20KB is too small).
+        for key in ("GROK_MAX_MCP_OUTPUT_BYTES", "MAX_MCP_OUTPUT_BYTES"):
+            cur = env.get(key)
+            try:
+                if cur is not None and int(cur) >= int(_MCP_IMAGE_OUTPUT_BYTES):
+                    continue
+            except ValueError:
+                pass
+            env[key] = _MCP_IMAGE_OUTPUT_BYTES
+        return env
+
+    def build_session_meta(self, *, system_prompt: str = "",
+                           resume_failed: bool = False) -> Dict:
+        meta = super().build_session_meta(
+            system_prompt=system_prompt, resume_failed=resume_failed)
+        # Grok does not expose MCP tools as bare names — discover with
+        # search_tool, call with use_tool. Without this, agents invent
+        # read_image / fail to find the vision path for screenshots.
+        image_rule = (
+            "Images on disk: do NOT use read_file (fails with Cannot read "
+            "binary file over ACP). Use MCP via use_tool with "
+            "tool_name=\"sublime__read_image\" and tool_input="
+            "{\"path\":\"/absolute/path.png\"}. If the tool is unknown, "
+            "search_tool query=\"read_image\" first. Media tools "
+            "(image_edit/image_gen) accept file paths directly."
+        )
+        existing = meta.get("rules") or ""
+        meta["rules"] = (existing + "\n" + image_rule).strip() if existing else image_rule
+        return meta
 
     def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:
         pm = permission_mode or "default"
