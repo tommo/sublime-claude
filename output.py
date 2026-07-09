@@ -873,21 +873,26 @@ class OutputView:
                         self.current.todos_all_done = True
         elif name == "update_goal":
             # Single sticky goal — not a multi-item Task list.
+            # completed=true CLEARS the sticky strip (tool line already records
+            # the completion). Progress-only messages only stick if a goal is
+            # already open, or they open a new active goal when message is set.
             blocked = (tool_input.get("blocked_reason") or "").strip()
             msg = (tool_input.get("message") or "").strip()
             if blocked:
                 self.current.goal = GoalState(
                     status="blocked", message=msg, blocked_reason=blocked)
             elif tool_input.get("completed") is True:
-                self.current.goal = GoalState(
-                    status="completed", message=msg, blocked_reason="")
+                # Done → drop sticky chrome. (Was: status=completed stayed
+                # painted forever as "◎ goal · done …".)
+                self.current.goal = None
             else:
                 prev = self.current.goal
-                self.current.goal = GoalState(
-                    status="active",
-                    message=msg or (prev.message if prev else ""),
-                    blocked_reason="",
-                )
+                if msg or (prev and prev.status in ("active", "blocked")):
+                    self.current.goal = GoalState(
+                        status="active",
+                        message=msg or (prev.message if prev else ""),
+                        blocked_reason="",
+                    )
 
         self._render_current()
 
@@ -2508,7 +2513,9 @@ class OutputView:
         if not open_todos:
             self.current.todos_all_done = True
         goal = self.current.goal
-        show_goal = bool(goal and goal.status in ("active", "blocked", "completed"))
+        # Sticky strip: only open goals (active/blocked). completed is cleared
+        # on update_goal and never carried to the next turn.
+        show_goal = bool(goal and goal.status in ("active", "blocked"))
         show_tasks = False
         show = []
         hidden = 0
@@ -2531,8 +2538,6 @@ class OutputView:
             if show_goal:
                 if goal.status == "blocked":
                     glabel, body = "blocked", (goal.blocked_reason or goal.message or "")
-                elif goal.status == "completed":
-                    glabel, body = "done", (goal.message or "")
                 else:
                     glabel, body = "active", (goal.message or "")
                 # Prefix "◎ goal · <status>" is scoped separately from tasks.
