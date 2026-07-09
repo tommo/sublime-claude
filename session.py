@@ -1029,9 +1029,11 @@ class Session:
                 # Hide the previous turn's @done(…) line while this wake processes;
                 # meta() of the wake result will set a fresh duration on completion.
                 self.output.current.duration = 0
+                self.output.current.has_meta = False
                 self.output._render_current()
         self.output._update_title()
         self._animate()
+        self._query_start = time.time()
         query_params = {"prompt": full_prompt}
         if hasattr(self, '_pending_images') and self._pending_images:
             query_params["images"] = self._pending_images
@@ -2105,7 +2107,16 @@ class Session:
             self._save_session()
         cost = params.get("total_cost_usd") or 0
         self.total_cost += cost
-        dur = params.get("duration_ms", 0) / 1000
+        try:
+            dur = float(params.get("duration_ms") or 0) / 1000.0
+        except (TypeError, ValueError):
+            dur = 0.0
+        # ACP bridges often omit/zero duration_ms — fall back to local elapsed.
+        if dur <= 0 and getattr(self, "_query_start", None):
+            try:
+                dur = max(0.0, time.time() - self._query_start)
+            except Exception:
+                pass
         usage = params.get("usage")
         if usage:
             self.context_usage = usage

@@ -195,6 +195,7 @@ class Conversation:
     goal: Optional[GoalState] = None  # sticky single goal from update_goal
     working: bool = True  # True while processing, False when done
     duration: float = 0.0
+    has_meta: bool = False  # True after meta() — show @done even if duration is 0
     usage: dict = None
     region: tuple = (0, 0)
     context_names: List[str] = field(default_factory=list)  # Context files used
@@ -1207,7 +1208,11 @@ class OutputView:
         if not self.current:
             return
 
-        self.current.duration = duration
+        try:
+            self.current.duration = max(0.0, float(duration or 0))
+        except (TypeError, ValueError):
+            self.current.duration = 0.0
+        self.current.has_meta = True
         self.current.usage = usage
         self.current.working = False
         self._render_current()
@@ -2557,9 +2562,11 @@ class OutputView:
                 elif expanded:
                     lines.append("  (super+click to collapse)\n")
 
-        # Meta
-        if self.current.duration > 0:
-            meta_parts = [f"{self.current.duration:.1f}s"]
+        # Meta — show after meta() even when duration_ms was 0 (ACP/Grok).
+        if self.current.has_meta or self.current.duration > 0:
+            meta_parts = []
+            if self.current.duration > 0:
+                meta_parts.append(f"{self.current.duration:.1f}s")
             if self.current.usage:
                 u = self.current.usage
                 def _n(k):
@@ -2592,6 +2599,8 @@ class OutputView:
                         meta_parts.append(_model)
                 elif _label and _label != "Claude":
                     meta_parts.append(_label)
+            if not meta_parts:
+                meta_parts.append("ok")
             lines.append(f"\n  @done({', '.join(meta_parts)})\n")
 
         text = "".join(lines)
@@ -2682,6 +2691,136 @@ class OutputView:
         if len(lines) <= 1 and len(text) < 80:
             return f" → {text[:60]}"
         return f" → {len(lines)} lines"
+
+    def _parse_websearch_hits(self, result: str) -> list:
+        """Extract [{title, url}, ...] from WebSearch tool result text."""
+        import json
+        import re
+        from urllib.parse import urlparse
+
+        if not result or not str(result).strip():
+            return []
+        text = str(result).strip()
+        hits = []
+
+        def _add(title, url):
+            title = (title or "").strip()
+            url = (url or "").strip()
+            if not title and not url:
+                return
+            if not title:
+                try:
+                    title = urlparse(url).netloc or url
+                except Exception:
+                    title = url
+            # de-dupe by url then title
+            key = url or title
+            if any((h.get("url") or h.get("title")) == key for h in hits):
+                return
+            hits.append({"title": title, "url": url})
+
+        # 1) Claude Code: Links: [{title, url}, ...]
+        idx = text.find("Links:")
+        if idx >= 0:
+            rest = text[idx + len("Links:"):].lstrip()
+            if rest.startswith("["):
+                try:
+                    arr, _ = json.JSONDecoder().raw_decode(rest)
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if isinstance(item, dict):
+                                _add(item.get("title") or item.get("name"),
+                                     item.get("url") or item.get("link"))
+                            elif isinstance(item, str) and item.startswith("http"):
+                                _add("", item)
+                except Exception:
+                    pass
+
+        # 2) Full JSON payload
+        if not hits:
+            try:
+                data = json.loads(text)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict):
+                            _add(item.get("title") or item.get("name"),
+                                 item.get("url") or item.get("link"))
+                elif isinstance(data, dict):
+                    arr = (data.get("results") or data.get("organic")
+                           or data.get("items") or data.get("data") or [])
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if not isinstance(item, dict):
+                                continue
+                            # nested content arrays (Claude toolUseResult shape)
+                            content = item.get("content")
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict):
+                                        _add(c.get("title"), c.get("url") or c.get("link"))
+                            else:
+                                _add(item.get("title") or item.get("name"),
+                                     item.get("url") or item.get("link"))
+            except Exception:
+                pass
+
+        # 3) Markdown links [title](url)
+        if not hits:
+            for title, url in re.findall(
+                    r"\[([^\]]+)\]\((https?://[^)\s]+)\)", text):
+                _add(title, url)
+
+        # 4) web_search_result-ish lines / bare titles before URLs
+        if not hits:
+            for url in re.findall(r"https?://[^\s\]\"'<>]+", text):
+                _add("", url.rstrip(".,);"))
+
+        return hits
+
+    def _format_websearch_result(self, result: str) -> str:
+        """WebSearch: result count + top titles (with host)."""
+        from urllib.parse import urlparse
+
+        hits = self._parse_websearch_hits(result)
+        if not hits:
+            if not result or not str(result).strip():
+                return " → 0 results"
+            # Fallback: show first non-empty line of prose summary
+            for line in str(result).splitlines():
+                s = line.strip()
+                if not s or s.startswith("Web search results") or s.startswith("Links:"):
+                    continue
+                if len(s) > 90:
+                    s = s[:89] + "…"
+                return f" → {s}"
+            return " → done"
+
+        max_show = 6
+        max_title = 72
+        lines = [f" → {len(hits)} result{'s' if len(hits) != 1 else ''}"]
+        for h in hits[:max_show]:
+            title = (h.get("title") or "").replace("\n", " ").strip()
+            if len(title) > max_title:
+                title = title[: max_title - 1] + "…"
+            host = ""
+            url = h.get("url") or ""
+            if url:
+                try:
+                    host = urlparse(url).netloc
+                    if host.startswith("www."):
+                        host = host[4:]
+                except Exception:
+                    host = ""
+            if host and title and host.lower() not in title.lower():
+                lines.append(f"    │ {title}  · {host}")
+            elif title:
+                lines.append(f"    │ {title}")
+            elif host:
+                lines.append(f"    │ {host}")
+        omitted = len(hits) - max_show
+        if omitted > 0:
+            lines.append(f"    │ … +{omitted} more")
+        return "\n".join(lines) if len(lines) > 1 else lines[0]
 
     def _media_path_for_tool(self, tool: "ToolCall") -> Optional[str]:
         if not isinstance(tool.tool_input, dict):

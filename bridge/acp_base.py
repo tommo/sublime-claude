@@ -60,6 +60,9 @@ INPUT_KEY_MAP = {
     "oldString": "old_string",
     "newString": "new_string",
     "oldText": "old_string",
+    "newText": "new_string",  # Edit; Write also copies to content below
+    "contents": "content",  # Grok write body alias
+    "oldText": "old_string",
     "newText": "new_string",
     "old_str": "old_string",
     "new_str": "new_string",
@@ -1012,6 +1015,12 @@ class AcpBridge(BaseBridge):
         # WebSearch-shaped tools: ensure query
         if tool_name == "WebSearch" and not out.get("query"):
             out["query"] = out.get("pattern") or out.get("q") or ""
+        # Write: Grok/ACP may only set new_string (diff) or contents
+        if tool_name == "Write" and not out.get("content"):
+            for alt in ("contents", "new_string", "newText", "text", "body"):
+                if out.get(alt):
+                    out["content"] = out[alt]
+                    break
         return out
 
     def _tool_input_from_update(self, upd: dict, tool_name: str = "") -> dict:
@@ -1157,7 +1166,9 @@ class AcpBridge(BaseBridge):
                 if inner.get("oldText") is not None:
                     out["old_string"] = inner["oldText"]
                 if inner.get("newText") is not None:
+                    # Edit formatter uses new_string; Write size uses content.
                     out["new_string"] = inner["newText"]
+                    out["content"] = inner["newText"]
                 if out:
                     return out
         return None
@@ -1386,6 +1397,7 @@ class AcpBridge(BaseBridge):
         self._query_req_id = req_id
         self._prompt_cancelled = False
         self._cancel_in_flight = False
+        turn_t0 = time.time()
         try:
             result = await self._send_prompt(prompt_blocks) or {}
             stop_reason = result.get("stopReason", "end_turn")
@@ -1394,13 +1406,14 @@ class AcpBridge(BaseBridge):
                 or stop_reason in ("cancelled", "canceled", "interrupted")
             )
             usage = self.usage_from_prompt_result(result)
+            duration_ms = max(0, int((time.time() - turn_t0) * 1000))
             if usage:
                 send_notification("message",
                                   {"type": "turn_usage", "usage": usage})
             send_notification("message", {
                 "type": "result",
                 "session_id": self.session_id or "",
-                "duration_ms": 0,
+                "duration_ms": duration_ms,
                 "is_error": False,
                 "num_turns": 1,
                 "total_cost_usd": 0,
@@ -1416,10 +1429,11 @@ class AcpBridge(BaseBridge):
                     "stopReason": stop_reason})
         except Exception as e:
             if self._prompt_cancelled:
+                duration_ms = max(0, int((time.time() - turn_t0) * 1000))
                 send_notification("message", {
                     "type": "result",
                     "session_id": self.session_id or "",
-                    "duration_ms": 0,
+                    "duration_ms": duration_ms,
                     "is_error": False,
                     "num_turns": 1,
                     "total_cost_usd": 0,

@@ -288,11 +288,48 @@ def _edit(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _write(view: "OutputView", tool: "ToolCall") -> str:
-    out = f": {tool.tool_input.get('file_path', '')}"
-    content = tool.tool_input.get("content") or ""
+    """Write: path + size, same spirit as Claude Code Read (lines/bytes).
+
+    Claude SDK puts body in tool_input.content. ACP/Grok often only expose
+    path + newText (diff) or `contents` / `new_string` — accept all.
+    """
+    import os
+    ti = tool.tool_input or {}
+    path = (
+        ti.get("file_path")
+        or ti.get("path")
+        or ti.get("target_file")
+        or ti.get("filePath")
+        or ""
+    )
+    content = (
+        ti.get("content")
+        or ti.get("contents")
+        or ti.get("new_string")
+        or ti.get("newText")
+        or ""
+    )
+    if not isinstance(content, str):
+        content = str(content) if content is not None else ""
+    out = f": {path}" if path else ""
+    nbytes = 0
+    lines = 0
     if content:
-        lines = len(content.splitlines())
+        lines = len(content.splitlines()) or (1 if content else 0)
         nbytes = len(content.encode("utf-8", "replace"))
+    elif tool.status == "done" and path and os.path.isfile(path):
+        # Content stripped from tool stream — measure written file on disk.
+        try:
+            nbytes = os.path.getsize(path)
+            with open(path, "rb") as f:
+                # Count newlines without loading whole file into str if huge
+                data = f.read()
+            lines = data.count(b"\n")
+            if data and not data.endswith(b"\n"):
+                lines += 1
+        except OSError:
+            pass
+    if nbytes or lines:
         size = f"{nbytes / 1024:.1f} KB" if nbytes >= 1024 else f"{nbytes} B"
         out += f" → {lines} lines, {size}"
     return out
@@ -313,7 +350,11 @@ def _grep(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _websearch(view: "OutputView", tool: "ToolCall") -> str:
-    return f": {tool.tool_input.get('query', '')}"
+    q = tool.tool_input.get("query", "") if tool.tool_input else ""
+    out = f": {q}" if q else ""
+    if tool.result and tool.status in ("done", "error"):
+        out += view._format_websearch_result(tool.result)
+    return out
 
 
 def _search_tool(view: "OutputView", tool: "ToolCall") -> str:
