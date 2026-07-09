@@ -755,6 +755,9 @@ class Session:
     def clear_context(self) -> None:
         self.context.clear()
 
+    def remove_context_at(self, index: int) -> bool:
+        return self.context.remove_at(index)
+
     def _update_context_display(self) -> None:
         self.context._refresh_display()
 

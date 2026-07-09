@@ -1090,7 +1090,11 @@ class MCPSocketServer:
               f"resume_id={resume_id!r} fork={fork} "
               f"profile={profile!r} checkpoint={checkpoint!r} persona_id={persona_id} "
               f"caller_view={_caller_view_id} subsession_id={subsession_id}")
-        session = create_session(window, resume_id=resume_id, fork=fork, profile=profile_config, initial_context=initial_context, backend=backend)
+        # Background subsession — do not steal focus from the parent sheet.
+        session = create_session(
+            window, resume_id=resume_id, fork=fork, profile=profile_config,
+            initial_context=initial_context, backend=backend, focus=False,
+        )
         print(f"[MCP spawn] created view_id={session.output.view.id() if session.output and session.output.view else None} "
               f"backend={session.backend} prompt_preview={prompt[:80]!r}")
         if name:

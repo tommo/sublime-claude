@@ -10,8 +10,9 @@ so existing callers (commands.py, listeners.py, output.py) keep working.
 """
 import base64
 import os
+import re
 import tempfile
-from typing import List, Tuple, TYPE_CHECKING
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .session import Session
@@ -35,6 +36,11 @@ _CODE_EXTS = (
     ".svg",  # openable as text
 )
 
+# Trailing line-range suffix: :L10, :L10-L20, :L1-L5,L10-L12
+_LINE_RANGE_RE = re.compile(
+    r"(:L\d+(?:-L\d+)?(?:,L\d+(?:-L\d+)?)*)\s*$"
+)
+
 
 def is_code_path(path: str) -> bool:
     """True if path should open in the editor (vs reveal in Finder)."""
@@ -54,13 +60,40 @@ def is_image_path(path: str) -> bool:
     return bool(path) and path.lower().endswith(_IMAGE_EXTS)
 
 
+def split_selection_ref(ref: str) -> Tuple[str, str]:
+    """Split 'path:L10-L20' → ('path', 'L10-L20'). Range may be ''."""
+    if not ref:
+        return "", ""
+    m = _LINE_RANGE_RE.search(ref)
+    if not m:
+        return ref, ""
+    return ref[: m.start()], m.group(1)[1:]  # drop leading ':'
+
+
+def format_line_range(row_start: int, row_end: int) -> str:
+    """1-based inclusive rows → 'L10' or 'L10-L20'."""
+    if row_start == row_end:
+        return f"L{row_start}"
+    return f"L{row_start}-L{row_end}"
+
+
+def first_line_of_range(line_range: str) -> Optional[int]:
+    """First line number from 'L10-L20' / 'L10' / 'L1-L2,L9'."""
+    if not line_range:
+        return None
+    m = re.match(r"L(\d+)", line_range)
+    return int(m.group(1)) if m else None
+
+
 class ContextItem:
     """A pending context item to attach to next query."""
-    def __init__(self, kind: str, name: str, content: str, path: str = ""):
+    def __init__(self, kind: str, name: str, content: str, path: str = "",
+                 line_range: str = ""):
         self.kind = kind  # "file" | "selection" | "folder" | "image" | "path"
-        self.name = name  # Display name
+        self.name = name  # Display name (includes :L… for selections)
         self.content = content  # Actual content (or __IMAGE__:mime:b64 for images)
         self.path = path  # Absolute path on disk when known
+        self.line_range = line_range  # e.g. "L10-L20" for selection chips
 
     @property
     def open_action(self) -> str:
@@ -70,7 +103,7 @@ class ContextItem:
         p = self.path or self.name
         if is_image_path(p):
             return "reveal"
-        if is_code_path(p):
+        if is_code_path(p) or self.kind == "selection":
             return "open"
         return "reveal"
 
@@ -105,17 +138,22 @@ class ContextManager:
         self._refresh_display()
 
     def add_selection(self, path: str, content: str) -> None:
-        # path may be "file.py:L1-L10"
-        file_part = (path or "").split(":")[0]
+        # path may be "file.py:L1-L10" or plain path (range optional).
+        file_part, line_range = split_selection_ref(path or "")
         abspath = (
             os.path.abspath(os.path.expanduser(file_part))
             if file_part and not file_part.startswith("untitled")
             else file_part)
-        name = os.path.basename(file_part) if file_part else "selection"
+        base = os.path.basename(file_part) if file_part else "selection"
+        # Preserve line range on the chip (and in the agent-facing header).
+        name = f"{base}:{line_range}" if line_range else base
+        loc = f"{abspath or file_part or path}:{line_range}" if line_range else (
+            abspath or file_part or path or "selection")
         self.items.append(ContextItem(
             "selection", name,
-            f"Selection from {path}:\n```\n{content}\n```",
-            path=abspath or ""))
+            f"Selection from {loc}:\n```\n{content}\n```",
+            path=abspath or "",
+            line_range=line_range))
         self._refresh_display()
 
     def add_folder(self, path: str) -> None:
@@ -217,6 +255,14 @@ class ContextManager:
     def clear(self) -> None:
         self.items = []
         self._refresh_display()
+
+    def remove_at(self, index: int) -> bool:
+        """Remove one pending item by index. Returns True if removed."""
+        if index < 0 or index >= len(self.items):
+            return False
+        del self.items[index]
+        self._refresh_display()
+        return True
 
     def take(self) -> Tuple[List[ContextItem], List[str]]:
         """Consume the current items: returns (items_snapshot, names) and clears."""

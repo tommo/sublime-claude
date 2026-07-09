@@ -1172,9 +1172,14 @@ class ClaudeCodeAddSelectionCommand(sublime_plugin.WindowCommand):
             return
         content = view.substr(sel[0])
         path = view.file_name() or "untitled"
-        s.add_context_selection(path, content)
-        name = path.split("/")[-1] if "/" in path else path
-        sublime.status_message(f"Added selection from: {name}")
+        from .context_manager import format_line_range
+        r0 = view.rowcol(sel[0].begin())[0] + 1
+        r1 = view.rowcol(sel[0].end())[0] + 1
+        label = f"{path}:{format_line_range(r0, r1)}"
+        s.add_context_selection(label, content)
+        base = path.split("/")[-1] if "/" in path else path
+        sublime.status_message(
+            f"Added selection from: {base}:{format_line_range(r0, r1)}")
 
 
 class ClaudeCodeAddOpenFilesCommand(sublime_plugin.WindowCommand):
@@ -4046,16 +4051,13 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
             return False
         path = _last_copy_meta["file"]
         regions = _last_copy_meta["regions"]
-        region_parts = []
-        for start, end in regions:
-            if start == end:
-                region_parts.append(f"L{start}")
-            else:
-                region_parts.append(f"L{start}-L{end}")
-        region_str = ",".join(region_parts)
+        from .context_manager import format_line_range
+        region_str = ",".join(
+            format_line_range(start, end) for start, end in regions)
         label = f"{path}:{region_str}"
         session.add_context_selection(label, text)
-        sublime.status_message(f"Pasted as context: {os.path.basename(path)}:{region_str}")
+        sublime.status_message(
+            f"Pasted as context: {os.path.basename(path)}:{region_str}")
         return True
 
     def _get_clipboard_image(self):

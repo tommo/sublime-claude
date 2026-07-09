@@ -513,15 +513,13 @@ class OutputView:
                 detail = self._format_tool_detail(bt)
                 self.view.run_command("append", {"characters": f"  {BACKGROUND_PREFIX}{bt.name}{detail}\n"})
 
-        # Add context line if any
+        # Add context anchor if any. Names + open/reveal live in the inline
+        # phantom only (buffer keeps just 📎 so we don't double-render).
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
         if session and session.pending_context:
-            names = [item.name for item in session.pending_context]
-            ctx_line = f"{CONTEXT_PREFIX}{', '.join(names)}\n"
-            # print(f"[Claude] enter_input_mode: adding context line: {repr(ctx_line)}")
             ctx_start = self.view.size()
-            self.view.run_command("append", {"characters": ctx_line})
+            self.view.run_command("append", {"characters": f"{CONTEXT_PREFIX}\n"})
             self._pending_context_region = (ctx_start, self.view.size())
         else:
             self._pending_context_region = (0, 0)
@@ -540,7 +538,7 @@ class OutputView:
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
         self.view.show(self._input_start)
 
-        # Clickable open/reveal chips under the 📎 context line
+        # Clickable open/reveal chips inline after 📎 (same line, not a 2nd row)
         items = list(session.pending_context) if session and session.pending_context else []
         sublime.set_timeout(
             lambda it=items: self._refresh_context_phantoms(it), 10)
@@ -581,6 +579,8 @@ class OutputView:
         self._input_mode = False
         self.view.settings().set("claude_input_mode", False)
         self.view.set_read_only(True)
+        self._pending_context_region = (0, 0)
+        self._refresh_context_phantoms([])
         return input_text
 
     def get_input_text(self) -> str:
@@ -692,16 +692,11 @@ class OutputView:
             self._refresh_context_phantoms([])
             return
 
-        # Build context display
-        names = [item.name for item in context_items]
-        text = f"\n{CONTEXT_PREFIX}{', '.join(names)} ({len(names)} file{'s' if len(names) > 1 else ''})\n"
-        # print(f"[Claude] set_pending_context: writing context text: {repr(text)}")
-
-        # Write at end
+        # Anchor only (📎); clickable names/actions are the inline phantom.
+        text = f"\n{CONTEXT_PREFIX}\n"
         start = self.view.size()
         end = self._write(text)
         self._pending_context_region = (start, end)
-        # print(f"[Claude] set_pending_context: wrote at ({start}, {end}), view_size now={self.view.size()}")
         self._scroll_to_end()
         sublime.set_timeout(
             lambda items=list(context_items): self._refresh_context_phantoms(items),
@@ -3116,8 +3111,8 @@ class OutputView:
         except Exception as e:
             sublime.status_message(f"Reveal failed: {e}")
 
-    def _open_path(self, path: str) -> None:
-        """Open a code/text file in Sublime."""
+    def _open_path(self, path: str, line: int = None) -> None:
+        """Open a code/text file in Sublime; optional 1-based line jump."""
         path = os.path.expanduser(path or "")
         if not path:
             return
@@ -3127,11 +3122,21 @@ class OutputView:
         if os.path.isdir(path):
             self._reveal_path(path)
             return
-        window.open_file(path)
-        sublime.status_message(f"Opened {os.path.basename(path)}")
+        if line and line > 0:
+            window.open_file(
+                f"{path}:{line}", sublime.ENCODED_POSITION)
+            sublime.status_message(
+                f"Opened {os.path.basename(path)}:{line}")
+        else:
+            window.open_file(path)
+            sublime.status_message(f"Opened {os.path.basename(path)}")
 
     def _refresh_context_phantoms(self, context_items: list) -> None:
-        """Clickable chips on the 📎 line: open (code) / reveal (non-code)."""
+        """Clickable chips inline after the buffer 📎 (single line, no duplicate).
+
+        Click name → open/reveal. Ctrl/Cmd+click name → remove that item.
+        Trailing "clear" → drop all pending context.
+        """
         import html as _html
         if not self.view or not self.view.is_valid():
             return
@@ -3165,48 +3170,119 @@ class OutputView:
             end = nl + 1 if nl >= 0 else self.view.size()
 
         chips = []
-        for item in context_items:
+        for i, item in enumerate(context_items):
             path = getattr(item, "path", "") or ""
             name = _html.escape(item.name or os.path.basename(path) or "?")
             try:
-                action = item.open_action  # property: "open" | "reveal"
+                action = item.open_action  # open | reveal (click still uses this)
             except Exception:
                 action = "reveal"
-            if action not in ("open", "reveal"):
-                action = "reveal"
-            if not path:
-                chips.append(
-                    f'<span style="color:color(var(--foreground) alpha(0.75))">'
-                    f'{name}</span>')
-                continue
-            href = f"{action}:{path}"
-            label = "open" if action == "open" else "reveal"
-            chips.append(
-                f'<a href="{_html.escape(href)}">{name}</a>'
-                f'<span style="color:color(var(--foreground) alpha(0.45))">'
-                f' · {label}</span>'
+            tip = (
+                f"{'open' if action == 'open' else 'reveal'}; "
+                f"ctrl/cmd+click to remove"
             )
+            # Name only — no "· open" suffix (many items would be noisy).
+            chips.append(f'<a href="item:{i}" title="{_html.escape(tip)}">{name}</a>')
+        clear_chip = (
+            f'<a href="clear" title="clear all context" '
+            f'style="color:color(var(--foreground) alpha(0.55))">clear</a>'
+        )
+        # No leading 📎 — buffer already has CONTEXT_PREFIX on this line.
         body = (
             f'<body id="claude-context-chips" '
-            f'style="margin:0;padding:1px 0;font-size:11px;'
+            f'style="margin:0;padding:0;font-size:11px;'
             f'color:color(var(--foreground) alpha(0.85))">'
-            f'📎 {" · ".join(chips)}</body>'
+            f'{" · ".join(chips)}'
+            f'<span style="color:color(var(--foreground) alpha(0.35))"> · </span>'
+            f'{clear_chip}</body>'
         )
         try:
-            # LAYOUT_BELOW keeps buffer names as fallback; chips are clickable
+            # INLINE after 📎 / before trailing newline → one visual row.
+            # Region may include a leading \n (set_pending_context); locate 📎.
+            line_end = end - 1 if end > start and self.view.substr(end - 1) == "\n" else end
+            region_txt = self.view.substr(sublime.Region(start, end))
+            pref_at = region_txt.find(CONTEXT_PREFIX)
+            if pref_at >= 0:
+                anchor = start + pref_at + len(CONTEXT_PREFIX)
+            else:
+                anchor = start
+            anchor = max(start, min(anchor, line_end))
             ph = sublime.Phantom(
-                sublime.Region(start, min(start + 1, end)),
+                sublime.Region(anchor, anchor),
                 body,
-                sublime.LAYOUT_BLOCK,
+                sublime.LAYOUT_INLINE,
                 on_navigate=self._handle_context_href,
             )
             self._context_phantom_set.update([ph])
         except Exception as e:
             print(f"[Claude] context phantoms: {e}")
 
+    @staticmethod
+    def _modifier_held_for_remove() -> bool:
+        """True if Ctrl or primary (Cmd on macOS) is held during a chip click."""
+        import sys
+        try:
+            if sys.platform == "darwin":
+                from ctypes import CDLL, c_uint64, util
+                lib = CDLL(util.find_library("ApplicationServices"))
+                # kCGEventSourceStateHIDSystemState = 1
+                lib.CGEventSourceFlagsState.argtypes = [c_uint64]
+                lib.CGEventSourceFlagsState.restype = c_uint64
+                flags = lib.CGEventSourceFlagsState(1)
+                k_control = 0x00040000
+                k_command = 0x00100000
+                return bool(flags & (k_control | k_command))
+            if sys.platform == "win32":
+                import ctypes
+                # VK_CONTROL=0x11, VK_LWIN/RWIN not required; primary≈Ctrl on Win
+                return bool(ctypes.windll.user32.GetAsyncKeyState(0x11) & 0x8000)
+        except Exception:
+            pass
+        return False
+
     def _handle_context_href(self, href: str) -> None:
         if not href:
             return
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view) if self.view else None
+
+        if href == "clear":
+            if session:
+                session.clear_context()
+                sublime.status_message("Context cleared")
+            return
+
+        if href.startswith("item:"):
+            try:
+                idx = int(href[5:])
+            except ValueError:
+                return
+            if not session or idx < 0 or idx >= len(session.pending_context):
+                return
+            item = session.pending_context[idx]
+            if self._modifier_held_for_remove():
+                name = item.name or "?"
+                if session.remove_context_at(idx):
+                    sublime.status_message(f"Removed context: {name}")
+                return
+            path = getattr(item, "path", "") or ""
+            if not path:
+                sublime.status_message(f"No path for {item.name}")
+                return
+            try:
+                action = item.open_action
+            except Exception:
+                action = "reveal"
+            if action == "open":
+                from .context_manager import first_line_of_range
+                line = first_line_of_range(
+                    getattr(item, "line_range", "") or "")
+                self._open_path(path, line=line)
+            else:
+                self._reveal_path(path)
+            return
+
+        # Back-compat hrefs
         if href.startswith("open:"):
             self._open_path(href[5:])
         elif href.startswith("reveal:"):

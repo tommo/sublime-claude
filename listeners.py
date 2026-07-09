@@ -1,9 +1,11 @@
 """Claude Code event listeners for Sublime Text."""
-import sublime
-import sublime_plugin
-import urllib.parse
 import os
 import platform
+import re
+import urllib.parse
+
+import sublime
+import sublime_plugin
 
 from .core import get_session_for_view, get_active_session, in_startup_quiet
 from .session import Session
@@ -258,8 +260,17 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # Check if this is an orphaned view that needs reconnection
         s = get_session_for_view(self.view)
         if not s:
+            # create_session is mid-flight (new_file → on_activated); it will
+            # register the real Session — do not invent a sleeping orphan.
+            if window.settings().get("claude_creating_session"):
+                return
             self._reconnect_orphaned_view(window, quiet=quiet)
             s = get_session_for_view(self.view)
+
+        # Live / intentional sessions that truly have focus still get full UX
+        # even during the startup quiet window (New Session mid-reload).
+        if quiet and is_real_active and s and not s.is_sleeping:
+            quiet = False
 
         if quiet:
             # Registry only — no title churn, no input mode, no focus.
@@ -671,7 +682,11 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 if sel and not sel[0].empty():
                     content = active_view.substr(sel[0])
                     path = active_view.file_name() or "untitled"
-                    session.add_context_selection(path, content)
+                    from .context_manager import format_line_range
+                    r0 = active_view.rowcol(sel[0].begin())[0] + 1
+                    r1 = active_view.rowcol(sel[0].end())[0] + 1
+                    label = f"{path}:{format_line_range(r0, r1)}"
+                    session.add_context_selection(label, content)
         elif choice == "open":
             for v in window.views():
                 if v.file_name() and not v.settings().get("claude_output"):

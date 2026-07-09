@@ -91,8 +91,14 @@ def get_active_session(window: sublime.Window) -> Optional[Session]:
     return None
 
 
-def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: Optional[str] = None) -> Session:
-    """Create a new session (always creates new, doesn't reuse)."""
+def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: Optional[str] = None, focus: bool = True) -> Session:
+    """Create a new session (always creates new, doesn't reuse).
+
+    focus=True (default): intentional New Session UX — sheet is focused.
+    focus=False: background create (e.g. MCP spawn) — do not steal focus.
+    Startup multi-tab restore does not use this path; orphans reconnect via
+    listeners with a quiet window so they never raise every sheet.
+    """
     if backend is None:
         backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
 
@@ -103,23 +109,29 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         old_session.output.set_name(old_session.name or "Claude")
 
     s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend)
-    # Create the sheet without stealing focus (new_file focuses; show restores).
-    s.output.show(focus=False)
-    if s.output.view and backend != "claude":
-        spec = backends.get(backend)
-        s.output.view.settings().set("claude_backend", backend)
-        s.output.set_name(spec.label)
-        if spec.theme:
-            s.output.view.settings().set("color_scheme", spec.theme)
-    s.start()
-    # Register by view id and mark as active session (registry only — not focus)
-    if s.output.view:
-        view_id = s.output.view.id()
-        sublime._claude_sessions[view_id] = s
-        window.settings().set("claude_active_view", view_id)
-        print(f"[Claude] create_session: view_id={view_id}")
-    else:
-        print(f"[Claude] create_session: ERROR - no output view!")
+    # new_file() fires on_activated before we can register — suppress orphan
+    # reconnect so we don't attach a sleeping session to this brand-new sheet.
+    window.settings().set("claude_creating_session", True)
+    try:
+        s.output.show(focus=focus)
+        if s.output.view and backend != "claude":
+            spec = backends.get(backend)
+            s.output.view.settings().set("claude_backend", backend)
+            s.output.set_name(spec.label)
+            if spec.theme:
+                s.output.view.settings().set("color_scheme", spec.theme)
+        # Register before start so any later activation finds this session.
+        if s.output.view:
+            view_id = s.output.view.id()
+            sublime._claude_sessions[view_id] = s
+            # Track as last-active session for commands; view focus is separate.
+            window.settings().set("claude_active_view", view_id)
+            print(f"[Claude] create_session: view_id={view_id} focus={focus}")
+        else:
+            print(f"[Claude] create_session: ERROR - no output view!")
+        s.start()
+    finally:
+        window.settings().erase("claude_creating_session")
     schedule_auto_sleep()
     return s
 
