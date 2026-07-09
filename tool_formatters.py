@@ -235,6 +235,38 @@ def _read_image(view: "OutputView", tool: "ToolCall") -> str:
     return out
 
 
+def _scheduler_create(view: "OutputView", tool: "ToolCall") -> str:
+    ti = tool.tool_input or {}
+    interval = ti.get("interval") or ti.get("cron") or ""
+    prompt = _clip(str(ti.get("prompt") or ""), 50)
+    bits = []
+    if interval:
+        bits.append(str(interval))
+    if prompt:
+        bits.append(prompt)
+    out = (": " + " · ".join(bits)) if bits else ""
+    if tool.status == "done":
+        out += " ↻ armed"
+    elif tool.status == "error" and tool.result:
+        out += f" ✗ {_clip(str(tool.result), 40)}"
+    return out
+
+
+def _scheduler_list(view: "OutputView", tool: "ToolCall") -> str:
+    if tool.status == "done" and tool.result:
+        return f": {_clip(str(tool.result), 60)}"
+    return ""
+
+
+def _scheduler_delete(view: "OutputView", tool: "ToolCall") -> str:
+    ti = tool.tool_input or {}
+    tid = ti.get("id") or ti.get("task_id") or ""
+    out = f": {tid}" if tid else ""
+    if tool.status == "done":
+        out += " ✓ cancelled"
+    return out
+
+
 def _edit(view: "OutputView", tool: "ToolCall") -> str:
     file_path = tool.tool_input.get("file_path", "")
     # A failed edit never applied — its diff is misleading noise, so hide it.
@@ -438,6 +470,13 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "x_semantic_search": _x_search,
     "x_user_search": _x_user_search,
     "x_thread_fetch": _x_thread_fetch,
+    # Scheduler / /loop
+    "scheduler_create": _scheduler_create,
+    "CronCreate": _scheduler_create,
+    "scheduler_list": _scheduler_list,
+    "CronList": _scheduler_list,
+    "scheduler_delete": _scheduler_delete,
+    "CronDelete": _scheduler_delete,
 }
 
 

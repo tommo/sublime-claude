@@ -1,24 +1,115 @@
 # Workflow Visualization Proposal — native output view
 
-Status: **design only, not implemented.** Source: analysis of a live ultracode/Workflow
-agent's bridge log (`/tmp/claude_bridge.log`, session `0afc0471…`) against the current
-rendering path. No bridge change is required — the data already arrives.
+Status: **partially implemented (2026-07).** Core consumer + detail UI landed; see
+§0 for POC results and refined plan. Historical root-cause analysis kept below for
+context (sections 1+ describe pre-ship state).
 
-## 1. Root cause: the rich feed is dropped, not missing
+Source: analysis of a live ultracode/Workflow agent's bridge log
+(`/tmp/claude_bridge.log`, session `0afc0471…`) against the rendering path.
+No bridge change is required — the data already arrives.
 
-The bridge forwards **every** `SystemMessage` generically (`bridge/main.py:1072-1079`), so
-the per-tick `SystemMessage subtype=task_progress` records — each carrying a full
-`workflow_progress[]` tree — **do reach the plugin**. But `_on_msg_system`'s dispatch
-(`session.py:1758-1768`) only routes `compact_boundary / task_started / task_updated /
-task_notification`; `task_progress` matches nothing and is **silently discarded**.
+## 0. POC findings + refined plan (2026-07-09)
 
-Result: an entire spawned workflow collapses to one generic Task line
-`☐ Task: subagent_type - description` (`tool_formatters.py:75-78`) plus a single global
-spinner — the "appears busy" state. Confirmed live: the running agent's view showed only
-`Claude: ⠧ thinking…, $12.69, 8q, ctx:141k` and a *static* todo checklist, while the bridge
+### What already shipped
+
+Commits on this package (newest first among workflow work):
+
+- `28ddb4e` refocus parent when workflow detail view closes
+- `1b221c2` rich workflow detail view (styled HTML + shared chrome)
+- `66c0ed4` accumulate agents across **partial** `task_progress` ticks
+- `fef8fc3` workflow progress + click-to-open detail view
+
+Live code paths (`session.py`):
+
+| Piece | Status |
+|---|---|
+| `_on_msg_system` → `task_progress` | wired |
+| `_workflows` accumulate by `(phaseIndex, index)` | wired |
+| no-op tick suppression via `sig` | wired |
+| conversation redirect phantom (`⚙ workflow: … · open ↗`) | wired |
+| dedicated detail view + `_build_workflow_html` | wired |
+| failure/retry glyphs | defensive only (real enum unconfirmed) |
+
+### POC (2026-07-09)
+
+1. **Live inject** into active Claude session via `sublime_eval` calling
+   `_on_sys_task_progress` with synthetic partial ticks.
+2. **Pure merge tests**: `tests/test_workflow_merge.py` (no Sublime).
+
+Verified:
+
+- Partial tick 2 updates only `scene.common` → agent count stays 2 (not 1).
+- Tick 3 adds a third agent → total 3, done 1.
+- Final tick → `completed=True`, detail view opens with phases Engine/Editor.
+- HTML panel renders header bar + phase rows + live tool activity.
+
+### Architectural drift vs original proposal
+
+| Proposal (§3) | Shipped | Note |
+|---|---|---|
+| Inline multi-row panel replacing Task line | Compact redirect + **separate detail view** | Intentional: keeps history short, full panel on demand |
+| Collapse-to-header on completion in-conversation | Redirect flips to `✓`; detail stays full | Detail collapse not done |
+| Phantom anchored at Task line region | Phantom at **last newline of whole view** | Bug / polish target |
+| One phantom per task_id | **Single** `PhantomSet("claude_workflow")` | Concurrent workflows clobber each other |
+| Wide-fanout collapse + dot-strips | Not implemented | |
+| Status-bar phase aggregate | Not implemented | |
+| Spinner-driven live elapsed between ticks | Elapsed only on material `sig` change | Freezes between tool/token changes |
+
+### Refined plan (next goals)
+
+**G1 — Fixture harness — DONE (2026-07-09)**  
+`tests/test_workflow_merge.py` green. `sublime_tool(name="workflow_poc")` dual-injects
+`poc-wf-a` / `poc-wf-b` and rebinds reloaded session methods for dogfood.
+
+**G2 — Redirect correctness — DONE (2026-07-09)**  
+- `_ensure_workflow_anchor`: prefer Task tool line via `_task_tool_map`, else sticky
+  HIDDEN region (`claude_workflow_anchor_*`), not raw EOF-each-tick.
+- `_render_all_workflow_redirects`: one `PhantomSet`, **N phantoms** (no single-task clobber).
+
+**G3 — Detail collapse — DONE (2026-07-09)**  
+- Completed detail view: header + compact `✔ label — preview` lines (no live tool rows).
+- Still open: wide-fanout collapse; spinner-driven elapsed between material ticks.
+
+**G4 — Real-world capture (evidence) — open**  
+- Capture a failing/retried ultracode run → lock failure glyph map.
+- Confirm Grok/non-Claude backends never emit `task_progress` (no false panels).
+
+**G5 — Doc sync — in progress**  
+- This §0 is the source of truth; ROADMAP link optional.
+
+### Non-goals for next iteration
+
+- Bridge protocol changes
+- Streaming assistant text / cost dashboard / remote channels (separate backlog)
+- Full inline replacement of Task lines (shipped UX is redirect+detail)
+
+### Recommended next `/goal` (evidence-bound)
+
+```
+/goal Harden ClaudeCode workflow visualization: (1) tests/test_workflow_merge.py
+stays green; (2) redirect phantom anchors near the related Task line and supports
+≥2 concurrent task_ids without clobber; (3) completed workflows show compact ✓
+redirect and detail view collapses to header; (4) optional sublime_tool injects
+the POC fixture for manual QA. Use only ClaudeCode package. Between iterations
+run pure tests then live inject. If real failure-state enum remains unobserved,
+leave failure glyphs defensive and document the capture gap.
+```
+
+---
+
+## 1. Root cause (historical — pre-ship): the rich feed was dropped, not missing
+
+The bridge forwards **every** `SystemMessage` generically, so per-tick
+`SystemMessage subtype=task_progress` records — each carrying a
+`workflow_progress[]` tree — **did reach the plugin**. Early dispatch only
+routed `compact_boundary / task_started / task_updated / task_notification`;
+`task_progress` was **silently discarded**.
+
+Result: an entire spawned workflow collapsed to one generic Task line
+plus a single global spinner — the "appears busy" state — while the bridge
 streamed detailed per-agent progress every few hundred ms.
 
-**This is a consumer + renderer, not a bridge change.**
+**This is a consumer + renderer, not a bridge change.** (Feed is now wired.)
 
 ## 2. Data available per tick (dropped today)
 

@@ -2949,13 +2949,22 @@ class ClaudeToggleTasksFoldCommand(sublime_plugin.TextCommand):
     """Expand/collapse the Tasks list in a Claude output view.
 
     Folded (default): running tasks always visible, pending capped at 3 total,
-    completed hidden. Expanded: everything shown."""
+    completed hidden. Expanded: everything shown.
+
+    Works in input mode: re-renders via refresh_preserving_input so the draft
+    prompt is not lost (plain _render_current no-ops while input_mode is on).
+    """
     def run(self, edit):
         view = self.view
         expanded = view.settings().get("claude_tasks_expanded", False)
         view.settings().set("claude_tasks_expanded", not expanded)
         s = get_session_for_view(view)
-        if s and s.output:
+        if not s or not s.output:
+            return
+        # Always use preserve path when input is open; otherwise normal render.
+        if s.output.is_input_mode():
+            s.output.refresh_preserving_input()
+        else:
             s.output._render_current()
 
     def is_enabled(self):
@@ -4126,12 +4135,18 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
         line = self.view.substr(line_region)
         col = pt - line_region.begin()
 
-        # Super+click on the Tasks banner or its fold hint toggles the list
-        # (the banner line carries "Tasks", the hint lines carry "super+click").
-        if "Tasks" in line and "done" in line and "active" in line:
+        # Super+click (or plain click via same command) on fold hint / goal line
+        # toggles the task list. Works in input mode (toggle preserves draft).
+        if "super+click to expand" in line or "super+click to collapse" in line:
             self.view.run_command("claude_toggle_tasks_fold")
             return
-        if "super+click to expand" in line or "super+click to collapse" in line:
+        if line.strip().startswith("◎ goal ·") and self.view.settings().get("claude_output"):
+            self.view.run_command("claude_toggle_tasks_fold")
+            return
+        # Also accept task rows when folded (hint may be the only affordance,
+        # but goal+pending rows are common click targets).
+        if (line.strip().startswith("… +") and "more" in line
+                and self.view.settings().get("claude_output")):
             self.view.run_command("claude_toggle_tasks_fold")
             return
 

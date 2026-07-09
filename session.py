@@ -1005,6 +1005,9 @@ class Session:
                 self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
             return
 
+        # New query supersedes any prior interrupt debounce.
+        self._interrupting = False
+
         if not silent:
             self.output.show()
             # Auto-name session from first prompt if not already named
@@ -1017,12 +1020,13 @@ class Session:
         # prompt itself isn't rendered. The previous turn's meta() flipped
         # self.output.current.working=False; re-arm it so advance_spinner
         # actually re-renders the ⠋ line at the bottom of the conversation.
-        if silent and self.output.current is not None:
+        if self.output.current is not None:
             self.output.current.working = True
-            # Hide the previous turn's @done(…) line while this wake processes;
-            # meta() of the wake result will set a fresh duration on completion.
-            self.output.current.duration = 0
-            self.output._render_current()
+            if silent:
+                # Hide the previous turn's @done(…) line while this wake processes;
+                # meta() of the wake result will set a fresh duration on completion.
+                self.output.current.duration = 0
+                self.output._render_current()
         self.output._update_title()
         self._animate()
         query_params = {"prompt": full_prompt}
@@ -1083,6 +1087,19 @@ class Session:
         else:
             completion = "success"
 
+        # Interrupt already restored idle UI immediately. Late bridge ack:
+        # just clear the interrupting flag and skip re-rendering.
+        if completion == "interrupted" and not self.working:
+            self._interrupting = False
+            if self._response_callback:
+                cb = self._response_callback
+                self._response_callback = None
+                try:
+                    cb("")
+                except Exception:
+                    pass
+            return
+
         # 2. Handle UI for each completion type
         if completion == "error":
             error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
@@ -1101,6 +1118,7 @@ class Session:
         else:
             self._status("ready")
 
+        self._interrupting = False
         self.output.set_name(self.name or "Claude")
         self.output.clear_all_permissions()
 
@@ -1182,6 +1200,8 @@ class Session:
 
     def _enter_input_with_draft(self) -> None:
         """Enter input mode and restore draft with cursor at end."""
+        if not self.output:
+            return
         # Skip if already in input mode or session is working
         if self.output.is_input_mode() or self.working:
             return
@@ -1197,10 +1217,26 @@ class Session:
             self.query(prompt)
             return
 
+        # Stale conversation.working can block enter_input_mode even when the
+        # session is idle (common after interrupt race). Clear it first.
+        if self.output.current and self.output.current.working and not self.working:
+            self.output.current.working = False
+
         self.output.enter_input_mode()
 
         # Check if enter_input_mode actually succeeded (might have deferred)
         if not self.output.is_input_mode():
+            # Retry once after pending render / race settles.
+            def _retry():
+                if self.working or not self.output or self.output.is_input_mode():
+                    return
+                if self.output.current and self.output.current.working:
+                    self.output.current.working = False
+                self.output.enter_input_mode()
+                if self.output.is_input_mode():
+                    self._input_mode_entered = True
+                    self.last_idle_at = time.time()
+            sublime.set_timeout(_retry, 50)
             return
 
         self._input_mode_entered = True
@@ -1257,21 +1293,58 @@ class Session:
             break_channel: If True, also breaks any active channel connection.
                           Set to False when interrupt is from channel message.
         """
+        # Debounce Esc spam — multiple cancels after the turn ends kill Grok
+        # (session/cancel on a dead prompt → ChatStateActor dead).
+        if getattr(self, "_interrupting", False):
+            return
+        if not self.working and not getattr(self, "_inject_pending", False):
+            # Idle: only clear input is handled by the command; nothing to cancel.
+            if break_channel and self.output and self.output.view:
+                from . import notalone
+                notalone.interrupt_channel(self.output.view.id())
+            return
+
+        self._interrupting = True
+        self._queued_prompts.clear()
+
+        # Immediate UI: idle + *[interrupted]* + input. Do NOT leave
+        # session.working=True with conversation.working=False (no busy mark
+        # and no input — the "dead UI" state after a hung cancel).
+        self.working = False
+        self.current_tool = None
+        self._clear_deferred_state()
+        try:
+            if self.output:
+                self.output.interrupted()
+        except Exception:
+            pass
+        self._status("interrupted")
+        self._enter_input_with_draft()
+
         if self.client:
             sent = self.client.send("interrupt", {})
-            self._status("interrupting...")
-            # Don't set working=False here — wait for _on_done to confirm
-            # the bridge actually stopped. This prevents input mode race.
-            self._queued_prompts.clear()
-            # If bridge is dead, _on_done won't fire — force cleanup
             if not sent:
-                self.working = False
+                self._interrupting = False
                 self._status("error: bridge died")
-                self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
-                self._enter_input_with_draft()
+                try:
+                    self.output.text(
+                        "\n\n*Bridge process died. Please restart the session.*\n")
+                except Exception:
+                    pass
+            else:
+                # Late _on_done from the cancelled query is a no-op for UI;
+                # clear interrupting when it arrives (or after a short grace).
+                gen = getattr(self, "_interrupt_gen", 0) + 1
+                self._interrupt_gen = gen
+
+                def _clear_interrupting(_gen=gen):
+                    if getattr(self, "_interrupt_gen", 0) == _gen:
+                        self._interrupting = False
+
+                sublime.set_timeout(_clear_interrupting, 3000)
 
         # Break any active channel connection (only for user-initiated interrupts)
-        if break_channel and self.output.view:
+        if break_channel and self.output and self.output.view:
             from . import notalone
             notalone.interrupt_channel(self.output.view.id())
 
@@ -1477,24 +1550,32 @@ class Session:
         return self._wakeup_phantom_set
 
     def _update_wakeup_banner(self, show: bool = True) -> None:
-        """Pin '⏰ next wakeup at HH:MM' at the input area while a self-paced loop
-        waits for its next scheduled wake. Plugin-side: time derived from the
-        ScheduleWakeup delay (mirrors the bridge clamp)."""
+        """Pin '↻ next wakeup at HH:MM' while a self-paced loop is armed.
+
+        Shown whenever next_wake_at is in the future — not only in input mode
+        (input-only made scheduled loops look dead mid-turn / after render).
+        """
         ps = self._get_wakeup_phantom_set()
         if not ps or not self.output or not self.output.view:
             return
         nxt = getattr(self, 'next_wake_at', None)
-        in_input = getattr(self.output, '_input_mode', False)
-        if not (show and in_input and nxt and nxt > time.time()):
+        if not (show and nxt and nxt > time.time()):
             ps.update([])
             return
         when = datetime.datetime.fromtimestamp(nxt).strftime("%H:%M")
-        mins = int((nxt - time.time()) / 60)
-        label = f"↻ next wakeup at {when}" + (f" · ~{mins}m" if mins else "")
+        mins = max(0, int((nxt - time.time()) / 60))
+        secs = max(0, int(nxt - time.time()))
+        eta = f"~{mins}m" if mins else f"~{secs}s"
+        label = f"↻ next wakeup at {when} · {eta}"
         view = self.output.view
+        # Prefer just above the input marker when present; else last newline.
         content = view.substr(sublime.Region(0, view.size()))
-        last_nl = content.rfind("\n")
-        pt = last_nl if last_nl >= 0 else 0
+        pt = None
+        if getattr(self.output, "_input_mode", False) and getattr(self.output, "_input_start", 0):
+            pt = max(0, self.output._input_start - 1)
+        if pt is None:
+            last_nl = content.rfind("\n")
+            pt = last_nl if last_nl >= 0 else 0
         html = f'<body style="margin: 4px 0; color: var(--bluish);">{label}</body>'
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
 
@@ -1857,14 +1938,33 @@ class Session:
             self.query(message)
 
     def _on_loop_scheduled(self, params: dict) -> None:
-        """Bridge reports the exact next self-wake time (cron or ScheduleWakeup)
-        so the wakeup hint is accurate for both paths. fire_at None = cleared."""
+        """Bridge reports the exact next self-wake time (cron or ScheduleWakeup
+        or Grok scheduler_create) so the wakeup hint is accurate.
+        fire_at None = cleared."""
         self.next_wake_at = params.get("fire_at")
         if self.next_wake_at:
             self.is_looping = True
+        else:
+            # Cleared next fire — leave is_looping until user cancels / no jobs;
+            # still refresh banner so the ↻ chip drops.
+            pass
         if self.output:
             self.output._update_title()
             self._update_wakeup_banner(show=True)
+
+    @staticmethod
+    def _parse_schedule_interval(interval: str) -> Optional[float]:
+        """Parse 60s / 5m / 2h / 1d → seconds (min 60)."""
+        import re
+        s = (interval or "").strip().lower()
+        m = re.fullmatch(r"(\d+)\s*([smhd])?", s)
+        if not m:
+            return None
+        n = int(m.group(1))
+        unit = m.group(2) or "s"
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        sec = float(n * mult)
+        return max(60.0, sec) if sec > 0 else None
 
     def _on_notification_wake(self, params: dict) -> None:
         """Fire a new query from a notification wake event (timer, channel, etc)."""
@@ -1905,8 +2005,11 @@ class Session:
             return
         # A real content event arrived → the retry hint no longer applies.
         self._clear_api_retry_hint()
-        # Agent armed a self-wake / cron → this is now a looping session.
-        if name in ("ScheduleWakeup", "CronCreate"):
+        # Agent armed a self-wake / cron / Grok scheduler → looping session.
+        if name in (
+            "ScheduleWakeup", "CronCreate", "scheduler_create",
+            "SchedulerCreate",
+        ):
             self.is_looping = True
             if name == "ScheduleWakeup":
                 try:
@@ -1915,7 +2018,19 @@ class Session:
                     d = 0
                 # mirror the bridge clamp so the displayed time matches the timer
                 self.next_wake_at = time.time() + max(60.0, min(d, 3600.0)) if d > 0 else None
+            elif name in ("CronCreate", "scheduler_create", "SchedulerCreate"):
+                # Prefer bridge loop_scheduled; estimate from interval as fallback.
+                interval = (
+                    tool_input.get("interval")
+                    or tool_input.get("cron")
+                    or ""
+                )
+                if interval and not self.next_wake_at:
+                    sec = self._parse_schedule_interval(str(interval))
+                    if sec:
+                        self.next_wake_at = time.time() + sec
             self.output._update_title()
+            self._update_wakeup_banner(show=True)
         if background:
             # Background tools don't take over current_tool (spinner stays on foreground)
             self.output.tool(name, tool_input, tool_id=tool_id, background=True)
@@ -1990,10 +2105,14 @@ class Session:
         print(f"[Claude] [{dur:.1f}s, ${cost:.4f}]" if cost else f"[Claude] [{dur:.1f}s]")
         if usage:
             print(f"[Claude] usage: {usage}")
-        if params.get("status") == "interrupted":
-            # Manual interrupt — the SDK still emits a ResultMessage here, but
-            # _on_done's interrupt path renders the *[interrupted]* marker.
-            # Skip both @done and the "turn failed" hint (and auto-retry).
+        stop = params.get("stop_reason") or params.get("stopReason") or ""
+        if (
+            params.get("status") == "interrupted"
+            or stop in ("interrupted", "cancelled", "canceled")
+        ):
+            # Manual interrupt — _on_done renders *[interrupted]*. Skip @done
+            # and "turn failed" (and auto-retry). ACP sends stop_reason without
+            # status on the message notification.
             if self.output.current:
                 self.output.current.working = False
             return
@@ -2002,7 +2121,7 @@ class Session:
             # write the normal @done meta — that falsely signals success. Mark
             # the turn idle and surface a brief error note; _on_done adds the
             # detailed message if the bridge also returns an error response.
-            stop = params.get("stop_reason") or "error"
+            stop = stop or "error"
             if self.output.current:
                 self.output.current.working = False
             if self._maybe_schedule_auto_retry(stop):
@@ -2298,7 +2417,7 @@ class Session:
         wf["completed"] = bool(agents) and all(a.get("state") in self._WF_DONE for a in agents)
         # Clickable redirect in the conversation (persists past turn-end) + live
         # detail in the workflow's own view if the user opened it.
-        self._render_workflow_redirect(task_id)
+        self._render_all_workflow_redirects()
         self._render_workflow_detail(task_id)
 
     def _get_workflow_phantom_set(self):
@@ -2306,28 +2425,98 @@ class Session:
             self._workflow_phantom_set = sublime.PhantomSet(self.output.view, "claude_workflow")
         return self._workflow_phantom_set
 
-    def _render_workflow_redirect(self, task_id: str) -> None:
-        """Compact clickable line in the conversation → opens the detail view.
-        Persists past turn-end (the workflow runs in the background)."""
+    def _workflow_anchor_key(self, task_id: str) -> str:
+        # Region key must be a valid sublime region name (no spaces).
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in (task_id or "wf"))[:48]
+        return f"claude_workflow_anchor_{safe}"
+
+    def _ensure_workflow_anchor(self, task_id: str) -> int:
+        """Stable phantom anchor: prefer related Task tool line, else sticky HIDDEN region.
+
+        Avoids the old EOF-only placement that jumped every render and clobbered
+        multi-workflow phantoms into one last-newline point.
+        """
+        view = self.output.view if self.output else None
+        if not view:
+            return 0
+        key = self._workflow_anchor_key(task_id)
+        existing = view.get_regions(key)
+        if existing:
+            return existing[0].begin()
+
+        pt = None
+        # 1) tool_use_id from task_started map → find that tool's line in the buffer
+        tool_use_id = self._task_tool_map.get(task_id)
+        if tool_use_id and self.output:
+            tool = self.output.find_tool_by_id(tool_use_id)
+            if tool is None:
+                # also search DONE tools — find_tool_by_id only checks pending/bg
+                for conv in list(self.output.conversations) + (
+                        [self.output.current] if self.output.current else []):
+                    if not conv:
+                        continue
+                    for e in conv.events:
+                        if getattr(e, "id", None) == tool_use_id:
+                            tool = e
+                            break
+            if tool is not None:
+                content = view.substr(sublime.Region(0, view.size()))
+                import re
+                from .output import BACKGROUND, DONE, ERROR
+                sym = self.output.SYMBOLS.get(getattr(tool, "status", BACKGROUND), "⚙")
+                name = getattr(tool, "name", "Task") or "Task"
+                prefix = f"  {sym} {name}"
+                m = re.search(re.escape(prefix), content)
+                if m is not None:
+                    # place just after the tool line
+                    line = view.line(m.start())
+                    pt = min(line.end() + 1, view.size())
+
+        # 2) fallback: before input area if known, else last content newline
+        if pt is None:
+            if getattr(self.output, "_input_mode", False) and getattr(self.output, "_input_start", 0):
+                pt = max(0, self.output._input_start - 1)
+            else:
+                content = view.substr(sublime.Region(0, view.size()))
+                last_nl = content.rfind("\n")
+                pt = last_nl if last_nl >= 0 else 0
+
+        # Stable region so later ticks re-use the same point even as buffer grows
+        view.add_regions(key, [sublime.Region(pt, pt)], "", "", sublime.HIDDEN)
+        return pt
+
+    def _render_all_workflow_redirects(self) -> None:
+        """Rebuild redirect phantoms for every tracked workflow (no clobber)."""
         ps = self._get_workflow_phantom_set()
         if not ps or not self.output or not self.output.view:
             return
-        wf = self._workflows.get(task_id)
-        if not wf:
+        if not self._workflows:
             ps.update([])
             return
-        view = self.output.view
-        content = view.substr(sublime.Region(0, view.size()))
-        last_nl = content.rfind("\n")
-        pt = last_nl if last_nl >= 0 else 0
         esc = lambda s: str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        g = "✓" if wf.get("completed") else "⚙"
-        label = (f'{g} workflow: {esc(wf.get("summary"))[:32]} · {wf.get("done", 0)}/{wf.get("total", 0)} agents '
-                 f'· <a href="open">open ↗</a>')
-        html = (f'<body style="margin:4px 0; padding:1px 8px; color:color(var(--foreground) alpha(0.65)); '
-                f'background-color:color(var(--background) blend(var(--foreground) 96%));">{label}</body>')
-        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK,
-                                   lambda href, tid=task_id: self._open_workflow_view(tid))])
+        phantoms = []
+        # Stable order so multi-workflow layout doesn't thrash
+        for task_id in sorted(self._workflows.keys()):
+            wf = self._workflows.get(task_id)
+            if not wf or "agents" not in wf:
+                continue
+            pt = self._ensure_workflow_anchor(task_id)
+            g = "✓" if wf.get("completed") else "⚙"
+            label = (f'{g} workflow: {esc(wf.get("summary"))[:32]} · '
+                     f'{wf.get("done", 0)}/{wf.get("total", 0)} agents · '
+                     f'<a href="open">open ↗</a>')
+            html = (f'<body style="margin:4px 0; padding:1px 8px; '
+                    f'color:color(var(--foreground) alpha(0.65)); '
+                    f'background-color:color(var(--background) blend(var(--foreground) 96%));">'
+                    f'{label}</body>')
+            phantoms.append(sublime.Phantom(
+                sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK,
+                lambda href, tid=task_id: self._open_workflow_view(tid)))
+        ps.update(phantoms)
+
+    def _render_workflow_redirect(self, task_id: str) -> None:
+        """Compat: single-id entry → full multi-workflow redraw."""
+        self._render_all_workflow_redirects()
 
     def _find_view_by_id(self, vid: int):
         for w in sublime.windows():
@@ -2442,6 +2631,20 @@ class Session:
                    f'<span style="color:{bar_col}; font-size:1.05rem;">{bar}</span>'
                    f'&nbsp;&nbsp;<span style="font-weight:bold;">{done}/{total}</span> '
                    f'<span style="{dim}">agents&nbsp;·&nbsp;{cls._wf_tokens(tok)} tok&nbsp;·&nbsp;{elapsed}</span></div>')
+
+        # Completion: collapse to header only (proposal §2 / G3). Keeps history short;
+        # full per-agent state still lives in _workflows if needed later.
+        if completed:
+            previews = []
+            for a in sorted(agents, key=lambda x: (x.get("phaseIndex") or 0, x.get("index") or 0)):
+                lab = esc(a.get("label"))[:24]
+                rp = esc(a.get("resultPreview") or "")[:40]
+                previews.append(f'✔ {lab}' + (f' — {rp}' if rp else ""))
+            if previews:
+                out.append(f'<div style="{dim}; margin-top:2px;">' +
+                           '<br>'.join(previews[:12]) + '</div>')
+            out.append('</body>')
+            return "".join(out)
 
         by_phase = {}
         for a in agents:
@@ -2623,9 +2826,18 @@ class Session:
         if not self.context_usage:
             return None
         u = self.context_usage
-        input_t = (u.get("input_tokens", 0)
-                 + u.get("cache_read_input_tokens", 0)
-                 + u.get("cache_creation_input_tokens", 0))
+        # Usage fields may be explicitly null (Grok turn_usage mid-stream).
+        def _n(key: str) -> int:
+            v = u.get(key, 0)
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+        input_t = (
+            _n("input_tokens")
+            + _n("cache_read_input_tokens")
+            + _n("cache_creation_input_tokens")
+        )
         if not input_t:
             return None
         return max(1, input_t // 1000)

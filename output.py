@@ -413,10 +413,13 @@ class OutputView:
         if session and session.working:
             return
 
-        # Exit any current conversation's working state
+        # Stale conversation.working after interrupt: session is idle but the
+        # turn flag never cleared → blocked input forever. Trust session.working.
         if self.current and self.current.working:
-            # print(f"[Claude] enter_input_mode: current conversation is working, can't enter input mode")
-            return  # Can't input while working
+            if session and not session.working:
+                self.current.working = False
+            else:
+                return  # Can't input while working
 
         # Additional safety: check if there's a pending render that should complete first
         if self._render_pending:
@@ -2377,6 +2380,41 @@ class OutputView:
             except AttributeError:
                 pass  # Not available in older Sublime builds
 
+    def refresh_preserving_input(self) -> None:
+        """Re-render conversation (e.g. tasks fold) without losing the input draft.
+
+        `_do_render` intentionally no-ops in input mode so it cannot corrupt the
+        editable tail. Callers that only change sticky chrome (tasks fold, goal)
+        must exit → render → re-enter with draft restored.
+        """
+        if not self.view or not self.current:
+            return
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
+        draft = ""
+        was_input = self._input_mode
+        if was_input:
+            draft = self.get_input_text()
+            if session is not None:
+                session.draft_prompt = draft
+            self.exit_input_mode(keep_text=False)
+        # Sync render (skip debounce); input_mode is off so _do_render proceeds.
+        self._render_pending = False
+        self._auto_scroll = False
+        self._do_render()
+        if not was_input:
+            return
+        if session is not None and session.working:
+            return
+        # enter_input_mode may defer if a render is pending — none should be.
+        self.enter_input_mode()
+        if draft and self._input_mode and self.view:
+            self.view.run_command("append", {"characters": draft})
+            end = self.view.size()
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(end, end))
+            self.view.show(end)
+
     def _do_render(self) -> None:
         """Actually perform the render."""
         self._render_pending = False
@@ -2463,12 +2501,18 @@ class OutputView:
             if _hint:
                 lines.append(f"  {_hint}\n")
 
-        # Todo list — open work only (hide completed/cancelled/deleted).
-        # Folded by default: running always shown, pending capped at 3.
+        # Adaptive Work strip: Goal (north star) + Tasks (steps) as one block.
+        # Distinct line prefixes → different colors via ClaudeOutput.sublime-syntax
+        # (claude.goal.* vs claude.task.*). No dual ───── banners.
         open_todos = _open_todos(self.current.todos)
-        # Settled list → clear carry flag so next prompt starts empty.
         if not open_todos:
             self.current.todos_all_done = True
+        goal = self.current.goal
+        show_goal = bool(goal and goal.status in ("active", "blocked", "completed"))
+        show_tasks = False
+        show = []
+        hidden = 0
+        expanded = False
         if open_todos:
             active = [t for t in open_todos if _todo_is_active(t)]
             pending = [t for t in open_todos if not _todo_is_active(t)]
@@ -2479,42 +2523,48 @@ class OutputView:
             else:
                 cap = max(0, 3 - len(active))
                 show = active + pending[:cap]
-            if show:
-                counts = "{} active · {} pending".format(len(active), len(pending))
-                lines.append("\n  ───── Tasks  ·  {}  ─────\n".format(counts))
+            show_tasks = bool(show)
+            hidden = len(open_todos) - len(show) if show else 0
+
+        if show_goal or show_tasks:
+            lines.append("\n")
+            if show_goal:
+                if goal.status == "blocked":
+                    glabel, body = "blocked", (goal.blocked_reason or goal.message or "")
+                elif goal.status == "completed":
+                    glabel, body = "done", (goal.message or "")
+                else:
+                    glabel, body = "active", (goal.message or "")
+                # Prefix "◎ goal · <status>" is scoped separately from tasks.
+                gline = "  ◎ goal · {}".format(glabel)
+                if body:
+                    gline += "  {}".format(body.replace("\n", " ").strip())
+                lines.append(gline + "\n")
+            if show_tasks:
                 for todo in show:
+                    # ▸ active (warm) vs ○ pending (dim) — not the goal glyph.
                     icon = "▸" if _todo_is_active(todo) else "○"
                     lines.append("  {} {}\n".format(icon, todo.content))
-                hidden = len(open_todos) - len(show)
                 if hidden > 0:
                     lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
                 elif expanded:
                     lines.append("  (super+click to collapse)\n")
-
-        # Single sticky goal (Grok /goal + update_goal) — not a multi-item list.
-        goal = self.current.goal
-        if goal and goal.status in ("active", "blocked", "completed"):
-            if goal.status == "blocked":
-                label = "blocked"
-                body = goal.blocked_reason or goal.message or ""
-            elif goal.status == "completed":
-                label = "done"
-                body = goal.message or ""
-            else:
-                label = "active"
-                body = goal.message or ""
-            lines.append("\n  ───── Goal  ·  {}  ─────\n".format(label))
-            if body:
-                lines.append("  ▸ {}\n".format(body))
 
         # Meta
         if self.current.duration > 0:
             meta_parts = [f"{self.current.duration:.1f}s"]
             if self.current.usage:
                 u = self.current.usage
-                input_t = (u.get("input_tokens", 0)
-                         + u.get("cache_read_input_tokens", 0)
-                         + u.get("cache_creation_input_tokens", 0))
+                def _n(k):
+                    try:
+                        return int(u.get(k) or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                input_t = (
+                    _n("input_tokens")
+                    + _n("cache_read_input_tokens")
+                    + _n("cache_creation_input_tokens")
+                )
                 if input_t:
                     if input_t >= 1000:
                         meta_parts.append(f"{input_t // 1000}k ctx")

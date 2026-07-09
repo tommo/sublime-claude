@@ -20,9 +20,12 @@ Claude-parity surface shared by all ACP backends:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
+import re
 import sys
+import time
 import uuid as uuidlib
 from typing import Any, Dict, List, Optional
 
@@ -116,6 +119,18 @@ class AcpBridge(BaseBridge):
         self._prompt_cancelled: bool = False
         self._prompt_fut: Optional[asyncio.Future] = None
         self._prompt_acp_id: Optional[int] = None
+        # True from first cancel notify until query fully settles — blocks
+        # spam session/cancel (Grok ChatStateActor dies on cancel-after-done).
+        self._cancel_in_flight: bool = False
+        # Grok scheduler: track next fire for loop banner / wakes.
+        self._schedule_next_fire: Optional[float] = None
+        # toolCallId → last known input (completed updates often omit rawInput).
+        self._tool_inputs_by_id: Dict[str, dict] = {}
+        # toolCallId → normalized name (completed updates often omit title/_meta).
+        self._tool_names_by_id: Dict[str, str] = {}
+        # Client-side backup timers when host does not inject scheduled prompts.
+        # task_id (or toolCallId) → asyncio.Task
+        self._client_schedule_tasks: Dict[str, Any] = {}
         # Serialize writes to agent stdin — concurrent create_task handlers
         # (permission + terminal + fs) would otherwise interleave JSON lines.
         self._acp_write_lock: Optional[asyncio.Lock] = None
@@ -162,6 +177,7 @@ class AcpBridge(BaseBridge):
         "read_image", "mcp__sublime__read_image",
         "x_keyword_search", "x_semantic_search", "x_user_search",
         "x_thread_fetch",
+        "scheduler_list", "CronList",
     })
     # ACP / Grok tool kinds that are read-only research (from toolCall.kind or
     # _meta x.ai/tool.kind).
@@ -246,12 +262,18 @@ class AcpBridge(BaseBridge):
                 "reasoningTokens", "totalTokens")
         if not any(k in meta for k in keys):
             return None
+        def _tok(key: str) -> int:
+            v = meta.get(key)
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
         return {
-            "input_tokens": meta.get("inputTokens"),
-            "output_tokens": meta.get("outputTokens"),
-            "cache_read_input_tokens": meta.get("cachedReadTokens"),
-            "reasoning_tokens": meta.get("reasoningTokens"),
-            "total_tokens": meta.get("totalTokens"),
+            "input_tokens": _tok("inputTokens"),
+            "output_tokens": _tok("outputTokens"),
+            "cache_read_input_tokens": _tok("cachedReadTokens"),
+            "reasoning_tokens": _tok("reasoningTokens"),
+            "total_tokens": _tok("totalTokens"),
             "model": meta.get("modelId"),
         }
 
@@ -359,13 +381,26 @@ class AcpBridge(BaseBridge):
                 continue
             if method == "session/update":
                 kind = (params.get("update") or {}).get("sessionUpdate")
-                if kind in ("tool_call", "tool_call_update", "current_mode_update"):
+                if kind in (
+                    "tool_call", "tool_call_update", "current_mode_update",
+                    "scheduled_task_created", "scheduled_task_fired",
+                    "scheduled_task_deleted",
+                ):
                     self.file_log(f"← acp update {kind}: {json.dumps(params)[:400]}")
                 self._forward_update(params)
             elif method and "mcp" in method.lower():
                 # Surface MCP lifecycle (servers_updated, init_progress, …)
                 self.file_log(
                     f"← acp {method}: {json.dumps(params)[:600]}")
+            elif method in (
+                "x.ai/session/update", "_x.ai/session/update",
+            ):
+                # Grok may nest schedule lifecycle under x.ai/session/update.
+                self.file_log(
+                    f"← acp {method}: {json.dumps(params)[:600]}")
+                upd = params.get("update") or params
+                if isinstance(upd, dict):
+                    self._handle_schedule_lifecycle(upd)
             # Other notifications (_x.ai/*, etc.) are intentionally ignored.
 
     def _acp_id(self) -> int:
@@ -428,12 +463,24 @@ class AcpBridge(BaseBridge):
 
         upd = params.get("update", {})
         kind = upd.get("sessionUpdate")
+        # After user interrupt: drop *new* tool starts so ☐ rows don't appear
+        # post-[interrupted]. Still accept tool_call_update completions so
+        # already-open rows can settle.
+        if self._prompt_cancelled and kind == "tool_call":
+            self.file_log(
+                f"drop tool_call after cancel: "
+                f"{(upd.get('title') or upd.get('toolCallId') or '')!r}")
+            return
         if kind == "agent_message_chunk":
+            if self._prompt_cancelled:
+                return  # no more assistant stream after cancel
             text = (upd.get("content") or {}).get("text", "")
             if text:
                 send_notification("message",
                                   {"type": "text_delta", "text": text})
         elif kind == "agent_thought_chunk":
+            if self._prompt_cancelled:
+                return
             text = (upd.get("content") or {}).get("text", "")
             if text:
                 send_notification("message",
@@ -443,6 +490,12 @@ class AcpBridge(BaseBridge):
             tool_input = self._tool_input_from_update(upd, tool_name)
             tid = upd.get("toolCallId")
             self._tool_ids_emitted.add(tid)
+            if tid:
+                if tool_name and tool_name != "tool":
+                    self._tool_names_by_id[tid] = tool_name
+                if tool_input:
+                    prev = self._tool_inputs_by_id.get(tid) or {}
+                    self._tool_inputs_by_id[tid] = {**prev, **tool_input}
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
@@ -455,12 +508,21 @@ class AcpBridge(BaseBridge):
                 send_notification("message",
                                   {"type": "turn_usage", "usage": usage})
             status = upd.get("status")
-            tool_name = self._normalize_tool_name(upd)
             tid = upd.get("toolCallId")
+            tool_name = self._normalize_tool_name(upd)
+            # Completed updates often strip title/_meta → name becomes "tool".
+            # Recover the name we saw on the open tool_call / earlier update.
+            if (not tool_name or tool_name == "tool") and tid:
+                tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
+            elif tid and tool_name and tool_name != "tool":
+                self._tool_names_by_id[tid] = tool_name
             # Grok: bare tool_call then richer update. Emit tool_use at most
             # once per id (plugin upserts); re-emitting created a second ☐
             # that never received tool_result → last row stuck pending.
             enriched = self._tool_input_from_update(upd, tool_name)
+            if tid and enriched:
+                prev = self._tool_inputs_by_id.get(tid) or {}
+                self._tool_inputs_by_id[tid] = {**prev, **enriched}
             if tid not in self._tool_ids_emitted:
                 if enriched or upd.get("rawInput") or upd.get("locations"):
                     self._tool_ids_emitted.add(tid)
@@ -514,6 +576,20 @@ class AcpBridge(BaseBridge):
                     "is_error": is_error,
                 })
                 self._tool_ids_emitted.discard(tid)
+                if not is_error and tool_name in (
+                    "scheduler_create", "CronCreate", "ScheduleWakeup",
+                    "scheduler_delete", "CronDelete", "SchedulerDelete",
+                ):
+                    # completed updates often drop rawInput — use cached input.
+                    cached = self._tool_inputs_by_id.get(tid) or {}
+                    merged = {**cached, **(enriched or {})}
+                    self.file_log(
+                        f"scheduler complete name={tool_name} tid={tid} "
+                        f"keys={list(merged.keys())}")
+                    self._note_scheduler_tool_result(
+                        tool_name, merged, text, tool_call_id=tid or "")
+                self._tool_inputs_by_id.pop(tid, None)
+                self._tool_names_by_id.pop(tid, None)
         elif kind == "user_message_chunk":
             # Agents (notably Grok) re-broadcast the user prompt. The plugin
             # already renders ◎ <prompt> — do not double-print as text_delta.
@@ -528,7 +604,279 @@ class AcpBridge(BaseBridge):
             self._handle_mode_update(upd)
         elif kind == "available_commands_update":
             self._handle_commands_update(upd)
+        elif kind in (
+            "scheduled_task_created", "scheduled_task_fired",
+            "scheduled_task_deleted",
+        ):
+            self._handle_schedule_lifecycle(upd)
         # turn_completed / session_summary_generated: ignore (result RPC covers end)
+
+    # ── Scheduler / /loop (Grok native) ────────────────────────────────
+
+    @staticmethod
+    def _parse_interval_seconds(interval: str) -> Optional[float]:
+        """Parse Grok interval strings: 60s, 5m, 2h, 1d (min 60s)."""
+        if not interval or not isinstance(interval, str):
+            return None
+        s = interval.strip().lower()
+        m = re.fullmatch(r"(\d+)\s*([smhd])?", s)
+        if not m:
+            return None
+        n = int(m.group(1))
+        unit = m.group(2) or "s"
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+        sec = float(n * mult)
+        return max(60.0, sec) if sec > 0 else None
+
+    @staticmethod
+    def _parse_fire_at(value: Any) -> Optional[float]:
+        """Parse next_fire_at from epoch, ms, or ISO string → epoch seconds."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            t = float(value)
+            # ms timestamps
+            if t > 1e12:
+                t = t / 1000.0
+            return t if t > 0 else None
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return None
+            try:
+                return float(s)
+            except ValueError:
+                pass
+            try:
+                # ISO-8601
+                from datetime import datetime
+                if s.endswith("Z"):
+                    s = s[:-1] + "+00:00"
+                return datetime.fromisoformat(s).timestamp()
+            except Exception:
+                return None
+        return None
+
+    def _emit_loop_scheduled(self, fire_at: Optional[float]) -> None:
+        self._schedule_next_fire = fire_at
+        send_notification("loop_scheduled", {"fire_at": fire_at})
+        self.file_log(
+            f"loop_scheduled fire_at={fire_at!r}"
+            + (f" ({datetime.datetime.fromtimestamp(fire_at).isoformat()})"
+               if fire_at else ""))
+
+    def _handle_schedule_lifecycle(self, upd: dict) -> None:
+        """Grok sessionUpdate: scheduled_task_created|fired|deleted."""
+        kind = (
+            upd.get("sessionUpdate")
+            or upd.get("kind")
+            or upd.get("type")
+            or ""
+        )
+        kind = str(kind).replace("-", "_")
+        if kind == "scheduled_task_created" or "created" in kind and "schedul" in kind:
+            fire = self._parse_fire_at(
+                upd.get("next_fire_at")
+                or upd.get("nextFireAt")
+                or upd.get("fire_at")
+                or upd.get("fireAt")
+            )
+            if fire is None:
+                # Derive from interval on create payload
+                interval = (
+                    upd.get("interval")
+                    or (upd.get("task") or {}).get("interval")
+                    or ""
+                )
+                sec = self._parse_interval_seconds(str(interval)) if interval else None
+                if sec:
+                    fire = time.time() + sec
+            if fire:
+                self._emit_loop_scheduled(fire)
+            return
+        if kind == "scheduled_task_fired" or kind.endswith("task_fired"):
+            prompt = (
+                upd.get("prompt")
+                or upd.get("human_schedule")
+                or (upd.get("task") or {}).get("prompt")
+                or ""
+            )
+            # Next fire for recurring (if provided)
+            fire = self._parse_fire_at(
+                upd.get("next_fire_at") or upd.get("nextFireAt")
+            )
+            self._emit_loop_scheduled(fire)
+            if prompt:
+                display = "↻ " + str(prompt).split("\n", 1)[0][:60]
+                send_notification("notification_wake", {
+                    "wake_prompt": prompt,
+                    "display_message": display,
+                })
+                self.file_log(f"scheduled_task_fired → wake: {prompt[:80]!r}")
+            return
+        if kind == "scheduled_task_deleted" or "deleted" in kind and "schedul" in kind:
+            # Best-effort: clear banner; list may still have other jobs.
+            # Prefer next_fire_at if agent includes remaining tasks' soonest fire.
+            fire = self._parse_fire_at(
+                upd.get("next_fire_at") or upd.get("nextFireAt")
+            )
+            self._emit_loop_scheduled(fire)
+            return
+
+    def _cancel_client_schedule(self, key: str) -> None:
+        t = self._client_schedule_tasks.pop(key, None)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _arm_client_schedule_backup(
+            self, key: str, interval_sec: float, prompt: str,
+            fire_immediately: bool, recurring: bool) -> None:
+        """Bridge-local timer: inject wake if host never sends scheduled_task_*.
+
+        Grok ACP often creates the schedule server-side but does not always
+        push x.ai/scheduled_task_inject_prompt back into the bridge. Claude
+        ScheduleWakeup already uses an in-process timer; mirror that here so
+        goal+cron dogfood actually re-enters the session.
+        """
+        if not prompt or interval_sec <= 0:
+            return
+        self._cancel_client_schedule(key)
+
+        async def _run() -> None:
+            try:
+                # Let the current turn finish emitting tool_result / end_turn.
+                first_delay = 1.5 if fire_immediately else interval_sec
+                self.file_log(
+                    f"client_schedule[{key}]: first_delay={first_delay:.1f}s "
+                    f"interval={interval_sec:.0f}s immediate={fire_immediately} "
+                    f"recurring={recurring}")
+                await asyncio.sleep(first_delay)
+                while True:
+                    nxt = (time.time() + interval_sec) if recurring else None
+                    self._emit_loop_scheduled(nxt)
+                    display = "↻ " + prompt.strip().split("\n", 1)[0][:60]
+                    send_notification("notification_wake", {
+                        "wake_prompt": prompt,
+                        "display_message": display,
+                    })
+                    self.file_log(
+                        f"client_schedule[{key}]: wake fired "
+                        f"({len(prompt)} chars)")
+                    if not recurring:
+                        self._emit_loop_scheduled(None)
+                        break
+                    await asyncio.sleep(interval_sec)
+            except asyncio.CancelledError:
+                self.file_log(f"client_schedule[{key}]: cancelled")
+            except Exception as e:
+                self.file_log(f"client_schedule[{key}]: error {e}")
+            finally:
+                self._client_schedule_tasks.pop(key, None)
+
+        try:
+            loop = asyncio.get_running_loop()
+            self._client_schedule_tasks[key] = loop.create_task(_run())
+        except RuntimeError:
+            self.file_log(
+                f"client_schedule[{key}]: no running loop — cannot arm timer")
+
+    def _note_scheduler_tool_result(
+            self, tool_name: str, tool_input: dict, text: str,
+            tool_call_id: str = "") -> None:
+        """Arm loop banner + client wake backup from scheduler tool results.
+
+        Completed tool_call_update often omits rawInput; callers must pass the
+        cached create payload. Host sessionUpdate inject remains preferred when
+        present — client timer is a reliability layer for ACP.
+        """
+        name = (tool_name or "").strip()
+        # Delete / cancel → drop backup timer + clear banner if no other jobs.
+        if name in ("scheduler_delete", "CronDelete", "SchedulerDelete"):
+            del_id = (
+                (tool_input or {}).get("id")
+                or (tool_input or {}).get("task_id")
+                or ""
+            )
+            data = None
+            try:
+                data = json.loads(text) if text and text.lstrip().startswith("{") else None
+            except Exception:
+                pass
+            if isinstance(data, dict):
+                del_id = del_id or data.get("id") or ""
+            if del_id:
+                self._cancel_client_schedule(str(del_id))
+            if tool_call_id:
+                self._cancel_client_schedule(f"tc:{tool_call_id}")
+            # If no client jobs left, clear banner.
+            if not self._client_schedule_tasks:
+                self._emit_loop_scheduled(None)
+            self.file_log(f"scheduler delete: cancelled client timer id={del_id!r}")
+            return
+
+        interval = (
+            (tool_input or {}).get("interval")
+            or (tool_input or {}).get("cron")
+            or ""
+        )
+        delay = (tool_input or {}).get("delaySeconds") or (tool_input or {}).get("delay_seconds")
+        prompt = (tool_input or {}).get("prompt") or (tool_input or {}).get("message") or ""
+        fire_immediately = bool(
+            (tool_input or {}).get("fire_immediately")
+            or (tool_input or {}).get("fireImmediately")
+        )
+        recurring = (tool_input or {}).get("recurring")
+        if recurring is None:
+            recurring = True
+        else:
+            recurring = bool(recurring)
+
+        fire = None
+        task_id = ""
+        # Prefer explicit next fire in tool output JSON
+        try:
+            data = json.loads(text) if text and text.lstrip().startswith("{") else None
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            task_id = str(data.get("id") or data.get("task_id") or "")
+            fire = self._parse_fire_at(
+                data.get("next_fire_at")
+                or data.get("nextFireAt")
+                or data.get("fire_at")
+            )
+            if fire is None and isinstance(data.get("task"), dict):
+                fire = self._parse_fire_at(data["task"].get("next_fire_at"))
+                task_id = task_id or str(data["task"].get("id") or "")
+            # humanSchedule "every 2 minutes" — fall through to interval parse
+        sec = None
+        if interval:
+            sec = self._parse_interval_seconds(str(interval))
+            if fire is None and sec:
+                fire = time.time() + (1.5 if fire_immediately else sec)
+        if fire is None and delay is not None:
+            try:
+                d = float(delay)
+                sec = max(60.0, min(d, 7 * 86400))
+                fire = time.time() + sec
+            except (TypeError, ValueError):
+                pass
+        if fire:
+            self._emit_loop_scheduled(fire)
+            self.file_log(
+                f"scheduler tool {tool_name}: armed next_fire≈{fire:.0f} "
+                f"immediate={fire_immediately}")
+        # Client backup timer (host inject often missing in ACP).
+        key = task_id or (f"tc:{tool_call_id}" if tool_call_id else "")
+        if key and prompt and sec:
+            self._arm_client_schedule_backup(
+                key, float(sec), str(prompt), fire_immediately, recurring)
+        elif key and prompt and delay is not None and sec:
+            self._arm_client_schedule_backup(
+                key, float(sec), str(prompt), True, False)
 
     def _handle_mode_update(self, upd: dict) -> None:
         mode = upd.get("currentModeId") or upd.get("modeId") or ""
@@ -1037,6 +1385,7 @@ class AcpBridge(BaseBridge):
         prompt_blocks = self._build_prompt_blocks(prompt, images)
         self._query_req_id = req_id
         self._prompt_cancelled = False
+        self._cancel_in_flight = False
         try:
             result = await self._send_prompt(prompt_blocks) or {}
             stop_reason = result.get("stopReason", "end_turn")
@@ -1084,6 +1433,7 @@ class AcpBridge(BaseBridge):
             if self._query_req_id == req_id:
                 self._query_req_id = None
             self._prompt_cancelled = False
+            self._cancel_in_flight = False
             self._prompt_fut = None
             self._prompt_acp_id = None
 
@@ -1253,32 +1603,59 @@ class AcpBridge(BaseBridge):
         Sending it as a request returns Method not found and never unblocks
         the prompt. After notify, session/prompt resolves with
         stopReason=cancelled — handle_query maps that to interrupted.
+
+        Idempotent: extra Esc presses must NOT re-send session/cancel after
+        the turn already ended (Grok logs ChatStateActor dead / channel_dropped).
         """
+        fut = self._prompt_fut
+        active = fut is not None and not fut.done()
+        has_query = self._query_req_id is not None
+        # Idle — nothing to cancel (don't poke Grok).
+        if not active and not has_query:
+            self.file_log("interrupt: idle (no in-flight prompt)")
+            send_result(req_id, {"status": "interrupted"})
+            return
+        # Cancel already in progress / done for this turn — no second notify.
+        if self._cancel_in_flight and not active:
+            self.file_log("interrupt: already cancelled; skip session/cancel")
+            send_result(req_id, {"status": "interrupted"})
+            return
+
+        first_cancel = not self._prompt_cancelled
         self._prompt_cancelled = True
+        self._cancel_in_flight = True
+
         # Kill client-side terminals so terminal/wait_for_exit unblocks.
         for tid in list(self._terminals):
             try:
                 await self._terminal_close(tid)
             except Exception:
                 pass
-        if self.session_id is not None:
+
+        # One session/cancel per turn only.
+        if first_cancel and self.session_id is not None:
             try:
                 await self._notify_acp(
                     "session/cancel", {"sessionId": self.session_id})
             except Exception as e:
                 self.log(f"session/cancel notify failed: {e}")
+        elif not first_cancel:
+            self.file_log("interrupt: skip duplicate session/cancel")
+
         # Unblock local await if the agent is slow/stuck (e.g. terminal wait).
         # Prefer resolving with cancelled so handle_query takes the normal path.
         fut = self._prompt_fut
         if fut is not None and not fut.done():
-            # Give the agent a brief moment to deliver stopReason=cancelled.
+            # Brief grace for agent stopReason=cancelled, then force so the
+            # plugin query RPC always completes (otherwise UI never idles).
             try:
-                await asyncio.wait_for(asyncio.shield(fut), timeout=0.4)
+                await asyncio.wait_for(asyncio.shield(fut), timeout=0.35)
             except (asyncio.TimeoutError, Exception):
-                if not fut.done():
-                    fut.set_result({"stopReason": "cancelled"})
-                    self.file_log(
-                        "interrupt: forced local prompt future to cancelled")
+                pass
+            if not fut.done():
+                fut.set_result({"stopReason": "cancelled"})
+                self.file_log(
+                    "interrupt: forced local prompt future to cancelled")
         # Unblock any permission waiters so they don't keep the turn alive.
         for pid, pfut in list(self.pending_permissions.items()):
             if pfut and not pfut.done():
@@ -1373,6 +1750,9 @@ class AcpBridge(BaseBridge):
         "x.ai/ask_user_question": "_acp_ask_user_question",
         "_x.ai/exit_plan_mode": "_acp_exit_plan_mode",
         "x.ai/exit_plan_mode": "_acp_exit_plan_mode",
+        # Grok scheduler fire → client injects the prompt as a new turn.
+        "x.ai/scheduled_task_inject_prompt": "_acp_scheduled_task_inject",
+        "_x.ai/scheduled_task_inject_prompt": "_acp_scheduled_task_inject",
         "fs/read_text_file": "_acp_fs_read",
         "fs/write_text_file": "_acp_fs_write",
         "terminal/create": "_acp_terminal_create",
@@ -1708,6 +2088,41 @@ class AcpBridge(BaseBridge):
             if labels:
                 norm[key] = labels
         return norm
+
+    async def _acp_scheduled_task_inject(self, params: dict) -> dict:
+        """Grok fires a scheduled task: inject prompt as a new session turn.
+
+        Wire: x.ai/scheduled_task_inject_prompt { sessionId, prompt, ... }
+        Plugin path: notification_wake → Session.query (same as Claude cron).
+        """
+        prompt = (
+            params.get("prompt")
+            or params.get("text")
+            or params.get("message")
+            or ""
+        )
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(
+                "x.ai/scheduled_task_inject_prompt: missing or empty prompt")
+        sid = params.get("sessionId") or params.get("session_id") or ""
+        if self.session_id and sid and sid != self.session_id:
+            self.file_log(
+                f"scheduled_task_inject: sessionId mismatch "
+                f"{sid!r} vs {self.session_id!r} (still injecting)")
+        fire = self._parse_fire_at(
+            params.get("next_fire_at") or params.get("nextFireAt")
+        )
+        # Update loop banner for recurring schedules.
+        self._emit_loop_scheduled(fire)
+        display = "↻ " + prompt.strip().split("\n", 1)[0][:60]
+        send_notification("notification_wake", {
+            "wake_prompt": prompt,
+            "display_message": display,
+        })
+        self.file_log(
+            f"scheduled_task_inject → wake ({len(prompt)} chars): "
+            f"{prompt[:100]!r}")
+        return {}
 
     async def _acp_ask_user_question(self, params: dict) -> dict:
         """Handle Grok `_x.ai/ask_user_question` → plugin question UI.
@@ -2065,6 +2480,10 @@ class AcpBridge(BaseBridge):
         # Escalate after a beat if still alive (done by waiters).
 
     async def _acp_terminal_create(self, params: dict) -> dict:
+        # After cancel, refuse new shells so the agent cannot keep spawning
+        # work while the prompt is winding down.
+        if self._prompt_cancelled:
+            raise ValueError("terminal/create rejected: turn cancelled")
         cmd = params.get("command")
         if not cmd:
             raise ValueError("terminal/create requires command")
@@ -2175,7 +2594,15 @@ class AcpBridge(BaseBridge):
         tid = params.get("terminalId") or ""
         slot = self._terminals.get(tid)
         if not slot:
-            raise ValueError(f"unknown terminalId: {tid}")
+            # Already released/killed (e.g. on interrupt) — empty output,
+            # cancelled exit. Matches terminal/wait_for_exit soft handling.
+            self.file_log(
+                f"terminal/output {tid} unknown (released); return cancelled")
+            return {
+                "output": "",
+                "truncated": False,
+                "exitStatus": {"exitCode": 130, "signal": "SIGTERM"},
+            }
         out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
         return {"output": out, "truncated": bool(slot["truncated"]),
                 "exitStatus": slot.get("exit_status")}
@@ -2246,8 +2673,8 @@ class AcpBridge(BaseBridge):
         if reader and not reader.done():
             reader.cancel()
             try:
-                await reader
-            except (asyncio.CancelledError, Exception):
+                await asyncio.wait_for(reader, timeout=0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
         # Hard kill if still alive after cancel.
         proc = slot.get("proc")

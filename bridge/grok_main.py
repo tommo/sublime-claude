@@ -116,6 +116,16 @@ class GrokBridge(AcpBridge):
         "XSemanticSearch": "x_semantic_search",
         "XUserSearch": "x_user_search",
         "XThreadFetch": "x_thread_fetch",
+        # Scheduler / /loop (Grok native; maps from Claude Cron* aliases too).
+        "scheduler_create": "scheduler_create",
+        "SchedulerCreate": "scheduler_create",
+        "CronCreate": "scheduler_create",
+        "scheduler_list": "scheduler_list",
+        "SchedulerList": "scheduler_list",
+        "CronList": "scheduler_list",
+        "scheduler_delete": "scheduler_delete",
+        "SchedulerDelete": "scheduler_delete",
+        "CronDelete": "scheduler_delete",
     }
 
 

@@ -33,3 +33,11 @@ from Telegram or Discord.
 - Click to expand/collapse tool sections
 - MCP tool parameters (pass args to saved tools)
 - notalone channel mode (`CHANNEL_SPEC.md`)
+- Workflow panel: wide-fanout collapse + live elapsed between ticks; capture failing-run state enum (see `docs/workflow_visualization_proposal.md` §0)
+
+## Done (recent)
+
+### Workflow visualization (ultracode task_progress)
+Live multi-agent panel from `task_progress` events — partial-tick merge, multi-workflow
+redirect phantoms with sticky anchors, detail view collapse-on-complete. Fixture:
+`tests/test_workflow_merge.py`, dogfood tool: `.claude/sublime_tools/workflow_poc.py`.
