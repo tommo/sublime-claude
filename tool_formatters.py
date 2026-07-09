@@ -8,10 +8,201 @@ _format_bash_result, etc.) and returns the detail string starting with ": ".
 Adding a tool = one entry in TOOL_FORMATTERS instead of editing a 90-line chain.
 Unknown tool names fall through to the MCP-style result formatter (when applicable).
 """
-from typing import Callable, Dict, TYPE_CHECKING
+import json
+import os
+import re
+from typing import Callable, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .output import OutputView, ToolCall
+
+# Grok Imagine / video tools — result is a saved file path.
+MEDIA_TOOLS = frozenset({
+    "image_gen", "image_edit", "image_to_video", "reference_to_video", "video_gen",
+})
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
+MEDIA_EXTS = IMAGE_EXTS + VIDEO_EXTS
+
+# X / Twitter search tools.
+X_SEARCH_TOOLS = frozenset({
+    "x_keyword_search", "x_semantic_search", "x_user_search", "x_thread_fetch",
+})
+
+
+def extract_media_path(result: Optional[str], tool_input: Optional[dict] = None) -> Optional[str]:
+    """Best-effort absolute path from media tool result / input."""
+    candidates = []
+    if isinstance(tool_input, dict):
+        for k in ("path", "file_path", "output_path", "image", "filename"):
+            v = tool_input.get(k)
+            if isinstance(v, str) and v.strip():
+                candidates.append(v.strip())
+        # image_edit may pass image as list of refs
+        imgs = tool_input.get("images")
+        if isinstance(imgs, list):
+            for v in imgs:
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v.strip())
+
+    text = (result or "").strip()
+    if text:
+        # Whole-result JSON: {"path":"…","filename":"1.jpg",…}
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                for k in ("path", "file_path", "output_path", "filename"):
+                    v = obj.get(k)
+                    if isinstance(v, str) and v.strip():
+                        candidates.append(v.strip())
+            elif isinstance(obj, str):
+                candidates.append(obj)
+        except Exception:
+            pass
+        # Embedded JSON object
+        for m in re.finditer(r'\{[^{}]*"(?:path|file_path|filename)"[^{}]*\}', text):
+            try:
+                obj = json.loads(m.group(0))
+                if isinstance(obj, dict):
+                    for k in ("path", "file_path", "filename"):
+                        v = obj.get(k)
+                        if isinstance(v, str) and v.strip():
+                            candidates.append(v.strip())
+            except Exception:
+                pass
+        # Bare absolute/relative media paths in text
+        for m in re.finditer(
+                r'(?:/|~/)[^\s"\']+?\.(?:png|jpe?g|webp|gif|bmp|mp4|webm|mov|mkv)\b',
+                text, re.I):
+            candidates.append(m.group(0))
+        for m in re.finditer(
+                r'(?:images|videos)/\S+?\.(?:png|jpe?g|webp|gif|bmp|mp4|webm|mov|mkv)\b',
+                text, re.I):
+            candidates.append(m.group(0))
+
+    for c in candidates:
+        p = os.path.expanduser(c)
+        if os.path.isfile(p):
+            return p
+        # session-relative images/1.jpg — leave to caller with session root
+        if c.startswith(("images/", "videos/")) or not os.path.isabs(p):
+            # Prefer absolute paths that exist; keep first absolute even if missing
+            # (file may still be writing).
+            pass
+    # Prefer first absolute-looking candidate even if not yet on disk
+    for c in candidates:
+        p = os.path.expanduser(c)
+        if os.path.isabs(p) and p.lower().endswith(MEDIA_EXTS):
+            return p
+    for c in candidates:
+        if c.lower().endswith(MEDIA_EXTS):
+            return os.path.expanduser(c)
+    return None
+
+
+def media_display_path(path: str) -> str:
+    """Short label: images/1.jpg or basename."""
+    if not path:
+        return ""
+    norm = path.replace("\\", "/")
+    for marker in ("/images/", "/videos/"):
+        idx = norm.find(marker)
+        if idx >= 0:
+            return norm[idx + 1:]  # images/1.jpg
+    if norm.startswith(("images/", "videos/")):
+        return norm
+    return os.path.basename(path)
+
+
+def is_image_path(path: str) -> bool:
+    return bool(path) and path.lower().endswith(IMAGE_EXTS)
+
+
+def is_video_path(path: str) -> bool:
+    return bool(path) and path.lower().endswith(VIDEO_EXTS)
+
+
+def _clip(s: str, n: int = 70) -> str:
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _media_path_suffix(tool: "ToolCall") -> str:
+    path = None
+    if isinstance(tool.tool_input, dict):
+        path = tool.tool_input.get("_media_path") or tool.tool_input.get("path")
+    if not path:
+        path = extract_media_path(tool.result, tool.tool_input)
+    if not path:
+        return ""
+    if tool.status in ("done", "error"):
+        label = media_display_path(path)
+        # Images get an inline minihtml phantom; videos: path only (reveal via click).
+        return f" → {label}"
+    return ""
+
+
+def _image_gen(view: "OutputView", tool: "ToolCall") -> str:
+    prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
+    out = f": {prompt}" if prompt else ""
+    out += _media_path_suffix(tool)
+    return out
+
+
+def _image_edit(view: "OutputView", tool: "ToolCall") -> str:
+    prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
+    out = f": {prompt}" if prompt else ": edit"
+    out += _media_path_suffix(tool)
+    return out
+
+
+def _image_to_video(view: "OutputView", tool: "ToolCall") -> str:
+    prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
+    out = f": {prompt}" if prompt else ": animate"
+    out += _media_path_suffix(tool)
+    return out
+
+
+def _reference_to_video(view: "OutputView", tool: "ToolCall") -> str:
+    prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
+    out = f": {prompt}" if prompt else ": refs→video"
+    out += _media_path_suffix(tool)
+    return out
+
+
+def _video_gen(view: "OutputView", tool: "ToolCall") -> str:
+    prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
+    out = f": {prompt}" if prompt else ""
+    out += _media_path_suffix(tool)
+    return out
+
+
+def _x_search(view: "OutputView", tool: "ToolCall") -> str:
+    """x_keyword_search / x_semantic_search — query + optional result count."""
+    inp = tool.tool_input or {}
+    q = inp.get("query") or inp.get("q") or ""
+    out = f": {_clip(str(q), 80)}" if q else ""
+    if tool.result and tool.status == "done":
+        out += view._format_x_search_result(tool.result)
+    return out
+
+
+def _x_user_search(view: "OutputView", tool: "ToolCall") -> str:
+    inp = tool.tool_input or {}
+    q = inp.get("query") or inp.get("q") or inp.get("username") or ""
+    out = f": {_clip(str(q), 60)}" if q else ""
+    if tool.result and tool.status == "done":
+        out += view._format_x_search_result(tool.result)
+    return out
+
+
+def _x_thread_fetch(view: "OutputView", tool: "ToolCall") -> str:
+    inp = tool.tool_input or {}
+    tid = inp.get("post_id") or inp.get("tweet_id") or inp.get("id") or ""
+    out = f": #{tid}" if tid else ""
+    if tool.result and tool.status == "done":
+        out += view._format_x_search_result(tool.result)
+    return out
 
 
 def _bash(view: "OutputView", tool: "ToolCall") -> str:
@@ -82,14 +273,36 @@ def _websearch(view: "OutputView", tool: "ToolCall") -> str:
     return f": {tool.tool_input.get('query', '')}"
 
 
+def _search_tool(view: "OutputView", tool: "ToolCall") -> str:
+    """Grok search_tool — discover MCP tools by query (not WebSearch)."""
+    q = tool.tool_input.get("query", "")
+    return f": {q}" if q else ""
+
+
+def _update_goal(view: "OutputView", tool: "ToolCall") -> str:
+    """Grok update_goal — single active-goal progress (not a Task list)."""
+    inp = tool.tool_input or {}
+    if inp.get("blocked_reason"):
+        return f": blocked — {inp['blocked_reason']}"
+    if inp.get("completed") is True:
+        msg = (inp.get("message") or "").strip()
+        return f": completed — {msg}" if msg else ": completed"
+    msg = (inp.get("message") or "").strip()
+    return f": {msg}" if msg else ": progress"
+
+
 def _webfetch(view: "OutputView", tool: "ToolCall") -> str:
     return f": {tool.tool_input.get('url', '')}"
 
 
 def _task(view: "OutputView", tool: "ToolCall") -> str:
-    sub = tool.tool_input.get("subagent_type", "")
-    desc = tool.tool_input.get("description", "")
-    return f": {sub}" + (f" - {desc}" if desc else "")
+    sub = tool.tool_input.get("subagent_type", "") or ""
+    desc = tool.tool_input.get("description", "") or ""
+    if sub and desc:
+        return f": {sub} - {desc}"
+    if sub or desc:
+        return f": {sub or desc}"
+    return ""
 
 
 def _notebook_edit(view: "OutputView", tool: "ToolCall") -> str:
@@ -182,6 +395,8 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "Glob": _glob,
     "Grep": _grep,
     "WebSearch": _websearch,
+    "search_tool": _search_tool,
+    "update_goal": _update_goal,
     "WebFetch": _webfetch,
     "Task": _task,
     "NotebookEdit": _notebook_edit,
@@ -199,6 +414,17 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "Skill": _skill,
     "EnterPlanMode": _enter_plan_mode,
     "ExitPlanMode": _exit_plan_mode,
+    # Media generation
+    "image_gen": _image_gen,
+    "image_edit": _image_edit,
+    "image_to_video": _image_to_video,
+    "reference_to_video": _reference_to_video,
+    "video_gen": _video_gen,
+    # X / Twitter
+    "x_keyword_search": _x_search,
+    "x_semantic_search": _x_search,
+    "x_user_search": _x_user_search,
+    "x_thread_fetch": _x_thread_fetch,
 }
 
 

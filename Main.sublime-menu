@@ -58,6 +58,10 @@
                         "command": "grok_start"
                     },
                     {
+                        "caption": "Grok (Claude Code): New Session",
+                        "command": "grok_cc_start"
+                    },
+                    {
                         "caption": "Grok: Login…",
                         "command": "grok_login"
                     },

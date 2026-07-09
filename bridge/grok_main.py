@@ -1,0 +1,164 @@
+"""Grok Build ACP bridge — thin agent adapter over AcpBridge.
+
+Spawns `grok agent stdio` (optionally with --model / --always-approve),
+authenticates via cached_token, and uses standard session/set_model +
+session/set_mode.
+"""
+import os
+import shutil
+import sys
+from typing import Dict, List, Optional
+
+_BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_PLUGIN_DIR = os.path.dirname(_BRIDGE_DIR)
+sys.path.insert(0, _BRIDGE_DIR)
+sys.path.insert(0, _PLUGIN_DIR)
+
+from acp_base import AcpBridge, run_bridge  # noqa: E402
+
+
+GROK_BIN = os.environ.get("GROK_BIN") or shutil.which("grok") or "grok"
+
+
+class GrokBridge(AcpBridge):
+    BACKEND_NAME = "grok"
+    DEFAULT_MODEL = "grok-4.5"
+    LOG_PATH = "/tmp/grok_bridge.log"
+
+    # Grok accepts many modeId strings; map Claude permission modes to the
+    # closest Grok Build modes we care about.
+    PERM_TO_MODE = {
+        "default": "default",
+        "acceptEdits": "default",
+        "auto": "default",
+        "bypassPermissions": "bypassPermissions",
+        "plan": "plan",
+    }
+    MODE_TO_PERM = {
+        "default": "default",
+        "plan": "plan",
+        "bypassPermissions": "bypassPermissions",
+        "agent": "acceptEdits",
+        "code": "acceptEdits",
+        "ask": "default",
+    }
+    MODEL_ALIASES = {
+        "grok-4.5": "grok-4.5",
+        "grok-4-fast": "grok-composer-2.5-fast",
+        "grok-composer-2.5-fast": "grok-composer-2.5-fast",
+        "composer": "grok-composer-2.5-fast",
+        "composer-2.5": "grok-composer-2.5-fast",
+    }
+    # Grok Build tool ids + rawInput.variant values → Claude formatters.
+    # Prefer _meta.x.ai/tool.name when present; variants are a common fallback.
+    TOOL_TO_CANONICAL = {
+        "read_file": "Read",
+        "ReadFile": "Read",
+        "search_replace": "Edit",
+        "StrReplace": "Edit",
+        "write": "Write",
+        "WriteFile": "Write",
+        "run_terminal_command": "Bash",
+        "run_terminal_cmd": "Bash",
+        "Shell": "Bash",
+        "grep": "Grep",
+        "list_dir": "Glob",
+        "ListDir": "Glob",
+        "List": "Glob",  # never use — defensive if title first-word leaks
+        "web_search": "WebSearch",
+        "web_fetch": "WebFetch",
+        "open_page": "WebFetch",
+        "todo_write": "TodoWrite",
+        "TodoWrite": "TodoWrite",
+        "spawn_subagent": "Task",
+        "Task": "Task",
+        "get_command_or_subagent_output": "TaskGet",
+        "TaskOutput": "TaskGet",
+        "TaskGet": "TaskGet",
+        "ask_user_question": "ask_user",
+        "AskUserQuestion": "ask_user",
+        "enter_plan_mode": "EnterPlanMode",
+        "exit_plan_mode": "ExitPlanMode",
+        "EnterPlanMode": "EnterPlanMode",
+        "ExitPlanMode": "ExitPlanMode",
+        # MCP tool discovery (NOT web search). Keep own name + formatter.
+        "search_tool": "search_tool",
+        "SearchTool": "search_tool",
+        "search_codebase": "Grep",
+        # Single active goal progress (not TodoWrite / Task*).
+        "update_goal": "update_goal",
+        "UpdateGoal": "update_goal",
+        # Media generation (Imagine / video) — keep names for preview UX.
+        "image_gen": "image_gen",
+        "ImageGen": "image_gen",
+        "image_edit": "image_edit",
+        "ImageEdit": "image_edit",
+        "image_to_video": "image_to_video",
+        "ImageToVideo": "image_to_video",
+        "reference_to_video": "reference_to_video",
+        "ReferenceToVideo": "reference_to_video",
+        "video_gen": "video_gen",
+        "VideoGen": "video_gen",
+        # X / Twitter search tools.
+        "x_keyword_search": "x_keyword_search",
+        "x_semantic_search": "x_semantic_search",
+        "x_user_search": "x_user_search",
+        "x_thread_fetch": "x_thread_fetch",
+        "XKeywordSearch": "x_keyword_search",
+        "XSemanticSearch": "x_semantic_search",
+        "XUserSearch": "x_user_search",
+        "XThreadFetch": "x_thread_fetch",
+    }
+
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._always_approve: bool = False
+
+    def agent_argv(self) -> List[str]:
+        args = [GROK_BIN, "agent"]
+        if self.model:
+            args += ["--model", self.model]
+        # Full bypass: agent skips permission RPCs entirely. Other modes
+        # (acceptEdits / default / plan) go through session/request_permission
+        # so AcpBridge can apply plugin allowed_tools + auto-allow patterns.
+        if self._always_approve or self.permission_mode == "bypassPermissions":
+            args.append("--always-approve")
+        args.append("stdio")
+        return args
+
+    def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:
+        pm = permission_mode or "default"
+        self._always_approve = (pm == "bypassPermissions")
+        return super().permission_mode_to_agent_mode(pm)
+
+    async def after_agent_initialize(self, init_result: dict) -> None:
+        # Prefer cached ~/.grok/auth.json; fall back to first advertised method.
+        methods = init_result.get("authMethods") or self._auth_methods or []
+        method_ids = [m.get("id") for m in methods if isinstance(m, dict)]
+        preferred = None
+        meta = init_result.get("_meta") or {}
+        preferred = meta.get("defaultAuthMethodId")
+        if preferred not in method_ids:
+            preferred = "cached_token" if "cached_token" in method_ids else (
+                method_ids[0] if method_ids else None)
+        if not preferred:
+            self.log("no auth methods advertised; hoping agent is already authed")
+            return
+        try:
+            await self._send_acp("authenticate", {"methodId": preferred})
+            self.log(f"authenticated via {preferred}")
+        except Exception as e:
+            # Session may still work if process already has credentials.
+            self.log(f"authenticate({preferred}) failed: {e}")
+
+    def usage_from_prompt_result(self, result: dict) -> Optional[Dict]:
+        return super().usage_from_prompt_result(result)
+
+
+def main() -> None:
+    run_bridge(GrokBridge())
+
+
+if __name__ == "__main__":
+    main()

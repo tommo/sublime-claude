@@ -274,6 +274,11 @@ def _dsr_available() -> bool:
     return bool(os.environ.get("DSR_BIN") or shutil.which("dsr"))
 
 
+def _grok_available() -> bool:
+    """Native Grok Build ACP: `grok` CLI on PATH (or GROK_BIN)."""
+    return bool(os.environ.get("GROK_BIN") or shutil.which("grok"))
+
+
 BACKENDS: Dict[str, BackendSpec] = {
     "pi": BackendSpec(
         name="pi",
@@ -290,12 +295,25 @@ BACKENDS: Dict[str, BackendSpec] = {
         ],
         available=_pi_available,
     ),
+    # Native Grok Build via ACP (`grok agent stdio`).
     "grok": BackendSpec(
         name="grok",
         label="Grok",
         abbrev="GR",
-        # Reuses the Claude bridge (main.py); a bundled Anthropic<->xAI proxy is
-        # spawned by GrokProxyManager and the bridge is pointed at it via env.
+        bridge_script="grok_main.py",
+        fallback_model="grok-4.5",
+        default_models=[
+            ("grok-4.5", "Grok 4.5"),
+            ("grok-composer-2.5-fast", "Composer 2.5"),
+        ],
+        available=_grok_available,
+        pinned=True,
+    ),
+    # xAI via Anthropic-compat proxy + Claude Code bridge (legacy path).
+    "grok_cc": BackendSpec(
+        name="grok_cc",
+        label="Grok (Claude Code)",
+        abbrev="GCC",
         bridge_script="main.py",
         fallback_model="grok-4.5",
         default_models=grok_backend.GROK_MODELS,

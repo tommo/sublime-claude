@@ -273,6 +273,20 @@ class DsrStartCommand(sublime_plugin.WindowCommand):
         create_session(self.window, backend="dsr")
 
 
+class GrokStartCommand(sublime_plugin.WindowCommand):
+    """Start a native Grok Build session via ACP (`grok agent stdio`)."""
+    def run(self) -> None:
+        import shutil
+        if not os.environ.get("GROK_BIN") and not shutil.which("grok"):
+            sublime.error_message(
+                "grok CLI not found.\n\n"
+                "Install Grok Build and put `grok` in PATH, or set GROK_BIN.\n"
+                "Then run `grok login` once."
+            )
+            return
+        create_session(self.window, backend="grok")
+
+
 # ─── Custom Anthropic-compatible providers ────────────────────────────────────
 # Manage arbitrary Anthropic-compat endpoints (base URL + auth + model aliases),
 # mirroring the ccm model-switcher's env surface. Config is persisted to
@@ -1482,7 +1496,7 @@ class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
         # and has its own legacy default_model key handled below).
         seen = set()
         backends_list = []
-        for name in ("claude", "codex", "copilot", "pi", "dsr"):
+        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
             if backends.is_available(name) or name == "claude":
                 backends_list.append(name)
                 seen.add(name)
@@ -1557,7 +1571,7 @@ class ClaudeSetDefaultProviderCommand(sublime_plugin.WindowCommand):
         # available custom providers. Same ordering as ClaudeSetDefaultModelCommand.
         seen = set()
         backends_list = []
-        for name in ("claude", "codex", "copilot", "pi", "dsr"):
+        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
             if name == "claude" or backends.is_available(name):
                 backends_list.append(name)
                 seen.add(name)
@@ -2256,7 +2270,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         # Include current backend with "(current)" marker so users can see what's active.
         if not is_term:
             ordered = []
-            for name in ("claude", "codex", "copilot", "pi", "dsr"):
+            for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
                 if name in available_backends and name not in ordered:
                     ordered.append(name)
             for name in available_backends:
@@ -4098,6 +4112,18 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
             self.view.run_command("claude_toggle_tasks_fold")
             return
 
+        # Media tool line / "· preview" → popup (not inline phantom).
+        media_path = self._media_path_from_line(line)
+        if media_path:
+            try:
+                from . import claude_code
+                session = claude_code.get_session_for_view(self.view)
+                if session and session.output:
+                    session.output.show_media_popup(media_path, location=pt)
+                    return
+            except Exception:
+                pass
+
         # Try to find URL at position
         url_pattern = r'https?://[^\s\]\)>\'"]+|file://[^\s\]\)>\'"]+'
         for match in re.finditer(url_pattern, line):
@@ -4120,6 +4146,25 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
                         path_with_line = parts[0]
                         line_num = int(parts[1])
 
+                # Media short/absolute path under cursor → popup preview
+                if path_with_line.startswith(("images/", "videos/")) or (
+                        path_with_line.lower().endswith(
+                            (".png", ".jpg", ".jpeg", ".webp", ".gif",
+                             ".mp4", ".webm", ".mov"))):
+                    resolved = path_with_line if os.path.isfile(path_with_line) \
+                        else self._resolve_media_short_path(path_with_line)
+                    if resolved and os.path.isfile(resolved):
+                        try:
+                            from . import claude_code
+                            session = claude_code.get_session_for_view(self.view)
+                            if session and session.output:
+                                session.output.show_media_popup(
+                                    resolved, location=pt)
+                                return
+                        except Exception:
+                            pass
+                        return
+
                 # Check if file exists
                 if os.path.isfile(path_with_line):
                     window = self.view.window()
@@ -4131,6 +4176,74 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
                     return
 
         sublime.status_message("No link or file path found at cursor")
+
+    def _media_path_from_line(self, line: str):
+        """If this is a done media tool line, return absolute media path."""
+        from .tool_formatters import MEDIA_TOOLS, media_display_path, extract_media_path
+        #  ✔ image_gen: … → images/1.jpg  · preview
+        for name in MEDIA_TOOLS:
+            if name in line and ("→" in line or "preview" in line):
+                # Prefer short path token after →
+                m = re.search(
+                    r'→\s*((?:images|videos)/[^\s]+|\S+\.(?:png|jpe?g|webp|gif|mp4|webm|mov))',
+                    line, re.I)
+                short = m.group(1) if m else None
+                if short:
+                    resolved = self._resolve_media_short_path(short)
+                    if resolved:
+                        return resolved
+                # Fall back: latest matching tool by name
+                try:
+                    from . import claude_code
+                    session = claude_code.get_session_for_view(self.view)
+                    if not session or not session.output:
+                        return None
+                    out = session.output
+                    convs = list(out.conversations)
+                    if out.current is not None:
+                        convs.append(out.current)
+                    for conv in reversed(convs):
+                        for event in reversed(getattr(conv, "events", []) or []):
+                            if getattr(event, "name", "") != name:
+                                continue
+                            inp = getattr(event, "tool_input", None) or {}
+                            path = inp.get("_media_path") or extract_media_path(
+                                getattr(event, "result", None), inp)
+                            if path and os.path.isfile(path):
+                                return path
+                except Exception:
+                    return None
+        return None
+
+    def _resolve_media_short_path(self, short: str):
+        """Map images/1.jpg (or basename) to absolute path via tool results."""
+        try:
+            from . import claude_code
+            from .tool_formatters import media_display_path, extract_media_path, MEDIA_TOOLS
+            session = claude_code.get_session_for_view(self.view)
+            if not session or not session.output:
+                return None
+            out = session.output
+            convs = list(out.conversations)
+            if out.current is not None:
+                convs.append(out.current)
+            for conv in reversed(convs):
+                for event in reversed(getattr(conv, "events", []) or []):
+                    name = getattr(event, "name", "")
+                    if name not in MEDIA_TOOLS:
+                        continue
+                    inp = getattr(event, "tool_input", None) or {}
+                    path = inp.get("_media_path") or extract_media_path(
+                        getattr(event, "result", None), inp)
+                    if not path:
+                        continue
+                    disp = media_display_path(path)
+                    base = os.path.basename(path)
+                    if short in (disp, base, path) or path.endswith("/" + short):
+                        return path
+        except Exception:
+            return None
+        return None
 
     def want_event(self):
         return True

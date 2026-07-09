@@ -866,55 +866,51 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         send_result(id, {"status": "ok"})
 
     async def _handle_exit_plan_mode(self, tool_input: dict):
-        """Handle ExitPlanMode - show plan approval UI and wait for response."""
-        self.plan_id += 1
-        pid = self.plan_id
+        """Handle ExitPlanMode — shared plan approval UI (base.request_plan_approval).
+
+        On approve, re-send tool_input with the plan file content as of the
+        user's response (Claude Code: user edits to the plan are applied).
+        """
+        from base import request_plan_approval
+
+        tool_input = dict(tool_input or {})
+        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+            f.write(f"ExitPlanMode: input={str(tool_input)[:200]}\n")
+
+        result = await request_plan_approval(self, tool_input, timeout=3600)
 
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-            f.write(f"ExitPlanMode: pid={pid}, input={str(tool_input)[:200]}\n")
+            f.write(f"ExitPlanMode response: {result!r}\n")
 
-        future = asyncio.get_event_loop().create_future()
-        self.pending_plan_approvals[pid] = future
+        if not result:
+            return PermissionResultDeny(message="User wants to continue planning")
 
-        # Send notification to Sublime with plan details
-        send_notification("plan_mode_exit", {
-            "id": pid,
-            "tool_input": tool_input,
-        })
+        approved = result.get("approved")
+        plan_text = result.get("plan") or ""
+        if plan_text:
+            # Claude ExitPlanMode input uses `plan` for the document body.
+            tool_input = dict(tool_input)
+            tool_input["plan"] = plan_text
+            if result.get("planFilePath"):
+                tool_input.setdefault("planFilePath", result["planFilePath"])
 
-        try:
-            result = await asyncio.wait_for(future, timeout=3600)  # 1 hour timeout
-            with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                f.write(f"ExitPlanMode response: pid={pid}, approved={result}\n")
-
-            if result is True:
-                # Approved - allow the tool
-                return PermissionResultAllow(updated_input=tool_input)
-            elif result is False:
-                # Rejected - deny and stop
-                return PermissionResultDeny(message="Plan rejected by user")
-            else:
-                # None = continue planning - deny but with continue message
-                return PermissionResultDeny(message="User wants to continue planning")
-        except asyncio.TimeoutError:
-            return PermissionResultDeny(message="Plan approval timed out")
-        finally:
-            self.pending_plan_approvals.pop(pid, None)
+        if approved is True:
+            return PermissionResultAllow(updated_input=tool_input)
+        if approved is False:
+            return PermissionResultDeny(message="Plan rejected by user")
+        return PermissionResultDeny(message="User wants to continue planning")
 
     async def handle_plan_response(self, id: int, params: dict) -> None:
         """Handle plan approval response from Sublime."""
-        pid = params.get("id")
-        approved = params.get("approved")  # True, False, or None (continue)
+        from base import resolve_plan_response
 
+        payload = resolve_plan_response(self, params)
         with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-            f.write(f"plan_response: pid={pid}, approved={approved}\n")
-
-        if pid in self.pending_plan_approvals:
-            self.pending_plan_approvals[pid].set_result(approved)
-        else:
-            with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
-                f.write(f"  -> WARNING: pid {pid} not found!\n")
-
+            f.write(
+                f"plan_response: pid={params.get('id')}, "
+                f"approved={payload.get('approved') if isinstance(payload, dict) else payload}, "
+                f"plan_chars={len((payload or {}).get('plan') or '') if isinstance(payload, dict) else 0}\n"
+            )
         send_result(id, {"status": "ok"})
 
     def _build_content_with_images(self, prompt: str, images: list) -> list:

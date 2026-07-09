@@ -28,6 +28,10 @@
         "command": "grok_start"
     },
     {
+        "caption": "Grok (Claude Code): New Session",
+        "command": "grok_cc_start"
+    },
+    {
         "caption": "DeepSeek: New Session",
         "command": "deep_seek_start"
     },

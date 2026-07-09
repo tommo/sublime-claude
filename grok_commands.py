@@ -89,11 +89,11 @@ class GrokStartProxyCommand(sublime_plugin.WindowCommand):
             "Grok proxy on :%d (%s)" % (mgr.port, "up" if ok else "failed"))
 
 
-class GrokStartCommand(sublime_plugin.WindowCommand):
-    """Start a new Grok session (xAI via the bundled grok_proxy).
+class GrokCcStartCommand(sublime_plugin.WindowCommand):
+    """Start Grok via Claude Code bridge + Anthropic-compat proxy (legacy).
 
-    Requires a one-time login ('Claude: Grok Login'); the proxy is auto-spawned
-    on session start by the grok backend's dynamic_env.
+    Prefer 'Grok: New Session' (native ACP) for Grok Build. This path reuses
+    the Claude agent SDK pointed at the bundled grok_proxy.
     """
 
     def run(self):
@@ -113,7 +113,7 @@ class GrokStartCommand(sublime_plugin.WindowCommand):
                     "with the `grok` CLI, then start a session.")
                 return
         from .core import create_session
-        create_session(self.window, backend="grok")
+        create_session(self.window, backend="grok_cc")
 
     def is_visible(self):
         # Always visible so the login-prompt path is reachable pre-login.

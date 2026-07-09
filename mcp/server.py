@@ -155,7 +155,7 @@ def handle_request(request: dict) -> dict:
                 # ─── Session Tools ────────────────────────────────────────
                 {
                     "name": "list_backends",
-                    "description": "List backends available for spawn_session's `backend` argument — built-ins (claude, codex, copilot, pi, dsr) plus any custom Anthropic-compatible providers, each with live availability (auth/CLI resolved), kind, bridge family, and models. Call this before spawn_session to pick a valid backend instead of guessing. Also reports the default backend and the fork-family rule (fork_current only works within the same bridge family).",
+                    "description": "List backends available for spawn_session's `backend` argument — built-ins (claude, codex, copilot, pi, dsr, grok, grok_cc) plus any custom Anthropic-compatible providers, each with live availability (auth/CLI resolved), kind, bridge family, and models. Call this before spawn_session to pick a valid backend instead of guessing. Also reports the default backend and the fork-family rule (fork_current only works within the same bridge family).",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
@@ -179,7 +179,7 @@ def handle_request(request: dict) -> dict:
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
                             "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
-                            "backend": {"type": "string", "description": "Optional: backend to use — a built-in (claude, codex, copilot, pi, dsr) or a custom Anthropic-compatible provider from settings.custom_providers (default: claude)"},
+                            "backend": {"type": "string", "description": "Optional: backend to use — a built-in (claude, codex, copilot, pi, dsr, grok, grok_cc) or a custom Anthropic-compatible provider from settings.custom_providers (default: claude)"},
                             "fork_current": {"type": "boolean", "description": "Optional: fork from the current session (preserves conversation history). Default: false"},
                             "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },

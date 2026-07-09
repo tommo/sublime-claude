@@ -425,9 +425,11 @@ class Session:
         self.last_activity = time.time()
         # Keep _pending_resume_at alive for consecutive undo support
         self._input_mode_entered = False  # Reset for fresh start after init
-        # Capture session_id from initialize response (set via --session-id CLI arg)
-        if result.get("session_id"):
-            self.session_id = result["session_id"]
+        # Capture session_id from initialize response (set via --session-id CLI arg).
+        # ACP bridges may also send camelCase sessionId — accept both.
+        sid = result.get("session_id") or result.get("sessionId")
+        if sid:
+            self.session_id = sid
             print(f"[Claude] session_id={self.session_id}")
         # Show loaded MCP servers and agents
         mcp_servers = result.get("mcp_servers", [])
@@ -439,6 +441,19 @@ class Session:
         if agents:
             print(f"[Claude] Agents: {agents}")
             parts.append(f"agents: {', '.join(agents)}")
+        if result.get("resumed"):
+            parts.append("resumed")
+        if result.get("resume_fallback"):
+            parts.append("fresh (load miss)")
+            # Soft notice — agent context was not restored (common for ACP
+            # agents that only persist named REPL sessions to disk).
+            try:
+                self.output.text(
+                    "\n*Session reopened without agent transcript "
+                    "(UI history kept; model starts fresh).*\n"
+                )
+            except Exception:
+                pass
         if parts:
             self._status(f"ready ({'; '.join(parts)})")
         else:
@@ -1609,6 +1624,18 @@ class Session:
             return None  # No CLI available
         elif self.backend == "pi":
             return None  # No direct terminal resume for pi RPC
+        elif self.backend == "dsr":
+            # dsr ACP sessions: drop into repl when a named transcript exists;
+            # otherwise plain repl in the project cwd.
+            cli = os.environ.get("DSR_BIN") or shutil.which("dsr") or "dsr"
+            if self.session_id:
+                return [cli, "repl", f"--session={self.session_id}"]
+            return [cli, "repl"]
+        elif self.backend == "grok":
+            cli = os.environ.get("GROK_BIN") or shutil.which("grok") or "grok"
+            if self.session_id:
+                return [cli, "--resume", self.session_id]
+            return [cli]
         else:
             cli = (cc_launch.resolve_claude(settings)
                    or settings.get("claude_cli_path") or "claude")
@@ -1897,7 +1924,11 @@ class Session:
                 self._bg_task_ids.add(tool_id)
             self._update_status_bar()
             return
-        if self.current_tool and self.current_tool.strip():
+        # Serial Claude path: auto-close previous nameless tool. Concurrent ACP
+        # batches all carry ids — auto-done would mark the wrong Read/Bash done
+        # early and leave a later same-name ☐ forever pending.
+        if (not tool_id and self.current_tool and self.current_tool.strip()
+                and self.current_tool != name):
             self.output.tool_done(self.current_tool)
         self.current_tool = name
         self.output.tool(name, tool_input, tool_id=tool_id, background=False)
@@ -2616,14 +2647,18 @@ class Session:
 
     def _handle_permission_request(self, params: dict) -> None:
         """Handle permission request from bridge - show in output view."""
-        from .output import PERM_ALLOW
+        from .output import PERM_ALLOW, PERM_ALLOW_ALL, PERM_ALLOW_SESSION
 
         pid = params.get("id")
         tool = params.get("tool", "Unknown")
         tool_input = params.get("input", {})
         def on_response(response: str) -> None:
             if self.client:
-                allow = (response == PERM_ALLOW)
+                # ALLOW_ALL / ALLOW_SESSION are normalized to allow in output.py
+                # before the callback for Claude UX, but we still receive the
+                # original token when output keeps it — accept both.
+                allow = response in (PERM_ALLOW, PERM_ALLOW_ALL, PERM_ALLOW_SESSION)
+                always = response == PERM_ALLOW_ALL
                 if not allow:
                     # Mark tool as error immediately - SDK won't send tool_result for denied
                     self.output.tool_error(tool)
@@ -2631,6 +2666,7 @@ class Session:
                 self.client.send("permission_response", {
                     "id": pid,
                     "allow": allow,
+                    "always": always,
                     "input": tool_input if allow else None,
                     "message": None if allow else "User denied permission",
                 })
@@ -2664,10 +2700,14 @@ class Session:
         """Handle exiting plan mode - show inline approval UI."""
         from .output import PLAN_APPROVE
         plan_id = params.get("id")
-        tool_input = params.get("tool_input", {})
+        tool_input = params.get("tool_input", {}) or {}
 
-        # Find the most recent plan file
-        plan_file = self._find_plan_file()
+        # Prefer path from bridge (Grok session plan.md); else scan.
+        plan_file = (
+            tool_input.get("planFilePath")
+            or tool_input.get("plan_file")
+            or self._find_plan_file()
+        )
         self.plan_file = plan_file
         allowed_prompts = tool_input.get("allowedPrompts", [])
 
@@ -2675,10 +2715,17 @@ class Session:
             approved = response == PLAN_APPROVE
             self.plan_mode = False
 
+            # Claude Code: only *saved* plan file content is sent back on
+            # ExitPlanMode (unsaved buffer edits are ignored).
+            plan_text = self._read_plan_content(plan_file) if plan_file else (
+                tool_input.get("plan") or "")
+
             if self.client:
                 self.client.send("plan_response", {
                     "id": plan_id,
                     "approved": approved,
+                    "plan": plan_text,
+                    "planFilePath": plan_file or "",
                 })
 
             if approved:
@@ -2705,17 +2752,28 @@ class Session:
             enable_wrap()
 
     def _find_plan_file(self) -> Optional[str]:
-        """Find the most recent plan file in ~/.claude/plans/."""
+        """Find the most recent plan file in ~/.claude/plans/ (or Grok session)."""
         import glob
         plans_dir = os.path.expanduser("~/.claude/plans")
-        if not os.path.exists(plans_dir):
-            return None
+        if os.path.exists(plans_dir):
+            plan_files = glob.glob(os.path.join(plans_dir, "*.md"))
+            if plan_files:
+                return max(plan_files, key=os.path.getmtime)
+        # Grok Build: ~/.grok/sessions/<enc_cwd>/<session>/plan.md
+        if self.plan_file and os.path.isfile(self.plan_file):
+            return self.plan_file
+        return None
 
-        plan_files = glob.glob(os.path.join(plans_dir, "*.md"))
-        if not plan_files:
-            return None
-
-        return max(plan_files, key=os.path.getmtime)
+    def _read_plan_content(self, plan_file: str) -> str:
+        """Read plan text from disk only (saved content; ignore unsaved buffer)."""
+        if not plan_file or not os.path.isfile(plan_file):
+            return ""
+        try:
+            with open(plan_file, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception as e:
+            print(f"[Claude] _read_plan_content: {e}")
+        return ""
 
     # ─── Notification API (notalone2) ──────────────────────────────────
 

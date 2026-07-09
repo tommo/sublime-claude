@@ -1,4 +1,5 @@
 """Structured output view with region tracking."""
+import os
 import sublime
 import sublime_plugin
 from dataclasses import dataclass, field
@@ -6,7 +7,14 @@ from typing import List, Optional, Dict, Callable, Any
 
 from .constants import SPINNER_FRAMES, BACKEND_ABBREV, CONTEXT_PREFIX, BACKGROUND_PREFIX
 from .output_pending import clear_pending_block
-from .tool_formatters import format_tool_detail
+from .tool_formatters import (
+    format_tool_detail,
+    MEDIA_TOOLS,
+    extract_media_path,
+    media_display_path,
+    is_image_path,
+    is_video_path,
+)
 
 import re as _re
 
@@ -129,8 +137,51 @@ class ToolCall:
 class TodoItem:
     """A todo item from TodoWrite or Task* tools."""
     content: str
-    status: str  # pending, in_progress, completed
+    status: str  # pending, in_progress, completed, cancelled, deleted
     id: str = ""  # server-assigned id (set by TaskCreate result / TaskList)
+
+
+# Statuses that mean "no longer open work" — hide from widget + don't carry.
+_TODO_CLOSED = frozenset({
+    "completed", "cancelled", "canceled", "deleted",
+})
+
+
+def _todo_status_norm(status: str) -> str:
+    return (status or "pending").strip().lower().replace("-", "_")
+
+
+def _todo_is_open(todo: "TodoItem") -> bool:
+    """True if the item is still active work (not completed/cancelled/deleted)."""
+    if not (todo.content or "").strip():
+        return False
+    return _todo_status_norm(todo.status) not in _TODO_CLOSED
+
+
+def _todo_is_active(todo: "TodoItem") -> bool:
+    return _todo_status_norm(todo.status) == "in_progress"
+
+
+def _todo_is_completed(todo: "TodoItem") -> bool:
+    return _todo_status_norm(todo.status) == "completed"
+
+
+def _open_todos(todos: list) -> list:
+    """Open items only — used for widget + carry-forward between rounds."""
+    return [t for t in (todos or []) if _todo_is_open(t)]
+
+
+@dataclass
+class GoalState:
+    """Grok update_goal — one active autonomous objective (not a Task list)."""
+    status: str = "active"  # active | completed | blocked
+    message: str = ""
+    blocked_reason: str = ""
+
+
+def _goal_is_open(goal: Optional["GoalState"]) -> bool:
+    """Carry sticky goal only while still active/blocked (not completed)."""
+    return bool(goal) and goal.status in ("active", "blocked")
 
 
 @dataclass
@@ -141,6 +192,7 @@ class Conversation:
     events: List = field(default_factory=list)
     todos: List[TodoItem] = field(default_factory=list)  # current todo state
     todos_all_done: bool = False  # True when all todos completed (don't carry to next)
+    goal: Optional[GoalState] = None  # sticky single goal from update_goal
     working: bool = True  # True while processing, False when done
     duration: float = 0.0
     usage: dict = None
@@ -189,6 +241,9 @@ class OutputView:
         self._input_area_start: int = 0  # Start of entire input area (context + marker)
         self._input_marker: str = "◎ "  # Marker for input line
         self._spinner_frame: int = 0  # Current spinner animation frame
+        self._media_phantom_set = None  # inline image previews (minihtml data: URIs)
+        self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
+        self._media_anchor: Dict[str, int] = {}  # abs path -> buffer pt for popup
 
     def show(self, focus: bool = True) -> None:
         # If we already have a view, optionally focus it
@@ -671,6 +726,7 @@ class OutputView:
 
         # Finalize and save previous conversation
         prev_todos = []
+        prev_goal = None
         if self.current:
             # Ensure previous conversation is marked as done
             if self.current.working:
@@ -684,12 +740,16 @@ class OutputView:
                 dropped = len(self.conversations) - HISTORY_CAP
                 print(f"[Claude] conversation history capped: dropped {dropped} oldest turn(s)")
                 self.conversations = self.conversations[-HISTORY_CAP:]
-            # Carry todos forward only if not all completed
+            # Carry only still-open todos (drop completed/cancelled leftovers).
             if not self.current.todos_all_done:
-                prev_todos = self.current.todos
+                prev_todos = _open_todos(self.current.todos)
+            if _goal_is_open(self.current.goal):
+                prev_goal = self.current.goal
 
         # Start new
-        self.current = Conversation(prompt=text, todos=prev_todos, context_names=context_names or [])
+        self.current = Conversation(
+            prompt=text, todos=prev_todos, goal=prev_goal,
+            context_names=context_names or [])
         self._update_title()  # Show working indicator
 
         # Render prompt with optional context indicator
@@ -719,21 +779,53 @@ class OutputView:
         self._scroll_to_end()
 
     def tool(self, name: str, tool_input: dict = None, tool_id: str = None, background: bool = False) -> None:
-        """Add a pending tool."""
+        """Add a pending tool.
+
+        Same tool_id → upsert (ACP re-sends tool_call then tool_call_update
+        with richer input; appending would leave a second ☐ that never gets
+        tool_result).
+        """
         if not self.current:
             return
 
         tool_input = tool_input or {}
         status = BACKGROUND if background else PENDING
-        tool_call = ToolCall(name=name, tool_input=tool_input, status=status, id=tool_id)
-        self.current.events.append(tool_call)
+        # Upsert by id when still open — avoids duplicate ☐ rows.
+        if tool_id:
+            existing = self._find_pending_or_background_by_id(tool_id)
+            if existing is not None and existing.status in (PENDING, BACKGROUND):
+                existing.name = name
+                if tool_input:
+                    existing.tool_input = tool_input
+                if background:
+                    existing.status = BACKGROUND
+                # Fall through to TodoWrite/Task* side effects below, then re-render.
+                tool_call = existing
+            else:
+                tool_call = ToolCall(
+                    name=name, tool_input=tool_input, status=status, id=tool_id)
+                self.current.events.append(tool_call)
+        else:
+            tool_call = ToolCall(
+                name=name, tool_input=tool_input, status=status, id=tool_id)
+            self.current.events.append(tool_call)
 
         # Capture TodoWrite state (Anthropic stock tool — full snapshot per call)
         if name == "TodoWrite" and "todos" in tool_input:
+            raw = tool_input.get("todos") or []
+            # Keep closed items out of the live list so they don't reappear
+            # next round as fake "pending" (cancelled used to count as pending).
             self.current.todos = [
-                TodoItem(content=t.get("content", ""), status=t.get("status", "pending"))
-                for t in tool_input["todos"]
+                TodoItem(
+                    content=t.get("content", "") or t.get("activeForm", "") or "",
+                    status=_todo_status_norm(t.get("status", "pending")),
+                    id=str(t.get("id") or ""),
+                )
+                for t in raw
+                if isinstance(t, dict)
             ]
+            self.current.todos = _open_todos(self.current.todos)
+            self.current.todos_all_done = not self.current.todos
         # Task* variants (this harness's split API — incremental ops)
         elif name == "TaskCreate":
             subject = tool_input.get("subject", "") or tool_input.get("description", "")
@@ -746,32 +838,70 @@ class OutputView:
             new_status = tool_input.get("status")
             new_subject = tool_input.get("subject")
             if tid:
-                if new_status == "deleted":
-                    # A deleted task should leave the list, not linger as ○.
-                    self.current.todos = [t for t in self.current.todos if t.id != tid]
+                st = _todo_status_norm(new_status) if new_status else ""
+                if st in ("deleted", "cancelled", "canceled"):
+                    # Drop from list — cancelled is not "pending with ○".
+                    self.current.todos = [
+                        t for t in self.current.todos if t.id != tid]
+                    if not _open_todos(self.current.todos):
+                        self.current.todos_all_done = True
                 else:
                     for todo in self.current.todos:
                         if todo.id == tid:
                             if new_status:
-                                todo.status = new_status
+                                todo.status = st or new_status
                             if new_subject:
                                 todo.content = new_subject
                             break
+                    if not _open_todos(self.current.todos):
+                        self.current.todos_all_done = True
+        elif name == "update_goal":
+            # Single sticky goal — not a multi-item Task list.
+            blocked = (tool_input.get("blocked_reason") or "").strip()
+            msg = (tool_input.get("message") or "").strip()
+            if blocked:
+                self.current.goal = GoalState(
+                    status="blocked", message=msg, blocked_reason=blocked)
+            elif tool_input.get("completed") is True:
+                self.current.goal = GoalState(
+                    status="completed", message=msg, blocked_reason="")
+            else:
+                prev = self.current.goal
+                self.current.goal = GoalState(
+                    status="active",
+                    message=msg or (prev.message if prev else ""),
+                    blocked_reason="",
+                )
 
         self._render_current()
 
     def _find_pending_or_background_by_id(self, tool_id: str) -> Optional[ToolCall]:
-        """Find a ToolCall by id across ALL conversations including current."""
+        """Find a ToolCall by id across ALL conversations including current.
+
+        Prefer still-open (pending/background) over a same-id already-done row
+        left by a prior duplicate emit.
+        """
         if not tool_id:
             return None
+
+        def _scan(events):
+            done = None
+            for event in events:
+                if not isinstance(event, ToolCall) or event.id != tool_id:
+                    continue
+                if event.status in (PENDING, BACKGROUND):
+                    return event
+                done = event
+            return done
+
         if self.current:
-            for event in self.current.events:
-                if isinstance(event, ToolCall) and event.id == tool_id:
-                    return event
+            hit = _scan(self.current.events)
+            if hit is not None:
+                return hit
         for conv in self.conversations:
-            for event in conv.events:
-                if isinstance(event, ToolCall) and event.id == tool_id:
-                    return event
+            hit = _scan(conv.events)
+            if hit is not None:
+                return hit
         return None
 
     def find_tool_by_id(self, tool_id: str) -> Optional[ToolCall]:
@@ -876,28 +1006,52 @@ class OutputView:
         self._replace(line_region.begin(), end, "")
 
     def tool_done(self, name: str, result: str = None, tool_id: str = None) -> None:
-        """Mark tool as done. Prefer tool_id match, fall back to name+PENDING."""
-        target = self._find_pending_or_background_by_id(tool_id)
-        if target is None and self.current:
-            for event in reversed(self.current.events):
-                if isinstance(event, ToolCall) and event.name == name and event.status == PENDING:
-                    target = event
-                    break
-        if target is None:
+        """Mark tool as done. Prefer tool_id match, fall back to name+PENDING.
+
+        If duplicate open rows share the same id (legacy re-emits), close all of them.
+        """
+        targets = []
+        if tool_id and self.current:
+            for event in self.current.events:
+                if (isinstance(event, ToolCall) and event.id == tool_id
+                        and event.status in (PENDING, BACKGROUND)):
+                    targets.append(event)
+        if not targets:
+            target = self._find_pending_or_background_by_id(tool_id)
+            if target is None and self.current:
+                for event in reversed(self.current.events):
+                    if (isinstance(event, ToolCall) and event.name == name
+                            and event.status == PENDING):
+                        target = event
+                        break
+            if target is not None:
+                targets = [target]
+        if not targets:
             if self.current:
-                self.current.events.append(ToolCall(name=name, tool_input={}, status=DONE, result=result, id=tool_id))
+                self.current.events.append(ToolCall(
+                    name=name, tool_input={}, status=DONE, result=result, id=tool_id))
                 self._render_current()
             return
-        old_status = target.status
-        target.status = DONE
-        target.result = result
+        primary = targets[0]
+        for target in targets:
+            old_status = target.status
+            target.status = DONE
+            target.result = result
+            # Media tools: stash absolute path for formatters + inline phantoms.
+            if target.name in MEDIA_TOOLS and result:
+                path = extract_media_path(result, target.tool_input)
+                if path:
+                    if not isinstance(target.tool_input, dict):
+                        target.tool_input = {}
+                    target.tool_input["_media_path"] = path
+                    target.tool_input.setdefault("path", path)
+            if not self._is_in_current(target):
+                self._patch_tool_symbol(target, old_status)
         # Pull task state from Task* results
         if name in ("TaskList", "TaskCreate", "TaskGet") and result and self.current is not None:
-            self._sync_todos_from_task_result(name, target, result)
-        if self._is_in_current(target):
+            self._sync_todos_from_task_result(name, primary, result)
+        if any(self._is_in_current(t) for t in targets):
             self._render_current()
-        else:
-            self._patch_tool_symbol(target, old_status)
 
     def _sync_todos_from_task_result(self, name: str, tool: "ToolCall", result: str) -> None:
         """Parse Task* result text and merge into current.todos.
@@ -952,19 +1106,18 @@ class OutputView:
             return
 
         if name == "TaskList":
-            # Authoritative snapshot — replace.
-            self.current.todos = [
+            # Authoritative snapshot — open work only.
+            self.current.todos = _open_todos([
                 TodoItem(
                     content=it.get("subject") or it.get("content") or "",
-                    status=it.get("status") or "pending",
+                    status=_todo_status_norm(it.get("status") or "pending"),
                     id=str(it.get("id") or ""),
                 )
                 # Require real text — an id-only parse ("+" etc.) is garbage and
                 # would render as a blank ○.
                 for it in parsed_items if (it.get("subject") or it.get("content"))
-            ]
-            if self.current.todos and all(t.status == "completed" for t in self.current.todos):
-                self.current.todos_all_done = True
+            ])
+            self.current.todos_all_done = not self.current.todos
         elif name == "TaskCreate":
             # Backfill id on the todo we just appended (the result is for it), so a
             # later TaskUpdate(taskId=…) can match and flip its rendered status.
@@ -1082,13 +1235,21 @@ class OutputView:
         # still running in the bridge); todos we carry forward like prompt() does.
         carry_bg_tools = list(self.active_background_tools())
         carry_todos = []
+        carry_goal = None
         if self.current and self.current.todos and not self.current.todos_all_done:
-            carry_todos = list(self.current.todos)
+            carry_todos = _open_todos(self.current.todos)
         else:
             # No open todos on current; look at the most recent conversation
             for conv in reversed(self.conversations):
                 if conv.todos and not conv.todos_all_done:
-                    carry_todos = list(conv.todos)
+                    carry_todos = _open_todos(conv.todos)
+                    break
+        if self.current and _goal_is_open(self.current.goal):
+            carry_goal = self.current.goal
+        else:
+            for conv in reversed(self.conversations):
+                if _goal_is_open(conv.goal):
+                    carry_goal = conv.goal
                     break
 
         if self._input_mode:
@@ -1125,17 +1286,19 @@ class OutputView:
             self.current.region = (0, 0)  # Will be set on first render
             self.current.events.extend(carry_bg_tools)
             self.current.todos = carry_todos
+            self.current.goal = carry_goal
             self._update_title()  # Show working indicator
             return  # Don't enter input mode while working
 
         # Idle case: build a zero-prompt carry-forward conversation so the
-        # supportive UI (bg-tool entries, todos) stays visible. _do_render skips
-        # the prompt header when prompt is empty.
-        if carry_bg_tools or carry_todos:
+        # supportive UI (bg-tool entries, todos, goal) stays visible. _do_render
+        # skips the prompt header when prompt is empty.
+        if carry_bg_tools or carry_todos or carry_goal:
             carry = Conversation(prompt="", working=False)
             carry.events = list(carry_bg_tools)
             carry.todos = carry_todos
             carry.todos_all_done = False
+            carry.goal = carry_goal
             carry.region = (0, 0)
             self.current = carry
             self._render_current()
@@ -1610,14 +1773,14 @@ class OutputView:
         """Respond to a permission request with given callback."""
         import time
 
-        # Handle "allow all" - save to project settings and remember for this session
+        # Handle "allow all" - save to project settings and remember for this session.
+        # Keep PERM_ALLOW_ALL on the callback so ACP bridges can map to allow_always.
         if response == PERM_ALLOW_ALL:
             pattern = self._make_auto_allow_pattern(tool, tool_input)
             self.auto_allow_tools.add(pattern)
             self._save_auto_allowed_tool(pattern)
-            response = PERM_ALLOW
 
-        # Handle "allow 30s" - set timed auto-allow
+        # Handle "allow 30s" - set timed auto-allow (still reports as a plain allow)
         if response == PERM_ALLOW_SESSION:
             self._last_allowed_tool = tool
             self._last_allowed_time = time.time()
@@ -2092,9 +2255,10 @@ class OutputView:
                     opt = options[idx]
                     label = opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
                     selected_labels.append(label)
-                answer = ", ".join(selected_labels) if selected_labels else "(none)"
-                q_req.answers[question_text] = answer
-                self._clear_question(f"{header} → {answer}")
+                # Keep a list so ACP (Grok) can send answers as [label, ...].
+                q_req.answers[question_text] = selected_labels
+                summary = ", ".join(selected_labels) if selected_labels else "(none)"
+                self._clear_question(f"{header} → {summary}")
                 self._advance_question()
                 return True
             return False
@@ -2286,44 +2450,49 @@ class OutputView:
             if _hint:
                 lines.append(f"  {_hint}\n")
 
-        # Todo list (if any) — only real, non-deleted items; never an empty block.
-        # Folded by default (super+alt+T to expand): running tasks always shown,
-        # pending capped at 3 total, completed hidden (counted in the banner).
-        visible_todos = [t for t in self.current.todos
-                         if t.content.strip() and t.status != "deleted"]
-        if visible_todos:
-            done = [t for t in visible_todos if t.status == "completed"]
-            active = [t for t in visible_todos if t.status == "in_progress"]
-            pending = [t for t in visible_todos
-                       if t.status not in ("completed", "in_progress")]
+        # Todo list — open work only (hide completed/cancelled/deleted).
+        # Folded by default: running always shown, pending capped at 3.
+        open_todos = _open_todos(self.current.todos)
+        # Settled list → clear carry flag so next prompt starts empty.
+        if not open_todos:
+            self.current.todos_all_done = True
+        if open_todos:
+            active = [t for t in open_todos if _todo_is_active(t)]
+            pending = [t for t in open_todos if not _todo_is_active(t)]
             expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
                 if self.view else False
             if expanded:
-                show = visible_todos
+                show = open_todos
             else:
-                # Running always visible; pending fill the remaining slots up to 3.
                 cap = max(0, 3 - len(active))
                 show = active + pending[:cap]
             if show:
-                counts = "{} done · {} active · {} pending".format(
-                    len(done), len(active), len(pending))
+                counts = "{} active · {} pending".format(len(active), len(pending))
                 lines.append("\n  ───── Tasks  ·  {}  ─────\n".format(counts))
                 for todo in show:
-                    if todo.status == "completed":
-                        icon = "✓"
-                    elif todo.status == "in_progress":
-                        icon = "▸"
-                    else:
-                        icon = "○"
+                    icon = "▸" if _todo_is_active(todo) else "○"
                     lines.append("  {} {}\n".format(icon, todo.content))
-                hidden = len(visible_todos) - len(show)
+                hidden = len(open_todos) - len(show)
                 if hidden > 0:
                     lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
                 elif expanded:
                     lines.append("  (super+click to collapse)\n")
-            # Mark as done so next conversation starts fresh
-            if all(t.status == "completed" for t in visible_todos):
-                self.current.todos_all_done = True
+
+        # Single sticky goal (Grok /goal + update_goal) — not a multi-item list.
+        goal = self.current.goal
+        if goal and goal.status in ("active", "blocked", "completed"):
+            if goal.status == "blocked":
+                label = "blocked"
+                body = goal.blocked_reason or goal.message or ""
+            elif goal.status == "completed":
+                label = "done"
+                body = goal.message or ""
+            else:
+                label = "active"
+                body = goal.message or ""
+            lines.append("\n  ───── Goal  ·  {}  ─────\n".format(label))
+            if body:
+                lines.append("  ▸ {}\n".format(body))
 
         # Meta
         if self.current.duration > 0:
@@ -2407,9 +2576,460 @@ class OutputView:
         if getattr(self, '_auto_scroll', True):
             self._scroll_to_end()
 
+        # Inline image phantoms (minihtml data: + explicit size — ST docs).
+        # Defer one tick so region positions match the final buffer.
+        sublime.set_timeout(self._refresh_media_phantoms, 10)
+
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string. Dispatches via TOOL_FORMATTERS registry."""
         return format_tool_detail(self, tool)
+
+    def _format_x_search_result(self, result: str) -> str:
+        """Compact summary for X/Twitter tool results."""
+        if not result or not result.strip():
+            return " → 0"
+        text = result.strip()
+        # JSON list of posts?
+        try:
+            import json
+            data = json.loads(text)
+            if isinstance(data, list):
+                return f" → {len(data)} posts"
+            if isinstance(data, dict):
+                posts = data.get("posts") or data.get("results") or data.get("data")
+                if isinstance(posts, list):
+                    return f" → {len(posts)} posts"
+                if "username" in data or "name" in data:
+                    return f" → @{data.get('username') or data.get('name')}"
+        except Exception:
+            pass
+        lines = [l for l in text.splitlines() if l.strip()]
+        # Count http links as rough post count
+        import re
+        urls = re.findall(r'https?://(?:x|twitter)\.com/\S+', text)
+        if urls:
+            return f" → {len(set(urls))} links"
+        if len(lines) <= 1 and len(text) < 80:
+            return f" → {text[:60]}"
+        return f" → {len(lines)} lines"
+
+    def _media_path_for_tool(self, tool: "ToolCall") -> Optional[str]:
+        if not isinstance(tool.tool_input, dict):
+            return extract_media_path(tool.result, None)
+        return (
+            tool.tool_input.get("_media_path")
+            or extract_media_path(tool.result, tool.tool_input)
+        )
+
+    # minihtml only documents PNG/JPG/GIF. Phantoms use real downscaled
+    # thumbnails (small base64) — not full-res with CSS max-width.
+    _MEDIA_SOURCE_MAX_BYTES = 8_000_000  # refuse to read enormous originals
+    _MEDIA_PHANTOM_MAX_W = 96            # inline thumbnail edge
+    _MEDIA_POPUP_MAX_W = 360            # enlarge popup edge
+    _MINIHTML_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif")
+
+    def _minihtml_image_ok(self, path: str) -> bool:
+        return bool(path) and path.lower().endswith(self._MINIHTML_IMAGE_EXTS)
+
+    def _image_dimensions_from_bytes(self, data: bytes) -> tuple:
+        """Pixel size from PNG/JPEG/GIF header bytes. (0,0) if unknown."""
+        try:
+            import struct
+            if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+                w, h = struct.unpack(">II", data[16:24])
+                return int(w), int(h)
+            if data[:6] in (b"GIF87a", b"GIF89a") and len(data) >= 10:
+                w, h = struct.unpack("<HH", data[6:10])
+                return int(w), int(h)
+            if data[:2] == b"\xff\xd8":
+                i = 2
+                n = len(data)
+                while i + 9 < n:
+                    if data[i] != 0xFF:
+                        break
+                    marker = data[i + 1]
+                    seglen = struct.unpack(">H", data[i + 2:i + 4])[0]
+                    if marker in (
+                        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+                    ):
+                        h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                        return int(w), int(h)
+                    i += 2 + seglen
+        except Exception:
+            pass
+        return 0, 0
+
+    def _image_dimensions(self, path: str) -> tuple:
+        try:
+            with open(path, "rb") as f:
+                return self._image_dimensions_from_bytes(f.read(65536))
+        except Exception:
+            return 0, 0
+
+    def _scaled_display_size(self, w: int, h: int, max_w: int) -> tuple:
+        """Scale (w,h) into max_w box, keep aspect."""
+        if w <= 0 or h <= 0:
+            return max_w, max_w
+        if w <= max_w and h <= max_w:
+            return w, h
+        scale = min(max_w / float(w), max_w / float(h))
+        return max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+
+    def _make_thumbnail_bytes(self, path: str, max_edge: int) -> Optional[tuple]:
+        """Downscale image → (jpeg_bytes, width, height). Prefer small JPEG.
+
+        Tries Pillow, then macOS sips. Returns None if resize unavailable.
+        """
+        ow, oh = self._image_dimensions(path)
+        tw, th = self._scaled_display_size(ow, oh, max_edge)
+        # Already tiny — still re-encode as JPEG for consistent size, but
+        # only if we have a resizer; else caller may fall back carefully.
+        # 1) Pillow
+        try:
+            from PIL import Image  # type: ignore
+            import io
+            with Image.open(path) as im:
+                im = im.convert("RGB") if im.mode not in ("RGB", "L") else im
+                if im.mode == "L":
+                    im = im.convert("RGB")
+                im.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS
+                             if hasattr(Image, "Resampling")
+                             else Image.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, format="JPEG", quality=72, optimize=True)
+                data = buf.getvalue()
+                return data, im.size[0], im.size[1]
+        except Exception:
+            pass
+        # 2) macOS sips → temp jpeg (absolute path — ST's PATH may omit /usr/bin)
+        if sublime.platform() == "osx":
+            import subprocess
+            import tempfile
+            sips = "/usr/bin/sips"
+            if not os.path.isfile(sips):
+                sips = "sips"
+            tmp = None
+            try:
+                fd, tmp = tempfile.mkstemp(suffix=".jpg")
+                os.close(fd)
+                # -Z: max dimension (fit inside max_edge box)
+                r = subprocess.run(
+                    [sips, "-Z", str(max_edge), "-s", "format", "jpeg",
+                     path, "--out", tmp],
+                    capture_output=True, timeout=15)
+                if r.returncode == 0 and os.path.isfile(tmp):
+                    with open(tmp, "rb") as f:
+                        data = f.read()
+                    if data:
+                        w, h = self._image_dimensions_from_bytes(data)
+                        if w <= 0:
+                            w, h = tw, th
+                        return data, w, h
+            except Exception as e:
+                print(f"[Claude] sips thumbnail: {e}")
+            finally:
+                if tmp and os.path.isfile(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        return None
+
+    def _media_embed(self, path: str, max_edge: int = None) -> Optional[tuple]:
+        """Return (data_uri, width, height) — downscaled thumbnail for embeds.
+
+        Phantoms pass a small max_edge so base64 stays tiny (~few KB).
+        """
+        if max_edge is None:
+            max_edge = self._MEDIA_PHANTOM_MAX_W
+        if not self._minihtml_image_ok(path) or not os.path.isfile(path):
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+            size = os.path.getsize(path)
+            if size <= 0 or size > self._MEDIA_SOURCE_MAX_BYTES:
+                return None
+            cache_key = f"{path}|{max_edge}"
+            cached = self._media_uri_cache.get(cache_key)
+            if cached and cached[0] == mtime:
+                return cached[1], cached[2], cached[3]
+
+            import base64
+            thumb = self._make_thumbnail_bytes(path, max_edge)
+            if thumb:
+                data, w, h = thumb
+                uri = "data:image/jpeg;base64," + base64.b64encode(data).decode(
+                    "ascii")
+                self._media_uri_cache[cache_key] = (mtime, uri, w, h)
+                return uri, w, h
+
+            # No resizer: only embed if original is already tiny.
+            if size > 40_000:
+                print(f"[Claude] media: no thumbnailer, skip large embed "
+                      f"({size} B)")
+                return None
+            with open(path, "rb") as f:
+                raw = f.read()
+            ext = os.path.splitext(path)[1].lower()
+            mime = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".gif": "image/gif",
+            }.get(ext, "image/jpeg")
+            uri = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+            w, h = self._image_dimensions_from_bytes(raw)
+            w, h = self._scaled_display_size(w, h, max_edge)
+            self._media_uri_cache[cache_key] = (mtime, uri, w, h)
+            return uri, w, h
+        except Exception as e:
+            print(f"[Claude] media embed: {e}")
+            return None
+
+    def _refresh_media_phantoms(self) -> None:
+        """Inline minihtml phantoms under image tool lines (not video).
+
+        Per ST docs: <img> supports PNG/JPG/GIF via data:/file:/res:.
+        Forum: data: + explicit width/height → correct phantom box size.
+        """
+        if not self.view or not self.view.is_valid():
+            return
+        if self._media_phantom_set is None:
+            try:
+                self._media_phantom_set = sublime.PhantomSet(
+                    self.view, "claude_media")
+            except Exception as e:
+                print(f"[Claude] media PhantomSet: {e}")
+                return
+
+        media_tools = []
+        for conv in list(self.conversations) + (
+                [self.current] if self.current is not None else []):
+            for event in conv.events:
+                if (isinstance(event, ToolCall)
+                        and event.name in MEDIA_TOOLS
+                        and event.status == DONE):
+                    media_tools.append(event)
+
+        if not media_tools:
+            self._media_anchor.clear()
+            try:
+                self._media_phantom_set.update([])
+            except Exception:
+                pass
+            return
+
+        content = self.view.substr(sublime.Region(0, self.view.size()))
+        phantoms = []
+        used_pts = set()
+        anchors: Dict[str, int] = {}
+        sym = self.SYMBOLS.get(DONE, "✔")
+
+        for tool in media_tools:
+            path = self._media_path_for_tool(tool)
+            if not path or not is_image_path(path):
+                continue  # video: no inline preview
+            if not os.path.isfile(path):
+                continue
+            disp = media_display_path(path)
+            # Locate tool line (last match for this name+path wins).
+            candidates = []
+            pat = (r"(?m)^  " + _re.escape(sym) + r" "
+                   + _re.escape(tool.name) + r".*")
+            for m in _re.finditer(pat, content):
+                line = m.group(0)
+                if disp and disp in line:
+                    candidates.append(m.start())
+                elif path in line:
+                    candidates.append(m.start())
+                elif not candidates:
+                    candidates.append(m.start())
+            if not candidates:
+                continue
+            pt = candidates[-1]
+            if pt in used_pts:
+                continue
+            used_pts.add(pt)
+            line_end = content.find("\n", pt)
+            if line_end < 0:
+                line_end = len(content)
+            # Anchor at end of tool line → LAYOUT_BLOCK draws below it.
+            region = sublime.Region(line_end, line_end)
+            # Popup should open here (next to thumb), not at EOF.
+            anchors[path] = line_end
+            html = self._media_phantom_html(path, disp)
+            if not html:
+                continue
+
+            def _nav(href, _path=path, _loc=line_end):
+                self._handle_media_href(href, _path, location=_loc)
+
+            try:
+                phantoms.append(sublime.Phantom(
+                    region, html, sublime.LAYOUT_BLOCK, _nav))
+            except TypeError:
+                phantoms.append(sublime.Phantom(
+                    region, html, sublime.LAYOUT_BLOCK))
+
+        self._media_anchor = anchors
+        try:
+            self._media_phantom_set.update(phantoms)
+        except Exception as e:
+            print(f"[Claude] media phantoms update: {e}")
+
+    def _media_phantom_html(self, path: str, disp: str) -> str:
+        """Inline phantom body — data: URI + width/height (docs/forum recipe)."""
+        import html as _html
+        safe_disp = _html.escape(disp or os.path.basename(path) or path)
+        reveal_href = "reveal:" + path
+        popup_href = "popup:" + path
+        # No "open in Sublime" — ST image views are useless for generated media.
+        links = (
+            f'<a href="{_html.escape(reveal_href)}">reveal</a>'
+            f' · <a href="{_html.escape(popup_href)}">enlarge</a>'
+            f' · <span style="color:color(var(--foreground) alpha(0.5))">'
+            f'{safe_disp}</span>'
+        )
+        embed = self._media_embed(path, self._MEDIA_PHANTOM_MAX_W)
+        if embed:
+            uri, w, h = embed
+            # Explicit width/height required for correct phantom box (forum).
+            # Bytes are already a real downscaled JPEG thumbnail.
+            # Click thumbnail → enlarge popup (not open in ST).
+            img = (
+                f'<div style="margin:2px 0 2px 0">'
+                f'<a href="{_html.escape(popup_href)}">'
+                f'<img src="{uri}" width="{w}" height="{h}" />'
+                f'</a></div>'
+            )
+            return (
+                f'<body id="claude-media-phantom" '
+                f'style="margin:0;padding:0 0 0 24px;font-size:11px;'
+                f'color:color(var(--foreground) alpha(0.7))">'
+                f'{img}{links}</body>'
+            )
+        # Too large / unsupported type — links only under the tool line.
+        return (
+            f'<body id="claude-media-phantom" '
+            f'style="margin:0;padding:2px 0 4px 24px;font-size:11px;'
+            f'color:color(var(--foreground) alpha(0.7))">'
+            f'🖼 {links}</body>'
+        )
+
+    def show_media_popup(self, path: str, location: int = -1) -> None:
+        """Larger popup preview (super+click / enlarge link), anchored near image."""
+        if not self.view or not self.view.is_valid() or not path:
+            return
+        path = os.path.expanduser(path)
+        html = self._media_popup_html(path)
+        if not html:
+            sublime.status_message(f"Media: {path}")
+            return
+        if location < 0:
+            location = self._media_anchor.get(path, -1)
+        if location < 0:
+            # Fallback: short path text in buffer, else selection — never EOF.
+            disp = media_display_path(path)
+            content = self.view.substr(sublime.Region(0, self.view.size()))
+            if disp:
+                idx = content.rfind(disp)
+                if idx >= 0:
+                    location = idx
+            if location < 0:
+                sel = self.view.sel()
+                location = sel[0].begin() if sel else 0
+        # Keep anchor visible so popup doesn't appear off-screen / at bottom.
+        try:
+            self.view.show(location)
+        except Exception:
+            pass
+        try:
+            self.view.show_popup(
+                html,
+                flags=sublime.HIDE_ON_MOUSE_MOVE_AWAY,
+                location=location,
+                max_width=560,
+                max_height=480,
+                on_navigate=lambda href, _p=path, _l=location: self._handle_media_href(
+                    href, _p, location=_l),
+            )
+        except Exception as e:
+            print(f"[Claude] media popup: {e}")
+            sublime.status_message(f"Media: {media_display_path(path) or path}")
+
+    def _media_popup_html(self, path: str) -> str:
+        """minihtml for enlarge popup — same data: recipe, bigger max size."""
+        import html as _html
+        disp = media_display_path(path) or os.path.basename(path) or path
+        safe_disp = _html.escape(disp)
+        reveal_href = "reveal:" + path
+        style = (
+            "margin:0;padding:8px 10px;"
+            "background-color:var(--background);"
+            "color:var(--foreground);font-size:12px;"
+        )
+        links = (
+            f'<a href="{_html.escape(reveal_href)}">reveal</a>'
+            f' · <a href="dismiss:">dismiss</a>'
+            f'<br><span style="color:color(var(--foreground) alpha(0.55))">'
+            f'{safe_disp}</span>'
+        )
+        if is_video_path(path):
+            return (
+                f'<body id="claude-media-popup" style="{style}">'
+                f'<div style="margin-bottom:6px">🎬 video '
+                f'(no inline preview)</div>{links}</body>'
+            )
+        if not is_image_path(path):
+            return f'<body id="claude-media-popup" style="{style}">{links}</body>'
+        embed = self._media_embed(path, self._MEDIA_POPUP_MAX_W)
+        if embed:
+            uri, w, h = embed
+            img = (
+                f'<div style="margin:0 0 6px 0">'
+                f'<img src="{uri}" width="{w}" height="{h}" />'
+                f'</div>'
+            )
+            return f'<body id="claude-media-popup" style="{style}">{img}{links}</body>'
+        return (
+            f'<body id="claude-media-popup" style="{style}">'
+            f'<div style="margin-bottom:6px">🖼 image '
+            f'(preview too large or unsupported)</div>{links}</body>'
+        )
+
+    def _handle_media_href(self, href: str, fallback_path: str = "",
+                           location: int = -1) -> None:
+        """Navigate handler for media phantom/popup links (reveal / enlarge)."""
+        import subprocess
+        if href == "dismiss:" or href.startswith("dismiss"):
+            try:
+                self.view.hide_popup()
+            except Exception:
+                pass
+            return
+        path = fallback_path or ""
+        if href.startswith("popup:"):
+            path = href[6:] or fallback_path
+            # Anchor popup at the tool/phantom line, not the bottom of the view.
+            loc = location if location >= 0 else self._media_anchor.get(
+                os.path.expanduser(path), -1)
+            self.show_media_popup(path, location=loc)
+            return
+        if href.startswith("reveal:"):
+            path = href[7:]
+        path = os.path.expanduser(path)
+        if not path:
+            return
+        # reveal in Finder / Explorer / file manager — never open in ST
+        try:
+            if sublime.platform() == "osx":
+                subprocess.Popen(["open", "-R", path])
+            elif sublime.platform() == "windows":
+                subprocess.Popen(["explorer", "/select,", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
+            sublime.status_message(f"Revealed {os.path.basename(path)}")
+        except Exception as e:
+            sublime.status_message(f"Reveal failed: {e}")
 
     def _format_bash_result(self, result: str) -> str:
         """Format Bash command output (head + tail if long)."""
