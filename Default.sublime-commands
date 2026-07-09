@@ -24,6 +24,10 @@
         "command": "dsr_start"
     },
     {
+        "caption": "Grok: New Session",
+        "command": "grok_start"
+    },
+    {
         "caption": "DeepSeek: New Session",
         "command": "deep_seek_start"
     },
@@ -154,6 +158,23 @@
     {
         "caption": "Claude: Set Default Provider",
         "command": "claude_set_default_provider"
+    },
+    { "caption": "-" },
+    {
+        "caption": "Grok: Login (xAI / SuperGrok OAuth)",
+        "command": "grok_login"
+    },
+    {
+        "caption": "Grok: Import Login from grok CLI",
+        "command": "grok_import_cli_auth"
+    },
+    {
+        "caption": "Grok: Start Proxy",
+        "command": "grok_start_proxy"
+    },
+    {
+        "caption": "Grok: Stop Proxy",
+        "command": "grok_stop_proxy"
     },
     {
         "caption": "Claude: Copy Conversation",

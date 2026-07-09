@@ -21,6 +21,8 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from . import grok_backend
+
 
 def _pi_available() -> bool:
     """Check if pi CLI is installed."""
@@ -287,6 +289,19 @@ BACKENDS: Dict[str, BackendSpec] = {
             ("gpt-5.5", "GPT-5.5"),
         ],
         available=_pi_available,
+    ),
+    "grok": BackendSpec(
+        name="grok",
+        label="Grok",
+        abbrev="GR",
+        # Reuses the Claude bridge (main.py); a bundled Anthropic<->xAI proxy is
+        # spawned by GrokProxyManager and the bridge is pointed at it via env.
+        bridge_script="main.py",
+        fallback_model="grok-4.5",
+        default_models=grok_backend.GROK_MODELS,
+        dynamic_env=grok_backend.grok_dynamic_env,
+        available=grok_backend.grok_available,
+        pinned=True,
     ),
     "claude": BackendSpec(
         name="claude",

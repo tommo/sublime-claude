@@ -54,6 +54,15 @@
                     },
                     { "caption": "-" },
                     {
+                        "caption": "Grok: New Session",
+                        "command": "grok_start"
+                    },
+                    {
+                        "caption": "Grok: Login…",
+                        "command": "grok_login"
+                    },
+                    { "caption": "-" },
+                    {
                         "caption": "Manage Anthropic Providers…",
                         "command": "claude_manage_providers"
                     },

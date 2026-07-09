@@ -9,9 +9,19 @@
     "default_model": "opus",
 
     // Default provider (backend) for a bare "New Session". Defaults to "claude"
-    // (official Anthropic). Set to a built-in (codex/copilot/pi/dsr) or a custom
+    // (official Anthropic). Set to a built-in (codex/copilot/pi/dsr/grok) or a custom
     // provider key from custom_providers. Set via "Claude: Set Default Provider".
     // "default_backend": "claude",
+
+    // --- Grok (xAI) backend ---
+    // Uses xAI via a bundled Anthropic<->xAI proxy (grok_proxy/), authenticated
+    // with a SuperGrok OAuth login. First run: Command Palette -> "Claude: Grok
+    // Login" (opens a browser). After login, "Grok" appears in the backend
+    // picker. The proxy is auto-spawned on session start and survives sleep.
+    // "grok_proxy_port": 8787,             // localhost port for the proxy
+    // "grok_proxy_auth_token": "",         // bearer token clients present; auto-generated if blank
+    // "grok_proxy_base_url": "https://api.x.ai/v1",  // xAI upstream
+    // "grok_proxy_data_dir": "~/.claude/grok_proxy", // token + log + pid storage
 
     // Tools Claude is allowed to use without confirmation
     // Common tools: Read, Write, Edit, Bash, Glob, Grep, WebFetch, WebSearch
