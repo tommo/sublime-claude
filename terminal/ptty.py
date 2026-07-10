@@ -198,15 +198,21 @@ class TerminalScreen(pyte.Screen):
         else:
             super().set_margins(top, bottom)
 
+    # xterm alt-screen private modes (any of these means "TUI grid").
+    _ALT_SCREEN_MODES = (1049 << 5, 1047 << 5, 47 << 5)
+
+    def _in_alt_screen_mode(self):
+        return any(m in self.mode for m in self._ALT_SCREEN_MODES)
+
     def set_mode(self, *modes, **kwargs):
         super().set_mode(*modes, **kwargs)
-        if 1049 << 5 in self.mode and not self.alternate_buffer_mode:
+        if self._in_alt_screen_mode() and not self.alternate_buffer_mode:
             self.alternate_buffer_mode = True
             self.switch_to_screen(alt=True)
 
     def reset_mode(self, *modes, **kwargs):
         super().reset_mode(*modes, **kwargs)
-        if 1049 << 5 not in self.mode and self.alternate_buffer_mode:
+        if not self._in_alt_screen_mode() and self.alternate_buffer_mode:
             self.alternate_buffer_mode = False
             self.switch_to_screen(alt=False)
 

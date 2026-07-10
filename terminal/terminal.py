@@ -693,7 +693,13 @@ class Terminal:
     # ─── Mouse / scroll modes ───────────────────────────────────────────────
 
     def alternate_screen_enabled(self):
-        return (1049 << 5) in self.screen.mode or self.screen.alternate_buffer_mode
+        m = self.screen.mode
+        return (
+            self.screen.alternate_buffer_mode
+            or (1049 << 5) in m
+            or (1047 << 5) in m
+            or (47 << 5) in m
+        )
 
     def mouse_tracking_enabled(self):
         m = self.screen.mode
@@ -711,29 +717,42 @@ class Terminal:
         return self.mouse_tracking_enabled() or self.alternate_screen_enabled()
 
     def scroll(self, direction, lines=3):
-        """Send wheel input to the app: SGR mouse events if it tracks the mouse,
-        else cursor-key presses (alternate-scroll). direction: 'up' | 'down'."""
+        """Send wheel input to the app.
+
+        Alt-screen TUIs (Grok Build, etc.) almost always want cursor keys for
+        scrollback — SGR wheel at the cursor is often ignored. Prefer arrows
+        whenever we are on the alt screen or DECSET 1007 is set; only use SGR
+        mouse when the app tracks the mouse in the normal screen.
+        """
+        lines = max(1, int(lines or 1))
+        use_arrows = (
+            self.alternate_screen_enabled()
+            or self.alternate_scroll_enabled()
+            or not self.mouse_tracking_enabled()
+        )
         logger.info(
             "scroll %s x%d | alt_screen=%s mouse_tracking=%s sgr=%s -> %s",
             direction, lines, self.alternate_screen_enabled(),
             self.mouse_tracking_enabled(), self.sgr_mouse_enabled(),
-            "sgr-mouse" if self.mouse_tracking_enabled() else "arrow-keys")
-        if self.mouse_tracking_enabled():
-            # SGR (1006) wheel buttons: 64 = up, 65 = down. Fall back to the
-            # legacy X10 encoding when SGR isn't negotiated.
-            cb = 64 if direction == "up" else 65
-            col = min(self.screen.cursor.x + 1, self.screen.columns)
-            row = min(self.screen.cursor.y + 1, self.screen.lines)
-            for _ in range(lines):
-                if self.sgr_mouse_enabled():
-                    self.send_string("\x1b[<{};{};{}M".format(cb, col, row), normalized=False)
-                else:
-                    self.send_string("\x1b[M{}{}{}".format(
-                        chr(32 + cb), chr(32 + col), chr(32 + row)), normalized=False)
-        else:
+            "arrow-keys" if use_arrows else "sgr-mouse")
+        if use_arrows:
             key = "up" if direction == "up" else "down"
             for _ in range(lines):
                 self.send_key(key)
+            return
+        # SGR (1006) wheel buttons: 64 = up, 65 = down. Fall back to the
+        # legacy X10 encoding when SGR isn't negotiated.
+        cb = 64 if direction == "up" else 65
+        col = min(self.screen.cursor.x + 1, self.screen.columns)
+        row = min(self.screen.cursor.y + 1, self.screen.lines)
+        for _ in range(lines):
+            if self.sgr_mouse_enabled():
+                self.send_string(
+                    "\x1b[<{};{};{}M".format(cb, col, row), normalized=False)
+            else:
+                self.send_string("\x1b[M{}{}{}".format(
+                    chr(32 + cb), chr(32 + col), chr(32 + row)),
+                    normalized=False)
 
     def find_image(self, pt):
         view = self.view

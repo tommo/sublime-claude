@@ -321,9 +321,11 @@ class ClaudeTerminalScrollCommand(sublime_plugin.TextCommand):
       decides whether to follow the bottom purely from the resulting viewport
       position, so no follow flag needs threading through here.
 
-    Note: only Linux/Windows synthesize scroll_up/scroll_down button events that
-    reach this command. macOS scrolls the view natively; the renderer's
-    position-based follow handles that path."""
+    Platform note: Linux/Windows deliver scroll_up/scroll_down to mousemap.
+    macOS does not (ST Default (OSX).sublime-mousemap has no scroll buttons);
+    alt-screen TUIs on macOS use padded-viewport capture in the renderer
+    instead. This command still runs if a mousemap event is ever delivered.
+    """
     def run(self, edit, action="up", lines=3):
         terminal = Terminal.from_id(self.view.id())
         if not terminal:

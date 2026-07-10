@@ -2263,24 +2263,34 @@ class AcpBridge(BaseBridge):
                 "input": {"plan": plan_content[:2000]},
             })
 
-        # Prefer existing session plan.md if Grok already wrote it.
+        # Canonical Grok plan path: ~/.grok/sessions/<enc_cwd>/<sessionId>/plan.md
+        # (cwd is URL-encoded with literal %2F segments). Always ensure planContent
+        # is on disk there so post-approve tool execution can read it.
         plan_path = ""
         if self.session_id:
             enc_cwd = (self.cwd or "").replace("/", "%2F")
-            cand = os.path.join(
+            plan_path = os.path.join(
                 os.path.expanduser("~/.grok/sessions"),
                 enc_cwd, self.session_id, "plan.md",
             )
-            if os.path.isfile(cand):
-                plan_path = cand
-        if not plan_path and plan_content:
-            plan_path = os.path.join(self.cwd or os.getcwd(), ".grok-plan.md")
+        if plan_content and plan_path:
             try:
-                with open(plan_path, "w", encoding="utf-8") as f:
-                    f.write(plan_content)
+                os.makedirs(os.path.dirname(plan_path), exist_ok=True)
+                # Don't clobber a newer on-disk plan if agent already wrote it.
+                if not os.path.isfile(plan_path):
+                    with open(plan_path, "w", encoding="utf-8") as f:
+                        f.write(plan_content)
             except Exception as e:
                 self.file_log(f"exit_plan_mode: plan file write failed: {e}")
-                plan_path = ""
+        if not plan_path or not os.path.isfile(plan_path or ""):
+            if plan_content:
+                plan_path = os.path.join(self.cwd or os.getcwd(), ".grok-plan.md")
+                try:
+                    with open(plan_path, "w", encoding="utf-8") as f:
+                        f.write(plan_content)
+                except Exception as e:
+                    self.file_log(f"exit_plan_mode: fallback plan write failed: {e}")
+                    plan_path = ""
 
         tool_input = {
             "plan": plan_content,
@@ -2310,21 +2320,21 @@ class AcpBridge(BaseBridge):
                 plan_path = result["planFilePath"]
 
         ok = approved is True
-        # Grok TUI semantics (see user-guide plan mode):
-        #   approved=true  → start building (plan stays on disk / plan.md)
-        #   approved=false + feedback → revise plan / keep planning
-        # Never put the plan body in `feedback` on approve — non-empty
-        # feedback is treated as "request changes" and the agent revises
-        # instead of implementing.
+        # Grok ExitPlanModeExtResponse (2 fields: approved + feedback).
+        # Observed in bridge log: {"approved": true, "feedback": ""} still
+        # yields tool result "The user wants to revise the plan…" — Grok
+        # treats *presence* of feedback (even empty string) as request-changes.
+        # On approve: omit feedback entirely (or null). Never send plan body.
+        # On reject/cancel: send short feedback text for the revise path.
         if ok:
             summary = "Plan approved — implement"
-            feedback = ""
+            resp = {"approved": True}
         elif approved is False:
             summary = "Plan rejected — revise or stop"
-            feedback = summary
+            resp = {"approved": False, "feedback": summary}
         else:
             summary = "Continue planning"
-            feedback = summary
+            resp = {"approved": False, "feedback": summary}
         if tool_call_id:
             send_notification("message", {
                 "type": "tool_result",
@@ -2334,11 +2344,8 @@ class AcpBridge(BaseBridge):
             })
         self.file_log(
             f"exit_plan_mode result approved={approved!r} "
-            f"plan_chars={len(plan_text)} feedback={feedback!r}")
-        return {
-            "approved": bool(ok),
-            "feedback": feedback,
-        }
+            f"plan_chars={len(plan_text)} resp={json.dumps(resp)[:200]}")
+        return resp
 
     _IMAGE_EXTS = (
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",

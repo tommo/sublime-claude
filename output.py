@@ -2516,29 +2516,35 @@ class OutputView:
         # Adaptive Work strip: Goal (north star) + Tasks (steps) as one block.
         # Distinct line prefixes → different colors via ClaudeOutput.sublime-syntax
         # (claude.goal.* vs claude.task.*). No dual ───── banners.
+        #
+        # Only while the turn is live (working). When meta/@done finalizes the
+        # turn, drop the strip so finished history has no task-list "corpse".
+        # Open todos/goals still carry into the next Conversation via prompt().
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
             self.current.todos_all_done = True
         goal = self.current.goal
-        # Sticky strip: only open goals (active/blocked). completed is cleared
-        # on update_goal and never carried to the next turn.
-        show_goal = bool(goal and goal.status in ("active", "blocked"))
+        show_goal = False
         show_tasks = False
         show = []
         hidden = 0
         expanded = False
-        if open_todos:
-            active = [t for t in open_todos if _todo_is_active(t)]
-            pending = [t for t in open_todos if not _todo_is_active(t)]
-            expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
-                if self.view else False
-            if expanded:
-                show = open_todos
-            else:
-                cap = max(0, 3 - len(active))
-                show = active + pending[:cap]
-            show_tasks = bool(show)
-            hidden = len(open_todos) - len(show) if show else 0
+        if self.current.working:
+            # Sticky strip: only open goals (active/blocked). completed is
+            # cleared on update_goal and never carried to the next turn.
+            show_goal = bool(goal and goal.status in ("active", "blocked"))
+            if open_todos:
+                active = [t for t in open_todos if _todo_is_active(t)]
+                pending = [t for t in open_todos if not _todo_is_active(t)]
+                expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
+                    if self.view else False
+                if expanded:
+                    show = open_todos
+                else:
+                    cap = max(0, 3 - len(active))
+                    show = active + pending[:cap]
+                show_tasks = bool(show)
+                hidden = len(open_todos) - len(show) if show else 0
 
         if show_goal or show_tasks:
             lines.append("\n")
