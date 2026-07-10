@@ -2310,10 +2310,21 @@ class AcpBridge(BaseBridge):
                 plan_path = result["planFilePath"]
 
         ok = approved is True
-        summary = (
-            "Plan approved — implement" if ok else
-            ("Plan rejected" if approved is False else "Continue planning")
-        )
+        # Grok TUI semantics (see user-guide plan mode):
+        #   approved=true  → start building (plan stays on disk / plan.md)
+        #   approved=false + feedback → revise plan / keep planning
+        # Never put the plan body in `feedback` on approve — non-empty
+        # feedback is treated as "request changes" and the agent revises
+        # instead of implementing.
+        if ok:
+            summary = "Plan approved — implement"
+            feedback = ""
+        elif approved is False:
+            summary = "Plan rejected — revise or stop"
+            feedback = summary
+        else:
+            summary = "Continue planning"
+            feedback = summary
         if tool_call_id:
             send_notification("message", {
                 "type": "tool_result",
@@ -2323,12 +2334,10 @@ class AcpBridge(BaseBridge):
             })
         self.file_log(
             f"exit_plan_mode result approved={approved!r} "
-            f"plan_chars={len(plan_text)}")
-        # Grok ExtResponse: approved + feedback. Saved plan text is available
-        # on disk; on approve pass it in feedback so agent can see post-edit plan.
+            f"plan_chars={len(plan_text)} feedback={feedback!r}")
         return {
             "approved": bool(ok),
-            "feedback": plan_text if ok and plan_text else ("" if ok else summary),
+            "feedback": feedback,
         }
 
     _IMAGE_EXTS = (
