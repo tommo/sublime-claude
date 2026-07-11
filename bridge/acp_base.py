@@ -2258,19 +2258,107 @@ class AcpBridge(BaseBridge):
         )
 
     @staticmethod
-    def _exit_plan_ext_response(approved):
-        """Grok ExitPlanModeExtResponse: {approved: bool, feedback?: str}.
+    def _plan_unified_diff(before: str, after: str, *, max_chars: int = 12000) -> str:
+        """Unified diff of plan before approval UI vs after user edits."""
+        import difflib
+        if (before or "") == (after or ""):
+            return ""
+        lines = list(difflib.unified_diff(
+            (before or "").splitlines(),
+            (after or "").splitlines(),
+            fromfile="plan (proposed)",
+            tofile="plan (current)",
+            lineterm="",
+        ))
+        if not lines:
+            return ""
+        diff = "\n".join(lines)
+        if len(diff) > max_chars:
+            return diff[:max_chars] + "\n… (diff truncated)"
+        return diff
 
-        Footgun: Grok treats presence of feedback (even empty string "") as
-        "user wants to revise the plan". On approve, omit feedback entirely.
-        On reject/cancel, include short feedback text.
+    @staticmethod
+    def _format_plan_user_feedback(
+        *,
+        approved: bool,
+        user_notes: str = "",
+        plan_before: str = "",
+        plan_after: str = "",
+        plan_path: str = "",
+    ) -> str:
+        """Embed plan path / diff / body in ExtResponse feedback.
+
+        Used for both approve and request_changes so the agent sees user
+        edits immediately (Grok surfaces feedback as review comments /
+        "The user said: …"). Diff is always included when non-empty.
         """
+        parts = []
+        notes = (user_notes or "").strip()
+        if notes:
+            parts.append(notes)
+        elif not approved:
+            parts.append("Plan rejected — revise or stop")
+
+        after = plan_after or ""
+        before = plan_before or ""
+        if plan_path:
+            parts.append(f"Plan file: {plan_path}")
+
+        diff = AcpBridge._plan_unified_diff(before, after)
+        if diff:
+            parts.append(
+                "## Plan diff (proposed → current)\n```diff\n"
+                + diff
+                + "\n```"
+            )
+        elif approved and (before or after):
+            parts.append("## Plan diff\n(no changes from proposed plan)")
+
+        # Always include current body on reject; on approve include when
+        # there was a diff or notes so the agent has the final plan text.
+        include_body = (not approved) or bool(diff) or bool(notes)
+        if include_body:
+            if after.strip():
+                body = (
+                    after if len(after) <= 16000
+                    else after[:16000] + "\n… (plan truncated)"
+                )
+                parts.append("## Current plan\n" + body)
+            elif before.strip() and not approved:
+                body = (
+                    before if len(before) <= 16000
+                    else before[:16000] + "\n… (plan truncated)"
+                )
+                parts.append("## Proposed plan (unchanged on disk)\n" + body)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _exit_plan_ext_response(approved, feedback: str = ""):
+        """Grok ExitPlanModeExtResponse — outcome-tagged (like AskUser).
+
+        Confirmed via ACP probe against grok agent stdio:
+          {"outcome": "approved"}  → PlanReady / "User has approved your plan…"
+          {"approved": true}       → WRONG; maps to revise text
+
+        Outcomes (snake_case, internally tagged on `outcome`):
+          approved | request_changes | abandoned
+        Optional `feedback` only for request_changes (revision notes) or
+        approve-with-comments.
+        """
+        fb = (feedback or "").strip()
         if approved is True:
-            return {"approved": True}
-        elif approved is False:
-            return {"approved": False, "feedback": "Plan rejected — revise or stop"}
-        else:
-            return {"approved": False, "feedback": "Continue planning"}
+            resp = {"outcome": "approved"}
+            if fb:
+                resp["feedback"] = fb
+            return resp
+        if approved is False:
+            # Explicit reject → request changes (stay in plan mode).
+            return {
+                "outcome": "request_changes",
+                "feedback": fb or "Plan rejected — revise or stop",
+            }
+        # Cancel / dismiss without approve → abandon plan mode.
+        return {"outcome": "abandoned"}
 
     def _ensure_plan_on_disk(self, plan_content: str, plan_path: str) -> str:
         """Write plan_content to disk if not already present; return path or fallback."""
@@ -2339,13 +2427,53 @@ class AcpBridge(BaseBridge):
             if result.get("planFilePath"):
                 plan_path = result["planFilePath"]
 
-        resp = self._exit_plan_ext_response(approved)
+        # Prefer on-disk plan at response time (user may have saved edits).
+        if plan_path and os.path.isfile(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8", errors="replace") as f:
+                    disk = f.read()
+                if disk:
+                    plan_text = disk
+            except Exception:
+                pass
+
+        # Optional freeform notes from plugin.
+        user_feedback = ""
+        if isinstance(result, dict):
+            user_feedback = (
+                result.get("feedback")
+                or result.get("comments")
+                or result.get("message")
+                or ""
+            )
+            if not isinstance(user_feedback, str):
+                user_feedback = str(user_feedback or "")
+
+        # Approve + reject: embed plan path / diff / body in feedback so the
+        # agent sees user edits without re-reading plan.md.
+        if approved is True or approved is False:
+            user_feedback = self._format_plan_user_feedback(
+                approved=bool(approved),
+                user_notes=user_feedback,
+                plan_before=plan_content,
+                plan_after=plan_text,
+                plan_path=plan_path or "",
+            )
+
+        resp = self._exit_plan_ext_response(approved, user_feedback)
         ok = approved is True
-        summary = (
-            "Plan approved — implement" if ok
-            else "Plan rejected — revise or stop" if approved is False
-            else "Continue planning"
-        )
+        if ok:
+            summary = (
+                (user_feedback[:800] + "…") if len(user_feedback) > 800
+                else (user_feedback or "Plan approved — implement")
+            )
+        elif approved is False:
+            # Plugin transcript: keep short; full plan+diff is in ExtResponse feedback.
+            summary = (user_feedback[:800] + "…") if len(user_feedback) > 800 else (
+                user_feedback or "Plan rejected — revise or stop"
+            )
+        else:
+            summary = "Continue planning"
         if tool_call_id:
             send_notification("message", {
                 "type": "tool_result",
