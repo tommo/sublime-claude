@@ -2243,12 +2243,59 @@ class AcpBridge(BaseBridge):
             "partial_answers": {},
         }
 
-    async def _acp_exit_plan_mode(self, params: dict) -> dict:
-        """Grok `_x.ai/exit_plan_mode` → same plan UI as Claude ExitPlanMode.
+    @staticmethod
+    def _resolve_grok_plan_path(session_id: str, cwd: str) -> str:
+        """Canonical Grok plan path: ~/.grok/sessions/<enc_cwd>/<sid>/plan.md.
 
-        Reuses base.request_plan_approval (plan_mode_exit + plan_response).
-        Maps the bool result to Grok's ExitPlanModeExtResponse shape.
+        cwd is URL-encoded with literal %2F segments.
         """
+        if not session_id or not cwd:
+            return ""
+        enc_cwd = cwd.replace("/", "%2F")
+        return os.path.join(
+            os.path.expanduser("~/.grok/sessions"),
+            enc_cwd, session_id, "plan.md",
+        )
+
+    @staticmethod
+    def _exit_plan_ext_response(approved):
+        """Grok ExitPlanModeExtResponse: {approved: bool, feedback?: str}.
+
+        Footgun: Grok treats presence of feedback (even empty string "") as
+        "user wants to revise the plan". On approve, omit feedback entirely.
+        On reject/cancel, include short feedback text.
+        """
+        if approved is True:
+            return {"approved": True}
+        elif approved is False:
+            return {"approved": False, "feedback": "Plan rejected — revise or stop"}
+        else:
+            return {"approved": False, "feedback": "Continue planning"}
+
+    def _ensure_plan_on_disk(self, plan_content: str, plan_path: str) -> str:
+        """Write plan_content to disk if not already present; return path or fallback."""
+        if not plan_content:
+            return plan_path or ""
+        if plan_path:
+            try:
+                os.makedirs(os.path.dirname(plan_path), exist_ok=True)
+                if not os.path.isfile(plan_path):
+                    with open(plan_path, "w", encoding="utf-8") as f:
+                        f.write(plan_content)
+                return plan_path
+            except Exception as e:
+                self.file_log(f"exit_plan_mode: plan file write failed: {e}")
+        fallback = os.path.join(self.cwd or os.getcwd(), ".grok-plan.md")
+        try:
+            with open(fallback, "w", encoding="utf-8") as f:
+                f.write(plan_content)
+            return fallback
+        except Exception as e:
+            self.file_log(f"exit_plan_mode: fallback plan write failed: {e}")
+            return ""
+
+    async def _acp_exit_plan_mode(self, params: dict) -> dict:
+        """Grok `_x.ai/exit_plan_mode` → same plan UI as Claude ExitPlanMode."""
         plan_content = params.get("planContent") or params.get("plan") or ""
         tool_call_id = params.get("toolCallId") or ""
         self.file_log(
@@ -2263,34 +2310,9 @@ class AcpBridge(BaseBridge):
                 "input": {"plan": plan_content[:2000]},
             })
 
-        # Canonical Grok plan path: ~/.grok/sessions/<enc_cwd>/<sessionId>/plan.md
-        # (cwd is URL-encoded with literal %2F segments). Always ensure planContent
-        # is on disk there so post-approve tool execution can read it.
-        plan_path = ""
-        if self.session_id:
-            enc_cwd = (self.cwd or "").replace("/", "%2F")
-            plan_path = os.path.join(
-                os.path.expanduser("~/.grok/sessions"),
-                enc_cwd, self.session_id, "plan.md",
-            )
-        if plan_content and plan_path:
-            try:
-                os.makedirs(os.path.dirname(plan_path), exist_ok=True)
-                # Don't clobber a newer on-disk plan if agent already wrote it.
-                if not os.path.isfile(plan_path):
-                    with open(plan_path, "w", encoding="utf-8") as f:
-                        f.write(plan_content)
-            except Exception as e:
-                self.file_log(f"exit_plan_mode: plan file write failed: {e}")
-        if not plan_path or not os.path.isfile(plan_path or ""):
-            if plan_content:
-                plan_path = os.path.join(self.cwd or os.getcwd(), ".grok-plan.md")
-                try:
-                    with open(plan_path, "w", encoding="utf-8") as f:
-                        f.write(plan_content)
-                except Exception as e:
-                    self.file_log(f"exit_plan_mode: fallback plan write failed: {e}")
-                    plan_path = ""
+        plan_path = self._resolve_grok_plan_path(
+            self.session_id or "", self.cwd or "")
+        plan_path = self._ensure_plan_on_disk(plan_content, plan_path)
 
         tool_input = {
             "plan": plan_content,
@@ -2302,7 +2324,6 @@ class AcpBridge(BaseBridge):
 
         if not result:
             approved = None
-            # Fall back to on-disk plan (saved only), then request snapshot.
             plan_text = ""
             if plan_path and os.path.isfile(plan_path):
                 try:
@@ -2314,27 +2335,17 @@ class AcpBridge(BaseBridge):
                 plan_text = plan_content
         else:
             approved = result.get("approved")
-            # Plugin sends disk-saved plan only (unsaved buffer ignored).
             plan_text = result.get("plan") or plan_content
             if result.get("planFilePath"):
                 plan_path = result["planFilePath"]
 
+        resp = self._exit_plan_ext_response(approved)
         ok = approved is True
-        # Grok ExitPlanModeExtResponse (2 fields: approved + feedback).
-        # Observed in bridge log: {"approved": true, "feedback": ""} still
-        # yields tool result "The user wants to revise the plan…" — Grok
-        # treats *presence* of feedback (even empty string) as request-changes.
-        # On approve: omit feedback entirely (or null). Never send plan body.
-        # On reject/cancel: send short feedback text for the revise path.
-        if ok:
-            summary = "Plan approved — implement"
-            resp = {"approved": True}
-        elif approved is False:
-            summary = "Plan rejected — revise or stop"
-            resp = {"approved": False, "feedback": summary}
-        else:
-            summary = "Continue planning"
-            resp = {"approved": False, "feedback": summary}
+        summary = (
+            "Plan approved — implement" if ok
+            else "Plan rejected — revise or stop" if approved is False
+            else "Continue planning"
+        )
         if tool_call_id:
             send_notification("message", {
                 "type": "tool_result",

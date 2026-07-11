@@ -314,17 +314,14 @@ class ClaudeTerminalResetCommand(sublime_plugin.TextCommand):
 class ClaudeTerminalScrollCommand(sublime_plugin.TextCommand):
     """Wheel handler for terminal views (bound for all terminal views).
 
-    - alt-screen / mouse-tracking apps: hand the wheel to the app (arrow keys or
-      SGR mouse events).
-    - normal buffer (e.g. Claude Code): discrete, line-based scrollback scroll
-      that replaces Sublime's smooth/momentum editor scrolling. The renderer
-      decides whether to follow the bottom purely from the resulting viewport
-      position, so no follow flag needs threading through here.
+    - mouse-tracking TUIs (Grok widgets with scrollbars): SGR wheel at pointer
+    - alt-screen without mouse tracking: cursor keys
+    - normal buffer: discrete line-based scrollback scroll
 
-    Platform note: Linux/Windows deliver scroll_up/scroll_down to mousemap.
-    macOS does not (ST Default (OSX).sublime-mousemap has no scroll buttons);
-    alt-screen TUIs on macOS use padded-viewport capture in the renderer
-    instead. This command still runs if a mousemap event is ever delivered.
+    Linux/Windows: mousemap delivers scroll_up/scroll_down here.
+    macOS: ST does not synthesize scroll_* for the trackpad; wheel cannot
+    be captured without fighting the viewport — use keys or enable Grok
+    mouse reporting and use a platform that delivers scroll buttons.
     """
     def run(self, edit, action="up", lines=3):
         terminal = Terminal.from_id(self.view.id())

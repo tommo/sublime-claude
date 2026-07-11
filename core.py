@@ -44,17 +44,16 @@ def plugin_loaded() -> None:
     # Orphaned claude_output views reconnect lazily on first activation via
     # ClaudeOutputEventListener._reconnect_orphaned_view (listeners.py).
     # Order bookmarks attach lazily on view load via ClaudeCodeEventListener.on_load.
-    # After quiet period, settle the *currently active* Claude sheet only.
+    # After quiet period: sleep ⏸ on all restored sessions; full UX only on active.
     schedule_auto_sleep()
-    sublime.set_timeout(_startup_settle_active, int(_STARTUP_QUIET_S * 1000) + 50)
+    sublime.set_timeout(_startup_settle_views, int(_STARTUP_QUIET_S * 1000) + 50)
 
 
-def _startup_settle_active() -> None:
-    """After session restore, fully reconnect only the active Claude view."""
+def _startup_settle_views() -> None:
+    """After session restore, apply sleep UI to all Claude sheets; live UX on active."""
     try:
-        from .listeners import settle_active_claude_view
-        for w in sublime.windows():
-            settle_active_claude_view(w)
+        from .listeners import settle_startup_claude_views
+        settle_startup_claude_views()
     except Exception as e:
         print(f"[Claude] startup settle: {e}")
 

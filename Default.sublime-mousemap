@@ -24,21 +24,18 @@
         "command": "claude_terminal_open_link",
         "context": [{ "key": "claude_terminal" }]
     },
-    // Terminal wheel (Linux/Windows — macOS does not deliver scroll_* events;
-    // alt-screen TUIs on macOS use padded-viewport capture in render.py).
-    // alt-screen/mouse apps -> app; normal buffer -> discrete line scroll.
+    // button1 is intentionally unbound — Default drag_select must handle
+    // click-to-focus. TUI SGR is forwarded in on_post_text_command after that.
+    //
+    // Terminal wheel (Linux/Windows only — macOS has no scroll_* mousemap events).
     {
         "button": "scroll_up", "modifiers": [],
         "command": "claude_terminal_scroll", "args": {"action": "up", "lines": 3},
-        "context": [
-            { "key": "setting.claude_terminal", "operator": "equal", "operand": true }
-        ]
+        "context": [{ "key": "claude_terminal" }]
     },
     {
         "button": "scroll_down", "modifiers": [],
         "command": "claude_terminal_scroll", "args": {"action": "down", "lines": 3},
-        "context": [
-            { "key": "setting.claude_terminal", "operator": "equal", "operand": true }
-        ]
+        "context": [{ "key": "claude_terminal" }]
     }
 ]

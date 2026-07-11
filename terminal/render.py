@@ -122,12 +122,6 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         self.region_scopes = {}   # key -> scope, so we can snapshot/restore colors
         self._alt_active = False  # are we currently showing the alt screen?
         self._alt_snapshot = None  # saved primary view while on the alt screen
-        # macOS does not deliver scroll_up/scroll_down mousemap events (only
-        # Linux/Windows do). For alt-screen TUIs we pad the buffer so native
-        # trackpad scrolling moves the viewport; each render converts that
-        # delta into app scroll keys and re-centers.
-        self._alt_scroll_pad = 40  # blank lines above + below the TUI grid
-        self._alt_home_y = 0.0
         settings = sublime.load_settings("ClaudeTerminal.sublime-settings")
         self.scrollback_history_size = settings.get("scrollback_history_size", 10000)
         self.brighten_bold_text = settings.get("brighten_bold_text", False)
@@ -166,25 +160,18 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         # scrolled up to read" from "content grew below" (the latter doesn't move
         # the viewport, so we stay engaged).
         #
-        # Alt-screen is special: the TUI owns scrolling. On Linux/Windows the
-        # mousemap feeds the app; on macOS we convert viewport motion over a
-        # padded buffer into app scroll keys (see _capture_alt_wheel).
+        # Alt-screen always follows the TUI grid (no padded-viewport wheel
+        # capture — that fought the trackpad). Wheel → app only via mousemap
+        # (Linux/Windows). Clicks → SGR via claude_terminal_mouse.
         pin_bottom = view.settings().get("claude_terminal_view.pin_bottom", False)
         if pin_bottom:
             view.settings().set("claude_terminal_view.pin_bottom", False)  # one-shot
-        alt = terminal.alternate_screen_enabled()
-        following = (
-            pin_bottom
-            or (alt and not self._alt_wheel_capture_enabled())
-            or (not alt and self._user_at_bottom(view))
-        )
+        following = (pin_bottom or terminal.alternate_screen_enabled()
+                     or self._user_at_bottom(view))
         prev_vp = view.viewport_position()
 
         self.update_lines(edit, terminal)
-        if alt and self._alt_wheel_capture_enabled():
-            self._ensure_alt_scroll_padding(edit, terminal)
-            self._capture_alt_wheel(view, terminal)
-        elif following:
+        if following:
             self.trim_trailing_spaces(edit, terminal)
             self.trim_history(edit, terminal)
             view.run_command("claude_terminal_show_cursor")
@@ -335,11 +322,6 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
         self.colored_lines = {}
         self.region_scopes = {}
 
-    def _alt_wheel_capture_enabled(self):
-        # macOS never delivers scroll_up/scroll_down to mousemap (ST Default
-        # (OSX) has no scroll buttons; Linux does). Use padded-viewport capture.
-        return sublime.platform() == "osx"
-
     def _enter_alt(self, edit, view, terminal):
         # snapshot the primary view (text + offset + color regions) then clear it
         snap_regions = {}
@@ -350,75 +332,20 @@ class ClaudeTerminalRenderCommand(sublime_plugin.TextCommand, TerminusViewMixin)
             "offset": terminal.offset,
             "colored_lines": {ln: list(ks) for ln, ks in self.colored_lines.items()},
             "regions": snap_regions,
-            "scroll_past_end": view.settings().get("scroll_past_end"),
         }
         self._erase_all_regions(view)
         view.replace(edit, sublime.Region(0, view.size()), "")
         view.settings().set("terminus.highlight_counter", 0)
-        # macOS: pad so trackpad can move the viewport; convert → app scroll.
-        if self._alt_wheel_capture_enabled():
-            pad = self._alt_scroll_pad
-            view.insert(edit, 0, "\n" * pad)
-            terminal.offset = pad
-            # Allow overscroll past the bottom pad as well.
-            view.settings().set("scroll_past_end", True)
-        else:
-            terminal.offset = 0
+        # Lock the grid: no overscroll slack (avoids document-scroll fighting).
+        view.settings().set("scroll_past_end", False)
+        terminal.offset = 0
         terminal.screen.dirty.update(range(terminal.screen.lines))
-
-    def _ensure_alt_scroll_padding(self, edit, terminal):
-        """Keep top pad + bottom pad around the TUI grid (macOS wheel capture)."""
-        if not self._alt_wheel_capture_enabled():
-            return
-        view = self.view
-        pad = self._alt_scroll_pad
-        screen_lines = terminal.screen.lines
-        # Top pad
-        if terminal.offset < pad:
-            view.insert(edit, 0, "\n" * (pad - terminal.offset))
-            terminal.offset = pad
-        # Bottom pad: after last grid line
-        last_grid = terminal.offset + screen_lines - 1
-        lastrow = view.rowcol(view.size())[0]
-        need_last = last_grid + pad
-        if lastrow < need_last:
-            view.insert(edit, view.size(), "\n" * (need_last - lastrow))
-
-    def _capture_alt_wheel(self, view, terminal):
-        """Convert native viewport motion into app scroll; re-center on grid."""
-        lh = view.line_height()
-        if lh <= 0:
-            return
-        pad = self._alt_scroll_pad
-        home_y = pad * lh
-        self._alt_home_y = home_y
-        cur_y = view.viewport_position()[1]
-        delta_lines = (cur_y - home_y) / lh
-        if abs(delta_lines) >= 0.6:
-            n = int(round(delta_lines))
-            if n != 0:
-                # Scroll down in the view → user wants later content → app "down"
-                action = "down" if n > 0 else "up"
-                logger.info("alt-wheel capture: vpΔ=%.1f → %s x%d", delta_lines, action, abs(n))
-                terminal.scroll(action, abs(n))
-        # Always re-center so continuous trackpad scrolling keeps working.
-        x, _ = view.viewport_position()
-        if abs(view.viewport_position()[1] - home_y) > 0.5:
-            view.set_viewport_position((x, home_y), False)
-            sublime.set_timeout(
-                lambda: view.set_viewport_position((x, home_y), False), 0)
 
     def _leave_alt(self, edit, view, terminal):
         snap = self._alt_snapshot
         self._alt_snapshot = None
         self._erase_all_regions(view)
         view.replace(edit, sublime.Region(0, view.size()), "")
-        if snap and "scroll_past_end" in snap:
-            spe = snap["scroll_past_end"]
-            if spe is None:
-                view.settings().erase("scroll_past_end")
-            else:
-                view.settings().set("scroll_past_end", spe)
         if not snap:
             terminal.offset = 0
         else:
@@ -512,32 +439,33 @@ class ClaudeTerminalShowCursorCommand(sublime_plugin.TextCommand, TerminusViewMi
 
     def focus_cursor(self, edit, terminal):
         view = self.view
-
-        sel = view.sel()
-        sel.clear()
-
         screen = terminal.screen
-        if screen.cursor.hidden:
-            return
-
         cursor = screen.cursor
         offset = terminal.offset
 
-        if len(view.sel()) > 0 and view.sel()[0].empty():
-            row, col = view.rowcol(view.sel()[0].end())
-            if row == offset + cursor.y and col == cursor.x:
-                return
-
-        # make sure the view has enough lines
+        # Resolve terminal cursor → text point (even when the app hides it).
         self.ensure_position(edit, cursor.y + offset)
-
         line_region = view.line(view.text_point(cursor.y + offset, 0))
         text = view.substr(line_region)
         col = rev_wcwidth(text, cursor.x) + 1
-
         self.ensure_position(edit, cursor.y + offset, col)
         pt = view.text_point(cursor.y + offset, col)
 
+        sel = view.sel()
+        # ST requires a non-empty sel() for mouse clicks / focus to work.
+        # Old Terminus code did sel.clear() then return on cursor.hidden,
+        # leaving zero regions — clicks could not activate the view.
+        if screen.cursor.hidden:
+            if len(sel) == 0:
+                sel.add(sublime.Region(pt, pt))
+            return
+
+        if len(sel) == 1 and sel[0].empty():
+            row, cur_col = view.rowcol(sel[0].end())
+            if row == offset + cursor.y and cur_col == col:
+                return
+
+        sel.clear()
         sel.add(sublime.Region(pt, pt))
 
     def scroll_to_cursor(self, terminal):

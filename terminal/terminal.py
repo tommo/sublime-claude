@@ -135,6 +135,11 @@ class Terminal:
         self._external_q = None         # set in adopt(): engine-pump → renderer queue
         self._adopted = False           # True when bound to a borrowed pty
         self._adopted_release = False   # True during a hand-back (do NOT kill the pty)
+        # Last mouse text point (from on_hover/click) for SGR mouse targeting.
+        self._last_mouse_pt = None
+        # Buttons currently held (SGR button codes 0/1/2) for motion reporting.
+        self._mouse_buttons_down = set()
+        self._last_motion_cell = None  # (col, row) de-dupe for hover motion
 
     # ─── User input tracking ───────────────────────────────────────────────
 
@@ -434,7 +439,14 @@ class Terminal:
         _env = os.environ.copy()
         _env["TERM"] = "xterm-256color"
         _env.setdefault("COLORTERM", "truecolor")  # let TUIs emit 24-bit color
-        _env.update(env)
+        _env.update(env or {})
+        # Grok (and similar TUIs) detect the host from TERM_PROGRAM. GUI-launched
+        # Sublime has none → "Unknown". Claim a known embedded-terminal identity.
+        _env.setdefault("TERM_PROGRAM", "vscode")
+        _env.setdefault("TERM_PROGRAM_VERSION", "1.0.0")
+        # Grok gates DECSET mouse modes behind this feature flag (default off).
+        # Without it, click/wheel never reach the app — only native ST selection.
+        _env["GROK_MOUSE_REPORTING_TOGGLE"] = "1"
         saved_index = view.settings().get("claude_terminal.index") if view else None
         if saved_index:
             self.index = saved_index
@@ -651,6 +663,8 @@ class Terminal:
         self.send_string(get_key_code(*args, **kwargs), normalized=False)
 
     def send_string(self, string, normalized=True):
+        if not self.process:
+            return
         if normalized:
             # normalize CR and CRLF to CR (or CRLF if LNM)
             string = string.replace("\r\n", "\n")
@@ -705,6 +719,15 @@ class Terminal:
         m = self.screen.mode
         return (1000 << 5) in m or (1002 << 5) in m or (1003 << 5) in m
 
+    def mouse_drag_tracking_enabled(self):
+        """DECSET 1002: report motion while a button is held."""
+        m = self.screen.mode
+        return (1002 << 5) in m or (1003 << 5) in m
+
+    def mouse_any_event_enabled(self):
+        """DECSET 1003: report all motion (even with no button)."""
+        return (1003 << 5) in self.screen.mode
+
     def sgr_mouse_enabled(self):
         return (1006 << 5) in self.screen.mode
 
@@ -716,43 +739,127 @@ class Terminal:
         """True when the wheel should drive the app instead of the ST viewport."""
         return self.mouse_tracking_enabled() or self.alternate_screen_enabled()
 
-    def scroll(self, direction, lines=3):
+    def wants_app_mouse(self):
+        """True when clicks/drags should be forwarded as terminal mouse events.
+
+        Mouse-tracking DECSET is the protocol signal, but many TUIs (Grok) only
+        enable it after an in-app toggle. While on the alt screen we still
+        forward SGR events so widgets can receive them once the app listens.
+        """
+        return self.mouse_tracking_enabled() or self.alternate_screen_enabled()
+
+    def note_mouse_point(self, pt):
+        """Remember last mouse text point for SGR mouse targeting."""
+        if pt is not None:
+            self._last_mouse_pt = pt
+
+    def cell_from_point(self, pt=None, col=None, row=None):
+        """1-based terminal (col, row) from view point or explicit cell."""
+        cols = max(1, self.screen.columns)
+        rows = max(1, self.screen.lines)
+        if col is not None and row is not None:
+            return (min(max(int(col), 1), cols), min(max(int(row), 1), rows))
+        if pt is None:
+            pt = self._last_mouse_pt
+        view = self.view
+        if pt is not None and view and view.is_valid():
+            r, c = view.rowcol(pt)
+            # View row → terminal cell (offset is scrollback above the grid).
+            term_row = r - int(self.offset) + 1
+            term_col = c + 1
+            return (min(max(term_col, 1), cols), min(max(term_row, 1), rows))
+        # Fallback: cursor cell (not ideal for widgets; hover is preferred).
+        return (
+            min(self.screen.cursor.x + 1, cols),
+            min(self.screen.cursor.y + 1, rows),
+        )
+
+    def _send_sgr_mouse(self, cb, col, row, pressed=True):
+        """Emit one SGR mouse report (CSI < btn ; col ; row M/m).
+
+        Always SGR — Grok and modern TUIs expect it even before 1006 is
+        negotiated. X10 is obsolete and breaks btn>=64 (wheel).
+        """
+        final = "M" if pressed else "m"
+        seq = "\x1b[<{};{};{}{}".format(int(cb), int(col), int(row), final)
+        self.send_string(seq, normalized=False)
+
+    def send_mouse_button(self, button, pt=None, pressed=True, motion=False,
+                          col=None, row=None):
+        """Send a mouse button/motion event to the app.
+
+        button: 0=left, 1=middle, 2=right (SGR). Wheel uses scroll() instead.
+        """
+        if not self.wants_app_mouse():
+            return
+        button = int(button)
+        c, r = self.cell_from_point(pt=pt, col=col, row=row)
+        if pt is not None:
+            self.note_mouse_point(pt)
+
+        if motion:
+            # Motion reports use button + 32; if no button held and 1003, button=3.
+            if button < 0:
+                cb = 32 + 3
+            else:
+                cb = 32 + button
+            self._send_sgr_mouse(cb, c, r, pressed=True)
+            logger.info("mouse motion cb=%d @%d,%d", cb, c, r)
+            return
+
+        if pressed:
+            self._mouse_buttons_down.add(button)
+            self._send_sgr_mouse(button, c, r, pressed=True)
+        else:
+            self._mouse_buttons_down.discard(button)
+            self._send_sgr_mouse(button, c, r, pressed=False)
+
+    def send_mouse_motion_at(self, pt):
+        """Report motion for 1002 (drag) / 1003 (any-event) tracking."""
+        if not self.wants_app_mouse():
+            return
+        report = False
+        held = -1
+        # When tracking modes are negotiated, honour them. On bare alt-screen
+        # (Grok before/without DECSET), still report drag motion while held.
+        if self.mouse_any_event_enabled():
+            held = next(iter(self._mouse_buttons_down), -1)
+            report = True
+        elif self.mouse_drag_tracking_enabled() and self._mouse_buttons_down:
+            held = next(iter(self._mouse_buttons_down))
+            report = True
+        elif self.alternate_screen_enabled() and self._mouse_buttons_down:
+            held = next(iter(self._mouse_buttons_down))
+            report = True
+        if not report:
+            return
+        # Skip duplicate cells — on_hover is noisy.
+        cell = self.cell_from_point(pt=pt)
+        if cell == self._last_motion_cell:
+            return
+        self._last_motion_cell = cell
+        self.send_mouse_button(held, pt=pt, motion=True)
+
+    def scroll(self, direction, lines=3, col=None, row=None):
         """Send wheel input to the app.
 
-        Alt-screen TUIs (Grok Build, etc.) almost always want cursor keys for
-        scrollback — SGR wheel at the cursor is often ignored. Prefer arrows
-        whenever we are on the alt screen or DECSET 1007 is set; only use SGR
-        mouse when the app tracks the mouse in the normal screen.
+        Prefer SGR wheel (64/65) when the app tracks the mouse or is on the
+        alt screen; otherwise cursor keys. macOS ST does not deliver scroll_*
+        mousemap events — only Linux/Windows hit this via mousemap.
         """
-        lines = max(1, int(lines or 1))
-        use_arrows = (
-            self.alternate_screen_enabled()
-            or self.alternate_scroll_enabled()
-            or not self.mouse_tracking_enabled()
-        )
-        logger.info(
-            "scroll %s x%d | alt_screen=%s mouse_tracking=%s sgr=%s -> %s",
-            direction, lines, self.alternate_screen_enabled(),
-            self.mouse_tracking_enabled(), self.sgr_mouse_enabled(),
-            "arrow-keys" if use_arrows else "sgr-mouse")
-        if use_arrows:
-            key = "up" if direction == "up" else "down"
+        lines = max(1, min(int(lines or 1), 8))
+        if self.mouse_tracking_enabled() or self.alternate_screen_enabled():
+            cb = 64 if direction == "up" else 65
+            c, r = self.cell_from_point(col=col, row=row)
+            print("[ClaudeTerminal] scroll {} x{} -> sgr @{},{} tracking={}".format(
+                direction, lines, c, r, self.mouse_tracking_enabled()))
             for _ in range(lines):
-                self.send_key(key)
+                self._send_sgr_mouse(cb, c, r, pressed=True)
             return
-        # SGR (1006) wheel buttons: 64 = up, 65 = down. Fall back to the
-        # legacy X10 encoding when SGR isn't negotiated.
-        cb = 64 if direction == "up" else 65
-        col = min(self.screen.cursor.x + 1, self.screen.columns)
-        row = min(self.screen.cursor.y + 1, self.screen.lines)
+
+        key = "up" if direction == "up" else "down"
         for _ in range(lines):
-            if self.sgr_mouse_enabled():
-                self.send_string(
-                    "\x1b[<{};{};{}M".format(cb, col, row), normalized=False)
-            else:
-                self.send_string("\x1b[M{}{}{}".format(
-                    chr(32 + cb), chr(32 + col), chr(32 + row)),
-                    normalized=False)
+            self.send_key(key)
 
     def find_image(self, pt):
         view = self.view

@@ -34,6 +34,41 @@ def settle_active_claude_view(window: sublime.Window) -> None:
             s._enter_input_with_draft()
 
 
+def settle_startup_claude_views() -> None:
+    """After quiet period: show sleep state on every restored Claude sheet.
+
+    Quiet reconnect registers sessions without title/phantom churn so multi-tab
+    restore does not raise each sheet. Once quiet ends, apply ⏸ titles and
+    sleep overlays on all sleeping sessions — still without focusing them.
+    Only the truly active sheet gets full live UX (input mode / start).
+    """
+    for w in sublime.windows():
+        # Register any orphans that never received on_activated during restore.
+        for view in w.views():
+            if not view.settings().get("claude_output"):
+                continue
+            if get_session_for_view(view):
+                continue
+            if w.settings().get("claude_creating_session"):
+                continue
+            ClaudeOutputEventListener(view)._reconnect_orphaned_view(w, quiet=True)
+
+        for s in list(sublime._claude_sessions.values()):
+            if s.window != w:
+                continue
+            if not s.output or not s.output.view or not s.output.view.is_valid():
+                continue
+            if s.is_sleeping:
+                # Title + overlay only; _show_overlay_phantom already skips
+                # view.show() when the sheet is not focused.
+                s._apply_sleep_ui()
+            else:
+                # Keep tab title in sync (◇ etc.) without focusing.
+                s.output.set_name(s.display_name)
+
+        settle_active_claude_view(w)
+
+
 _last_copy_meta = None  # {file, regions: [(row_start, row_end), ...], text}
 
 
@@ -273,7 +308,9 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             quiet = False
 
         if quiet:
-            # Registry only — no title churn, no input mode, no focus.
+            # No phantom / input / focus. Sleeping tabs still get ⏸ titles.
+            if s and s.is_sleeping:
+                s.output.set_name(s.display_name)
             return
 
         # Update this session's status and title
@@ -390,13 +427,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # Reset active states
         session.output.reset_active_states()
 
-        # Quiet path: registry + sleeping flag only — no tab rename / phantom /
-        # view.show (those make sheets look "raised" during multi-tab restore).
+        # Quiet path: registry + sleep title only — no phantom / view.show /
+        # start (those can jostle multi-tab restore). Tab ⏸ is safe and is how
+        # the user sees sleeping state without focusing every sheet.
         # is_sleeping is derived (session_id + no client + not initialized).
         if quiet:
             if resume_id and not session.session_id:
                 session.session_id = resume_id
-            view.settings().set("claude_sleeping", True)
+            if resume_id:
+                view.settings().set("claude_sleeping", True)
+                session.output.set_name(session.display_name)
             view.settings().erase("claude_reconnecting")
             return
 
