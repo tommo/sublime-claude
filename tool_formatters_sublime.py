@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 # Names arrive as mcp__sublime__X, sublime__X, bare X, or use_tool wrapper.
 
-def _ti(tool: "ToolCall") -> dict:
+def _tool_input(tool: "ToolCall") -> dict:
     return tool.tool_input if isinstance(tool.tool_input, dict) else {}
 
 
@@ -42,10 +42,10 @@ def _mcp_short_name(name: str) -> str:
 
 
 def _terminal_run(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    cmd = (ti.get("command") or "").strip()
-    idx = ti.get("index")
-    tag = ti.get("tag") or ti.get("target_id") or ""
+    inp = _tool_input(tool)
+    cmd = (inp.get("command") or "").strip()
+    idx = inp.get("index")
+    tag = inp.get("tag") or inp.get("target_id") or ""
     bits = []
     if idx is not None:
         bits.append(f"#{idx}")
@@ -60,10 +60,10 @@ def _terminal_run(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _terminal_read(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    idx = ti.get("index")
-    lines = ti.get("lines")
-    tag = ti.get("tag") or ti.get("target_id") or ""
+    inp = _tool_input(tool)
+    idx = inp.get("index")
+    lines = inp.get("lines")
+    tag = inp.get("tag") or inp.get("target_id") or ""
     bits = []
     if idx is not None:
         bits.append(f"#{idx}")
@@ -81,9 +81,9 @@ def _terminal_list(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _terminal_close(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    idx = ti.get("index")
-    tag = ti.get("tag") or ti.get("target_id") or ""
+    inp = _tool_input(tool)
+    idx = inp.get("index")
+    tag = inp.get("tag") or inp.get("target_id") or ""
     bits = []
     if idx is not None:
         bits.append(f"#{idx}")
@@ -93,10 +93,10 @@ def _terminal_close(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _find_file(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    q = ti.get("query") or ""
-    pat = ti.get("pattern") or ""
-    lim = ti.get("limit")
+    inp = _tool_input(tool)
+    q = inp.get("query") or ""
+    pat = inp.get("pattern") or ""
+    lim = inp.get("limit")
     bits = [_clip(str(q), 50)] if q else []
     if pat:
         bits.append(f"glob {pat}")
@@ -109,11 +109,11 @@ def _find_file(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _get_symbols(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    q = ti.get("query") or ""
+    inp = _tool_input(tool)
+    q = inp.get("query") or ""
     if isinstance(q, list):
         q = ", ".join(str(x) for x in q[:5])
-    fp = ti.get("file_path") or ""
+    fp = inp.get("file_path") or ""
     bits = [_clip(str(q), 50)] if q else []
     if fp:
         bits.append(_basename(fp))
@@ -124,8 +124,8 @@ def _get_symbols(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _goto_symbol(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    q = ti.get("query") or ""
+    inp = _tool_input(tool)
+    q = inp.get("query") or ""
     out = _join_bits(_clip(str(q), 60)) if q else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -133,20 +133,20 @@ def _goto_symbol(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _read_view(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    path = ti.get("file_path") or ti.get("path") or ti.get("view_name") or ""
+    inp = _tool_input(tool)
+    path = inp.get("file_path") or inp.get("path") or inp.get("view_name") or ""
     bits = []
     if path:
         bits.append(_basename(path) if "/" in str(path) or "\\" in str(path)
                     else _clip(str(path), 40))
-    if ti.get("head"):
-        bits.append(f"head {ti['head']}")
-    if ti.get("tail"):
-        bits.append(f"tail {ti['tail']}")
-    if ti.get("grep"):
-        bits.append(f"grep {_clip(str(ti['grep']), 30)}")
-    if ti.get("grep_i"):
-        bits.append(f"grep -i {_clip(str(ti['grep_i']), 30)}")
+    if inp.get("head"):
+        bits.append(f"head {inp['head']}")
+    if inp.get("tail"):
+        bits.append(f"tail {inp['tail']}")
+    if inp.get("grep"):
+        bits.append(f"grep {_clip(str(inp['grep']), 30)}")
+    if inp.get("grep_i"):
+        bits.append(f"grep -i {_clip(str(inp['grep_i']), 30)}")
     out = _join_bits(*bits)
     if tool.status == "done" and tool.result:
         text = str(tool.result)
@@ -183,11 +183,11 @@ def _list_personas(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    name = ti.get("name") or ""
-    backend = ti.get("backend") or ""
-    profile = ti.get("profile") or ""
-    prompt = ti.get("prompt") or ""
+    inp = _tool_input(tool)
+    name = inp.get("name") or ""
+    backend = inp.get("backend") or ""
+    profile = inp.get("profile") or ""
+    prompt = inp.get("prompt") or ""
     bits = []
     if name:
         bits.append(str(name)[:30])
@@ -195,7 +195,7 @@ def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
         bits.append(str(backend))
     if profile:
         bits.append(f"profile={profile}")
-    if ti.get("fork_current"):
+    if inp.get("fork_current"):
         bits.append("fork")
     if prompt:
         bits.append(_clip(str(prompt), 45))
@@ -206,9 +206,9 @@ def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _send_to_session(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    vid = ti.get("view_id")
-    prompt = ti.get("prompt") or ""
+    inp = _tool_input(tool)
+    vid = inp.get("view_id")
+    prompt = inp.get("prompt") or ""
     bits = []
     if vid is not None:
         bits.append(f"view {vid}")
@@ -224,9 +224,9 @@ def _list_sessions(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _read_session_output(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    vid = ti.get("view_id")
-    lines = ti.get("lines")
+    inp = _tool_input(tool)
+    vid = inp.get("view_id")
+    lines = inp.get("lines")
     bits = []
     if vid is not None:
         bits.append(f"view {vid}")
@@ -245,8 +245,8 @@ def _list_profile_docs(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _read_profile_doc(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    path = ti.get("path") or ""
+    inp = _tool_input(tool)
+    path = inp.get("path") or ""
     out = _join_bits(path) if path else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -254,8 +254,8 @@ def _read_profile_doc(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _lsp(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    cmd = ti.get("cmd") or ti.get("command") or ""
+    inp = _tool_input(tool)
+    cmd = inp.get("cmd") or inp.get("command") or ""
     out = _join_bits(_clip(str(cmd), 70)) if cmd else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -263,8 +263,8 @@ def _lsp(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _sublime_eval(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    code = ti.get("code") or ""
+    inp = _tool_input(tool)
+    code = inp.get("code") or ""
     out = _join_bits(_clip(str(code), 60)) if code else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -272,8 +272,8 @@ def _sublime_eval(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _sublime_tool(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    name = ti.get("name") or ""
+    inp = _tool_input(tool)
+    name = inp.get("name") or ""
     return _join_bits(name) if name else ""
 
 
@@ -284,9 +284,9 @@ def _list_tools(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _set_timer(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    sec = ti.get("seconds")
-    wake = ti.get("wake_prompt") or ""
+    inp = _tool_input(tool)
+    sec = inp.get("seconds")
+    wake = inp.get("wake_prompt") or ""
     bits = []
     if sec is not None:
         bits.append(f"{sec}s")
@@ -296,9 +296,9 @@ def _set_timer(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _signal_complete(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    sid = ti.get("session_id")
-    summary = ti.get("result_summary") or ""
+    inp = _tool_input(tool)
+    sid = inp.get("session_id")
+    summary = inp.get("result_summary") or ""
     bits = []
     if sid is not None:
         bits.append(f"session {sid}")
@@ -308,9 +308,9 @@ def _signal_complete(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _wait_for_subsession(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    sid = ti.get("subsession_id") or ""
-    wake = ti.get("wake_prompt") or ""
+    inp = _tool_input(tool)
+    sid = inp.get("subsession_id") or ""
+    wake = inp.get("wake_prompt") or ""
     bits = []
     if sid:
         bits.append(_clip(str(sid), 24))
@@ -332,15 +332,15 @@ def _discover_services(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _unregister_notification(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    nid = ti.get("notification_id") or ""
+    inp = _tool_input(tool)
+    nid = inp.get("notification_id") or ""
     return _join_bits(str(nid)[:40]) if nid else ""
 
 
 def _subscribe(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    ntype = ti.get("notification_type") or ""
-    wake = ti.get("wake_prompt") or ""
+    inp = _tool_input(tool)
+    ntype = inp.get("notification_type") or ""
+    wake = inp.get("wake_prompt") or ""
     bits = []
     if ntype:
         bits.append(str(ntype)[:40])
@@ -350,8 +350,8 @@ def _subscribe(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _chatroom(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    cmd = ti.get("cmd") or ""
+    inp = _tool_input(tool)
+    cmd = inp.get("cmd") or ""
     out = _join_bits(_clip(str(cmd), 70)) if cmd else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -359,8 +359,8 @@ def _chatroom(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _garage_search(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    q = ti.get("query") or ""
+    inp = _tool_input(tool)
+    q = inp.get("query") or ""
     out = _join_bits(_clip(str(q), 55)) if q else ""
     if tool.status == "done" and tool.result:
         out += view._format_mcp_result(tool.result)
@@ -368,10 +368,10 @@ def _garage_search(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _order(view: "OutputView", tool: "ToolCall") -> str:
-    ti = _ti(tool)
-    action = ti.get("action") or ti.get("cmd") or ti.get("op") or ""
-    prompt = ti.get("prompt") or ti.get("message") or ""
-    path = ti.get("file_path") or ti.get("path") or ""
+    inp = _tool_input(tool)
+    action = inp.get("action") or inp.get("cmd") or inp.get("op") or ""
+    prompt = inp.get("prompt") or inp.get("message") or ""
+    path = inp.get("file_path") or inp.get("path") or ""
     bits = []
     if action:
         bits.append(str(action)[:20])
@@ -380,7 +380,7 @@ def _order(view: "OutputView", tool: "ToolCall") -> str:
     if prompt:
         bits.append(_clip(str(prompt), 40))
     if not bits:
-        for k, v in list(ti.items())[:3]:
+        for k, v in list(inp.items())[:3]:
             if v is not None and v != "":
                 bits.append(f"{k}={_clip(str(v), 24)}")
     out = _join_bits(*bits)
@@ -391,8 +391,8 @@ def _order(view: "OutputView", tool: "ToolCall") -> str:
 
 def _mcp_call_args_fallback(tool: "ToolCall") -> str:
     """Show key call args for unknown sublime MCP tools."""
-    ti = _ti(tool)
-    if not ti:
+    inp = _tool_input(tool)
+    if not inp:
         return ""
     prefer = (
         "query", "cmd", "command", "path", "file_path", "prompt", "name",
@@ -402,9 +402,9 @@ def _mcp_call_args_fallback(tool: "ToolCall") -> str:
     bits = []
     seen = set()
     for k in prefer:
-        if k not in ti or k in seen:
+        if k not in inp or k in seen:
             continue
-        v = ti[k]
+        v = inp[k]
         if v is None or v == "" or v == {} or v == []:
             continue
         seen.add(k)
@@ -415,7 +415,7 @@ def _mcp_call_args_fallback(tool: "ToolCall") -> str:
         if len(bits) >= 3:
             break
     if not bits:
-        for k, v in list(ti.items())[:3]:
+        for k, v in list(inp.items())[:3]:
             if v is None or v == "" or str(k).startswith("_"):
                 continue
             bits.append(f"{k}={_clip(str(v), 28)}")

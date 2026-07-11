@@ -225,8 +225,8 @@ def _read(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _read_image(view: "OutputView", tool: "ToolCall") -> str:
-    ti = tool.tool_input or {}
-    path = ti.get("path") or ti.get("file_path") or ti.get("target_file") or ""
+    inp = tool.tool_input or {}
+    path = inp.get("path") or inp.get("file_path") or inp.get("target_file") or ""
     out = f": {path}" if path else ""
     if tool.status == "error" and tool.result:
         out += f" ✗ {_clip(str(tool.result), 60)}"
@@ -236,9 +236,9 @@ def _read_image(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _scheduler_create(view: "OutputView", tool: "ToolCall") -> str:
-    ti = tool.tool_input or {}
-    interval = ti.get("interval") or ti.get("cron") or ""
-    prompt = _clip(str(ti.get("prompt") or ""), 50)
+    inp = tool.tool_input or {}
+    interval = inp.get("interval") or inp.get("cron") or ""
+    prompt = _clip(str(inp.get("prompt") or ""), 50)
     bits = []
     if interval:
         bits.append(str(interval))
@@ -259,8 +259,8 @@ def _scheduler_list(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _scheduler_delete(view: "OutputView", tool: "ToolCall") -> str:
-    ti = tool.tool_input or {}
-    tid = ti.get("id") or ti.get("task_id") or ""
+    inp = tool.tool_input or {}
+    tid = inp.get("id") or inp.get("task_id") or ""
     out = f": {tid}" if tid else ""
     if tool.status == "done":
         out += " ✓ cancelled"
@@ -294,19 +294,19 @@ def _write(view: "OutputView", tool: "ToolCall") -> str:
     path + newText (diff) or `contents` / `new_string` — accept all.
     """
     import os
-    ti = tool.tool_input or {}
+    inp = tool.tool_input or {}
     path = (
-        ti.get("file_path")
-        or ti.get("path")
-        or ti.get("target_file")
-        or ti.get("filePath")
+        inp.get("file_path")
+        or inp.get("path")
+        or inp.get("target_file")
+        or inp.get("filePath")
         or ""
     )
     content = (
-        ti.get("content")
-        or ti.get("contents")
-        or ti.get("new_string")
-        or ti.get("newText")
+        inp.get("content")
+        or inp.get("contents")
+        or inp.get("new_string")
+        or inp.get("newText")
         or ""
     )
     if not isinstance(content, str):
@@ -451,7 +451,10 @@ def _exit_plan_mode(view: "OutputView", tool: "ToolCall") -> str:
 
 
 from .tool_formatters_sublime import (
-    SUBLIME_MCP_FORMATTERS, _mcp_call_args_fallback, _mcp_short_name,
+    SUBLIME_MCP_FORMATTERS,
+    _mcp_call_args_fallback,
+    _mcp_short_name,
+    _tool_input,
 )
 
 
@@ -510,31 +513,36 @@ _register_sublime_mcp_aliases(TOOL_FORMATTERS)
 def _unwrap_use_tool(tool: "ToolCall") -> "ToolCall":
     """Grok use_tool / CallMcpTool → inner sublime tool name + args."""
     name = tool.name or ""
-    ti = _ti(tool)
+    inp = _tool_input(tool)
     if name not in ("use_tool", "CallMcpTool", "call_mcp_tool"):
         # Still unwrap if tool_name is nested (some bridges keep outer name)
-        if not (ti.get("tool_name") or ti.get("name")) or name.startswith(
+        if not (inp.get("tool_name") or inp.get("name")) or name.startswith(
                 ("mcp__", "sublime__")):
             return tool
-    inner_name = ti.get("tool_name") or ti.get("name") or name
-    inner_input = ti.get("tool_input") or ti.get("arguments") or ti.get("input")
+    inner_name = inp.get("tool_name") or inp.get("name") or name
+    inner_input = inp.get("tool_input") or inp.get("arguments") or inp.get("input")
     if not isinstance(inner_input, dict):
         # tool_input may be the args themselves without nesting
-        if any(k in ti for k in (
+        if any(k in inp for k in (
                 "query", "path", "cmd", "command", "prompt", "file_path",
                 "code", "view_id", "seconds")):
-            inner_input = {k: v for k, v in ti.items()
+            inner_input = {k: v for k, v in inp.items()
                            if k not in ("tool_name", "name", "server")}
         else:
-            inner_input = ti
+            inner_input = inp
     short = _mcp_short_name(str(inner_name))
     display = f"mcp__sublime__{short}" if short in SUBLIME_MCP_FORMATTERS else str(inner_name)
-    return type(tool)(
+    try:
+        from .output_models import ToolCall as _ToolCall
+        ctor = _ToolCall
+    except Exception:
+        ctor = type(tool)
+    return ctor(
         name=display,
         tool_input=inner_input if isinstance(inner_input, dict) else {},
-        status=tool.status,
-        result=tool.result,
-        id=tool.id,
+        status=getattr(tool, "status", "pending"),
+        result=getattr(tool, "result", None),
+        id=getattr(tool, "id", None),
     )
 
 
