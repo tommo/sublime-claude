@@ -224,14 +224,50 @@ def _read(view: "OutputView", tool: "ToolCall") -> str:
     return out
 
 
+def _read_image_path(tool: "ToolCall") -> str:
+    """Resolve on-disk path from flat or nested use_tool input / result text."""
+    inp = tool.tool_input if isinstance(tool.tool_input, dict) else {}
+    # Flat: {path} / {file_path}. Nested Grok UseTool: {tool_input: {path}}.
+    nested = inp.get("tool_input") or inp.get("arguments") or inp.get("input")
+    if isinstance(nested, dict):
+        path = (
+            nested.get("path")
+            or nested.get("file_path")
+            or nested.get("target_file")
+            or ""
+        )
+    else:
+        path = ""
+    if not path:
+        path = (
+            inp.get("path")
+            or inp.get("file_path")
+            or inp.get("target_file")
+            or ""
+        )
+    if not path and tool.result:
+        # MCP text: "Image loaded (path=/abs/file.png, bytes=…)"
+        m = re.search(r"path=([^\s,)]+)", str(tool.result))
+        if m:
+            path = m.group(1)
+    return path or ""
+
+
 def _read_image(view: "OutputView", tool: "ToolCall") -> str:
-    inp = tool.tool_input or {}
-    path = inp.get("path") or inp.get("file_path") or inp.get("target_file") or ""
-    out = f": {path}" if path else ""
+    path = _read_image_path(tool)
+    label = media_display_path(path) if path else ""
+    # Prefer a useful short path; fall back to full if basename is useless
+    # (e.g. tmpXXXX.png) — still never emit a fake "✓ vision" mark.
+    if path and (not label or label == os.path.basename(path)):
+        # Keep last 2 path segments when not images/N.jpg style
+        parts = path.replace("\\", "/").rstrip("/").split("/")
+        if len(parts) >= 2:
+            label = "/".join(parts[-2:])
+        else:
+            label = parts[-1] if parts else path
+    out = f": {label}" if label else ""
     if tool.status == "error" and tool.result:
         out += f" ✗ {_clip(str(tool.result), 60)}"
-    elif tool.status == "done":
-        out += " ✓ vision"
     return out
 
 
@@ -511,25 +547,34 @@ _register_sublime_mcp_aliases(TOOL_FORMATTERS)
 
 
 def _unwrap_use_tool(tool: "ToolCall") -> "ToolCall":
-    """Grok use_tool / CallMcpTool → inner sublime tool name + args."""
+    """Grok use_tool / CallMcpTool → inner sublime tool name + args.
+
+    Also peels nested `{tool_name, tool_input:{…}}` when the outer name was
+    already rewritten to `sublime__*` / `mcp__*` (bridge renames title but
+    leaves UseTool-shaped rawInput).
+    """
     name = tool.name or ""
     inp = _tool_input(tool)
-    if name not in ("use_tool", "CallMcpTool", "call_mcp_tool"):
-        # Still unwrap if tool_name is nested (some bridges keep outer name)
-        if not (inp.get("tool_name") or inp.get("name")) or name.startswith(
-                ("mcp__", "sublime__")):
-            return tool
+    nested = inp.get("tool_input") or inp.get("arguments") or inp.get("input")
+    has_nested_args = isinstance(nested, dict)
+    is_wrapper_name = name in ("use_tool", "CallMcpTool", "call_mcp_tool")
+    is_use_tool_shape = bool(
+        has_nested_args and (inp.get("tool_name") or inp.get("name")
+                             or inp.get("variant") == "UseTool"
+                             or inp.get("variant") == "use_tool"))
+    if not is_wrapper_name and not is_use_tool_shape:
+        return tool
     inner_name = inp.get("tool_name") or inp.get("name") or name
-    inner_input = inp.get("tool_input") or inp.get("arguments") or inp.get("input")
-    if not isinstance(inner_input, dict):
+    if has_nested_args:
+        inner_input = nested
+    elif any(k in inp for k in (
+            "query", "path", "cmd", "command", "prompt", "file_path",
+            "code", "view_id", "seconds", "target_file")):
         # tool_input may be the args themselves without nesting
-        if any(k in inp for k in (
-                "query", "path", "cmd", "command", "prompt", "file_path",
-                "code", "view_id", "seconds")):
-            inner_input = {k: v for k, v in inp.items()
-                           if k not in ("tool_name", "name", "server")}
-        else:
-            inner_input = inp
+        inner_input = {k: v for k, v in inp.items()
+                       if k not in ("tool_name", "name", "server", "variant")}
+    else:
+        inner_input = inp
     short = _mcp_short_name(str(inner_name))
     display = f"mcp__sublime__{short}" if short in SUBLIME_MCP_FORMATTERS else str(inner_name)
     try:

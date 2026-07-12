@@ -1251,18 +1251,27 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
         import base64
 
         try:
-            helpers_dir = os.path.join(os.path.dirname(__file__), "helpers")
+            # helpers/ lives at package root (sibling of commands/), not under
+            # this module dir — after the commands.py → commands/ split,
+            # dirname(__file__) is .../commands/.
+            pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            helpers_dir = os.path.join(pkg_root, "helpers")
             system = platform.system()
 
             if system == "Darwin":
-                cmd = ["osascript", "-l", "JavaScript",
-                       os.path.join(helpers_dir, "clipboard_image.js")]
+                helper = os.path.join(helpers_dir, "clipboard_image.js")
+                cmd = ["osascript", "-l", "JavaScript", helper]
             elif system == "Linux":
-                cmd = ["bash", os.path.join(helpers_dir, "clipboard_image_linux.sh")]
+                helper = os.path.join(helpers_dir, "clipboard_image_linux.sh")
+                cmd = ["bash", helper]
             elif system == "Windows":
-                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File",
-                       os.path.join(helpers_dir, "clipboard_image_windows.ps1")]
+                helper = os.path.join(helpers_dir, "clipboard_image_windows.ps1")
+                cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", helper]
             else:
+                return None, None, None
+
+            if not os.path.isfile(helper):
+                print(f"[Claude] clipboard helper missing: {helper}")
                 return None, None, None
 
             result = subprocess.run(

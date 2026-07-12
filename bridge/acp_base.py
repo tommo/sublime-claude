@@ -164,9 +164,11 @@ class AcpBridge(BaseBridge):
         # Serialize writes to agent stdin — concurrent create_task handlers
         # (permission + terminal + fs) would otherwise interleave JSON lines.
         self._acp_write_lock: Optional[asyncio.Lock] = None
-        # Hard cap so a hung child never freezes the turn forever.
+        # terminal/wait_for_exit: 0 = wait until process exits (ACP default).
+        # Positive = optional client-side cap (seconds). Long agent tools
+        # (codex exec, builds) need unlimited wait; use terminal/kill to abort.
         self.terminal_wait_timeout_s: float = float(
-            os.environ.get("SUBLIME_CLAUDE_TERM_TIMEOUT", "120") or 120)
+            os.environ.get("SUBLIME_CLAUDE_TERM_TIMEOUT", "0") or 0)
         # Hard gates (fail / drop), not soft truncation of useful content.
         # StreamReader limit must be >> largest NDJSON we will parse.
         self.acp_stream_limit = int(
@@ -1021,6 +1023,27 @@ class AcpBridge(BaseBridge):
         """Map agent rawInput → Claude formatter keys only."""
         if not isinstance(raw, dict):
             return {}
+        # Grok UseTool / MCP wrapper: {tool_name, tool_input:{path:…}} — peel
+        # so formatters see the real args (read_image path, etc.).
+        nested = raw.get("tool_input") or raw.get("arguments") or raw.get("input")
+        if isinstance(nested, dict) and (
+                raw.get("variant") in ("UseTool", "use_tool")
+                or raw.get("tool_name")
+                or raw.get("name")
+                or tool_name in (
+                    "use_tool", "CallMcpTool", "call_mcp_tool",
+                    "read_image", "mcp__sublime__read_image")
+                or (isinstance(tool_name, str) and (
+                    tool_name.startswith("sublime__")
+                    or tool_name.startswith("mcp__sublime__")))):
+            # Prefer nested args when present; keep outer keys only as fallback
+            peeled = dict(nested)
+            for k, v in raw.items():
+                if k in ("tool_input", "arguments", "input", "tool_name",
+                         "name", "variant", "server"):
+                    continue
+                peeled.setdefault(k, v)
+            raw = peeled
         out: dict = {}
         for k, v in raw.items():
             # Grep search root stays as path (Claude Grep also uses path);
@@ -1030,6 +1053,13 @@ class AcpBridge(BaseBridge):
                 continue
             if k == "path" and tool_name in ("Read", "Write", "Edit"):
                 out["file_path"] = v
+                continue
+            if k == "path" and (
+                    tool_name in ("read_image", "mcp__sublime__read_image")
+                    or (isinstance(tool_name, str)
+                        and tool_name.endswith("read_image"))):
+                # Keep as path — formatter + MCP expect path, not file_path
+                out["path"] = v
                 continue
             if k == "path":
                 # Default: file path for file tools
@@ -2675,6 +2705,27 @@ class AcpBridge(BaseBridge):
                 pass
         # Escalate after a beat if still alive (done by waiters).
 
+    @staticmethod
+    def _exit_status_from_code(code: Optional[int]) -> dict:
+        """Map subprocess returncode → ACP TerminalExitStatus.
+
+        ACP schema: exitCode is uint32 | null (minimum 0). Python reports
+        signal deaths as negative codes (e.g. -15 for SIGTERM). Returning
+        negatives makes Grok fail with: failed to deserialize response.
+        Spec: exitCode null when terminated by signal.
+        """
+        if code is None:
+            return {"exitCode": 0, "signal": None}
+        if code < 0:
+            sig_num = -code
+            try:
+                import signal as _signal
+                sig_name = _signal.Signals(sig_num).name
+            except (ValueError, AttributeError):
+                sig_name = f"SIG{sig_num}"
+            return {"exitCode": None, "signal": sig_name}
+        return {"exitCode": int(code), "signal": None}
+
     async def _acp_terminal_create(self, params: dict) -> dict:
         # After cancel, refuse new shells so the agent cannot keep spawning
         # work while the prompt is winding down.
@@ -2764,20 +2815,20 @@ class AcpBridge(BaseBridge):
                     drain(proc.stderr, "stderr"),
                     return_exceptions=True)
                 code = await proc.wait()
-                slot["exit_status"] = {
-                    "exitCode": code if code is not None else 0,
-                    "signal": None,
-                }
+                slot["exit_status"] = self._exit_status_from_code(code)
             except asyncio.CancelledError:
                 self._kill_terminal_proc(proc)
+                code = None
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    code = await asyncio.wait_for(proc.wait(), timeout=1.0)
                 except Exception:
                     try:
                         os.killpg(proc.pid, 9)
+                        code = await asyncio.wait_for(proc.wait(), timeout=0.5)
                     except Exception:
-                        pass
-                slot["exit_status"] = {"exitCode": 130, "signal": "SIGTERM"}
+                        code = -9
+                slot["exit_status"] = self._exit_status_from_code(
+                    code if code is not None else -15)
                 raise
             except Exception as e:
                 self.file_log(f"terminal {tid} reader error: {e}")
@@ -2797,7 +2848,7 @@ class AcpBridge(BaseBridge):
             return {
                 "output": "",
                 "truncated": False,
-                "exitStatus": {"exitCode": 130, "signal": "SIGTERM"},
+                "exitStatus": {"exitCode": None, "signal": "SIGTERM"},
             }
         out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
         return {"output": out, "truncated": bool(slot["truncated"]),
@@ -2808,12 +2859,17 @@ class AcpBridge(BaseBridge):
         slot = self._terminals.get(tid)
         if not slot:
             # Already released/killed (e.g. on interrupt) — report cancelled.
-            return {"exitCode": 130, "signal": "SIGTERM"}
+            return {"exitCode": None, "signal": "SIGTERM"}
         reader = slot.get("reader")
         timeout = self.terminal_wait_timeout_s
         if reader is not None and not reader.done():
             try:
-                await asyncio.wait_for(asyncio.shield(reader), timeout=timeout)
+                if timeout and timeout > 0:
+                    await asyncio.wait_for(
+                        asyncio.shield(reader), timeout=timeout)
+                else:
+                    # ACP: wait until exit; agent aborts via terminal/kill.
+                    await asyncio.shield(reader)
             except asyncio.TimeoutError:
                 self.file_log(
                     f"terminal/wait_for_exit {tid} TIMEOUT after {timeout}s "
@@ -2825,12 +2881,17 @@ class AcpBridge(BaseBridge):
                 except Exception:
                     if not reader.done():
                         reader.cancel()
+                        try:
+                            await reader
+                        except Exception:
+                            pass
                 if not slot.get("exit_status"):
+                    # Optional client timeout: still ACP-valid (no negative).
                     slot["exit_status"] = {
-                        "exitCode": 124, "signal": "SIGTERM",
+                        "exitCode": None, "signal": "SIGTERM",
                     }
             except asyncio.CancelledError:
-                return {"exitCode": 130, "signal": "SIGTERM"}
+                return {"exitCode": None, "signal": "SIGTERM"}
             except Exception as e:
                 self.file_log(f"terminal/wait_for_exit {tid} error: {e}")
         elif reader is not None and reader.done():
@@ -2841,7 +2902,14 @@ class AcpBridge(BaseBridge):
                 pass
         # Terminal may have been closed during wait.
         slot = self._terminals.get(tid) or slot
-        es = slot.get("exit_status") or {"exitCode": 130, "signal": "SIGTERM"}
+        es = slot.get("exit_status") or {
+            "exitCode": None, "signal": "SIGTERM",
+        }
+        # Sanitize any legacy negative codes still sitting on the slot.
+        code = es.get("exitCode")
+        if isinstance(code, int) and code < 0:
+            es = self._exit_status_from_code(code)
+            slot["exit_status"] = es
         self.file_log(
             f"terminal/wait_for_exit {tid} → "
             f"exitCode={es.get('exitCode')} signal={es.get('signal')}")

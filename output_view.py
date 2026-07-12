@@ -176,23 +176,60 @@ class OutputView:
         return pos + len(text)
 
     def _replace(self, start: int, end: int, text: str) -> int:
-        """Replace region with text. Returns new end position."""
+        """Replace [start, end) with text. Returns new end (= start + len(text))."""
         if not self.view or not self.view.is_valid():
             return end
-
-        old_size = self.view.size()
         self.view.set_read_only(False)
-        self.view.run_command("claude_replace", {"start": start, "end": end, "text": text})
+        self.view.run_command("claude_replace", {
+            "start": start, "end": end, "text": text,
+        })
         self.view.set_read_only(True)
-        # Calculate actual new end from view size delta (more reliable than len())
-        new_size = self.view.size()
-        return end + (new_size - old_size)
+        return start + len(text)
+
+    def _is_following_tail(self, slack: int = 120) -> bool:
+        """True if the visible bottom is near the buffer end (user following stream)."""
+        if not self.view or not self.view.is_valid():
+            return True
+        size = self.view.size()
+        if size <= 0:
+            return True
+        vis = self.view.visible_region()
+        return vis.end() >= max(0, size - max(0, slack))
+
+    def _pin_view_state(self) -> dict:
+        """Snapshot selection + viewport so a full-region rewrite does not jump."""
+        if not self.view or not self.view.is_valid():
+            return {}
+        return {
+            "sels": [(r.a, r.b) for r in self.view.sel()],
+            "vp": self.view.viewport_position(),
+        }
+
+    def _restore_view_state(self, pin: dict) -> None:
+        """Restore selection/viewport after a replace that rewrote buffer text."""
+        if not pin or not self.view or not self.view.is_valid():
+            return
+        size = self.view.size()
+        sels = pin.get("sels") or []
+        self.view.sel().clear()
+        if sels:
+            for a, b in sels:
+                a = max(0, min(int(a), size))
+                b = max(0, min(int(b), size))
+                self.view.sel().add(sublime.Region(a, b))
+        else:
+            self.view.sel().add(sublime.Region(0, 0))
+        vp = pin.get("vp")
+        if vp is not None:
+            # Keep reading position stable while the tail grows (no animate).
+            self.view.set_viewport_position(vp, False)
 
     def _scroll_to_end(self, force: bool = False) -> None:
-        """Scroll to end, respecting user scroll position.
+        """Scroll to end when following the stream; leave history view alone.
 
-        Args:
-            force: If True, always scroll. If False, only scroll if cursor is near end.
+        Follow detection uses the *viewport* (not the caret). Scrolling with
+        the mouse leaves the caret at the old spot — caret-near-end was wrong
+        and also got yanked around by full-region replaces.
         """
         if not self.view or not self.view.is_valid():
             return
@@ -202,17 +239,10 @@ class OutputView:
             self.view.show(self._input_start, keep_to_left=False, animate=False)
             return
 
-        # Check if we should auto-scroll
-        if not force:
-            sel = self.view.sel()
-            if sel:
-                cursor = sel[0].end()
-                size = self.view.size()
-                # Only auto-scroll if cursor is near end (within 200 chars)
-                if size > 200 and cursor < size - 200:
-                    return  # User is viewing history, don't auto-scroll
+        if not force and not self._is_following_tail():
+            return  # User is reading history — don't steal the viewport
 
-        # Scroll to end without moving cursor
+        # Scroll to end without moving the caret
         end = self.view.size()
         self.view.show(end, keep_to_left=False, animate=False)
 
@@ -2327,34 +2357,34 @@ class OutputView:
         # Distinct line prefixes → different colors via ClaudeOutput.sublime-syntax
         # (claude.goal.* vs claude.task.*). No dual ───── banners.
         #
-        # Only while the turn is live (working). When meta/@done finalizes the
-        # turn, drop the strip so finished history has no task-list "corpse".
-        # Open todos/goals still carry into the next Conversation via prompt().
+        # Goal is sticky while active/blocked — keep it visible between turns
+        # (idle / input mode), not only while busy. Tasks stay working-only so
+        # @done history does not leave a task-list "corpse". Open todos/goals
+        # still carry into the next Conversation via prompt().
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
             self.current.todos_all_done = True
         goal = self.current.goal
-        show_goal = False
+        # Sticky: active/blocked goals stay on the strip when idle so the user
+        # can see the objective in input mode. completed is cleared on
+        # update_goal and never carried to the next turn.
+        show_goal = bool(goal and goal.status in ("active", "blocked"))
         show_tasks = False
         show = []
         hidden = 0
         expanded = False
-        if self.current.working:
-            # Sticky strip: only open goals (active/blocked). completed is
-            # cleared on update_goal and never carried to the next turn.
-            show_goal = bool(goal and goal.status in ("active", "blocked"))
-            if open_todos:
-                active = [t for t in open_todos if _todo_is_active(t)]
-                pending = [t for t in open_todos if not _todo_is_active(t)]
-                expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
-                    if self.view else False
-                if expanded:
-                    show = open_todos
-                else:
-                    cap = max(0, 3 - len(active))
-                    show = active + pending[:cap]
-                show_tasks = bool(show)
-                hidden = len(open_todos) - len(show) if show else 0
+        if self.current.working and open_todos:
+            active = [t for t in open_todos if _todo_is_active(t)]
+            pending = [t for t in open_todos if not _todo_is_active(t)]
+            expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
+                if self.view else False
+            if expanded:
+                show = open_todos
+            else:
+                cap = max(0, 3 - len(active))
+                show = active + pending[:cap]
+            show_tasks = bool(show)
+            hidden = len(open_todos) - len(show) if show else 0
 
         if show_goal or show_tasks:
             lines.append("\n")
@@ -2449,6 +2479,15 @@ class OutputView:
                 rerender_ui = True
         elif end < view_size:
             end = view_size
+
+        # Full-region replace remaps any caret inside [start, end) and can
+        # thrash the viewport while streaming. If the user is not following
+        # the tail (or auto_scroll is off, e.g. spinner), pin sel + viewport
+        # and restore after the rewrite.
+        want_scroll = bool(getattr(self, "_auto_scroll", True))
+        following = want_scroll and self._is_following_tail()
+        pin = None if following else self._pin_view_state()
+
         new_end = self._replace(start, end, text)
         self.current.region = (start, new_end)
         self.view.add_regions(
@@ -2456,6 +2495,12 @@ class OutputView:
             [sublime.Region(start, new_end)],
             "", "", sublime.HIDDEN,
         )
+
+        if pin is not None:
+            self._restore_view_state(pin)
+        elif want_scroll:
+            # Following: keep tail in view; do not move the caret.
+            self._scroll_to_end(force=True)
 
         # Update title to reflect working state
         self._update_title()
@@ -2467,13 +2512,12 @@ class OutputView:
             if self.pending_question and self.pending_question.callback:
                 self._render_question()
 
-        # Scroll after render completes (only if auto_scroll is enabled)
-        if getattr(self, '_auto_scroll', True):
-            self._scroll_to_end()
-
         # Inline image phantoms (minihtml data: + explicit size — ST docs).
         # Defer one tick so region positions match the final buffer.
-        sublime.set_timeout(self._refresh_media_phantoms, 10)
+        # Skip while pinned-history streaming: phantoms at the tail don't help
+        # and re-layout adds flash.
+        if following or not self.current.working:
+            sublime.set_timeout(self._refresh_media_phantoms, 10)
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string. Dispatches via TOOL_FORMATTERS registry."""
