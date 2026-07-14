@@ -117,6 +117,7 @@ class Session:
         self.fork: bool = fork  # Fork from resume_id instead of continuing it
         self.profile: Optional[Dict] = profile  # Profile config (model, betas, system_prompt, preload_docs)
         self.initial_context: Optional[Dict] = initial_context  # Initial context (subsession_id, parent_view_id, etc.)
+        self.effort: Optional[str] = None  # Resolved reasoning effort for this session
         self.name: Optional[str] = None
         self.total_cost: float = 0.0
         self.query_count: int = 0
@@ -240,6 +241,9 @@ class Session:
             self.output.view.settings().set("claude_provider_label", spec.label or self.backend)
             if model_for_env:
                 self.output.view.settings().set("claude_model", model_for_env)
+            # Effort may be refined below; placeholder until init_params resolve.
+            if getattr(self, "effort", None):
+                self.output.view.settings().set("claude_effort", self.effort)
 
         # Diagnostic: log resolved spawn config (subsession-vs-standalone matters here)
         _is_subsession = bool(getattr(self, "subsession_id", None))
@@ -337,24 +341,20 @@ class Session:
         # Pass subsession_id if this is a subsession
         if hasattr(self, 'subsession_id') and self.subsession_id:
             init_params["subsession_id"] = self.subsession_id
-        # Effort resolution (fresh session; resume keeps CLI's saved value unless
-        # a profile pins it). Order: profile → provider (per-backend override) →
-        # CLAUDE_CODE_EFFORT_LEVEL env (e.g. a provider's extra_env) → global.
-        provider_effort = getattr(spec, "effort", None)
-        if not self.resume_id:
-            if self.profile and self.profile.get("effort"):
-                effort = self.profile["effort"]
-            elif provider_effort:
-                effort = provider_effort
-            else:
-                effort = env.get("CLAUDE_CODE_EFFORT_LEVEL") or settings.get("effort", "high")
+        # Effort resolution. Order: profile → provider override → env → global.
+        # Claude: on resume omit unless profile/provider pins (keep CLI session).
+        # Grok: always pass — agent spawn uses --reasoning-effort (not configurable
+        # via session/load alone).
+        effort = self._resolve_effort(settings, env, spec)
+        self.effort = effort
+        if self.backend == "grok" or not self.resume_id:
             init_params["effort"] = effort
         elif self.profile and self.profile.get("effort"):
-            # Profile explicitly sets effort — honor it even on resume
-            init_params["effort"] = self.profile["effort"]
-        elif provider_effort:
-            # Provider override (e.g. after change_backend) — apply on resume too
-            init_params["effort"] = provider_effort
+            init_params["effort"] = effort
+        elif getattr(spec, "effort", None):
+            init_params["effort"] = effort
+        if self.output and self.output.view and effort:
+            self.output.view.settings().set("claude_effort", effort)
 
         # Apply profile config or default model
         if self.profile:
@@ -454,10 +454,31 @@ class Session:
                 )
             except Exception:
                 pass
+        # Prefer bridge-reported effort (actual agent) when present.
+        bridge_effort = result.get("effort")
+        if bridge_effort:
+            self.effort = str(bridge_effort)
+            if self.output and self.output.view:
+                self.output.view.settings().set("claude_effort", self.effort)
+        if self.effort and self.backend in ("claude", "grok"):
+            parts.append(f"effort:{self.effort}")
         if parts:
             self._status(f"ready ({'; '.join(parts)})")
         else:
             self._status("ready")
+        # One-line transcript hint so effort is obvious without the status bar.
+        if self.effort and self.backend in ("claude", "grok"):
+            try:
+                model = ""
+                if self.output and self.output.view:
+                    model = self.output.view.settings().get("claude_model") or ""
+                bit = f"{model} · " if model else ""
+                self.output.text(
+                    f"\n*{backends.get(self.backend).label}: {bit}"
+                    f"reasoning effort **{self.effort}***\n"
+                )
+            except Exception:
+                pass
         # Persist "open" state (so plugin_loaded can track which sessions had views)
         self._save_session()
         # Auto-enter input mode when ready
@@ -765,21 +786,91 @@ class Session:
         return self.context.build_prompt(prompt)
 
     def undo_message(self) -> None:
-        """Undo last conversation turn by rewinding the CLI session."""
+        """Undo last conversation turn (message round).
+
+        Claude: JSONL resume_session_at. Grok: x.ai/rewind points + disk
+        truncate + session/load resume.
+        """
         if not self.session_id:
             return
         if self.working and self.current_tool != "rewinding...":
             return
+        if self.backend == "grok":
+            turns = self.get_turns_for_undo()
+            if not turns:
+                print(f"[Claude] undo_message: no Grok rewind points")
+                sublime.status_message("No rewind points")
+                return
+            # Newest first from get_turns_for_undo — take last real turn.
+            _, rewind_id, draft = turns[0]
+            self._apply_undo(rewind_id, draft)
+            return
         rewind_id, undone_prompt = self._find_rewind_point()
         if not rewind_id:
             print(f"[Claude] undo_message: no rewind point found")
+            sublime.status_message("No rewind point found")
             return
         self._apply_undo(rewind_id, undone_prompt)
 
-    def _apply_undo(self, rewind_id: str, undone_prompt: str) -> None:
-        """Execute the rewind to rewind_id, restoring undone_prompt as draft."""
+    def _apply_undo(self, rewind_id, undone_prompt: str) -> None:
+        """Rewind agent + UI; restore undone_prompt as draft.
+
+        rewind_id is a Claude assistant uuid, or for Grok an int prompt_index
+        (or str digits).
+        """
+        if self.backend == "grok":
+            self._apply_grok_undo(rewind_id, undone_prompt)
+            return
         saved_id = self.session_id
         print(f"[Claude] undo: rewinding {saved_id} to {rewind_id}")
+        self._strip_view_from_last_prompt()
+        if self.client:
+            self.client.stop()
+            self.client = None
+        self.initialized = False
+        self.session_id = saved_id
+        self.resume_id = saved_id
+        self.fork = False
+        self.draft_prompt = undone_prompt or ""
+        self._input_mode_entered = True
+        self._pending_resume_at = rewind_id
+        self._save_session()
+        self.working = True
+        self.current_tool = "rewinding..."
+        self._animate()
+        self.start(resume_session_at=rewind_id)
+
+    def _strip_view_from_prompt_index(self, prompt_index: int) -> None:
+        """Remove rendered turns from prompt_index through end (◎ markers)."""
+        if not self.output or not self.output.view:
+            return
+        if self.output._input_mode:
+            self.output.exit_input_mode(keep_text=False)
+        view = self.output.view
+        content = view.substr(sublime.Region(0, view.size()))
+        import re as _re
+        # Match prompt lines: start of file or after newline, ◎ … ▶
+        matches = list(_re.finditer(r'(?m)^◎ .+? ▶', content))
+        if not matches:
+            return
+        if prompt_index < 0 or prompt_index >= len(matches):
+            # Fall back to last prompt
+            m = matches[-1]
+        else:
+            m = matches[prompt_index]
+        start = m.start()
+        # Include leading newline if present so we don't leave a blank gap wrong
+        if start > 0 and content[start - 1] == "\n":
+            start = start - 1
+        self.output._replace(start, view.size(), "")
+        if self.output.current:
+            self.output.current = None
+        view.erase_regions("claude_conversation")
+
+    def _strip_view_from_last_prompt(self) -> None:
+        """Claude path: drop the last ◎ … ▶ block."""
+        if not self.output or not self.output.view:
+            return
         if self.output._input_mode:
             self.output.exit_input_mode(keep_text=False)
         view = self.output.view
@@ -795,6 +886,49 @@ class Session:
         if self.output.current:
             self.output.current = None
         view.erase_regions("claude_conversation")
+
+    def _apply_grok_undo(self, prompt_index, undone_prompt: str) -> None:
+        """Grok: bridge rewind_execute (disk+ACP) then resume via session/load."""
+        try:
+            idx = int(prompt_index)
+        except (TypeError, ValueError):
+            print(f"[Claude] grok undo: bad prompt_index {prompt_index!r}")
+            sublime.status_message("Invalid rewind point")
+            return
+        if not self.client or not self.client.is_alive():
+            sublime.status_message("Bridge not ready for rewind")
+            return
+        print(f"[Claude] grok undo: session={self.session_id} → prompt_index={idx}")
+        self.working = True
+        self.current_tool = "rewinding..."
+        self._animate()
+        # Default conversation_only so we don't surprise-revert files unless
+        # the user later opts in. Disk truncate of chat_history still runs.
+        resp = self.client.send_wait(
+            "rewind_execute",
+            {
+                "prompt_index": idx,
+                "mode": "conversation_only",
+                "restore_files": False,
+            },
+            timeout=60.0,
+        )
+        if resp.get("error"):
+            err = resp["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            print(f"[Claude] grok undo failed: {msg}")
+            sublime.status_message(f"Rewind failed: {msg}")
+            self.working = False
+            self.current_tool = None
+            self._update_title_idle()
+            return
+        result = resp.get("result") or {}
+        draft = (result.get("draft_prompt") or undone_prompt or "").strip()
+        # Prefer preview from points if execute returned empty draft
+        if not draft:
+            draft = (undone_prompt or "").strip()
+        self._strip_view_from_prompt_index(idx)
+        saved_id = self.session_id
         if self.client:
             self.client.stop()
             self.client = None
@@ -802,14 +936,24 @@ class Session:
         self.session_id = saved_id
         self.resume_id = saved_id
         self.fork = False
-        self.draft_prompt = undone_prompt
+        self.draft_prompt = draft
         self._input_mode_entered = True
-        self._pending_resume_at = rewind_id
+        self._pending_resume_at = None  # Grok uses session/load, not resume_at
         self._save_session()
         self.working = True
         self.current_tool = "rewinding..."
         self._animate()
-        self.start(resume_session_at=rewind_id)
+        # Resume loads truncated chat_history via ACP session/load
+        self.start()
+        sublime.status_message(f"Rewound to turn {idx}" + (
+            f": {draft[:40]}…" if len(draft) > 40 else (f": {draft}" if draft else "")))
+
+    def _update_title_idle(self) -> None:
+        try:
+            if self.output:
+                self.output._update_title()
+        except Exception:
+            pass
 
     @staticmethod
     def _is_synthetic_turn(prompt: str) -> bool:
@@ -839,7 +983,13 @@ class Session:
         return False
 
     def get_turns_for_undo(self) -> list:
-        """Return [(label, rewind_id, draft_prompt)] for all undoable turns, newest first."""
+        """Return [(label, rewind_id, draft_prompt)] for all undoable turns, newest first.
+
+        Claude: rewind_id = prior assistant uuid.
+        Grok: rewind_id = prompt_index (int) from x.ai/rewind/points.
+        """
+        if self.backend == "grok":
+            return self._get_grok_turns_for_undo()
         turns = self._read_turns()
         result = []
         for i, (prompt, prev_asst_uuid) in enumerate(turns):
@@ -852,6 +1002,32 @@ class Session:
             result.append((label, prev_asst_uuid, prompt))
         result.reverse()
         return result
+
+    def _get_grok_turns_for_undo(self) -> list:
+        """Grok rewind points via bridge; newest first."""
+        if not self.client or not self.client.is_alive():
+            return []
+        resp = self.client.send_wait("rewind_points", {}, timeout=20.0)
+        if resp.get("error"):
+            print(f"[Claude] grok rewind_points: {resp.get('error')}")
+            return []
+        result = resp.get("result") or {}
+        points = result.get("points") or []
+        out = []
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            try:
+                idx = int(p.get("prompt_index"))
+            except (TypeError, ValueError):
+                continue
+            preview = (p.get("prompt_preview") or "").strip()
+            first = preview.split("\n")[0][:72] if preview else "(empty)"
+            files = " · files" if p.get("has_file_changes") else ""
+            label = f"{idx} — {first}{files}"
+            out.append((label, idx, preview))
+        out.reverse()  # newest first
+        return out
 
     def _read_turns(self) -> list:
         """Read JSONL and return [(prompt, prev_assistant_uuid)] for each user turn."""
@@ -2811,6 +2987,28 @@ class Session:
         sessions = sessions[:200]
         save_sessions(sessions)
 
+    def _resolve_effort(self, settings=None, env=None, spec=None) -> str:
+        """profile → provider → CLAUDE_CODE_EFFORT_LEVEL → settings (default high)."""
+        if settings is None:
+            settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        if env is None:
+            env = os.environ
+        if spec is None:
+            try:
+                spec = backends.get(self.backend)
+            except Exception:
+                spec = None
+        if self.profile and self.profile.get("effort"):
+            return str(self.profile["effort"]).strip()
+        pe = getattr(spec, "effort", None) if spec is not None else None
+        if pe:
+            return str(pe).strip()
+        return str(
+            env.get("CLAUDE_CODE_EFFORT_LEVEL")
+            or settings.get("effort", "high")
+            or "high"
+        ).strip()
+
     def _status(self, text: str) -> None:
         """Update status on output view only."""
         if not self.output.view or not self.output.view.is_valid():
@@ -2818,10 +3016,10 @@ class Session:
         label = backends.get(self.backend).label
         prefix = "[PLAN] " if self.plan_mode else ""
         parts = [f"{prefix}{text}"]
-        if self.backend == "claude":
-            settings = sublime.load_settings("ClaudeCode.sublime-settings")
-            effort = settings.get("effort", "high")
-            parts.append(f"effort:{effort}")
+        if self.backend in ("claude", "grok"):
+            effort = getattr(self, "effort", None) or self._resolve_effort()
+            if effort:
+                parts.append(f"effort:{effort}")
         if self.total_cost > 0:
             parts.append(f"${self.total_cost:.4f}")
         if self.query_count > 0:

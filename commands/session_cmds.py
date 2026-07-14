@@ -816,13 +816,15 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 if action == "undo_message" and data:
                     turns = data.get_turns_for_undo()
                     if not turns:
+                        sublime.status_message("No undoable turns")
                         return
                     labels = [t[0] for t in turns]
                     def _on_undo(uidx, _turns=turns, _s=data):
                         if uidx >= 0:
                             _, rewind_id, draft_prompt = _turns[uidx]
                             _s._apply_undo(rewind_id, draft_prompt)
-                    self.window.show_quick_panel(labels, _on_undo, placeholder="Undo to before…")
+                    self.window.show_quick_panel(
+                        labels, _on_undo, placeholder="Rewind to…")
                 elif action == "restart" and data:
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)

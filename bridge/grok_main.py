@@ -137,6 +137,11 @@ class GrokBridge(AcpBridge):
         args = [GROK_BIN, "agent"]
         if self.model:
             args += ["--model", self.model]
+        # Reasoning effort at spawn — Grok's reliable path (session/set_model
+        # does not always rebind effort mid-process).
+        if self.effort:
+            # max → xhigh via normalize_effort; pass canonical wire level.
+            args += ["--reasoning-effort", self.effort]
         # Full bypass: agent skips permission RPCs entirely. Other modes
         # (acceptEdits / default / plan) go through session/request_permission
         # so AcpBridge can apply plugin allowed_tools + auto-allow patterns.
@@ -144,6 +149,18 @@ class GrokBridge(AcpBridge):
             args.append("--always-approve")
         args.append("stdio")
         return args
+
+    def set_model_params(self) -> dict:
+        """Include reasoningEffort so set_model can rebind when supported."""
+        params = super().set_model_params()
+        if self.effort:
+            # Try both top-level and _meta — Grok versions vary.
+            params["reasoningEffort"] = self.effort
+            params["_meta"] = {
+                **(params.get("_meta") or {}),
+                "reasoningEffort": self.effort,
+            }
+        return params
 
     def spawn_env(self) -> Optional[Dict[str, str]]:
         from acp_base import apply_plain_terminal_env

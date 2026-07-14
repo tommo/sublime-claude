@@ -198,6 +198,24 @@
         ]
     },
     {
+        "keys": ["super+shift+z"],
+        "command": "claude_undo_message",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        "keys": ["super+shift+z"],
+        "command": "claude_undo_message",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "following_text", "operator": "regex_match", "operand": "^$" },
+            { "key": "preceding_text", "operator": "regex_match", "operand": "^◎\\s*$" }
+        ]
+    },
+    {
         "keys": ["alt+escape"],
         "command": "claude_code_interrupt"
     },

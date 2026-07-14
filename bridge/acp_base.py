@@ -126,6 +126,7 @@ class AcpBridge(BaseBridge):
         self.pending: Dict[int, asyncio.Future] = {}
         self.reader_task: Optional[asyncio.Task] = None
         self.model: str = self.DEFAULT_MODEL
+        self.effort: str = ""  # reasoning effort (low/medium/high/…); empty = agent default
         self.cwd: str = os.getcwd()
         self.agent_mode: str = ""
         self._view_id: Optional[Any] = None
@@ -234,6 +235,28 @@ class AcpBridge(BaseBridge):
         return self.MODEL_ALIASES.get(
             key, self.MODEL_ALIASES.get(key.lower(), key))
 
+    # Canonical effort levels used by Claude + Grok (Grok also has none/minimal/xhigh).
+    EFFORT_ALIASES: Dict[str, str] = {
+        "max": "xhigh",  # Claude "max" → Grok xhigh; harmless for Claude
+        "x-high": "xhigh",
+        "extra_high": "xhigh",
+        "extra-high": "xhigh",
+    }
+
+    def normalize_effort(self, effort: Optional[str]) -> str:
+        """Return a normalized effort string, or '' if unset/invalid."""
+        if not effort:
+            return ""
+        key = str(effort).strip().lower().replace(" ", "_")
+        key = self.EFFORT_ALIASES.get(key, key)
+        # Accept common levels; agent rejects unknowns at apply time.
+        if key in (
+            "none", "minimal", "low", "medium", "high", "xhigh", "max",
+            "deep",  # per-model menu id some agents accept
+        ):
+            return key
+        return key  # pass through; agent validates
+
     def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:
         if not permission_mode:
             return self.PERM_TO_MODE.get("default", "")
@@ -247,15 +270,20 @@ class AcpBridge(BaseBridge):
         """Hook after ACP `initialize` (e.g. authenticate)."""
         return None
 
+    def set_model_params(self) -> dict:
+        """Params for session/set_model. Subclasses may add effort/_meta."""
+        return {
+            "sessionId": self.session_id,
+            "modelId": self.model,
+        }
+
     async def apply_model(self) -> None:
-        """Push self.model to the live session. Default: session/set_model."""
+        """Push self.model (and effort, if any) to the live session."""
         if not self.session_id or not self.model:
             return
         try:
-            result = await self._send_acp("session/set_model", {
-                "sessionId": self.session_id,
-                "modelId": self.model,
-            }) or {}
+            result = await self._send_acp(
+                "session/set_model", self.set_model_params()) or {}
             # Grok: {_meta: {model: {Ok: id}}} ; others may return currentModelId
             current = result.get("currentModelId")
             if not current:
@@ -1237,11 +1265,17 @@ class AcpBridge(BaseBridge):
             "set_model": self.handle_set_model,
             "set_permission_mode": self.handle_set_permission_mode,
             # plan_response: BaseBridge.handle_plan_response (+ mode switch override)
+            "rewind_points": self.handle_rewind_points,
+            "rewind_execute": self.handle_rewind_execute,
         }
 
     async def handle_initialize(self, req_id: Optional[int],
                                  params: dict) -> None:
         self.model = self.normalize_model(params.get("model") or self.model)
+        # Capture effort before first agent spawn (Grok CLI flag is spawn-time).
+        self.effort = self.normalize_effort(params.get("effort"))
+        if self.effort:
+            self.file_log(f"initialize: effort={self.effort!r}")
         self.cwd = params.get("cwd") or self.cwd
         if self.cwd and os.path.isdir(self.cwd):
             try:
@@ -1334,6 +1368,8 @@ class AcpBridge(BaseBridge):
                 "edit_mode": self.agent_mode,
                 "modes": self._available_modes,
                 "models": self._available_models,
+                "effort": self.effort or None,
+                "model": self.model,
             })
             if self._resume_fallback:
                 send_notification("message", {
@@ -1747,9 +1783,15 @@ class AcpBridge(BaseBridge):
     async def handle_set_model(self, req_id: Optional[int],
                                 params: dict) -> None:
         self.model = self.normalize_model(params.get("model"))
+        if "effort" in params:
+            self.effort = self.normalize_effort(params.get("effort"))
         try:
             await self.apply_model()
-            send_result(req_id, {"ok": True, "model": self.model})
+            send_result(req_id, {
+                "ok": True,
+                "model": self.model,
+                "effort": self.effort or None,
+            })
         except Exception as e:
             send_error(req_id, -32000, f"set_model failed: {e}")
 
@@ -1796,6 +1838,280 @@ class AcpBridge(BaseBridge):
             except Exception as e:
                 self.log(f"plan_response mode switch failed: {e}")
         send_result(req_id, {"ok": True, "approved": approved})
+
+    # ── Message-round rewind (Grok x.ai/rewind/* + disk truncate) ─────
+
+    def _grok_session_dir(self) -> Optional[str]:
+        """Locate ~/.grok/sessions/<encoded_cwd>/<session_id>/."""
+        sid = self.session_id
+        if not sid:
+            return None
+        root = os.path.expanduser("~/.grok/sessions")
+        if not os.path.isdir(root):
+            return None
+        # Preferred: cwd-encoded path used by Grok Build.
+        if self.cwd:
+            enc = self.cwd.replace("/", "%2F")
+            cand = os.path.join(root, enc, sid)
+            if os.path.isdir(cand):
+                return cand
+        # Fallback: scan for session id directory.
+        try:
+            for name in os.listdir(root):
+                cand = os.path.join(root, name, sid)
+                if os.path.isdir(cand):
+                    return cand
+        except OSError:
+            pass
+        return None
+
+    async def handle_rewind_points(self, req_id: Optional[int],
+                                    params: dict) -> None:
+        """List rewind points for the current Grok ACP session."""
+        if not self.session_id:
+            send_error(req_id, -32000, "session not initialized")
+            return
+        try:
+            result = await self._send_acp(
+                "_x.ai/rewind/points",
+                {"sessionId": self.session_id},
+            ) or {}
+            points = result.get("rewind_points") or result.get("points") or []
+            if not isinstance(points, list):
+                points = []
+            # Normalize for plugin UI.
+            out = []
+            for p in points:
+                if not isinstance(p, dict):
+                    continue
+                idx = p.get("prompt_index")
+                if idx is None:
+                    idx = p.get("promptIndex")
+                try:
+                    idx = int(idx)
+                except (TypeError, ValueError):
+                    continue
+                preview = (
+                    p.get("prompt_preview")
+                    or p.get("promptPreview")
+                    or p.get("prompt_text")
+                    or ""
+                )
+                out.append({
+                    "prompt_index": idx,
+                    "prompt_preview": str(preview),
+                    "created_at": p.get("created_at") or p.get("createdAt") or "",
+                    "has_file_changes": bool(
+                        p.get("has_file_changes")
+                        or p.get("hasFileChanges")
+                        or (p.get("num_file_snapshots") or 0)
+                    ),
+                    "num_file_snapshots": int(
+                        p.get("num_file_snapshots")
+                        or p.get("numFileSnapshots")
+                        or 0
+                    ),
+                })
+            out.sort(key=lambda x: x["prompt_index"])
+            send_result(req_id, {
+                "ok": True,
+                "session_id": self.session_id,
+                "points": out,
+                "leaf_response_id": (
+                    result.get("leaf_response_id")
+                    or result.get("leafResponseId")
+                ),
+            })
+        except Exception as e:
+            send_error(req_id, -32000, f"rewind_points failed: {e}")
+
+    async def handle_rewind_execute(self, req_id: Optional[int],
+                                     params: dict) -> None:
+        """Rewind to a user-prompt index (conversation + optional files).
+
+        Grok ACP `_x.ai/rewind/execute` is best-effort (often success:false
+        without error). We always apply a client-side truncate of session
+        files so the next session/load sees the shortened history, then
+        call the ACP method for any server-side effects.
+        """
+        if not self.session_id:
+            send_error(req_id, -32000, "session not initialized")
+            return
+        try:
+            target = params.get("prompt_index")
+            if target is None:
+                target = params.get("target_prompt_index")
+            target = int(target)
+        except (TypeError, ValueError):
+            send_error(req_id, -32602, "prompt_index required (int)")
+            return
+        mode = (params.get("mode") or "conversation_only").strip()
+        if mode not in ("all", "conversation_only", "code_only", "files_only"):
+            mode = "conversation_only"
+        restore_files = bool(params.get("restore_files", mode in ("all", "files_only")))
+
+        disk = await asyncio.to_thread(
+            self._client_rewind_disk, target, restore_files)
+        acp_result: dict = {}
+        try:
+            acp_params = {
+                "sessionId": self.session_id,
+                "target_prompt_index": target,
+                "mode": mode,
+            }
+            leaf = params.get("expected_leaf_response_id") or params.get(
+                "leaf_response_id")
+            if leaf:
+                acp_params["expected_leaf_response_id"] = leaf
+            acp_result = await self._send_acp(
+                "_x.ai/rewind/execute", acp_params) or {}
+            self.file_log(
+                f"rewind/execute target={target} mode={mode} "
+                f"acp={str(acp_result)[:300]}")
+        except Exception as e:
+            self.file_log(f"rewind/execute ACP error (disk still applied): {e}")
+            acp_result = {"success": False, "error": str(e)}
+
+        draft = (disk or {}).get("draft_prompt") or ""
+        if not draft and isinstance(acp_result, dict):
+            draft = acp_result.get("prompt_text") or ""
+        send_result(req_id, {
+            "ok": True,
+            "prompt_index": target,
+            "draft_prompt": draft,
+            "disk": disk or {},
+            "acp": acp_result,
+            "session_id": self.session_id,
+        })
+
+    def _client_rewind_disk(self, target_prompt_index: int,
+                             restore_files: bool) -> dict:
+        """Truncate Grok session files to before user-prompt target_prompt_index.
+
+        Keeps system preamble; drops the Nth real user_query and everything
+        after. Optionally restores file_snapshots from that rewind point.
+        Returns {draft_prompt, truncated_user_turns, files_restored, session_dir}.
+        """
+        sdir = self._grok_session_dir()
+        if not sdir:
+            return {"error": "session dir not found", "draft_prompt": ""}
+
+        chat_path = os.path.join(sdir, "chat_history.jsonl")
+        rp_path = os.path.join(sdir, "rewind_points.jsonl")
+        draft = ""
+        files_restored: list = []
+
+        # Resolve draft + file snapshots from rewind_points.jsonl
+        snapshots: dict = {}
+        if os.path.isfile(rp_path):
+            kept_rp = []
+            with open(rp_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    idx = o.get("prompt_index")
+                    try:
+                        idx = int(idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if idx < target_prompt_index:
+                        kept_rp.append(line)
+                    elif idx == target_prompt_index:
+                        # Draft = this prompt; snapshots = pre-prompt files.
+                        # Prefer ACP preview if disk line has none.
+                        draft = (
+                            o.get("prompt_preview")
+                            or o.get("prompt_text")
+                            or draft
+                        )
+                        snapshots = o.get("file_snapshots") or {}
+                        # Do not keep this point or later ones.
+            with open(rp_path, "w", encoding="utf-8") as f:
+                for line in kept_rp:
+                    f.write(line + "\n")
+
+        # Truncate chat_history at the Nth real <user_query> user turn
+        user_turns = 0
+        cut_at = None
+        if os.path.isfile(chat_path):
+            lines = open(chat_path, "r", encoding="utf-8").read().splitlines()
+            for i, line in enumerate(lines):
+                try:
+                    o = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if o.get("type") != "user":
+                    continue
+                if o.get("synthetic_reason"):
+                    continue
+                content = o.get("content") or ""
+                text = content if isinstance(content, str) else ""
+                if isinstance(content, list):
+                    parts = []
+                    for b in content:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            parts.append(b.get("text") or "")
+                    text = "".join(parts)
+                # Real user prompts are wrapped in <user_query> by Grok.
+                if "<user_query>" not in text and user_turns == 0 and not text.strip():
+                    continue
+                # Skip pure system-ish user rows without user_query once we
+                # have seen at least one — but count rows with user_query.
+                if "<user_query>" not in text:
+                    continue
+                if user_turns == target_prompt_index:
+                    cut_at = i
+                    # Extract draft from user_query if rewind_points lacked it
+                    if not draft and "<user_query>" in text:
+                        try:
+                            draft = text.split("<user_query>", 1)[1]
+                            draft = draft.split("</user_query>", 1)[0].strip()
+                        except IndexError:
+                            draft = text.strip()
+                    break
+                user_turns += 1
+            if cut_at is not None:
+                with open(chat_path, "w", encoding="utf-8") as f:
+                    for line in lines[:cut_at]:
+                        f.write(line + "\n")
+
+        # Restore pre-prompt file contents
+        if restore_files and isinstance(snapshots, dict):
+            for _name, snap in snapshots.items():
+                if not isinstance(snap, dict):
+                    continue
+                path = snap.get("path") or _name
+                if not path:
+                    continue
+                if not os.path.isabs(path):
+                    path = os.path.join(self.cwd or ".", path)
+                content = snap.get("content")
+                if content is None:
+                    continue
+                try:
+                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content if isinstance(content, str) else str(content))
+                    files_restored.append(path)
+                except OSError as e:
+                    self.file_log(f"rewind restore {path!r}: {e}")
+
+        self.file_log(
+            f"client rewind disk target={target_prompt_index} "
+            f"cut_at={cut_at} draft_len={len(draft or '')} "
+            f"files={len(files_restored)} dir={sdir}")
+        return {
+            "session_dir": sdir,
+            "draft_prompt": draft or "",
+            "cut_at": cut_at,
+            "files_restored": files_restored,
+            "truncated_user_turns_before": user_turns if cut_at is not None else None,
+        }
 
     async def handle_shutdown(self, req_id: Optional[int],
                                params: dict) -> None:

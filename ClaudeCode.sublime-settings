@@ -24,7 +24,10 @@
     // Persona service URL for identity management
     "persona_url": "http://localhost:5002/personas",
 
-    // Reasoning effort level: "low", "high", "max"
+    // Reasoning effort for fresh sessions (and always for Grok spawn).
+    // Claude: low / medium / high / max
+    // Grok: low / medium / high / xhigh (max aliases to xhigh)
+    // Overridable per profile and per custom_providers.*.effort
     "effort": "high",
 
     // Auto-retry a turn that ends in error (e.g. provider 503/429 retries

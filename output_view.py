@@ -12,6 +12,7 @@ from .output_models import (
     PlanApproval, PermissionRequest, QuestionRequest, ToolCall, TodoItem,
     GoalState, Conversation,
     _open_todos, _goal_is_open,
+    _todo_status_norm, _todo_is_active,
 )
 from .tool_formatters import (
     format_tool_detail,
@@ -1956,18 +1957,14 @@ class OutputView:
         self._render_question()
         self._scroll_to_end(force=True)
 
-    def _render_question(self) -> None:
-        """Render the current question inline."""
-        if not self.pending_question or not self.view:
-            return
-
+    def _question_block_text(self) -> str:
+        """Build the inline question UI text (no side effects)."""
         q_req = self.pending_question
-        if q_req.current_idx >= len(q_req.questions):
-            return
-
+        if not q_req or q_req.current_idx >= len(q_req.questions):
+            return ""
         q = q_req.questions[q_req.current_idx]
-        question_text = q.get("question", "")
-        options = q.get("options", [])
+        question_text = (q.get("question") or "").replace("\n", " ").strip()
+        options = q.get("options") or []
         multi = q.get("multiSelect", False)
 
         lines = ["\n"]
@@ -1976,10 +1973,12 @@ class OutputView:
         else:
             lines.append(f"  ❓ {question_text}\n")
 
-        # Numbered options
         for i, opt in enumerate(options):
             label = opt.get("label", str(opt)) if isinstance(opt, dict) else str(opt)
             desc = opt.get("description", "") if isinstance(opt, dict) else ""
+            # Keep options single-line so re-renders don't leave orphan fragments.
+            label = str(label).replace("\n", " ").strip()
+            desc = str(desc).replace("\n", " ").strip()
             num = i + 1
             if multi:
                 check = "✓" if i in q_req.selected else " "
@@ -1990,31 +1989,101 @@ class OutputView:
                 line += f" — {desc}"
             lines.append(line + "\n")
 
-        # Other + confirm buttons
         if multi:
-            lines.append(f"    [O] Other...  [⏎] Confirm\n")
+            lines.append("    [O] Other...  [⏎] Confirm\n")
         else:
-            lines.append(f"    [O] Other...\n")
+            lines.append("    [O] Other...\n")
+        return "".join(lines)
 
-        text = "".join(lines)
+    def _trailing_ui_start(self) -> Optional[int]:
+        """Buffer offset where turn-modal UI (question/plan/permission) begins.
 
-        # Write to view
-        start = self.view.size()
-        end = self._write(text)
-        q_req.region = (start, end)
+        Conversation re-renders must stop here so the work-strip tail and the
+        question block don't eat each other.
+        """
+        if not self.view:
+            return None
+        starts = []
+        for key in (
+            "claude_question_block",
+            "claude_permission_block",
+            "claude_plan_block",
+        ):
+            regs = self.view.get_regions(key)
+            if regs and regs[0].size() > 0:
+                starts.append(regs[0].begin())
+        # Fall back to last known question region if named region was lost.
+        q = self.pending_question
+        if q and getattr(q, "region", None):
+            a, b = q.region
+            if b > a:
+                starts.append(a)
+        return min(starts) if starts else None
 
-        # Track region
+    def _render_question(self) -> None:
+        """Render the current question right after the conversation tail.
+
+        Always replace any existing question block in place (or re-anchor at
+        conversation end). Never blindly append at view.size() — that races
+        with work-strip re-renders and leaves orphan lines (e.g. ``d)`` junk).
+        """
+        if not self.pending_question or not self.view:
+            return
+
+        q_req = self.pending_question
+        if q_req.current_idx >= len(q_req.questions):
+            return
+
+        text = self._question_block_text()
+        if not text:
+            return
+
+        # Erase previous question block if still tracked (in-place refresh).
+        old = self.view.get_regions("claude_question_block")
+        if old and old[0].size() > 0:
+            write_at = old[0].begin()
+            self._replace(old[0].begin(), old[0].end(), "")
+        elif q_req.region and q_req.region[1] > q_req.region[0]:
+            a, b = q_req.region
+            a = max(0, min(a, self.view.size()))
+            b = max(a, min(b, self.view.size()))
+            write_at = a
+            if b > a:
+                self._replace(a, b, "")
+        else:
+            # Anchor after conversation region (task list lives inside it).
+            conv = self.view.get_regions("claude_conversation")
+            if conv and conv[0].size() > 0:
+                write_at = conv[0].end()
+            elif self.current and self.current.region:
+                write_at = min(self.current.region[1], self.view.size())
+            else:
+                write_at = self.view.size()
+
+        # Drop any orphan ❓ blocks still hanging after write_at (lost regions).
+        tail = self.view.substr(sublime.Region(write_at, self.view.size()))
+        if "❓" in tail:
+            # Only strip if it looks like a previous question UI, not user text.
+            orphan = tail.find("\n  ❓ ")
+            if orphan < 0:
+                orphan = tail.find("  ❓ ")
+            if orphan >= 0:
+                self._replace(write_at + orphan, self.view.size(), "")
+
+        end = self._write(text, pos=write_at)
+        q_req.region = (write_at, end)
+
         self.view.add_regions(
             "claude_question_block",
-            [sublime.Region(start, end)],
+            [sublime.Region(write_at, end)],
             "", "", sublime.HIDDEN,
         )
 
-        # Highlight option keys [1], [2], ..., [O], [⏎]
         import re
         key_regions = []
         for m in re.finditer(r'\[\d+\]|\[O\]|\[⏎\]', text):
-            key_regions.append(sublime.Region(start + m.start(), start + m.end()))
+            key_regions.append(
+                sublime.Region(write_at + m.start(), write_at + m.end()))
         if key_regions:
             self.view.add_regions(
                 "claude_question_keys",
@@ -2022,6 +2091,8 @@ class OutputView:
                 "claude.permission.button.allow",
                 "", sublime.DRAW_NO_OUTLINE,
             )
+        else:
+            self.view.erase_regions("claude_question_keys")
 
     def _clear_question(self, summary: str = "") -> None:
         """Remove question block. If summary, record the answer as a persistent
@@ -2430,12 +2501,13 @@ class OutputView:
                         meta_parts.append(f"{input_t // 1000}k ctx")
                     else:
                         meta_parts.append(f"{input_t} ctx")
-            # Append current provider + resolved model so it's visible per-turn
-            # (read from view settings set at session start in Session.start).
+            # Append current provider + resolved model + effort so it's visible
+            # per-turn (view settings set at session start in Session.start).
             _vs = self.view.settings() if self.view else None
             if _vs is not None:
                 _label = _vs.get("claude_provider_label")
                 _model = _vs.get("claude_model")
+                _effort = _vs.get("claude_effort")
                 if _model:
                     # "Claude/opus" is verbose; show just the model for the
                     # default backend, full label/model otherwise.
@@ -2445,6 +2517,8 @@ class OutputView:
                         meta_parts.append(_model)
                 elif _label and _label != "Claude":
                     meta_parts.append(_label)
+                if _effort:
+                    meta_parts.append(f"effort:{_effort}")
             if not meta_parts:
                 meta_parts.append("ok")
             lines.append(f"\n  @done({', '.join(meta_parts)})\n")
@@ -2453,31 +2527,20 @@ class OutputView:
 
         # Re-read view size (may have changed during text building)
         view_size = self.view.size()
-        # If there's content after our region, extend end to clean it up
-        # This handles race conditions where content was orphaned from previous renders
-        # BUT: Don't extend if there's a permission block - that's intentional content after the region
-        rerender_ui = False
+        # Conversation owns events + work strip (task list). Turn-modal UI
+        # (question / plan / permission) is *after* the conversation region.
+        # Never extend `end` into that tail — that was the “wrong re-render
+        # location” bug: task-list tail + question got mashed (orphan lines).
         has_trailing_ui = (
             (self.pending_permission and self.pending_permission.callback) or
             (self.pending_plan and self.pending_plan.callback) or
             (self.pending_question and self.pending_question.callback)
         )
-        if has_trailing_ui:
-            # Clamp end to not eat the trailing UI block
-            if self.pending_permission and self.pending_permission.callback:
-                ui_key = "claude_permission_block"
-            elif self.pending_plan and self.pending_plan.callback:
-                ui_key = "claude_plan_block"
-            else:
-                ui_key = "claude_question_block"
-            ui_region = self.view.get_regions(ui_key)
-            if ui_region and ui_region[0].size() > 0:
-                end = min(end, ui_region[0].begin())
-            else:
-                # UI block tracked region lost — extend to clean up, then re-render UI
-                end = view_size
-                rerender_ui = True
-        elif end < view_size:
+        trail = self._trailing_ui_start()
+        if trail is not None:
+            end = min(end, trail)
+        elif not has_trailing_ui and end < view_size:
+            # No modal UI — safe to absorb orphaned text after the region.
             end = view_size
 
         # Full-region replace remaps any caret inside [start, end) and can
@@ -2505,11 +2568,13 @@ class OutputView:
         # Update title to reflect working state
         self._update_title()
 
-        # Re-render UI blocks only if their tracked regions were lost
-        if rerender_ui:
-            if self.pending_permission and self.pending_permission.callback:
-                self._render_permission()
-            if self.pending_question and self.pending_question.callback:
+        # Keep question UI glued to the conversation tail (task list is *inside*
+        # the conversation; question is after). Re-place when the strip grows/
+        # shrinks so we never leave orphan option lines above the work strip.
+        if self.pending_question and self.pending_question.callback:
+            qreg = self.view.get_regions("claude_question_block")
+            if (not qreg or qreg[0].size() == 0
+                    or qreg[0].begin() != new_end):
                 self._render_question()
 
         # Inline image phantoms (minihtml data: + explicit size — ST docs).
