@@ -231,6 +231,8 @@ class Bridge:
                 send_result(id, {"ok": True})
             elif method == "poll_bg_tasks":
                 await self.poll_bg_tasks(id)
+            elif method == "cancel_loop":
+                await self.cancel_loop(id, params)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -1414,6 +1416,32 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
             "wake_prompt": prompt,
             "display_message": "⏰ " + prompt.split("\n", 1)[0][:60],
         })
+
+    async def cancel_loop(self, id: int, params: dict = None) -> None:
+        """User cancelled scheduled wakeup / cron from the plugin banner."""
+        n_cron = len(self._crons)
+        n_wake = len(self._wake_tasks)
+        self._crons.clear()
+        for t in list(self._wake_tasks):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._wake_tasks.clear()
+        self._pending_wake = None
+        self._pending_cron.clear()
+        try:
+            self._save_loop_state()
+        except Exception:
+            pass
+        try:
+            self._clear_loop_state()
+        except Exception:
+            pass
+        send_notification("loop_scheduled", {"fire_at": None})
+        with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
+            f.write(f"[loop] cancel_loop crons={n_cron} wakes={n_wake}\n")
+        send_result(id, {"ok": True, "crons": n_cron, "wakes": n_wake})
 
     # ── loop persistence: survive bridge/Sublime restarts ─────────────────────
     def _loop_state_path(self) -> str:

@@ -814,6 +814,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                     sublime.status_message(msg)
                     return
                 if action == "undo_message" and data:
+                    if getattr(data, "backend", "") == "grok":
+                        # Async points fetch — never send_wait on the UI thread.
+                        data.show_grok_undo_panel(self.window)
+                        return
                     turns = data.get_turns_for_undo()
                     if not turns:
                         sublime.status_message("No undoable turns")

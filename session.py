@@ -466,19 +466,12 @@ class Session:
             self._status(f"ready ({'; '.join(parts)})")
         else:
             self._status("ready")
-        # One-line transcript hint so effort is obvious without the status bar.
-        if self.effort and self.backend in ("claude", "grok"):
-            try:
-                model = ""
-                if self.output and self.output.view:
-                    model = self.output.view.settings().get("claude_model") or ""
-                bit = f"{model} · " if model else ""
-                self.output.text(
-                    f"\n*{backends.get(self.backend).label}: {bit}"
-                    f"reasoning effort **{self.effort}***\n"
-                )
-            except Exception:
-                pass
+        # Effort lives on status bar + @done only. Transcript hints stacked on
+        # every reconnect — strip any leftovers from earlier plugin versions.
+        try:
+            self.output.strip_trailing_status_hints()
+        except Exception:
+            pass
         # Persist "open" state (so plugin_loaded can track which sessions had views)
         self._save_session()
         # Auto-enter input mode when ready
@@ -788,22 +781,15 @@ class Session:
     def undo_message(self) -> None:
         """Undo last conversation turn (message round).
 
-        Claude: JSONL resume_session_at. Grok: x.ai/rewind points + disk
-        truncate + session/load resume.
+        Claude: JSONL resume_session_at. Grok: async rewind (never blocks UI).
         """
         if not self.session_id:
             return
         if self.working and self.current_tool != "rewinding...":
             return
         if self.backend == "grok":
-            turns = self.get_turns_for_undo()
-            if not turns:
-                print(f"[Claude] undo_message: no Grok rewind points")
-                sublime.status_message("No rewind points")
-                return
-            # Newest first from get_turns_for_undo — take last real turn.
-            _, rewind_id, draft = turns[0]
-            self._apply_undo(rewind_id, draft)
+            # Async: list points then execute last — must not send_wait on UI.
+            self._grok_undo_async(prompt_index=None, draft_prompt="")
             return
         rewind_id, undone_prompt = self._find_rewind_point()
         if not rewind_id:
@@ -819,7 +805,7 @@ class Session:
         (or str digits).
         """
         if self.backend == "grok":
-            self._apply_grok_undo(rewind_id, undone_prompt)
+            self._grok_undo_async(prompt_index=rewind_id, draft_prompt=undone_prompt or "")
             return
         saved_id = self.session_id
         print(f"[Claude] undo: rewinding {saved_id} to {rewind_id}")
@@ -887,46 +873,130 @@ class Session:
             self.output.current = None
         view.erase_regions("claude_conversation")
 
-    def _apply_grok_undo(self, prompt_index, undone_prompt: str) -> None:
-        """Grok: bridge rewind_execute (disk+ACP) then resume via session/load."""
-        try:
-            idx = int(prompt_index)
-        except (TypeError, ValueError):
-            print(f"[Claude] grok undo: bad prompt_index {prompt_index!r}")
-            sublime.status_message("Invalid rewind point")
-            return
+    def _grok_undo_async(self, prompt_index=None, draft_prompt: str = "") -> None:
+        """Grok message-round undo without blocking the UI thread.
+
+        Uses send() callbacks (main-thread), never send_wait. Flow:
+          optional rewind_points → rewind_execute → strip UI → restart session.
+        """
         if not self.client or not self.client.is_alive():
             sublime.status_message("Bridge not ready for rewind")
             return
-        print(f"[Claude] grok undo: session={self.session_id} → prompt_index={idx}")
+        if self.working and self.current_tool != "rewinding...":
+            return
+
         self.working = True
         self.current_tool = "rewinding..."
         self._animate()
-        # Default conversation_only so we don't surprise-revert files unless
-        # the user later opts in. Disk truncate of chat_history still runs.
-        resp = self.client.send_wait(
-            "rewind_execute",
-            {
-                "prompt_index": idx,
-                "mode": "conversation_only",
-                "restore_files": False,
-            },
-            timeout=60.0,
-        )
-        if resp.get("error"):
-            err = resp["error"]
-            msg = err.get("message") if isinstance(err, dict) else str(err)
+        sublime.status_message("Rewinding…")
+
+        def _fail(msg: str) -> None:
             print(f"[Claude] grok undo failed: {msg}")
             sublime.status_message(f"Rewind failed: {msg}")
             self.working = False
             self.current_tool = None
             self._update_title_idle()
+            self._enter_input_with_draft()
+
+        def _execute(idx: int, draft: str) -> None:
+            print(f"[Claude] grok undo: session={self.session_id} → prompt_index={idx}")
+            if not self.client or not self.client.is_alive():
+                _fail("bridge died")
+                return
+
+            state = {"done": False}
+
+            def on_exec(resp: dict) -> None:
+                if state["done"]:
+                    return
+                state["done"] = True
+                # Main thread (send callback via set_timeout).
+                if not isinstance(resp, dict):
+                    resp = {}
+                if "error" in resp:
+                    err = resp["error"]
+                    msg = err.get("message") if isinstance(err, dict) else str(err)
+                    _fail(msg or "execute error")
+                    return
+                # Bare result shape from rpc._handle
+                result = resp if "draft_prompt" in resp or "ok" in resp else (
+                    resp.get("result") or resp)
+                if not isinstance(result, dict):
+                    result = {}
+                d = (result.get("draft_prompt") or draft or "").strip()
+                self._finish_grok_undo(idx, d)
+
+            ok = self.client.send(
+                "rewind_execute",
+                {
+                    "prompt_index": idx,
+                    "mode": "conversation_only",
+                    "restore_files": False,
+                },
+                on_exec,
+            )
+            if not ok:
+                _fail("bridge send failed")
+                return
+
+            def _timeout():
+                if state["done"]:
+                    return
+                if self.current_tool != "rewinding...":
+                    return
+                state["done"] = True
+                _fail("timeout waiting for bridge (45s)")
+
+            sublime.set_timeout(_timeout, 45000)
+
+        # Index already known (quick panel) — skip points fetch.
+        if prompt_index is not None:
+            try:
+                idx = int(prompt_index)
+            except (TypeError, ValueError):
+                _fail(f"bad prompt_index {prompt_index!r}")
+                return
+            _execute(idx, draft_prompt or "")
             return
-        result = resp.get("result") or {}
-        draft = (result.get("draft_prompt") or undone_prompt or "").strip()
-        # Prefer preview from points if execute returned empty draft
-        if not draft:
-            draft = (undone_prompt or "").strip()
+
+        # Undo last turn: list points first.
+        def on_points(resp: dict) -> None:
+            if not isinstance(resp, dict):
+                resp = {}
+            if "error" in resp:
+                err = resp["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                _fail(msg or "points error")
+                return
+            result = resp if "points" in resp else (resp.get("result") or resp)
+            if not isinstance(result, dict):
+                result = {}
+            points = result.get("points") or []
+            if not points:
+                _fail("no rewind points")
+                return
+            # Prefer highest prompt_index (last user turn).
+            best = None
+            for p in points:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    i = int(p.get("prompt_index"))
+                except (TypeError, ValueError):
+                    continue
+                if best is None or i > best[0]:
+                    best = (i, (p.get("prompt_preview") or "").strip())
+            if best is None:
+                _fail("no valid rewind points")
+                return
+            _execute(best[0], best[1])
+
+        ok = self.client.send("rewind_points", {}, on_points)
+        if not ok:
+            _fail("bridge send failed")
+
+    def _finish_grok_undo(self, idx: int, draft: str) -> None:
+        """After successful rewind_execute: trim UI and reload session."""
         self._strip_view_from_prompt_index(idx)
         saved_id = self.session_id
         if self.client:
@@ -936,17 +1006,18 @@ class Session:
         self.session_id = saved_id
         self.resume_id = saved_id
         self.fork = False
-        self.draft_prompt = draft
+        self.draft_prompt = draft or ""
         self._input_mode_entered = True
-        self._pending_resume_at = None  # Grok uses session/load, not resume_at
+        self._pending_resume_at = None  # Grok uses session/load
         self._save_session()
         self.working = True
         self.current_tool = "rewinding..."
         self._animate()
-        # Resume loads truncated chat_history via ACP session/load
         self.start()
-        sublime.status_message(f"Rewound to turn {idx}" + (
-            f": {draft[:40]}…" if len(draft) > 40 else (f": {draft}" if draft else "")))
+        sublime.status_message(
+            f"Rewound to turn {idx}"
+            + (f": {draft[:40]}…" if len(draft) > 40 else (f": {draft}" if draft else ""))
+        )
 
     def _update_title_idle(self) -> None:
         try:
@@ -1004,30 +1075,66 @@ class Session:
         return result
 
     def _get_grok_turns_for_undo(self) -> list:
-        """Grok rewind points via bridge; newest first."""
-        if not self.client or not self.client.is_alive():
-            return []
-        resp = self.client.send_wait("rewind_points", {}, timeout=20.0)
-        if resp.get("error"):
-            print(f"[Claude] grok rewind_points: {resp.get('error')}")
-            return []
-        result = resp.get("result") or {}
-        points = result.get("points") or []
-        out = []
-        for p in points:
-            if not isinstance(p, dict):
-                continue
-            try:
-                idx = int(p.get("prompt_index"))
-            except (TypeError, ValueError):
-                continue
-            preview = (p.get("prompt_preview") or "").strip()
-            first = preview.split("\n")[0][:72] if preview else "(empty)"
-            files = " · files" if p.get("has_file_changes") else ""
-            label = f"{idx} — {first}{files}"
-            out.append((label, idx, preview))
-        out.reverse()  # newest first
-        return out
+        """Sync list for Claude-style callers — Grok must not block the UI.
+
+        Returns [] and kicks an async panel fetch if a window is available.
+        Prefer show_grok_undo_panel() from the command palette path.
+        """
+        # Never send_wait here — freezes Sublime (main-thread deadlock).
+        return []
+
+    def show_grok_undo_panel(self, window=None) -> None:
+        """Fetch rewind points async and show a quick panel (Grok)."""
+        win = window or self.window
+        if not win or not self.client or not self.client.is_alive():
+            sublime.status_message("Bridge not ready for rewind")
+            return
+        if self.working and self.current_tool != "rewinding...":
+            sublime.status_message("Busy — wait for the turn to finish")
+            return
+        sublime.status_message("Loading rewind points…")
+
+        def on_points(resp: dict) -> None:
+            if not isinstance(resp, dict):
+                resp = {}
+            if "error" in resp:
+                err = resp["error"]
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                sublime.status_message(f"Rewind points failed: {msg}")
+                return
+            result = resp if "points" in resp else (resp.get("result") or resp)
+            if not isinstance(result, dict):
+                result = {}
+            points = result.get("points") or []
+            turns = []
+            for p in points:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    idx = int(p.get("prompt_index"))
+                except (TypeError, ValueError):
+                    continue
+                preview = (p.get("prompt_preview") or "").strip()
+                first = preview.split("\n")[0][:72] if preview else "(empty)"
+                files = " · files" if p.get("has_file_changes") else ""
+                label = f"{idx} — {first}{files}"
+                turns.append((label, idx, preview))
+            turns.reverse()
+            if not turns:
+                sublime.status_message("No rewind points")
+                return
+            labels = [t[0] for t in turns]
+
+            def on_pick(i, _turns=turns):
+                if i < 0:
+                    return
+                _, rid, draft = _turns[i]
+                self._apply_undo(rid, draft)
+
+            win.show_quick_panel(labels, on_pick, placeholder="Rewind to…")
+
+        if not self.client.send("rewind_points", {}, on_points):
+            sublime.status_message("Bridge send failed")
 
     def _read_turns(self) -> list:
         """Read JSONL and return [(prompt, prev_assistant_uuid)] for each user turn."""
@@ -1739,6 +1846,7 @@ class Session:
 
         Shown whenever next_wake_at is in the future — not only in input mode
         (input-only made scheduled loops look dead mid-turn / after render).
+        Includes a remove control after the hint.
         """
         ps = self._get_wakeup_phantom_set()
         if not ps or not self.output or not self.output.view:
@@ -1761,8 +1869,38 @@ class Session:
         if pt is None:
             last_nl = content.rfind("\n")
             pt = last_nl if last_nl >= 0 else 0
-        html = f'<body style="margin: 4px 0; color: var(--bluish);">{label}</body>'
-        ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
+        # Clickable remove — cancels cron / ScheduleWakeup / client backup timers.
+        html = (
+            f'<body style="margin: 4px 0; color: var(--bluish);">'
+            f'{label}'
+            f' · <a href="cancel" style="color: var(--redish); '
+            f'text-decoration: none;">remove</a>'
+            f'</body>'
+        )
+        ps.update([sublime.Phantom(
+            sublime.Region(pt, pt),
+            html,
+            sublime.LAYOUT_BLOCK,
+            on_navigate=self._on_wakeup_banner_navigate,
+        )])
+
+    def _on_wakeup_banner_navigate(self, href: str) -> None:
+        if href == "cancel":
+            self.cancel_scheduled_loop()
+
+    def cancel_scheduled_loop(self) -> None:
+        """User-initiated cancel of cron / loop / scheduler wakeups."""
+        print(f"[Claude] cancel_scheduled_loop backend={self.backend}")
+        self.next_wake_at = None
+        self.is_looping = False
+        if self.output:
+            self.output._update_title()
+            self._update_wakeup_banner(show=False)
+        # Tell bridge to drop cron jobs / wake timers / Grok client backups.
+        if self.client and self.client.is_alive():
+            self.client.send("cancel_loop", {}, lambda r: print(
+                f"[Claude] cancel_loop → {r}"))
+        sublime.status_message("Scheduled wakeup removed")
 
     def _show_connecting_phantom(self) -> None:
         self._show_overlay_phantom("◎ Connecting...")
@@ -2130,9 +2268,8 @@ class Session:
         if self.next_wake_at:
             self.is_looping = True
         else:
-            # Cleared next fire — leave is_looping until user cancels / no jobs;
-            # still refresh banner so the ↻ chip drops.
-            pass
+            # Cleared (user remove / one-shot done / no remaining jobs).
+            self.is_looping = False
         if self.output:
             self.output._update_title()
             self._update_wakeup_banner(show=True)

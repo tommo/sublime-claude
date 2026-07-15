@@ -117,7 +117,10 @@ class OutputView:
         # Check if this is the active Claude view
         window = self.view.window()
         is_active = window and window.settings().get("claude_active_view") == self.view.id()
-        # ◉ = working, ◇ = idle, • = inactive+working, ❓ = questioning, ⏸ = sleeping
+        # Tab icons (active = this view is claude_active_view):
+        #   ◉ active + working   ◇ active + idle
+        #   • inactive + working (no prefix) inactive + idle
+        #   ❓ permission/question/plan   ⏸ sleeping   ↻ pending self-wake
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
         is_sleeping = session and session.is_sleeping
@@ -126,28 +129,28 @@ class OutputView:
             (self.pending_question and self.pending_question.callback) or
             (self.pending_plan and self.pending_plan.callback)
         )
-        # Tab title reflects the session-level working flag so silent wake-up
-        # queries (bg-task notifications, retain injects, …) still show ◉
-        # even though no visible Conversation was opened for them.
+        # Session-level working so silent wakes still show ◉ / • without a
+        # visible Conversation flip.
         is_working = (
             (session and session.working)
             or (self.current and self.current.working)
         )
-        # ↻ reflects a *confirmed pending* wake (next_wake_at in the future), not a
-        # sticky flag — so it self-clears once the wake fires or its time passes.
+        # ↻ = confirmed future wake only (clears when wake fires / expires).
         import time as _t
         _nxt = getattr(session, "next_wake_at", None) if session else None
         is_looping = bool(_nxt and _nxt > _t.time())
         if is_sleeping:
             prefix = "⏸ "
         elif is_questioning:
-            prefix = "❓"
-        elif is_looping:
-            prefix = "↻ "  # self-paced loop (scheduled wake / cron armed)
+            prefix = "❓ "
+        elif is_looping and not is_working:
+            # Don't hide a live turn behind ↻ — busy wins.
+            prefix = "↻ "
         elif is_active:
             prefix = "◉ " if is_working else "◇ "
         else:
-            prefix = "• " if is_working else "◇ "
+            # Inactive idle: no diamond (was wrongly ◇ and looked "idle-active").
+            prefix = "• " if is_working else ""
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
@@ -163,6 +166,57 @@ class OutputView:
         if len(name) > 24:
             name = name[:23] + "…"
         self.view.set_name(f"{prefix}{name}")
+
+    def strip_trailing_status_hints(self) -> None:
+        """Remove reconnect status spam from the view tail.
+
+        Effort/connect hints used to be appended on every init and stacked:
+          *Grok: grok-4.5 · reasoning effort **high***
+        Also drops trailing blank lines. Leaves real conversation content.
+        """
+        if not self.view or not self.view.is_valid():
+            return
+        import re
+        size = self.view.size()
+        if size <= 0:
+            return
+        scan_from = max(0, size - 4000)
+        tail = self.view.substr(sublime.Region(scan_from, size))
+        status_re = re.compile(
+            r"^\s*\*(?:"
+            r".*reasoning effort\s+\*\*[^*]+\*\*.*"
+            r"|Session reopened without agent transcript.*"
+            r")\*?\s*$"
+        )
+        # Build list of (line_start_abs, line_text) for lines in the tail.
+        # splitlines(True) keeps terminators so we can measure offsets.
+        parts = re.split(r"(?<=\n)", tail)
+        # Drop empty last part if tail ends with \n
+        if parts and parts[-1] == "":
+            parts.pop()
+        # Absolute start of each part
+        offsets = []
+        pos = scan_from
+        for p in parts:
+            offsets.append(pos)
+            pos += len(p)
+        # Drop trailing status / blank parts
+        cut = len(parts)
+        while cut > 0:
+            raw = parts[cut - 1]
+            line = raw.rstrip("\n")
+            if line.strip() == "" or status_re.match(line):
+                cut -= 1
+                continue
+            break
+        if cut == len(parts):
+            return
+        del_start = offsets[cut] if cut < len(offsets) else size
+        del_start = max(scan_from, min(del_start, size))
+        if del_start >= size:
+            return
+        # Leave a single trailing newline when there is prior content.
+        self._replace(del_start, size, "\n" if del_start > 0 else "")
 
     def _write(self, text: str, pos: Optional[int] = None) -> int:
         """Write text at position (or end). Returns end position."""
@@ -198,32 +252,109 @@ class OutputView:
         return vis.end() >= max(0, size - max(0, slack))
 
     def _pin_view_state(self) -> dict:
-        """Snapshot selection + viewport so a full-region rewrite does not jump."""
+        """Snapshot a *text anchor* at the viewport top + visible selection.
+
+        Pixel-only viewport y breaks when mid-buffer lines change length.
+        Also record the visible region so we can park the caret there — a caret
+        left at EOF makes ST chase the growing tail ("cursor still running").
+        """
         if not self.view or not self.view.is_valid():
             return {}
+        view = self.view
+        vp = view.viewport_position()
+        vis = view.visible_region()
+        try:
+            anchor = int(view.layout_to_text(vp))
+        except Exception:
+            anchor = vis.begin()
+        y_off = 0.0
+        try:
+            _ax, ay = view.text_to_layout(anchor)
+            y_off = float(vp[1]) - float(ay)
+        except Exception:
+            pass
         return {
-            "sels": [(r.a, r.b) for r in self.view.sel()],
-            "vp": self.view.viewport_position(),
+            "anchor": anchor,
+            "vis_a": vis.begin(),
+            "vis_b": vis.end(),
+            "y_off": y_off,
+            "x": float(vp[0]),
+            "sels": [(r.a, r.b) for r in view.sel()],
+            "size": view.size(),
         }
 
     def _restore_view_state(self, pin: dict) -> None:
-        """Restore selection/viewport after a replace that rewrote buffer text."""
+        """Restore viewport to the pinned text anchor; keep caret out of the tail."""
         if not pin or not self.view or not self.view.is_valid():
             return
-        size = self.view.size()
-        sels = pin.get("sels") or []
-        self.view.sel().clear()
-        if sels:
-            for a, b in sels:
-                a = max(0, min(int(a), size))
-                b = max(0, min(int(b), size))
-                self.view.sel().add(sublime.Region(a, b))
+        view = self.view
+        size = view.size()
+        anchor = max(0, min(int(pin.get("anchor") or 0), max(0, size)))
+        vis_a = max(0, min(int(pin.get("vis_a") or anchor), size))
+        vis_b = max(vis_a, min(int(pin.get("vis_b") or anchor), size))
+        y_off = float(pin.get("y_off") or 0)
+        x = float(pin.get("x") or 0)
+
+        def _apply_vp():
+            if not view.is_valid():
+                return
+            try:
+                _ax, ay = view.text_to_layout(anchor)
+                view.set_viewport_position((x, max(0.0, float(ay) + y_off)), False)
+            except Exception:
+                try:
+                    view.show(
+                        sublime.Region(anchor, anchor),
+                        show_surrounds=False,
+                        animate=False,
+                        keep_to_left=True,
+                    )
+                except Exception:
+                    pass
+
+        # Prefer carets that were in the visible slice; otherwise park at the
+        # viewport anchor so ST does not auto-scroll to an EOF caret every tick.
+        keep = []
+        for a, b in (pin.get("sels") or []):
+            lo, hi = (a, b) if a <= b else (b, a)
+            if hi >= vis_a and lo <= vis_b:
+                keep.append((
+                    max(0, min(int(a), size)),
+                    max(0, min(int(b), size)),
+                ))
+        view.sel().clear()
+        if keep:
+            for a, b in keep:
+                view.sel().add(sublime.Region(a, b))
         else:
-            self.view.sel().add(sublime.Region(0, 0))
-        vp = pin.get("vp")
-        if vp is not None:
-            # Keep reading position stable while the tail grows (no animate).
-            self.view.set_viewport_position(vp, False)
+            view.sel().add(sublime.Region(anchor, anchor))
+        _apply_vp()
+
+    def _schedule_viewport_restore(self, pin: dict) -> None:
+        """Re-apply pin after ST's post-edit scroll settles (double tick)."""
+        if not pin:
+            return
+        # Keep latest pin if multiple renders coalesce.
+        self._pending_vp_pin = pin
+
+        def _pass1():
+            p = getattr(self, "_pending_vp_pin", None)
+            if p is None:
+                return
+            self._restore_view_state(p)
+
+            def _pass2():
+                p2 = getattr(self, "_pending_vp_pin", None)
+                if p2 is None:
+                    return
+                self._restore_view_state(p2)
+                # Clear only if nothing newer was scheduled.
+                if getattr(self, "_pending_vp_pin", None) is p2:
+                    self._pending_vp_pin = None
+
+            sublime.set_timeout(_pass2, 0)
+
+        sublime.set_timeout(_pass1, 0)
 
     def _scroll_to_end(self, force: bool = False) -> None:
         """Scroll to end when following the stream; leave history view alone.
@@ -2295,6 +2426,13 @@ class OutputView:
         if not self.current or not self.current.working or not self.view:
             return
         self._spinner_frame += 1
+        # User reading mid-history: do not full-rewrite the buffer every tick
+        # just to flip ⠋→⠙ at the tail (main source of "fullscreen flash").
+        # Tool/text updates still re-render via their own paths (with pin).
+        if not self._is_following_tail():
+            if self._spinner_frame % 15 == 0:
+                self._update_title()
+            return
         self._render_current(auto_scroll=False)
         # Periodically clear undo history to prevent memory bloat
         if self._spinner_frame % 50 == 0:
@@ -2543,10 +2681,10 @@ class OutputView:
             # No modal UI — safe to absorb orphaned text after the region.
             end = view_size
 
-        # Full-region replace remaps any caret inside [start, end) and can
-        # thrash the viewport while streaming. If the user is not following
-        # the tail (or auto_scroll is off, e.g. spinner), pin sel + viewport
-        # and restore after the rewrite.
+        # Full-region replace remaps carets and can thrash the viewport while
+        # streaming. When the user is reading mid-history (or auto_scroll is
+        # off), pin a *text anchor* at the viewport top and restore after ST
+        # settles — pixel-y alone still jumps when mid-buffer line lengths change.
         want_scroll = bool(getattr(self, "_auto_scroll", True))
         following = want_scroll and self._is_following_tail()
         pin = None if following else self._pin_view_state()
@@ -2559,28 +2697,32 @@ class OutputView:
             "", "", sublime.HIDDEN,
         )
 
-        if pin is not None:
-            self._restore_view_state(pin)
-        elif want_scroll:
-            # Following: keep tail in view; do not move the caret.
-            self._scroll_to_end(force=True)
-
-        # Update title to reflect working state
+        # Update title (tab only — no viewport effect)
         self._update_title()
 
-        # Keep question UI glued to the conversation tail (task list is *inside*
-        # the conversation; question is after). Re-place when the strip grows/
-        # shrinks so we never leave orphan option lines above the work strip.
+        # Keep question UI glued to the conversation tail. When pinned, avoid
+        # re-anchoring every spinner tick unless the block is missing/misplaced
+        # — extra inserts at the end still make ST flicker the viewport.
         if self.pending_question and self.pending_question.callback:
             qreg = self.view.get_regions("claude_question_block")
-            if (not qreg or qreg[0].size() == 0
-                    or qreg[0].begin() != new_end):
+            need_q = (
+                not qreg or qreg[0].size() == 0
+                or qreg[0].begin() != new_end
+            )
+            if need_q and (following or not pin):
+                self._render_question()
+            elif need_q and pin:
+                # Still fix placement but restore pin after.
                 self._render_question()
 
-        # Inline image phantoms (minihtml data: + explicit size — ST docs).
-        # Defer one tick so region positions match the final buffer.
-        # Skip while pinned-history streaming: phantoms at the tail don't help
-        # and re-layout adds flash.
+        if pin is not None:
+            # Immediate + deferred restore (beats ST auto-scroll-to-caret).
+            self._restore_view_state(pin)
+            self._schedule_viewport_restore(pin)
+        elif want_scroll:
+            self._scroll_to_end(force=True)
+
+        # Phantoms: skip while pinned mid-history during a live turn (flashy).
         if following or not self.current.working:
             sublime.set_timeout(self._refresh_media_phantoms, 10)
 

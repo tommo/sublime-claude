@@ -461,6 +461,21 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # Clear reconnecting flag
         view.settings().erase("claude_reconnecting")
 
+    # Buffer-mutating commands that must stay inside the ◎ input region.
+    # Everything else (Cmd+D find_under_expand, multi-cursor, find, nav) is
+    # allowed over history — the view is read-mostly; we only block edits.
+    _INPUT_EDIT_COMMANDS = frozenset({
+        "insert", "insert_snippet", "insert_best_completion",
+        "left_delete", "right_delete", "delete_word", "delete_to_mark",
+        "cut", "paste", "paste_and_indent", "paste_from_history",
+        "swap_line_up", "swap_line_down", "join_lines", "duplicate_line",
+        "permute_lines", "permute_selection", "sort_lines", "wrap_lines",
+        "indent", "unindent", "reindent", "complete_under",
+        "commit_completion", "auto_complete", "replace_completion_with_next_completion",
+        "yank", "run_macro_file", "run_macro",
+        "upper_case", "lower_case", "title_case", "swap_case",
+    })
+
     def on_text_command(self, command_name, args):
         """Intercept text commands to restrict edits in input mode."""
         s = get_session_for_view(self.view)
@@ -476,37 +491,31 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not s.output.is_input_mode():
             return None
 
-        # Commands that are always safe (read-only, navigation, selection)
-        safe_commands = {
-            "copy", "select_all", "find_all_under",
-            "drag_select", "context_menu",
-            "move", "move_to", "scroll_lines",
-            "claude_submit_input", "claude_code_interrupt",
-            "claude_open_link", "claude_close_session"
-        }
-
-        if command_name in safe_commands:
+        # Plugin / navigation / selection / find — never block (Cmd+D etc.)
+        if command_name.startswith("claude_"):
+            return None
+        if command_name not in self._INPUT_EDIT_COMMANDS:
+            # Allow find_under_expand, drag_select, move, copy, select_*, …
             return None
 
-        # All other commands are potentially destructive - check if cursor is in input region
+        # Edit commands: keep them inside the input region only
         input_start = s.output._input_start
         sel = self.view.sel()
 
-        # Check ALL regions in the selection
         for region in sel:
-            # If typing outside input region, refocus to input area
             if region.begin() < input_start or region.end() < input_start:
-                # For insert commands, move cursor to end of input and allow the command
-                if command_name == "insert" or (command_name == "insert" and args and "characters" in args):
-                    # Move cursor to end of input area
+                # Typing outside history → jump to input and allow insert
+                if command_name == "insert":
                     input_end = self.view.size()
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(input_end, input_end))
                     self.view.show(input_end)
                     return None
 
-                # For other commands, block them
-                print(f"[Claude] BLOCKING {command_name} at position {region.begin()}, input_start={input_start}")
+                # Block destructive edits over conversation history
+                print(
+                    f"[Claude] BLOCKING {command_name} at {region.begin()}, "
+                    f"input_start={input_start}")
                 return ("noop", {})
 
         return None
@@ -618,15 +627,19 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 self.view.show(self.view.size())
                 return
 
-        # Block other commands that happened outside input area
+        # Soft-undo buffer edits that landed in history (not selection/find).
+        # find_under_expand / multi-cursor must not be reverted here.
         elif command and not command.startswith("claude"):
-            input_start = s.output._input_start
-            if len(self.view.sel()) > 0:
-                for region in self.view.sel():
-                    if region.begin() < input_start:
-                        # Unwanted edit in history - undo it
-                        self.view.run_command("soft_undo")
-                        return
+            if command not in self._INPUT_EDIT_COMMANDS:
+                # Non-edit (selection, nav, find) — leave alone
+                pass
+            else:
+                input_start = s.output._input_start
+                if len(self.view.sel()) > 0:
+                    for region in self.view.sel():
+                        if region.begin() < input_start:
+                            self.view.run_command("soft_undo")
+                            return
 
         # Don't capture an AskUserQuestion free-text answer as the prompt draft
         # (question input reuses _input_mode) — it would reappear next prompt.

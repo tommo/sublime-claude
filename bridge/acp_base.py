@@ -1267,7 +1267,18 @@ class AcpBridge(BaseBridge):
             # plan_response: BaseBridge.handle_plan_response (+ mode switch override)
             "rewind_points": self.handle_rewind_points,
             "rewind_execute": self.handle_rewind_execute,
+            "cancel_loop": self.handle_cancel_loop,
         }
+
+    async def handle_cancel_loop(self, req_id: Optional[int],
+                                  params: dict) -> None:
+        """Cancel all client-side schedule backups and clear the loop banner."""
+        keys = list(self._client_schedule_tasks.keys())
+        for key in keys:
+            self._cancel_client_schedule(key)
+        self._emit_loop_scheduled(None)
+        self.file_log(f"cancel_loop: cleared {len(keys)} client schedule(s)")
+        send_result(req_id, {"ok": True, "cancelled": len(keys)})
 
     async def handle_initialize(self, req_id: Optional[int],
                                  params: dict) -> None:
@@ -1963,11 +1974,19 @@ class AcpBridge(BaseBridge):
                 "leaf_response_id")
             if leaf:
                 acp_params["expected_leaf_response_id"] = leaf
-            acp_result = await self._send_acp(
-                "_x.ai/rewind/execute", acp_params) or {}
+            # Grok ACP execute often hangs or returns success:false; never
+            # block the bridge forever — disk truncate is the real work.
+            acp_result = await asyncio.wait_for(
+                self._send_acp("_x.ai/rewind/execute", acp_params),
+                timeout=12.0,
+            ) or {}
             self.file_log(
                 f"rewind/execute target={target} mode={mode} "
                 f"acp={str(acp_result)[:300]}")
+        except asyncio.TimeoutError:
+            self.file_log(
+                f"rewind/execute ACP TIMEOUT (disk still applied) target={target}")
+            acp_result = {"success": False, "error": "acp timeout"}
         except Exception as e:
             self.file_log(f"rewind/execute ACP error (disk still applied): {e}")
             acp_result = {"success": False, "error": str(e)}

@@ -12,6 +12,10 @@ class JsonRpcClient:
         self.proc: Optional[subprocess.Popen] = None
         self.request_id = 0
         self.pending: Dict[int, Callable[[dict], None]] = {}
+        # send_wait: id → (holder_dict, Event) completed on the reader thread
+        # so a blocked UI thread cannot deadlock waiting for set_timeout.
+        self._sync_waits: Dict[int, tuple] = {}
+        self._send_lock = threading.Lock()
         self.on_notification = on_notification
         self.reader_thread: Optional[threading.Thread] = None
         self.running = False
@@ -63,6 +67,11 @@ class JsonRpcClient:
     def stop(self) -> None:
         self.running = False
         self.pending.clear()
+        # Unblock any send_wait callers
+        for rid, (holder, ev) in list(self._sync_waits.items()):
+            holder["error"] = {"message": "Bridge stopped"}
+            ev.set()
+        self._sync_waits.clear()
         if self.proc:
             self.proc.terminate()
             self.proc.wait()
@@ -73,41 +82,64 @@ class JsonRpcClient:
         return self.proc is not None and self.proc.poll() is None
 
     def send(self, method: str, params: dict, callback: Optional[Callable[[dict], None]] = None) -> bool:
-        """Send request to bridge. Returns False if bridge is dead."""
+        """Send request to bridge. Returns False if bridge is dead.
+
+        Response callbacks run on the Sublime main thread (via set_timeout).
+        """
         if not self.proc or not self.proc.stdin:
             return False
         if self.proc.poll() is not None:
-            # Process has died
             print(f"[Claude] Bridge process died with code {self.proc.returncode}")
             return False
 
-        self.request_id += 1
-        req = {"jsonrpc": "2.0", "id": self.request_id, "method": method, "params": params}
-
-        if callback:
-            self.pending[self.request_id] = callback
-
-        self.proc.stdin.write((json.dumps(req) + "\n").encode())
-        self.proc.stdin.flush()
+        with self._send_lock:
+            self.request_id += 1
+            rid = self.request_id
+            req = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+            if callback:
+                self.pending[rid] = callback
+            try:
+                self.proc.stdin.write((json.dumps(req) + "\n").encode())
+                self.proc.stdin.flush()
+            except Exception as e:
+                self.pending.pop(rid, None)
+                print(f"[Claude] Bridge send failed: {e}")
+                return False
         return True
 
     def send_wait(self, method: str, params: dict, timeout: float = 30.0) -> dict:
-        """Send request and wait for response. Returns {"result": ...} or {"error": ...}."""
-        import time
-        result = {}
-        done = threading.Event()
+        """Send request and wait for response. Returns {"result": ...} or {"error": ...}.
 
-        def callback(response):
-            result.update(response)
-            done.set()
-
-        if not self.send(method, params, callback):
+        Completes on the reader thread (not set_timeout), so this must NOT be
+        used from the UI thread for long ops — it freezes the editor until the
+        bridge replies. Prefer async send() + callback for UI actions.
+        """
+        if not self.proc or not self.proc.stdin:
             return {"error": {"message": "Failed to send request - bridge is dead"}}
+        if self.proc.poll() is not None:
+            return {"error": {"message": f"Bridge process died with code {self.proc.returncode}"}}
+
+        holder: dict = {}
+        done = threading.Event()
+        with self._send_lock:
+            self.request_id += 1
+            rid = self.request_id
+            self._sync_waits[rid] = (holder, done)
+            req = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+            try:
+                self.proc.stdin.write((json.dumps(req) + "\n").encode())
+                self.proc.stdin.flush()
+            except Exception as e:
+                self._sync_waits.pop(rid, None)
+                return {"error": {"message": f"Bridge send failed: {e}"}}
 
         if not done.wait(timeout):
+            self._sync_waits.pop(rid, None)
             return {"error": {"message": f"Request timed out after {timeout}s"}}
 
-        return result
+        if "error" in holder:
+            return {"error": holder["error"]}
+        return {"result": holder.get("result", {})}
 
     def _read_loop(self) -> None:
         import sublime
@@ -129,6 +161,18 @@ class JsonRpcClient:
                     print(f"[Claude RPC] read_loop: invalid JSON line: {e}: {snippet!r}")
                     continue
 
+                mid = msg.get("id")
+                # send_wait completions: always on reader thread
+                if mid is not None and mid in self._sync_waits:
+                    holder, ev = self._sync_waits.pop(mid)
+                    if "error" in msg:
+                        holder["error"] = msg["error"]
+                    else:
+                        holder["result"] = msg.get("result", {})
+                    ev.set()
+                    continue
+
+                # Normal responses + notifications on the main thread
                 sublime.set_timeout(lambda m=msg: self._handle(m), 0)
             except Exception as e:
                 print(f"[Claude RPC] read_loop error: {e}")
@@ -148,6 +192,11 @@ class JsonRpcClient:
         print(f"[Claude RPC] read_loop: {detail}")
         self.running = False
 
+        for rid, (holder, ev) in list(self._sync_waits.items()):
+            holder["error"] = {"message": detail}
+            ev.set()
+        self._sync_waits.clear()
+
         pending = list(self.pending.items())
         self.pending.clear()
         if not pending:
@@ -160,6 +209,7 @@ class JsonRpcClient:
     def _handle(self, msg: dict) -> None:
         if "id" in msg and msg["id"] in self.pending:
             cb = self.pending.pop(msg["id"])
+            # Historical shape: bare result dict, or {"error": ...}
             cb({"error": msg["error"]} if "error" in msg else msg.get("result", {}))
         elif "method" in msg:
             self.on_notification(msg["method"], msg.get("params", {}))
