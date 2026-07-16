@@ -33,6 +33,22 @@ class ClaudeToggleSubmitModeCommand(sublime_plugin.ApplicationCommand):
 
 # --- Input Mode Commands ---
 
+def _caret_outside_composer(view, output) -> bool:
+    """True if any selection is before the ◎ draft (history / above composer)."""
+    if not output or not output.is_input_mode():
+        return False
+    # Free-text Other uses the same flag — allow Enter to submit that path
+    if getattr(output, "_question_input_mode", False):
+        return False
+    input_start = getattr(output, "_input_start", None)
+    if input_start is None:
+        return False
+    for region in view.sel():
+        if region.begin() < input_start or region.end() < input_start:
+            return True
+    return False
+
+
 class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
     """Handle Enter key in input mode - submit the prompt."""
     def run(self, edit):
@@ -57,11 +73,25 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             return
 
         if not s.output.is_input_mode():
+            # Sticky ◎ not open yet — open it (idle) rather than no-op
+            if not s.working and getattr(s, "_composer_allowed", True) and not s.is_sleeping:
+                try:
+                    s._enter_input_with_draft()
+                except Exception:
+                    pass
+            return
+
+        # Caret in history: focus ◎, don't submit
+        if _caret_outside_composer(self.view, s.output):
+            try:
+                s.output.focus_composer(force_show=True)
+            except Exception:
+                pass
             return
 
         text = s.output.get_input_text().strip()
 
-        # Ignore empty input
+        # Ignore empty input (already in ◎ — stay put)
         if not text:
             return
 
@@ -272,13 +302,21 @@ class ClaudeReplaceContentCommand(sublime_plugin.TextCommand):
 
 
 class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
-    """Insert newline in input mode (Shift+Enter)."""
+    """Insert newline in input mode (Shift+Enter / modifier-submit Enter)."""
     def run(self, edit):
         s = get_session_for_view(self.view)
-        if s and s.output.is_input_mode():
-            for region in self.view.sel():
-                if s.output.is_in_input_region(region.begin()):
-                    self.view.insert(edit, region.begin(), "\n")
+        if not s or not s.output.is_input_mode():
+            return
+        # Outside ◎: focus composer instead of a no-op / history edit
+        if _caret_outside_composer(self.view, s.output):
+            try:
+                s.output.focus_composer(force_show=True)
+            except Exception:
+                pass
+            return
+        for region in self.view.sel():
+            if s.output.is_in_input_region(region.begin()):
+                self.view.insert(edit, region.begin(), "\n")
 
 
 # --- Permission Commands ---

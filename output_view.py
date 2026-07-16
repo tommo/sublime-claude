@@ -487,12 +487,12 @@ class OutputView:
             from . import claude_code
             session = claude_code.get_session_for_view(self.view)
             if session:
-                try:
+                if hasattr(session, "_clear_queue_phantom"):
+                    session._clear_queue_phantom()
+                else:
                     ps = getattr(session, "_queue_phantom_set", None)
                     if ps:
                         ps.update([])
-                except Exception:
-                    pass
         except Exception:
             pass
         if self.view:
@@ -663,11 +663,14 @@ class OutputView:
         if _sess:
             _sess._update_permission_banner(show=False)
             _sess._update_wakeup_banner(show=False)
-            # Queue phantom re-anchors after re-enter; clear while strip is gone
+            # Queue hairline re-anchors after re-enter; clear while strip is gone
             try:
-                ps = getattr(_sess, "_queue_phantom_set", None)
-                if ps:
-                    ps.update([])
+                if hasattr(_sess, "_clear_queue_phantom"):
+                    _sess._clear_queue_phantom()
+                else:
+                    ps = getattr(_sess, "_queue_phantom_set", None)
+                    if ps:
+                        ps.update([])
             except Exception:
                 pass
 
@@ -933,6 +936,18 @@ class OutputView:
                 self._pad_phantom_set.update([])
         except Exception:
             pass
+        # Queue hairline lives on the session PhantomSet — clear it too
+        try:
+            from . import claude_code
+            _sess = claude_code.get_session_for_view(self.view)
+            if _sess and hasattr(_sess, "_clear_queue_phantom"):
+                _sess._clear_queue_phantom()
+            elif _sess:
+                ps = getattr(_sess, "_queue_phantom_set", None)
+                if ps:
+                    ps.update([])
+        except Exception:
+            pass
 
         OutputView.strip_composer_tail(self.view)
 
@@ -1015,28 +1030,32 @@ class OutputView:
         # Exit input mode if active (query is starting)
         # Save any typed text as draft so it's not lost
         if self._input_mode:
-            # Get session to save draft
             from . import claude_code
             session = claude_code.get_session_for_view(self.view)
             if session:
                 session.draft_prompt = self.get_input_text()
             self.exit_input_mode(keep_text=False)
         else:
-            # Not in input mode, but check for stale input markers
-            # This can happen after restart or if state got corrupted
+            # No sticky ◎ — still drop any orphaned queue hairline
+            try:
+                from . import claude_code
+                session = claude_code.get_session_for_view(self.view)
+                if session and hasattr(session, "_clear_queue_phantom"):
+                    session._clear_queue_phantom()
+            except Exception:
+                pass
+            # Stale input markers after restart / corrupted state
             content = self.view.substr(sublime.Region(0, self.view.size()))
             lines = content.split('\n')
-            # Check if last non-empty lines look like input area (marker without ▶, context, or queued line)
-            for line in reversed(lines[-5:]):  # Check last 5 lines
+            for line in reversed(lines[-5:]):
                 if not line.strip():
                     continue
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
                 is_context_line = line.startswith(CONTEXT_PREFIX)
                 is_queued_line = line.startswith('⏳ ')
                 if is_input_marker or is_context_line or is_queued_line:
-                    # Found stale input marker - clean it up
                     self.reset_input_mode()
-                break  # Only check the last non-empty line
+                break
 
         # Clear pending context display
         start, end = self._pending_context_region
@@ -3242,6 +3261,22 @@ class OutputView:
         following = (want_scroll and at_tail) or typing_at_tail
         pin = None if following else self._pin_view_state()
 
+        # Drop queue hairline *before* buffer rewrite — ST remaps LAYOUT_BLOCK
+        # phantoms inside the replaced range into mid-turn history (orphan split
+        # under the user ◎ prompt). Re-pin after if sticky ◎ still open.
+        try:
+            from . import claude_code
+            _sess_pre = claude_code.get_session_for_view(self.view)
+            if _sess_pre:
+                if hasattr(_sess_pre, "_clear_queue_phantom"):
+                    _sess_pre._clear_queue_phantom()
+                else:
+                    _ps = getattr(_sess_pre, "_queue_phantom_set", None)
+                    if _ps:
+                        _ps.update([])
+        except Exception:
+            pass
+
         old_end = end
         new_end = self._replace(start, end, text)
         delta = new_end - old_end
@@ -3339,12 +3374,16 @@ class OutputView:
             if _sess and getattr(_sess, "_wakeup_armed", None) and _sess._wakeup_armed():
                 sublime.set_timeout(
                     lambda s=_sess: s._update_wakeup_banner(show=True), 15)
-            if was_input and _sess and self._input_mode:
+            if _sess and self._input_mode and was_input:
                 sublime.set_timeout(
                     lambda s=_sess: s._update_permission_banner(show=True), 15)
                 sublime.set_timeout(
                     lambda s=_sess: s._update_queue_phantom(), 15)
                 sublime.set_timeout(self._update_composer_pad_phantom, 15)
+            elif _sess and not self._input_mode:
+                # Ensure no orphan splitter after this frame
+                if hasattr(_sess, "_clear_queue_phantom"):
+                    _sess._clear_queue_phantom()
         except Exception:
             pass
 

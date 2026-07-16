@@ -1899,6 +1899,19 @@ class Session:
         finally:
             self._firing_queue = False
 
+    def _clear_queue_phantom(self) -> None:
+        """Remove queue chips + hairline split (safe if never created)."""
+        try:
+            ps = getattr(self, "_queue_phantom_set", None)
+            if ps is not None:
+                ps.update([])
+            # Also clear via rebound set in case of view swap / stale attr
+            ps2 = self._phantom_set_for("_queue_phantom_set", "claude_queue")
+            if ps2 is not None and ps2 is not ps:
+                ps2.update([])
+        except Exception:
+            pass
+
     def _update_queue_phantom(self) -> None:
         """Composer chrome *above* ◎: optional queue chips + a hairline split.
 
@@ -1907,19 +1920,31 @@ class Session:
           ─ hairline ─
           ◎ input…
 
-        Keep the split subtle — a thick bar is distracting for every idle ◎.
+        Only while sticky ◎ is open. Conversation rewrites must not leave an
+        orphaned hairline mid-history (ST remaps LAYOUT_BLOCK into the turn).
         Anchor on the line *above* ◎ with LAYOUT_BLOCK.
         """
         import html as _html
-        ps = self._phantom_set_for("_queue_phantom_set", "claude_queue")
-        if not ps or not self.output or not self.output.view:
+        if not self.output or not self.output.view:
             return
         view = self.output.view
         if not view.is_valid():
             return
+        # Never draw over history / sleep / modal / free-text Other
         in_input = getattr(self.output, "_input_mode", False)
-        if not in_input:
-            ps.update([])
+        if (
+            not in_input
+            or getattr(self.output, "_question_input_mode", False)
+            or view.settings().get("claude_sleeping")
+            or (getattr(self.output, "has_turn_modal_ui", None)
+                and self.output.has_turn_modal_ui()
+                and not in_input)
+        ):
+            self._clear_queue_phantom()
+            return
+
+        ps = self._phantom_set_for("_queue_phantom_set", "claude_queue")
+        if not ps:
             return
 
         # Peel = start of composer (◎). Park phantom on the previous line so
@@ -1930,7 +1955,12 @@ class Session:
         if peel is None or peel < 0:
             peel = view.size()
         peel = min(max(0, int(peel)), view.size())
-        pt = max(0, peel - 1) if peel > 0 else 0
+        # If peel is 0 there is no "above ◎" line — skip rather than pin at 0
+        # (that used to leave a hairline at the top of the buffer).
+        if peel <= 0:
+            self._clear_queue_phantom()
+            return
+        pt = peel - 1
 
         rows = []
         q = list(self._queued_prompts or [])
@@ -1970,8 +2000,11 @@ class Session:
                 sublime.LAYOUT_BLOCK,
                 on_navigate=self._on_queue_phantom_navigate,
             )])
-        except Exception as e:
-            print(f"[Claude] queue phantom: {e}")
+        except Exception:
+            try:
+                self._clear_queue_phantom()
+            except Exception:
+                pass
 
     def _on_queue_phantom_navigate(self, href: str) -> None:
         if not href.startswith("drop:"):
