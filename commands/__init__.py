@@ -63,11 +63,12 @@ from .pty_cmds import (  # noqa: F401
     ClaudeCodeToggleTerminalRevealCommand,
 )
 
-# Quick Agent lives in quick_agent.py (panel, not doc view)
+# Quick Agent host (multi-slot, ≤3)
 from ..quick_agent import (  # noqa: F401
     ClaudeQuickAgentCommand,
     ClaudeQuickAgentConfigCommand,
     ClaudeQuickAgentStopCommand,
+    ClaudeQuickAgentNewSlotCommand,
 )
 from .text_cmds import (  # noqa: F401
     ClaudeToggleSubmitModeCommand,

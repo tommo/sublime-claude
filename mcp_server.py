@@ -354,6 +354,7 @@ class MCPSocketServer:
             "read_session_output": self._read_session_output,
             "list_profile_docs": self._list_profile_docs,
             "read_profile_doc": self._read_profile_doc,
+            "quick_done": self._quick_done,
             # Terminal tools (our own PTY terminal)
             "terminal_list": self._terminal_list,
             "terminal_send": self._terminal_send,
@@ -899,6 +900,17 @@ class MCPSocketServer:
             result["tail"] = tail
 
         return result
+
+    # ─── Quick Agent ─────────────────────────────────────────────────────
+
+    def _quick_done(self, status: str = "completed", message: str = "") -> dict:
+        """End the current Quick Agent slot (self-stop). Not for main sessions."""
+        from . import quick_agent as qa
+        return qa.complete_quick_from_tool(
+            status=status,
+            message=message,
+            view_id=self._caller_view_id,
+        )
 
     # ─── Session Spawn ────────────────────────────────────────────────────
 

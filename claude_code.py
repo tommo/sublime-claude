@@ -56,11 +56,12 @@ from .commands import (
     ClaudeCodeViewHistoryCommand,
 )
 
-# Quick Agent (bottom panel)
+# Quick Agent host (multi-slot)
 from .quick_agent import (
     ClaudeQuickAgentCommand,
     ClaudeQuickAgentConfigCommand,
     ClaudeQuickAgentStopCommand,
+    ClaudeQuickAgentNewSlotCommand,
 )
 
 # Event listeners

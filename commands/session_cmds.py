@@ -631,17 +631,20 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                                            or current_view.settings().get("pty_reveal_owner"))
         current_file = current_view.file_name() if current_view else None
 
-        # Quick Agent — full session sheet with pinned fast model (⌘⇧\)
+        # Quick Agent host — ≤3 transient slots (⌘⇧\)
         try:
             from .. import quick_agent as _qa
             _qa_label = _qa.config_label()
             _qa_live = _qa.get_quick_session(self.window) is not None
+            _h = _qa.get_host(self.window)
+            _n = len(_h.slots) if _h else 0
         except Exception:
             _qa_label = "trivia / short tasks"
             _qa_live = False
+            _n = 0
         items.append([
-            "⚡ Quick Agent" + (" · open" if _qa_live else ""),
-            f"{_qa_label} · full session UX · ⌘⇧\\",
+            "⚡ Quick Agent" + (f" · {_n}/3" if _qa_live else ""),
+            f"{_qa_label} · multi-slot host · ⌘⇧\\",
         ])
         actions.append(("quick_agent", None))
 

@@ -187,7 +187,7 @@
         "model": "flash",
         "effort": "low",
         "permission_mode": "bypassPermissions",
-        "system_prompt": "You are a Quick Agent for short trivia and focused tasks. Answer concisely. Prefer a few sentences unless the user asks for depth."
+        "system_prompt": "You are a Quick Agent for short trivia and focused tasks. Answer concisely. Prefer a few sentences unless the user asks for depth. When the request is fully handled, call MCP tool quick_done with status='completed' and a one-line message; if stuck use status='blocked'."
     },
 
     // Environment variables passed to bridge process

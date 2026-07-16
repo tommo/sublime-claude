@@ -482,6 +482,27 @@ For simple operations, prefer the dedicated tools above.""",
                     "description": "List saved tools in .claude/sublime_tools/ with descriptions",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
+                {
+                    "name": "quick_done",
+                    "description": """End the current Quick Agent slot when the short task is finished.
+Only valid inside a Quick Agent (⚡) session — not a full Claude/Grok sheet.
+Call with status='completed' and a one-line message when done, or status='blocked' if stuck.
+This stops the slot's bridge so the host can free the slot.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "status": {
+                                "type": "string",
+                                "description": "completed (default) or blocked",
+                                "enum": ["completed", "blocked"]
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "One-line summary or blocked reason"
+                            }
+                        }
+                    }
+                },
                 # ─── Terminal Tools ──────────────────────────────────────────
                 # For interactive/long-running processes (dev servers, REPLs, watch modes).
                 {

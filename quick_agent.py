@@ -1,23 +1,48 @@
-"""Quick Agent — a real session view with a pinned fast model config.
+"""Quick Agent host — multi-slot (≤3) transient agents in one sheet.
 
-Same UX as any Claude session (inline ◎ input, streaming, tools, permissions).
-Difference is only the model/backend profile from settings `quick_agent`
-(e.g. deepseek flash). One reusable Quick session per window.
+Each slot owns a short-lived Session (own bridge). One host view per window
+with a phantom tab bar; only the active slot paints the buffer. Soft-hide
+keeps bridges warm. Agents call quick_done to stop their own slot.
 """
 from __future__ import annotations
 
+import re
 import sublime
 import sublime_plugin
-from typing import Dict, Optional, List, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List, Tuple, Any
 
 from . import backends
 from .session import Session
 
-# window.id() → Session
-_quick_sessions: Dict[int, Session] = {}
-
-# Warm amber palette — distinct from default Claude / codex / copilot sheets
+MAX_QUICK_SLOTS = 3
 QUICK_COLOR_SCHEME = "Packages/ClaudeCode/ClaudeOutput-quick.hidden-tmTheme"
+TAB_BAR_KEY = "claude_quick_tabs"
+
+# window.id() → QuickHost
+_hosts: Dict[int, "QuickHost"] = {}
+
+# Pure helpers (unit-tested without a live bridge)
+def normalize_done_status(status: Optional[str]) -> str:
+    s = (status or "completed").strip().lower()
+    if s in ("blocked", "error", "failed", "fail"):
+        return "blocked"
+    return "completed"
+
+
+def can_add_slot(n_slots: int, cap: int = MAX_QUICK_SLOTS) -> bool:
+    return n_slots < cap
+
+
+def default_system_prompt() -> str:
+    return (
+        "You are a Quick Agent for short trivia and focused tasks. "
+        "Answer concisely. Prefer a few sentences unless the user asks for depth. "
+        "When the user's request is fully handled, call the MCP tool "
+        "quick_done (via use_tool / sublime tools) with status='completed' and a "
+        "one-line message summary. If you cannot finish, call quick_done with "
+        "status='blocked' and a short reason. Do not leave the session open waiting."
+    )
 
 
 def load_config() -> dict:
@@ -54,7 +79,6 @@ def config_label(cfg: dict = None) -> str:
 
 
 def resolve_model_id(cfg: dict = None) -> str:
-    """Map quick_agent model aliases (flash → haiku) for the bridge."""
     cfg = cfg if cfg is not None else load_config()
     model = (cfg.get("model") or "haiku").strip()
     if model == "flash":
@@ -62,42 +86,659 @@ def resolve_model_id(cfg: dict = None) -> str:
     return model
 
 
-# Per-window layout / return-focus live on window.settings():
-#   claude_quick_layout: {"group": int, "index": int}
-#   claude_quick_return_view: view id to restore on hide
+def stop_session_bridge(session: Optional[Session]) -> bool:
+    """Stop a session's bridge process. Returns True if a client was stopped."""
+    if not session:
+        return False
+    stopped = False
+    try:
+        if session.client:
+            session.client.stop()
+            stopped = True
+    except Exception:
+        pass
+    session.client = None
+    session.initialized = False
+    session.working = False
+    return stopped
+
+
+@dataclass
+class QuickSlot:
+    slot_id: str
+    session: Session
+    name: str
+    content: str = ""
+    scroll_pos: Tuple[float, float] = (0.0, 0.0)
+    draft: str = ""
+    status: str = "live"  # live | completed | blocked
+    status_message: str = ""
+
+
+class QuickHost:
+    """One host view + up to MAX_QUICK_SLOTS agent slots per window."""
+
+    def __init__(self, window: sublime.Window):
+        self.window = window
+        self.view: Optional[sublime.View] = None
+        self.slots: Dict[str, QuickSlot] = {}
+        self.active_id: Optional[str] = None
+        self._counter = 0
+        self._tab_phantom_set = None
+
+    # ── registry helpers ──────────────────────────────────────────────
+
+    @property
+    def active_slot(self) -> Optional[QuickSlot]:
+        if not self.active_id:
+            return None
+        return self.slots.get(self.active_id)
+
+    @property
+    def active_session(self) -> Optional[Session]:
+        sl = self.active_slot
+        return sl.session if sl else None
+
+    def slot_for_session(self, session: Session) -> Optional[QuickSlot]:
+        for sl in self.slots.values():
+            if sl.session is session:
+                return sl
+        return None
+
+    # ── show / hide host view ─────────────────────────────────────────
+
+    def ensure_view(self, focus: bool = True) -> Optional[sublime.View]:
+        if self.view and self.view.is_valid():
+            if focus:
+                self.window.focus_view(self.view)
+                _apply_quick_layout(self.window, self.view)
+            return self.view
+        self.window.settings().set("claude_creating_session", True)
+        try:
+            v = self.window.new_file()
+            v.set_scratch(True)
+            v.set_read_only(True)
+            v.settings().set("claude_output", True)
+            v.settings().set("claude_quick", True)
+            v.settings().set("claude_quick_host", True)
+            v.settings().set("auto_indent", False)
+            v.settings().set("color_scheme", QUICK_COLOR_SCHEME)
+            try:
+                v.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
+            except Exception:
+                pass
+            v.set_name("⚡ Quick")
+            self.view = v
+            _apply_quick_layout(self.window, v)
+            if focus:
+                self.window.focus_view(v)
+            return v
+        finally:
+            self.window.settings().erase("claude_creating_session")
+
+    def is_focused(self) -> bool:
+        if not self.view or not self.view.is_valid():
+            return False
+        av = self.window.active_view()
+        return bool(av and av.id() == self.view.id())
+
+    def soft_hide(self) -> bool:
+        if not self.view or not self.view.is_valid():
+            return False
+        self._save_active_surface()
+        _save_quick_layout(self.window, self.view)
+        # Detach all sessions from view registry
+        for sl in self.slots.values():
+            s = sl.session
+            if s.output and s.output.view:
+                try:
+                    if hasattr(s, "reset_phantoms_for_new_view"):
+                        s.reset_phantoms_for_new_view()
+                except Exception:
+                    pass
+                s.output.view = None
+                s.output._input_mode = False
+        try:
+            if hasattr(sublime, "_claude_sessions"):
+                sublime._claude_sessions.pop(self.view.id(), None)
+        except Exception:
+            pass
+        self.view.settings().set("claude_quick_soft_close", True)
+        try:
+            self.view.close()
+        except Exception:
+            pass
+        self.view = None
+        self._tab_phantom_set = None
+        if not _restore_return_view(self.window):
+            for v in self.window.views():
+                if not v.settings().get("claude_quick"):
+                    self.window.focus_view(v)
+                    break
+        sublime.status_message("Quick Agent hidden (⌘⇧\\ to show)")
+        return True
+
+    def show(self, source: sublime.View = None) -> Optional[Session]:
+        """Show host; create first slot if empty. Returns active session."""
+        _remember_return_view(self.window)
+        self.ensure_view(focus=True)
+        if not self.slots:
+            self.add_slot(source=source)
+        else:
+            # Rebind active to view and restore buffer
+            self._activate(self.active_id or next(iter(self.slots)),
+                           source=source, force_restore=True)
+        return self.active_session
+
+    # ── slots ─────────────────────────────────────────────────────────
+
+    def add_slot(self, source: sublime.View = None, name: str = None) -> Optional[QuickSlot]:
+        if not can_add_slot(len(self.slots)):
+            sublime.status_message(
+                f"Quick Agent: max {MAX_QUICK_SLOTS} slots — close one first")
+            sublime.error_message(
+                f"Quick Agent allows at most {MAX_QUICK_SLOTS} concurrent slots.\n"
+                f"Close a tab (×) before opening another.")
+            return None
+        self.ensure_view(focus=True)
+        if self.active_id and self.active_id in self.slots:
+            self._save_active_surface()
+            # Detach previous active from painting
+            prev = self.slots[self.active_id].session
+            if prev.output:
+                if prev.output.is_input_mode():
+                    try:
+                        prev.draft_prompt = prev.output.get_input_text()
+                        prev.output.exit_input_mode(keep_text=False)
+                    except Exception:
+                        pass
+                prev.output.view = None
+                prev.output._input_mode = False
+                if hasattr(prev, "reset_phantoms_for_new_view"):
+                    prev.reset_phantoms_for_new_view()
+
+        self._counter += 1
+        sid = f"q{self._counter}"
+        label = name or f"Q{self._counter}"
+        s = self._spawn_session(label)
+        _attach_focused_doc_context(s, source or _source_view_for_context(self.window))
+        slot = QuickSlot(slot_id=sid, session=s, name=label)
+        self.slots[sid] = slot
+        self.active_id = sid
+        self._bind_session_to_host(s, clear_buffer=True)
+        s.start()
+        self._schedule_input(s)
+        self._render_tab_bar()
+        return slot
+
+    def _spawn_session(self, label: str) -> Session:
+        cfg = load_config()
+        backend = (cfg.get("backend") or "deepseek").strip() or "deepseek"
+        model = resolve_model_id(cfg)
+        effort = (cfg.get("effort") or "low").strip() or "low"
+        system = (cfg.get("system_prompt") or default_system_prompt()).strip()
+        # Always append self-stop hint if not already present
+        if "quick_done" not in system:
+            system = system.rstrip() + "\n\n" + (
+                "When the request is fully handled, call MCP tool quick_done "
+                "with status='completed' and a one-line message. "
+                "If blocked, status='blocked' with reason."
+            )
+        profile = {"model": model, "effort": effort, "system_prompt": system}
+        s = Session(self.window, profile=profile, backend=backend)
+        s.quick_mode = True
+        s.sleep_disabled = True
+        s.name = f"⚡ {label} · {config_label(cfg)}"
+        s._quick_slot_id = None  # set after slot created
+        return s
+
+    def _bind_session_to_host(self, session: Session, clear_buffer: bool = False,
+                              restore_content: str = None) -> None:
+        view = self.ensure_view(focus=True)
+        if not view:
+            return
+        if hasattr(session, "reset_phantoms_for_new_view"):
+            session.reset_phantoms_for_new_view()
+        session.output.view = view
+        session.output._panel_name = None
+        session.output._input_mode = False
+        view.settings().set("claude_backend", session.backend)
+        view.settings().set("claude_quick", True)
+        view.settings().set("claude_quick_host", True)
+        view.settings().set("color_scheme", QUICK_COLOR_SCHEME)
+        session.output.set_name(session.name or "⚡ Quick")
+        if clear_buffer or restore_content is not None:
+            view.set_read_only(False)
+            view.run_command("select_all")
+            view.run_command("right_delete")
+            if restore_content:
+                view.run_command("append", {"characters": restore_content})
+            view.set_read_only(True)
+        if hasattr(sublime, "_claude_sessions"):
+            sublime._claude_sessions[view.id()] = session
+        self.window.settings().set("claude_active_view", view.id())
+
+    def _schedule_input(self, session: Session) -> None:
+        def _go(tries=0):
+            if self.active_session is not session:
+                return
+            sl = self.slot_for_session(session)
+            if sl and sl.status in ("completed", "blocked"):
+                self._show_done_chrome(sl)
+                self._render_tab_bar()
+                return
+            if session.initialized and not session.working:
+                session._input_mode_entered = False
+                if not session.output.is_input_mode():
+                    session._enter_input_with_draft()
+                try:
+                    if session.context and session.context.items:
+                        session.output.set_pending_context(list(session.context.items))
+                except Exception:
+                    pass
+                try:
+                    session._update_queue_phantom()
+                except Exception:
+                    pass
+                self._render_tab_bar()
+                return
+            if tries < 80:
+                sublime.set_timeout(lambda: _go(tries + 1), 100)
+        sublime.set_timeout(lambda: _go(), 50)
+
+    def _show_done_chrome(self, slot: QuickSlot) -> None:
+        """Append a done line if not already present; no bridge."""
+        s = slot.session
+        if not s.output or not s.output.view:
+            return
+        glyph = "✓" if slot.status == "completed" else "⚠"
+        line = f"\n  {glyph} quick_done · {slot.status}"
+        if slot.status_message:
+            line += f" · {slot.status_message}"
+        line += "\n"
+        try:
+            # Avoid duplicating if already at end
+            content = s.output.view.substr(sublime.Region(0, s.output.view.size()))
+            if "quick_done ·" in content[-200:]:
+                return
+            s.output.view.set_read_only(False)
+            s.output.view.run_command("append", {"characters": line})
+            s.output.view.set_read_only(True)
+        except Exception:
+            pass
+
+    def switch_to(self, slot_id: str) -> None:
+        if slot_id not in self.slots or slot_id == self.active_id:
+            if slot_id == self.active_id:
+                self.ensure_view(focus=True)
+            return
+        self._activate(slot_id)
+
+    def _activate(self, slot_id: str, source: sublime.View = None,
+                  force_restore: bool = False) -> None:
+        if slot_id not in self.slots:
+            return
+        if self.active_id and self.active_id in self.slots and self.active_id != slot_id:
+            self._save_active_surface()
+            prev = self.slots[self.active_id].session
+            if prev.output:
+                if prev.output.is_input_mode():
+                    try:
+                        prev.draft_prompt = prev.output.get_input_text()
+                        self.slots[self.active_id].draft = prev.draft_prompt
+                        prev.output.exit_input_mode(keep_text=False)
+                    except Exception:
+                        pass
+                prev.output.view = None
+                prev.output._input_mode = False
+                if hasattr(prev, "reset_phantoms_for_new_view"):
+                    prev.reset_phantoms_for_new_view()
+        self.active_id = slot_id
+        slot = self.slots[slot_id]
+        s = slot.session
+        s.draft_prompt = slot.draft or s.draft_prompt or ""
+        self._bind_session_to_host(
+            s, clear_buffer=True, restore_content=slot.content or "")
+        # Restore scroll
+        def _scroll():
+            if self.view and self.view.is_valid():
+                try:
+                    self.view.set_viewport_position(slot.scroll_pos, False)
+                except Exception:
+                    pass
+        sublime.set_timeout(_scroll, 10)
+        if source:
+            _attach_focused_doc_context(s, source)
+        if slot.status in ("completed", "blocked"):
+            self._show_done_chrome(slot)
+            self._render_tab_bar()
+            return
+        if s.client and s.client.is_alive() and s.initialized:
+            s._input_mode_entered = False
+            s._enter_input_with_draft()
+            try:
+                s._update_queue_phantom()
+            except Exception:
+                pass
+        elif not s.client or not s.client.is_alive():
+            # Dead bridge — restart if not done
+            if slot.status == "live":
+                self._restart_slot_bridge(slot)
+        self._render_tab_bar()
+
+    def _restart_slot_bridge(self, slot: QuickSlot) -> None:
+        s = slot.session
+        # New session object keeps name
+        name = slot.name
+        ns = self._spawn_session(name)
+        slot.session = ns
+        self._bind_session_to_host(ns, clear_buffer=False, restore_content=slot.content)
+        ns.start()
+        self._schedule_input(ns)
+
+    def _save_active_surface(self) -> None:
+        if not self.active_id or self.active_id not in self.slots:
+            return
+        if not self.view or not self.view.is_valid():
+            return
+        slot = self.slots[self.active_id]
+        s = slot.session
+        try:
+            if s.output and s.output.is_input_mode():
+                slot.draft = s.output.get_input_text()
+                s.draft_prompt = slot.draft
+                # Save buffer without peeling input carefully: full substr OK
+                # (input re-added on restore via enter_input)
+                peel = getattr(s.output, "_input_area_start", None)
+                if peel is not None and peel >= 0:
+                    slot.content = self.view.substr(sublime.Region(0, peel))
+                else:
+                    slot.content = self.view.substr(sublime.Region(0, self.view.size()))
+            else:
+                slot.content = self.view.substr(sublime.Region(0, self.view.size()))
+            vp = self.view.viewport_position()
+            if vp and len(vp) >= 2:
+                slot.scroll_pos = (float(vp[0]), float(vp[1]))
+        except Exception as e:
+            print(f"[Claude] quick save surface: {e}")
+
+    def close_slot(self, slot_id: str = None) -> None:
+        slot_id = slot_id or self.active_id
+        if not slot_id or slot_id not in self.slots:
+            return
+        slot = self.slots[slot_id]
+        stop_session_bridge(slot.session)
+        try:
+            if slot.session.output:
+                slot.session.output.view = None
+        except Exception:
+            pass
+        del self.slots[slot_id]
+        if not self.slots:
+            # Last slot — soft-hide host
+            self.active_id = None
+            self.soft_hide()
+            return
+        if self.active_id == slot_id:
+            self.active_id = None
+            nxt = next(iter(self.slots))
+            self._activate(nxt)
+        else:
+            self._render_tab_bar()
+
+    def complete_slot(
+        self,
+        session: Session,
+        status: str = "completed",
+        message: str = "",
+    ) -> dict:
+        """Self-stop: mark slot done/blocked and stop its bridge. Testable."""
+        status = normalize_done_status(status)
+        message = (message or "").strip()
+        slot = self.slot_for_session(session)
+        if not slot:
+            # Not multi-host? Fall back to single-session stop
+            if getattr(session, "quick_mode", False):
+                stop_session_bridge(session)
+                try:
+                    if session.output and session.output.view:
+                        glyph = "✓" if status == "completed" else "⚠"
+                        session.output.view.set_read_only(False)
+                        session.output.view.run_command(
+                            "append",
+                            {"characters": f"\n  {glyph} quick_done · {status}"
+                             + (f" · {message}" if message else "") + "\n"},
+                        )
+                        session.output.view.set_read_only(True)
+                except Exception:
+                    pass
+                return {"ok": True, "status": status, "message": message, "slot": None}
+            return {"ok": False, "error": "not a quick session"}
+
+        slot.status = status
+        slot.status_message = message
+        stop_session_bridge(session)
+        session.working = False
+        # Paint status if this slot is active
+        if self.active_id == slot.slot_id and self.view and self.view.is_valid():
+            if session.output:
+                session.output.view = self.view
+            self._show_done_chrome(slot)
+            try:
+                if session.output and session.output.is_input_mode():
+                    session.output.exit_input_mode(keep_text=False)
+            except Exception:
+                pass
+        self._render_tab_bar()
+        sublime.status_message(f"Quick · {slot.name}: {status}")
+        return {
+            "ok": True,
+            "status": status,
+            "message": message,
+            "slot": slot.slot_id,
+            "bridge_stopped": True,
+        }
+
+    # ── tab bar ───────────────────────────────────────────────────────
+
+    def _render_tab_bar(self) -> None:
+        if not self.view or not self.view.is_valid():
+            return
+        import html as _html
+        chips = []
+        for sid, sl in self.slots.items():
+            label = _html.escape(sl.name)
+            busy = sl.session.working if sl.session else False
+            if sl.status == "completed":
+                mark = "✓ "
+            elif sl.status == "blocked":
+                mark = "⚠ "
+            elif busy:
+                mark = "◉ "
+            else:
+                mark = ""
+            if sid == self.active_id:
+                style = (
+                    "color:var(--foreground);"
+                    "background-color:color(var(--foreground) alpha(0.18));"
+                    "padding:2px 8px;margin-right:4px;text-decoration:none;"
+                    "font-weight:bold;"
+                )
+            else:
+                style = (
+                    "color:color(var(--foreground) alpha(0.55));"
+                    "padding:2px 8px;margin-right:4px;text-decoration:none;"
+                )
+            chips.append(
+                f'<a href="tab:{sid}" style="{style}">{mark}{label}</a>'
+                f'<a href="close:{sid}" style="color:var(--redish);'
+                f'text-decoration:none;margin-right:8px;" title="close">×</a>'
+            )
+        # + new if under cap
+        if can_add_slot(len(self.slots)):
+            chips.append(
+                '<a href="new" style="color:var(--bluish);padding:2px 8px;'
+                'text-decoration:none;font-weight:bold;" title="new slot">+</a>'
+            )
+        else:
+            chips.append(
+                '<span style="color:color(var(--foreground) alpha(0.35));'
+                'padding:2px 8px;">(max 3)</span>'
+            )
+        html = (
+            '<body id="claude-quick-tabs" style="margin:0;padding:4px 0;">'
+            '<div style="padding:2px 4px;">'
+            f'{"".join(chips)}'
+            '</div></body>'
+        )
+        try:
+            if self._tab_phantom_set is None:
+                self._tab_phantom_set = sublime.PhantomSet(self.view, TAB_BAR_KEY)
+            self._tab_phantom_set.update([sublime.Phantom(
+                sublime.Region(0, 0),
+                html,
+                sublime.LAYOUT_BLOCK,
+                on_navigate=self._on_tab_navigate,
+            )])
+        except Exception as e:
+            print(f"[Claude] quick tab bar: {e}")
+
+    def _on_tab_navigate(self, href: str) -> None:
+        if href == "new":
+            self.add_slot(source=_source_view_for_context(self.window))
+            return
+        if href.startswith("tab:"):
+            self.switch_to(href.split(":", 1)[1])
+            return
+        if href.startswith("close:"):
+            self.close_slot(href.split(":", 1)[1])
+            return
+
+
+# ── window registry ───────────────────────────────────────────────────
+
+def get_host(window: sublime.Window) -> Optional[QuickHost]:
+    if not window:
+        return None
+    return _hosts.get(window.id())
+
+
+def ensure_host(window: sublime.Window) -> QuickHost:
+    h = _hosts.get(window.id())
+    if not h:
+        h = QuickHost(window)
+        _hosts[window.id()] = h
+    return h
 
 
 def get_quick_session(window: sublime.Window) -> Optional[Session]:
-    """Return the window's Quick Agent if its bridge is still alive.
-
-    The sheet may be soft-hidden (view closed, bridge kept).
-    """
-    if not window:
+    h = get_host(window)
+    if not h:
         return None
-    s = _quick_sessions.get(window.id())
-    if not s:
-        return None
-    if s.client and s.client.is_alive():
+    s = h.active_session
+    if s and (not s.client or not s.client.is_alive()) and h.active_slot and h.active_slot.status == "live":
+        # bridge dead — still return for UI
         return s
-    _quick_sessions.pop(window.id(), None)
-    try:
-        if s.output and s.output.view and hasattr(sublime, "_claude_sessions"):
-            sublime._claude_sessions.pop(s.output.view.id(), None)
-    except Exception:
-        pass
-    return None
+    return s
 
 
 def is_quick_view_focused(window: sublime.Window) -> bool:
-    s = get_quick_session(window)
-    if not s or not s.output or not s.output.view or not s.output.view.is_valid():
-        return False
-    active = window.active_view()
-    return bool(active and active.id() == s.output.view.id())
+    h = get_host(window)
+    return bool(h and h.is_focused())
 
+
+def hide_quick_view(window: sublime.Window) -> bool:
+    h = get_host(window)
+    if not h:
+        return False
+    return h.soft_hide()
+
+
+def stop_quick_session(window: sublime.Window, close_view: bool = True) -> None:
+    """Stop all slots and tear down host (Stop command)."""
+    h = _hosts.pop(window.id(), None)
+    if not h:
+        return
+    for sl in list(h.slots.values()):
+        stop_session_bridge(sl.session)
+    h.slots.clear()
+    h.active_id = None
+    if close_view and h.view and h.view.is_valid():
+        try:
+            h.view.settings().set("claude_quick_soft_close", True)
+            if hasattr(sublime, "_claude_sessions"):
+                sublime._claude_sessions.pop(h.view.id(), None)
+            h.view.close()
+        except Exception:
+            pass
+    h.view = None
+    sublime.status_message("Quick Agent stopped")
+
+
+def ensure_quick_session(window: sublime.Window, force_new: bool = False) -> Session:
+    """Show host / active slot. force_new → new slot (if under cap)."""
+    source = _source_view_for_context(window)
+    h = ensure_host(window)
+    if force_new:
+        sl = h.add_slot(source=source)
+        if not sl:
+            # Cap hit — return active if any
+            return h.active_session or _empty_fail_session(window)
+        return sl.session
+    s = h.show(source=source)
+    return s or _empty_fail_session(window)
+
+
+def _empty_fail_session(window) -> Session:
+    # Should not be used; callers check None. Provide a dead session for type compat.
+    s = Session(window, backend="deepseek")
+    s.quick_mode = True
+    return s
+
+
+def complete_quick_from_tool(
+    status: str = "completed",
+    message: str = "",
+    view_id: int = None,
+) -> dict:
+    """Entry for MCP quick_done — resolve calling quick session and complete."""
+    session = None
+    if view_id:
+        session = sublime._claude_sessions.get(view_id) if hasattr(sublime, "_claude_sessions") else None
+    if not session or not getattr(session, "quick_mode", False):
+        # Try active host in any window matching view
+        for h in _hosts.values():
+            if h.view and h.view.is_valid() and view_id and h.view.id() == view_id:
+                session = h.active_session
+                break
+            if h.active_session and getattr(h.active_session, "quick_mode", False):
+                # Prefer session whose output.view matches
+                if h.active_session.output and h.active_session.output.view:
+                    if view_id and h.active_session.output.view.id() == view_id:
+                        session = h.active_session
+                        break
+    if not session:
+        # Last resort: active window host
+        w = sublime.active_window()
+        h = get_host(w) if w else None
+        if h:
+            session = h.active_session
+    if not session or not getattr(session, "quick_mode", False):
+        return {"ok": False, "error": "quick_done only works inside a Quick Agent slot"}
+    h = None
+    for host in _hosts.values():
+        if host.slot_for_session(session):
+            h = host
+            break
+    if h:
+        return h.complete_slot(session, status=status, message=message)
+    # Single-slot legacy path
+    return QuickHost(session.window).complete_slot(session, status=status, message=message)
+
+
+# ── context / layout (shared) ─────────────────────────────────────────
 
 def _source_view_for_context(window: sublime.Window) -> Optional[sublime.View]:
-    """Document to attach as context — active non-Quick view, else return view."""
     if not window:
         return None
     av = window.active_view()
@@ -115,12 +756,6 @@ def _source_view_for_context(window: sublime.Window) -> Optional[sublime.View]:
 
 
 def _attach_focused_doc_context(session: Session, source: sublime.View = None) -> None:
-    """Add the focused document path (or selection) as pending context.
-
-    Replaces the previous auto-attached open context so reopen stays current.
-    Selection present → selection chip with :L… range + text.
-    No selection → path only (agent can read if needed; no whole-file slurp).
-    """
     if not session:
         return
     view = source
@@ -130,10 +765,7 @@ def _attach_focused_doc_context(session: Session, source: sublime.View = None) -
         return
     if view.settings().get("claude_output") or view.settings().get("claude_quick"):
         return
-
     from .context_manager import format_line_range
-
-    # Drop prior auto-attach from last open so context stays one focused doc
     prev = getattr(session, "_quick_auto_context_keys", None) or set()
     if prev and session.context:
         session.context.items = [
@@ -142,11 +774,9 @@ def _attach_focused_doc_context(session: Session, source: sublime.View = None) -
             and f"{it.path}:{it.line_range}" not in prev
             and it.path not in prev
         ]
-
     new_keys = set()
     path = view.file_name() or ""
     sels = [r for r in view.sel() if not r.empty()]
-
     if sels:
         for r in sels:
             content = view.substr(r)
@@ -163,17 +793,13 @@ def _attach_focused_doc_context(session: Session, source: sublime.View = None) -
             if path:
                 new_keys.add(path)
     elif path:
-        # Path ref only — no full file body (add_path would slurp text files)
         session.context._add_path_ref(path)
         new_keys.add(path)
         new_keys.add(path.split("/")[-1] if "/" in path else path)
     else:
-        # Untitled, no selection — nothing useful to attach
         session._quick_auto_context_keys = set()
         return
-
     session._quick_auto_context_keys = new_keys
-    # Refresh 📎 chips if already in input mode
     try:
         if session.output and session.output.is_input_mode():
             session.output.set_pending_context(list(session.context.items))
@@ -182,20 +808,17 @@ def _attach_focused_doc_context(session: Session, source: sublime.View = None) -
 
 
 def _remember_return_view(window: sublime.Window) -> None:
-    """Remember the focused document so hide can restore it."""
     if not window:
         return
     av = window.active_view()
     if not av or not av.is_valid():
         return
-    # Don't overwrite with the Quick sheet itself
     if av.settings().get("claude_quick") or av.settings().get("claude_output"):
         return
     window.settings().set("claude_quick_return_view", av.id())
 
 
 def _restore_return_view(window: sublime.Window) -> bool:
-    """Focus the document that was active when Quick Agent was shown."""
     if not window:
         return False
     vid = window.settings().get("claude_quick_return_view")
@@ -209,7 +832,6 @@ def _restore_return_view(window: sublime.Window) -> bool:
 
 
 def _save_quick_layout(window: sublime.Window, view: sublime.View) -> None:
-    """Remember group/index of the Quick sheet for this window."""
     if not window or not view or not view.is_valid():
         return
     try:
@@ -225,7 +847,6 @@ def _save_quick_layout(window: sublime.Window, view: sublime.View) -> None:
 
 
 def _apply_quick_layout(window: sublime.Window, view: sublime.View) -> None:
-    """Place the Quick sheet at the last remembered position in this window."""
     if not window or not view or not view.is_valid():
         return
     layout = window.settings().get("claude_quick_layout")
@@ -241,268 +862,15 @@ def _apply_quick_layout(window: sublime.Window, view: sublime.View) -> None:
         return
     if group < 0 or group >= n_groups:
         group = window.active_group()
-    # Clamp index into [0, len(views_in_group)] (len == append at end)
     try:
         n_in = len(window.views_in_group(group))
     except Exception:
         n_in = 0
-    # view may already be in that group counting toward n_in
     index = max(0, min(index, n_in))
     try:
         window.set_view_index(view, group, index)
     except Exception as e:
         print(f"[Claude] quick layout: {e}")
-
-
-def hide_quick_view(window: sublime.Window) -> bool:
-    """Soft-hide the Quick sheet: close the tab, keep the bridge + transcript.
-
-    Restores focus to the document that was active when Quick was shown.
-    """
-    s = get_quick_session(window)
-    if not s or not s.output:
-        return False
-    view = s.output.view
-    if not view or not view.is_valid():
-        return False
-
-    # Remember where this sheet lived for the next show
-    _save_quick_layout(window, view)
-
-    try:
-        if s.output.is_input_mode():
-            s.draft_prompt = s.output.get_input_text()
-            s.output.exit_input_mode(keep_text=False)
-        s._quick_hidden_buffer = view.substr(sublime.Region(0, view.size()))
-    except Exception:
-        s._quick_hidden_buffer = None
-
-    view.settings().set("claude_quick_soft_close", True)
-    try:
-        if hasattr(sublime, "_claude_sessions"):
-            sublime._claude_sessions.pop(view.id(), None)
-    except Exception:
-        pass
-
-    # Detach PhantomSets from the dying view
-    if hasattr(s, "reset_phantoms_for_new_view"):
-        s.reset_phantoms_for_new_view()
-
-    s.output.view = None
-    s.output._input_mode = False
-    s._input_mode_entered = False
-    try:
-        view.close()
-    except Exception:
-        pass
-
-    # Prefer the remembered document; fall back to any non-quick view
-    if not _restore_return_view(window):
-        for v in window.views():
-            if not v.settings().get("claude_quick"):
-                window.focus_view(v)
-                break
-
-    sublime.status_message("Quick Agent hidden (⌘⇧\\ to show)")
-    return True
-
-
-def stop_quick_session(window: sublime.Window, close_view: bool = True) -> None:
-    s = _quick_sessions.pop(window.id(), None)
-    if not s:
-        return
-    try:
-        if s.client:
-            s.client.stop()
-    except Exception:
-        pass
-    s.client = None
-    s.initialized = False
-    view = s.output.view if s.output else None
-    try:
-        if view and hasattr(sublime, "_claude_sessions"):
-            sublime._claude_sessions.pop(view.id(), None)
-    except Exception:
-        pass
-    if close_view and view and view.is_valid():
-        try:
-            view.settings().set("claude_quick_soft_close", True)
-            view.close()
-        except Exception:
-            pass
-    sublime.status_message("Quick Agent stopped")
-
-
-def _focus_input(session: Session) -> None:
-    """Force inline ◎ input mode (never show_input_panel)."""
-    if not session or not session.output:
-        return
-    if session.working:
-        return
-    if session.output.view and session.output.view.is_valid():
-        session.output.show(focus=True)
-        _apply_quick_layout(session.window, session.output.view)
-    session._input_mode_entered = False
-    if session.output.is_input_mode():
-        try:
-            v = session.output.view
-            if v and v.is_valid():
-                end = v.size()
-                v.sel().clear()
-                v.sel().add(sublime.Region(end, end))
-                v.show(end)
-                window = session.window
-                if window:
-                    window.focus_view(v)
-        except Exception:
-            pass
-        return
-    session._enter_input_with_draft()
-
-
-def _bind_quick_view(session: Session, *, restore_buffer: bool = False) -> Optional[sublime.View]:
-    """Attach a sheet for session: create if needed, restore layout, register."""
-    window = session.window
-    if not window:
-        return None
-    window.settings().set("claude_creating_session", True)
-    try:
-        recreated = False
-        if not session.output.view or not session.output.view.is_valid():
-            session.output.view = None
-            session.output._panel_name = None
-            session.output._input_mode = False
-            # Old PhantomSets point at the closed view — drop them
-            if hasattr(session, "reset_phantoms_for_new_view"):
-                session.reset_phantoms_for_new_view()
-            session.output.show(focus=True)
-            recreated = True
-        view = session.output.view
-        if not view:
-            return None
-        view.settings().set("claude_backend", session.backend)
-        view.settings().set("claude_quick", True)
-        view.settings().set("color_scheme", QUICK_COLOR_SCHEME)
-        session.output.set_name(session.name or "⚡ Quick")
-        if restore_buffer:
-            buf = getattr(session, "_quick_hidden_buffer", None) or ""
-            if buf:
-                view.set_read_only(False)
-                view.run_command("append", {"characters": buf})
-                view.set_read_only(True)
-            session._quick_hidden_buffer = None
-        if hasattr(sublime, "_claude_sessions"):
-            sublime._claude_sessions[view.id()] = session
-        window.settings().set("claude_active_view", view.id())
-        _apply_quick_layout(window, view)
-        window.focus_view(view)
-        if recreated:
-            # Permission / wakeup / media phantoms need a live view + input mode
-            session._quick_view_recreated = True
-        return view
-    finally:
-        window.settings().erase("claude_creating_session")
-
-
-def _reshow_hidden_session(session: Session, source: sublime.View = None) -> None:
-    """Re-create the sheet for a soft-hidden Quick session (bridge still up)."""
-    _remember_return_view(session.window)
-    _attach_focused_doc_context(session, source)
-    _bind_quick_view(session, restore_buffer=True)
-    if not session.working:
-        _focus_input(session)
-        # enter_input_mode pins the bypass/permission hint phantom; force a
-        # second pass after the new view settles (PhantomSet bind race).
-        def _repin():
-            if not session.output or not session.output.view:
-                return
-            if not session.output.is_input_mode():
-                session._input_mode_entered = False
-                session._enter_input_with_draft()
-            try:
-                session._update_permission_banner(show=True)
-                session._update_wakeup_banner(show=True)
-            except Exception:
-                pass
-            try:
-                session.output._refresh_media_phantoms()
-            except Exception:
-                pass
-            # Context chips after input mode is up
-            try:
-                if session.context and session.context.items:
-                    session.output.set_pending_context(list(session.context.items))
-            except Exception:
-                pass
-        sublime.set_timeout(_repin, 30)
-
-
-def ensure_quick_session(window: sublime.Window, force_new: bool = False) -> Session:
-    """Create or focus Quick Agent as a normal session sheet + inline input."""
-    # Capture focused doc *before* we steal focus for the Quick sheet
-    source = _source_view_for_context(window)
-
-    if not force_new:
-        existing = get_quick_session(window)
-        if existing and existing.client and existing.client.is_alive() and existing.initialized:
-            if existing.output and existing.output.view and existing.output.view.is_valid():
-                _remember_return_view(window)
-                _attach_focused_doc_context(existing, source)
-                _focus_input(existing)
-            else:
-                _reshow_hidden_session(existing, source=source)
-            return existing
-        if existing:
-            stop_quick_session(window, close_view=True)
-
-    cfg = load_config()
-    backend = (cfg.get("backend") or "deepseek").strip() or "deepseek"
-    model = resolve_model_id(cfg)
-    effort = (cfg.get("effort") or "low").strip() or "low"
-    system = (cfg.get("system_prompt") or (
-        "You are a Quick Agent for short trivia and focused tasks. "
-        "Answer concisely. Prefer a few sentences unless the user asks for depth."
-    )).strip()
-
-    profile = {
-        "model": model,
-        "effort": effort,
-        "system_prompt": system,
-    }
-
-    # Remember where the user was before we steal focus
-    _remember_return_view(window)
-
-    s = Session(window, profile=profile, backend=backend)
-    s.quick_mode = True
-    s.sleep_disabled = True
-    s.name = f"⚡ Quick · {config_label(cfg)}"
-
-    # Attach focused file / selection as 📎 context for the first turn
-    _attach_focused_doc_context(s, source)
-
-    # Full session sheet — same OutputView + enter_input_mode path as New Session
-    _bind_quick_view(s, restore_buffer=False)
-    _quick_sessions[window.id()] = s
-    s.start()  # _on_init → _enter_input_with_draft → ◎ input mode
-
-    # Belt-and-suspenders: if init wins the race after this returns, re-focus ◎
-    def _ensure_input(tries=0):
-        if get_quick_session(window) is not s:
-            return
-        if s.initialized and not s.working:
-            _focus_input(s)
-            try:
-                if s.context and s.context.items:
-                    s.output.set_pending_context(list(s.context.items))
-            except Exception:
-                pass
-            return
-        if tries < 50:
-            sublime.set_timeout(lambda: _ensure_input(tries + 1), 100)
-
-    sublime.set_timeout(lambda: _ensure_input(), 50)
-    return s
 
 
 def list_backend_choices() -> List[Tuple[str, str, str]]:
@@ -538,22 +906,20 @@ def list_model_choices(backend: str) -> List[Tuple[str, str]]:
     return items
 
 
-# ── Commands ────────────────────────────────────────────────────────────────
+# ── Commands ──────────────────────────────────────────────────────────
 
 
 class ClaudeQuickAgentCommand(sublime_plugin.WindowCommand):
-    """Toggle Quick Agent sheet (⌘⇧\\): show / focus, or hide when focused."""
-
-    def run(self, prompt: str = None, config: bool = False) -> None:
+    def run(self, prompt: str = None, config: bool = False, new_slot: bool = False) -> None:
         if config:
             self.window.run_command("claude_quick_agent_config")
             return
-        # Same shortcut again while focused → soft-hide (bridge stays warm)
         if not prompt and is_quick_view_focused(self.window):
             hide_quick_view(self.window)
             return
-        s = ensure_quick_session(self.window)
-        # No show_input_panel — type in the sheet's ◎ region like any session.
+        s = ensure_quick_session(self.window, force_new=bool(new_slot))
+        if not s:
+            return
         if prompt and str(prompt).strip():
             def _when_ready(tries=0):
                 if s.initialized and not s.working:
@@ -568,9 +934,12 @@ class ClaudeQuickAgentCommand(sublime_plugin.WindowCommand):
                 _when_ready()
 
 
-class ClaudeQuickAgentConfigCommand(sublime_plugin.WindowCommand):
-    """Pick backend + model for the Quick Agent session."""
+class ClaudeQuickAgentNewSlotCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        ensure_quick_session(self.window, force_new=True)
 
+
+class ClaudeQuickAgentConfigCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         cfg = load_config()
         current = config_label(cfg)
@@ -578,7 +947,6 @@ class ClaudeQuickAgentConfigCommand(sublime_plugin.WindowCommand):
         if not backends_list:
             sublime.error_message("No backends available for Quick Agent")
             return
-
         items = [[f"⚡ {t}", d] for _, t, d in backends_list]
         items.insert(0, [f"Current: {current}", "Keep backend, change model…"])
         choices = [("__keep__", None, None)] + backends_list
@@ -623,25 +991,18 @@ class ClaudeQuickAgentConfigCommand(sublime_plugin.WindowCommand):
             cfg["model"] = model
             cfg["effort"] = effort
             cfg.setdefault("permission_mode", "bypassPermissions")
-            # Inherit global tool list when not set — full session capability.
-            cfg.setdefault(
-                "system_prompt",
-                "You are a Quick Agent for short trivia and focused tasks. "
-                "Answer concisely. Prefer a few sentences unless the user asks for depth.",
-            )
+            cfg.setdefault("system_prompt", default_system_prompt())
             save_config(cfg)
             stop_quick_session(self.window, close_view=True)
             sublime.status_message(f"Quick Agent → {config_label(cfg)}")
-            ensure_quick_session(self.window, force_new=True)
+            ensure_quick_session(self.window, force_new=False)
 
         self.window.show_quick_panel(items, on_effort)
 
 
 class ClaudeQuickAgentStopCommand(sublime_plugin.WindowCommand):
-    """Stop the Quick Agent and close its view."""
-
     def run(self) -> None:
         stop_quick_session(self.window, close_view=True)
 
     def is_enabled(self) -> bool:
-        return get_quick_session(self.window) is not None
+        return get_host(self.window) is not None
