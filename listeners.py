@@ -325,8 +325,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             s._update_status_bar()
             s.output.set_name(s.display_name)
 
-            # Auto-enter input mode if session is idle and not already in input mode
-            if s.initialized and not s.working and not s.output.is_input_mode():
+            # Sticky composer: enter when idle *or* mid-turn (queue while streaming)
+            if s.initialized and not s.output.is_input_mode():
                 s._enter_input_with_draft()
             # If already in input mode, ensure cursor is positioned and view is responsive
             elif s.output.is_input_mode():

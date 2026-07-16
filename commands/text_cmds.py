@@ -80,12 +80,23 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
         s.output.exit_input_mode(keep_text=False)
         s.draft_prompt = ""
+        # Allow sticky composer to re-open immediately after submit
+        s._input_mode_entered = False
 
         # If session is working, queue the prompt instead
         if s.working:
             s.queue_prompt(text)
         else:
             s.query(text)
+
+        # Sticky EOF composer: re-arm ◎ so the next message can be typed
+        # (and queued) while this turn streams.
+        def _rearm():
+            if not s.output or s.output.is_input_mode():
+                return
+            s._input_mode_entered = False
+            s._enter_input_with_draft()
+        sublime.set_timeout(_rearm, 30)
 
     def _handle_command(self, session, cmd):
         """Handle a slash command."""

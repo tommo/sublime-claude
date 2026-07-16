@@ -419,25 +419,26 @@ class OutputView:
     # --- Inline Input ---
 
     def enter_input_mode(self) -> None:
-        """Enter input mode - show prompt marker and allow typing."""
+        """Enter sticky composer (◎ strip at EOF).
+
+        Works while the session is streaming — submit queues via queue_prompt.
+        """
         if not self.view or not self.view.is_valid():
             return
         if self._input_mode:
             return
-
-        # Check session-level working flag (authoritative busy state)
-        from . import claude_code
-        session = claude_code.get_session_for_view(self.view)
-        if session and session.working:
+        # Free-text question UI owns the input region — don't fight it.
+        if getattr(self, "_question_input_mode", False):
             return
 
-        # Stale conversation.working after interrupt: session is idle but the
-        # turn flag never cleared → blocked input forever. Trust session.working.
-        if self.current and self.current.working:
-            if session and not session.working:
-                self.current.working = False
-            else:
-                return  # Can't input while working
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
+
+        # Stale conversation.working after interrupt: clear when session is idle
+        # so we don't leave a stuck "working" turn flag. Streaming is OK — sticky
+        # composer is intentional while session.working.
+        if self.current and self.current.working and session and not session.working:
+            self.current.working = False
 
         # Additional safety: check if there's a pending render that should complete first
         if self._render_pending:
@@ -450,16 +451,13 @@ class OutputView:
         # This can happen after Sublime restart when OutputView state is lost but view content remains
         # BUT: Don't clean up fresh context that was just added
         has_pending_context = session and session.pending_context
-        # print(f"[Claude] enter_input_mode: has_pending_context={has_pending_context}, pending_context={session.pending_context if session else None}")
 
         content = self.view.substr(sublime.Region(0, self.view.size()))
-        # print(f"[Claude] enter_input_mode: view_size={self.view.size()}, last_50_chars={repr(content[-50:])}")
         if content:
             lines = content.split('\n')
-            # Check last few lines for stale input markers
+            # Check last few lines for stale input markers / separator
             cleanup_start = -1
-            # print(f"[Claude] enter_input_mode: checking last 5 lines for cleanup: {lines[-5:]}")
-            for i in range(len(lines) - 1, max(-1, len(lines) - 5), -1):
+            for i in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
                 line = lines[i]
                 # Input marker: starts with "◎ " but no " ▶" (which prompts have)
                 is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
@@ -467,7 +465,9 @@ class OutputView:
                 is_context_line = line.startswith(CONTEXT_PREFIX) and not has_pending_context
                 # Background task hint lines from previous input mode
                 is_bg_hint = line.strip().startswith((BACKGROUND_PREFIX, '✔ ', '✘ '))
-                if is_input_marker or is_context_line or is_bg_hint:
+                # Legacy buffer separator (removed; phantoms own the split now)
+                is_sep = bool(line.strip()) and set(line.strip()) <= set("┄─━-")
+                if is_input_marker or is_context_line or is_bg_hint or is_sep:
                     cleanup_start = len('\n'.join(lines[:i]))
                     if i > 0:
                         cleanup_start += 1
@@ -500,21 +500,14 @@ class OutputView:
             # _replace sets view to read-only, so set it back to False for append operations
             self.view.set_read_only(False)
 
-        # Build input area (context + marker)
-        self._input_area_start = self.view.size()
-        # print(f"[Claude] enter_input_mode: building input area at position {self._input_area_start}")
-
-        # Add newline prefix only if view has content AND doesn't already end with newline
-        prefix = ""
-        if self.view.size() > 0:
-            last_char = self.view.substr(self.view.size() - 1)
-            # print(f"[Claude] enter_input_mode: view has content, last_char={repr(last_char)}")
-            if last_char != "\n":
-                prefix = "\n"
-
-        if prefix:
-            # print(f"[Claude] enter_input_mode: adding newline prefix")
-            self.view.run_command("append", {"characters": prefix})
+        # Build input area (context + marker). Queue + split are phantoms parked
+        # *above* ◎ via LAYOUT_BELOW on the line before the composer — not buffer.
+        # Always end the transcript with a newline so peel-1 is a real line and
+        # chrome never anchors on the ◎ line (which put the split under input).
+        if self.view.size() == 0:
+            self.view.run_command("append", {"characters": "\n"})
+        elif self.view.substr(self.view.size() - 1) != "\n":
+            self.view.run_command("append", {"characters": "\n"})
         self._input_area_start = self.view.size()
 
         # Add background task hints
@@ -537,7 +530,6 @@ class OutputView:
 
         self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
-        # print(f"[Claude] enter_input_mode: input marker added, _input_start={self._input_start}")
 
         # NOW set input mode - after _input_start is correctly positioned
         # This ensures on_modified won't save wrong content as draft
@@ -554,10 +546,14 @@ class OutputView:
         sublime.set_timeout(
             lambda it=items: self._refresh_context_phantoms(it), 10)
 
-        # Pin the permission-mode banner at the fresh input area (non-baseline modes only)
+        # Pin permission / wakeup / queue chrome at the composer
         if session:
             session._update_permission_banner(show=True)
             session._update_wakeup_banner(show=True)
+            try:
+                session._update_queue_phantom()
+            except Exception:
+                pass
 
         # print(f"[Claude] enter_input_mode: COMPLETED, view_size={self.view.size()}, _input_mode={self._input_mode}, final_content={repr(self.view.substr(sublime.Region(0, self.view.size())))}")
 
@@ -566,13 +562,20 @@ class OutputView:
         if not self.view or not self._input_mode:
             return ""
 
-        # Drop permission-mode banner with the input area. Keep the cron Stop
-        # bar if a loop is still armed — re-pin after input is removed.
+        # Drop permission-mode / queue chrome with the input area. Keep the cron
+        # Stop bar if a loop is still armed — re-pin after input is removed.
         from . import claude_code
         _sess = claude_code.get_session_for_view(self.view)
         if _sess:
             _sess._update_permission_banner(show=False)
             _sess._update_wakeup_banner(show=False)
+            # Queue phantom re-anchors after re-enter; clear while strip is gone
+            try:
+                ps = getattr(_sess, "_queue_phantom_set", None)
+                if ps:
+                    ps.update([])
+            except Exception:
+                pass
 
         # Get the input text
         input_text = self.get_input_text()
@@ -761,10 +764,15 @@ class OutputView:
         prev_todos = []
         prev_goal = None
         if self.current:
-            # Ensure previous conversation is marked as done
-            if self.current.working:
-                self.current.working = False
-                self._render_current()
+            # Always clear busy mark and re-render *this* turn before we swap
+            # self.current. Debounced _render_current races with queued follow-up
+            # queries and leaves a stale ⠋/⠧ under the previous @done.
+            self.current.working = False
+            self._render_pending = False
+            try:
+                self._do_render()
+            except Exception as e:
+                print(f"[Claude] prompt finalize render: {e}")
             self.conversations.append(self.current)
             # Cap conversation history (memory bound). Print a hint when truncating
             # so users know history is being dropped (was previously silent).
@@ -1229,7 +1237,10 @@ class OutputView:
         self.current.has_meta = True
         self.current.usage = usage
         self.current.working = False
-        self._render_current()
+        # Sync flush: wipe spinner before a queued next-turn prompt() can
+        # swap self.current (debounced render would paint the *new* turn).
+        self._render_pending = False
+        self._do_render()
 
     def interrupted(self) -> None:
         """Show interrupted indicator."""
@@ -2484,49 +2495,87 @@ class OutputView:
                 pass  # Not available in older Sublime builds
 
     def refresh_preserving_input(self) -> None:
-        """Re-render conversation (e.g. tasks fold) without losing the input draft.
+        """Re-render conversation without losing the sticky composer draft.
 
-        `_do_render` intentionally no-ops in input mode so it cannot corrupt the
-        editable tail. Callers that only change sticky chrome (tasks fold, goal)
-        must exit → render → re-enter with draft restored.
+        Sticky input is re-anchored inside `_do_render` — no exit/re-enter.
         """
         if not self.view or not self.current:
             return
-        from . import claude_code
-        session = claude_code.get_session_for_view(self.view)
-        draft = ""
-        was_input = self._input_mode
-        if was_input:
-            draft = self.get_input_text()
-            if session is not None:
-                session.draft_prompt = draft
-            self.exit_input_mode(keep_text=False)
-        # Sync render (skip debounce); input_mode is off so _do_render proceeds.
         self._render_pending = False
         self._auto_scroll = False
         self._do_render()
-        if not was_input:
-            return
-        if session is not None and session.working:
-            return
-        # enter_input_mode may defer if a render is pending — none should be.
+
+    def _composer_peel_start(self) -> Optional[int]:
+        """Buffer offset where the sticky ◎ strip begins (or None)."""
+        if not self._input_mode or not self.view:
+            return None
+        peel = getattr(self, "_input_area_start", None)
+        if peel is None and self._input_start:
+            peel = max(0, self._input_start - len(self._input_marker))
+        if peel is None or peel < 0:
+            return None
+        return min(peel, self.view.size())
+
+    def _input_marker_intact(self) -> bool:
+        if not self.view or not self._input_mode:
+            return False
+        ms = self._input_start - len(self._input_marker)
+        if ms < 0 or self._input_start > self.view.size():
+            return False
+        return self.view.substr(sublime.Region(ms, self._input_start)) == self._input_marker
+
+    def _replant_composer(self, draft: str = "", caret_off: int = 0) -> None:
+        """Hard rebuild ◎ strip after a broken re-anchor (rare)."""
+        self._input_mode = False
+        if self.view:
+            self.view.settings().set("claude_input_mode", False)
         self.enter_input_mode()
-        if draft and self._input_mode and self.view:
+        if not self._input_mode or not self.view:
+            return
+        if draft:
+            self.view.set_read_only(False)
             self.view.run_command("append", {"characters": draft})
-            end = self.view.size()
-            self.view.sel().clear()
-            self.view.sel().add(sublime.Region(end, end))
-            self.view.show(end)
+        pos = min(self._input_start + max(0, caret_off), self.view.size())
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(pos, pos))
+        self.view.set_read_only(False)
 
     def _do_render(self) -> None:
-        """Actually perform the render."""
+        """Actually perform the render.
+
+        Sticky composer: conversation is rewritten in-place *before* the ◎
+        strip; input anchors shift by the replace delta so typing mid-stream
+        keeps working (submit → queue_prompt while busy).
+        """
         self._render_pending = False
         if not self.current or not self.view:
             return
 
-        # Don't render while in input mode - it would corrupt the input region
-        if self._input_mode:
-            return
+        # Snapshot sticky composer before rewrite
+        was_input = bool(self._input_mode) and not getattr(self, "_question_input_mode", False)
+        draft = ""
+        caret_off = 0
+        caret_in_composer = False
+        peel = None
+        if was_input:
+            draft = self.get_input_text()
+            try:
+                from . import claude_code
+                _s = claude_code.get_session_for_view(self.view)
+                if _s is not None:
+                    _s.draft_prompt = draft
+            except Exception:
+                pass
+            peel = self._composer_peel_start()
+            try:
+                sel = self.view.sel()
+                if sel and self._input_start is not None:
+                    b = sel[0].begin()
+                    if b >= self._input_start:
+                        caret_in_composer = True
+                        caret_off = b - self._input_start
+            except Exception:
+                pass
 
         # Read region from Sublime's tracked region (auto-adjusts when view shifts)
         view_size = self.view.size()
@@ -2547,7 +2596,7 @@ class OutputView:
             last_pos = content.rfind(prompt_marker)
             if last_pos >= 0:
                 start = last_pos
-                end = view_size
+                end = peel if (was_input and peel is not None) else view_size
             else:
                 return
 
@@ -2709,35 +2758,54 @@ class OutputView:
         view_size = self.view.size()
         # Conversation owns events + work strip (task list). Turn-modal UI
         # (question / plan / permission) is *after* the conversation region.
-        # Never extend `end` into that tail — that was the “wrong re-render
-        # location” bug: task-list tail + question got mashed (orphan lines).
+        # Sticky ◎ composer is after that. Never extend `end` into either tail.
         has_trailing_ui = (
             (self.pending_permission and self.pending_permission.callback) or
             (self.pending_plan and self.pending_plan.callback) or
             (self.pending_question and self.pending_question.callback)
         )
         trail = self._trailing_ui_start()
-        if trail is not None:
+        if peel is not None:
+            # Composer owns [peel, EOF); conversation must stop before it.
+            end = min(end, peel)
+            if trail is not None:
+                end = min(end, trail)
+        elif trail is not None:
             end = min(end, trail)
         elif not has_trailing_ui and end < view_size:
-            # No modal UI — safe to absorb orphaned text after the region.
+            # No modal UI / composer — safe to absorb orphaned text after region.
             end = view_size
 
         # Full-region replace remaps carets and can thrash the viewport while
         # streaming. When the user is reading mid-history (or auto_scroll is
         # off), pin a *text anchor* at the viewport top and restore after ST
         # settles — pixel-y alone still jumps when mid-buffer line lengths change.
+        # Typing in the sticky composer at the tail counts as "following".
         want_scroll = bool(getattr(self, "_auto_scroll", True))
-        following = want_scroll and self._is_following_tail()
+        at_tail = self._is_following_tail()
+        typing_at_tail = was_input and caret_in_composer and at_tail
+        following = (want_scroll and at_tail) or typing_at_tail
         pin = None if following else self._pin_view_state()
 
+        old_end = end
         new_end = self._replace(start, end, text)
+        delta = new_end - old_end
         self.current.region = (start, new_end)
         self.view.add_regions(
             "claude_conversation",
             [sublime.Region(start, new_end)],
             "", "", sublime.HIDDEN,
         )
+
+        # Shift sticky composer anchors with the conversation rewrite
+        if was_input and delta != 0:
+            if getattr(self, "_input_area_start", None) is not None:
+                self._input_area_start = max(0, self._input_area_start + delta)
+            if self._input_start is not None:
+                self._input_start = max(0, self._input_start + delta)
+            pca, pcb = self._pending_context_region
+            if pcb > pca:
+                self._pending_context_region = (max(0, pca + delta), max(0, pcb + delta))
 
         # Update title (tab only — no viewport effect)
         self._update_title()
@@ -2757,12 +2825,41 @@ class OutputView:
                 # Still fix placement but restore pin after.
                 self._render_question()
 
+        # Re-open sticky composer if the marker was lost, else restore caret
+        if was_input:
+            self.view.set_read_only(False)
+            if not self._input_marker_intact():
+                self._replant_composer(draft, caret_off)
+            elif caret_in_composer:
+                pos = min(self._input_start + max(0, caret_off), self.view.size())
+                try:
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(pos, pos))
+                except Exception:
+                    pass
+
         if pin is not None:
             # Immediate + deferred restore (beats ST auto-scroll-to-caret).
+            # If we already restored a composer caret, strip sels from pin so
+            # restore doesn't yank the caret back to pre-delta coords.
+            if was_input and caret_in_composer:
+                pin = dict(pin)
+                pin["sels"] = []
             self._restore_view_state(pin)
             self._schedule_viewport_restore(pin)
-        elif want_scroll:
+            if was_input and caret_in_composer and self._input_marker_intact():
+                pos = min(self._input_start + max(0, caret_off), self.view.size())
+                try:
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(pos, pos))
+                except Exception:
+                    pass
+        elif want_scroll or typing_at_tail:
             self._scroll_to_end(force=True)
+
+        # Keep composer editable after _replace set read_only
+        if was_input and self._input_mode:
+            self.view.set_read_only(False)
 
         # Phantoms: skip while pinned mid-history during a live turn (flashy).
         if following or not self.current.working:
@@ -2776,6 +2873,11 @@ class OutputView:
             if _sess and getattr(_sess, "_wakeup_armed", None) and _sess._wakeup_armed():
                 sublime.set_timeout(
                     lambda s=_sess: s._update_wakeup_banner(show=True), 15)
+            if was_input and _sess and self._input_mode:
+                sublime.set_timeout(
+                    lambda s=_sess: s._update_permission_banner(show=True), 15)
+                sublime.set_timeout(
+                    lambda s=_sess: s._update_queue_phantom(), 15)
         except Exception:
             pass
 

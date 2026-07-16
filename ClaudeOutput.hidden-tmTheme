@@ -183,6 +183,19 @@
             </dict>
         </dict>
 
+        <!-- Sticky composer boundary -->
+        <dict>
+            <key>name</key>
+            <string>Input Separator</string>
+            <key>scope</key>
+            <string>claude.input.sep</string>
+            <key>settings</key>
+            <dict>
+                <key>foreground</key>
+                <string>#4a5568</string>
+            </dict>
+        </dict>
+
         <!-- Claude-specific: Interrupted marker -->
         <dict>
             <key>name</key>

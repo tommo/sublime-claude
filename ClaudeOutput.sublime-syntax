@@ -7,6 +7,10 @@ hidden: true
 
 contexts:
   main:
+    # Sticky composer boundary (when not inside a conversation block)
+    - match: '^[┄─━-]{8,}\s*$'
+      scope: claude.input.sep comment.line
+
     # Prompt starts with ◎ and ends with ▶
     - match: '^◎ '
       scope: claude.prompt.marker punctuation.definition.prompt.begin
@@ -22,6 +26,11 @@ contexts:
   conversation:
     # Next prompt ends this section (pop BEFORE matching the new prompt)
     - match: '(?=^◎ )'
+      pop: true
+
+    # Sticky composer boundary (┄ rule above ◎ input)
+    - match: '^[┄─━-]{8,}\s*$'
+      scope: claude.input.sep comment.line
       pop: true
 
     # Done tag ends the conversation

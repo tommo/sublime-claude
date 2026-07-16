@@ -1342,6 +1342,20 @@ class Session:
             self._status("error: bridge died")
             self.working = False
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
+            return
+
+        # Sticky EOF composer: re-open ◎ so the next message can be typed
+        # (queued via inject) while this turn streams. Silent wakes keep any
+        # draft the user already had.
+        if not silent:
+            def _sticky():
+                if not self.output or self.output.is_input_mode():
+                    return
+                if getattr(self.output, "_question_input_mode", False):
+                    return
+                self._input_mode_entered = False
+                self._enter_input_with_draft()
+            sublime.set_timeout(_sticky, 40)
 
     def send_message_with_callback(self, message: str, callback: Callable[[str], None], silent: bool = False, display_prompt: str = None) -> None:
         """Send message and call callback with Claude's response.
@@ -1426,6 +1440,7 @@ class Session:
         self._interrupting = False
         self.output.set_name(self.name or "Claude")
         self.output.clear_all_permissions()
+        # Sticky composer may already be open mid-turn — leave it.
 
         # 3. Response callback fires for ALL completions (channel mode needs to know)
         if self._response_callback:
@@ -1461,9 +1476,11 @@ class Session:
             sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
             return
 
-        # 5. Process queued prompts (keep working=True, animation continues)
+        # 5. Process plugin-side queued prompts (sticky composer / queue_prompt).
+        # Keep working=True so the next query() owns the busy state.
         if self._queued_prompts:
             prompt = self._queued_prompts.pop(0)
+            self._update_queue_phantom()  # drop the fired chip before next turn
             # Synthetic prompts (bg-task wakes, retain injects, etc.) should
             # never be rendered as user input — fire them silently with a
             # short status-bar/background hint.
@@ -1472,12 +1489,10 @@ class Session:
                 display = f"{BACKGROUND_PREFIX}{first}"
                 self.query(prompt, display_prompt=display, silent=True)
             else:
-                self.output.text(f"\n**[queued]** {prompt}\n\n")
-                self.query(prompt)
+                self.query(prompt, display_prompt=prompt)
             return
 
-        # 6. Clear inject_pending - if inject was mid-query, it's done now
-        # If inject was queued, queued_inject notification will start new query
+        # 6. Clear inject_pending - Claude mid-stream inject / bridge queued_inject
         self._inject_pending = False
 
         # 7. Now set working=False and enter input mode
@@ -1493,6 +1508,10 @@ class Session:
         self._inject_pending = False
         self._pending_retain = None
         self._input_mode_entered = False  # Allow re-entry to input mode
+        try:
+            self._update_queue_phantom()
+        except Exception:
+            pass
 
     def resume_input_mode(self) -> None:
         """Re-enter input mode after a non-query action (errors, cancellation, etc.)
@@ -1504,26 +1523,30 @@ class Session:
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
     def _enter_input_with_draft(self) -> None:
-        """Enter input mode and restore draft with cursor at end."""
+        """Enter sticky composer and restore draft with cursor at end.
+
+        Allowed while working — user can queue the next message mid-stream.
+        """
         if not self.output:
             return
-        # Skip if already in input mode or session is working
-        if self.output.is_input_mode() or self.working:
+        # Skip if already in input mode
+        if self.output.is_input_mode():
             return
 
         # Skip if we've already entered input mode after the last query
         # This prevents duplicate entries from multiple callers (on_activated, _on_done, etc.)
-        if self._input_mode_entered:
+        # Still allow re-entry while working after submit cleared the strip.
+        if self._input_mode_entered and not self.working:
             return
 
         # Queued prompts (e.g. notalone inject while sleeping) take priority
-        if self._queued_prompts:
+        # only when idle — don't steal the composer while streaming.
+        if self._queued_prompts and not self.working:
             prompt = self._queued_prompts.pop(0)
             self.query(prompt)
             return
 
-        # Stale conversation.working can block enter_input_mode even when the
-        # session is idle (common after interrupt race). Clear it first.
+        # Stale conversation.working after interrupt: clear when session is idle.
         if self.output.current and self.output.current.working and not self.working:
             self.output.current.working = False
 
@@ -1533,19 +1556,21 @@ class Session:
         if not self.output.is_input_mode():
             # Retry once after pending render / race settles.
             def _retry():
-                if self.working or not self.output or self.output.is_input_mode():
+                if not self.output or self.output.is_input_mode():
                     return
-                if self.output.current and self.output.current.working:
+                if self.output.current and self.output.current.working and not self.working:
                     self.output.current.working = False
                 self.output.enter_input_mode()
                 if self.output.is_input_mode():
                     self._input_mode_entered = True
-                    self.last_idle_at = time.time()
+                    if not self.working:
+                        self.last_idle_at = time.time()
             sublime.set_timeout(_retry, 50)
             return
 
         self._input_mode_entered = True
-        self.last_idle_at = time.time()
+        if not self.working:
+            self.last_idle_at = time.time()
 
         if self.draft_prompt and self.output.view:
             self.output.view.run_command("append", {"characters": self.draft_prompt})
@@ -1555,21 +1580,131 @@ class Session:
 
 
     def queue_prompt(self, prompt: str) -> None:
-        """Inject a prompt into the current query stream."""
-        self._status(f"injected: {prompt[:30]}...")
+        """Queue a prompt for the next turn (or run immediately if idle).
 
-        if self.working and self.client:
-            # Mid-query: show prompt and inject via bridge
-            short = prompt[:100] + "..." if len(prompt) > 100 else prompt
-            self.output.text(f"\n◎ [injected] {short} ▶\n\n")
-            self._inject_pending = True  # Don't show "done" until inject query completes
-            self.client.send("inject_message", {"message": prompt})
-        elif self.client:
-            # Not working: start query directly (no round-trip delay)
-            self.query(prompt)
-        else:
-            # No client - queue locally for later
+        Sticky-composer / mid-stream: plugin-side queue + phantom chrome above
+        ◎ (not transcript lines). Fires from `_on_done` when the turn ends.
+        """
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return
+        self._status(f"queued: {prompt[:30]}...")
+
+        if self.working and self.client and self.client.is_alive():
             self._queued_prompts.append(prompt)
+            self._update_queue_phantom()
+            # Optional Claude mid-stream inject (same turn). If it works, drop
+            # the plugin queue entry so we do not double-run on turn end.
+            if self.backend == "claude":
+                def _on_inj(r, p=prompt):
+                    if not isinstance(r, dict) or r.get("error"):
+                        return  # keep local queue entry
+                    res = r.get("result") if isinstance(r.get("result"), dict) else {}
+                    if res.get("status") in ("ok", "queued"):
+                        try:
+                            self._queued_prompts.remove(p)
+                        except ValueError:
+                            pass
+                        if res.get("status") == "queued":
+                            self._inject_pending = True
+                        self._update_queue_phantom()
+                self.client.send("inject_message", {"message": prompt}, _on_inj)
+            return
+
+        if self.client and self.client.is_alive():
+            self.query(prompt)
+            return
+
+        self._queued_prompts.append(prompt)
+        self._update_queue_phantom()
+
+    def _update_queue_phantom(self) -> None:
+        """Composer chrome *above* ◎: queued chips, then a visible split rule.
+
+        Layout (top → bottom, phantoms only):
+          ⏳ queued msg  ×
+          ───────────────
+          ◎ input…
+
+        minihtml often drops zero-height border-only divs, so the split is a
+        real text rule with solid color. Anchor on the line *above* ◎ with
+        LAYOUT_BLOCK (same pattern as media tool phantoms: block below that
+        line = between transcript and composer).
+        """
+        import html as _html
+        ps = self._phantom_set_for("_queue_phantom_set", "claude_queue")
+        if not ps or not self.output or not self.output.view:
+            return
+        view = self.output.view
+        if not view.is_valid():
+            return
+        in_input = getattr(self.output, "_input_mode", False)
+        if not in_input:
+            ps.update([])
+            return
+
+        # Peel = start of composer (◎). Park phantom on the previous line so
+        # LAYOUT_BLOCK draws *below* that line and *above* ◎.
+        peel = getattr(self.output, "_input_area_start", None)
+        if peel is None or peel < 0:
+            peel = getattr(self.output, "_input_start", None)
+        if peel is None or peel < 0:
+            peel = view.size()
+        peel = min(max(0, int(peel)), view.size())
+        pt = max(0, peel - 1) if peel > 0 else 0
+
+        rows = []
+        q = list(self._queued_prompts or [])
+        if q:
+            rows.append(
+                '<div style="margin:2px 0 4px 0;font-size:11px;'
+                'color:#888888;">queue</div>'
+            )
+            for i, msg in enumerate(q):
+                short = msg.replace("\n", " ").strip()
+                if len(short) > 72:
+                    short = short[:72] + "…"
+                safe = _html.escape(short)
+                rows.append(
+                    f'<div style="margin:2px 0;padding:2px 8px;'
+                    f'background-color:#2a3040;color:#73d0ff;font-size:12px;">'
+                    f'⏳ {safe}'
+                    f'&nbsp;<a href="drop:{i}" style="color:#f28779;'
+                    f'text-decoration:none;font-weight:bold;" title="remove">×</a>'
+                    f'</div>'
+                )
+        # Full-width rule: LAYOUT_BLOCK body stretches; solid bar via padding+bg
+        # (more reliable than a short "────" run or zero-height borders).
+        rows.append(
+            '<div style="margin:6px 0 4px 0;padding:1px 0;'
+            'background-color:#5c6773;">'
+            '<span style="font-size:1px;color:#5c6773;">&nbsp;</span></div>'
+        )
+        html = (
+            f'<body id="claude-queue" style="margin:0;padding:2px 0 4px 0;">'
+            f'{"".join(rows)}</body>'
+        )
+        try:
+            ps.update([sublime.Phantom(
+                sublime.Region(pt, pt),
+                html,
+                sublime.LAYOUT_BLOCK,
+                on_navigate=self._on_queue_phantom_navigate,
+            )])
+        except Exception as e:
+            print(f"[Claude] queue phantom: {e}")
+
+    def _on_queue_phantom_navigate(self, href: str) -> None:
+        if not href.startswith("drop:"):
+            return
+        try:
+            idx = int(href.split(":", 1)[1])
+        except (TypeError, ValueError):
+            return
+        if 0 <= idx < len(self._queued_prompts):
+            self._queued_prompts.pop(idx)
+            self._update_queue_phantom()
+            sublime.status_message("Removed queued message")
 
     def show_queue_input(self) -> None:
         """Show input panel to queue a prompt while session is working."""
@@ -1808,6 +1943,7 @@ class Session:
         for attr in (
             "_overlay_phantom_set", "_permmode_phantom_set",
             "_wakeup_phantom_set", "_workflow_phantom_set",
+            "_queue_phantom_set",
         ):
             setattr(self, attr, None)
             setattr(self, attr + "_view_id", None)
@@ -2323,11 +2459,20 @@ class Session:
     # ── method-level handlers ────────────────────────────────────────────
 
     def _on_queued_inject(self, params: dict) -> None:
-        message = params.get("message", "")
-        if message:
-            self._inject_pending = False
-            self.working = True
-            self.query(message)
+        """Bridge-held inject (Claude SDK) after turn end — run if not already queued."""
+        message = (params.get("message") or "").strip()
+        if not message:
+            return
+        self._inject_pending = False
+        # Dedupe: sticky composer may already have this in _queued_prompts and
+        # _on_done will fire it; only run here if we're idle with an empty queue.
+        if message in self._queued_prompts:
+            return
+        if self.working:
+            self._queued_prompts.append(message)
+            return
+        self.working = True
+        self.query(message)
 
     def _on_loop_scheduled(self, params: dict) -> None:
         """Bridge reports the exact next self-wake time (cron or ScheduleWakeup
