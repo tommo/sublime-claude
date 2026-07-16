@@ -1,5 +1,14 @@
 [
     {
+        "keys": ["super+\\"],
+        "command": "claude_code_switch"
+    },
+    {
+        "keys": ["super+shift+\\"],
+        "command": "claude_quick_agent"
+    },
+    {
+        // Keep old chord as alias so existing muscle memory still works
         "keys": ["super+alt+\\"],
         "command": "claude_code_switch"
     },

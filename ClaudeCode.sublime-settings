@@ -178,6 +178,18 @@
     //     "deepseek": "deepseek-v4-pro"
     // },
 
+    // Quick Agent — full session sheet with a pinned fast model (same UX as
+    // New Session: inline ◎ input, streaming, tools). Open: "Claude: Quick Agent"
+    // or ⌘⇧\. Config: "Claude: Quick Agent Config". model "flash" → haiku alias
+    // (e.g. deepseek-v4-flash). Omit allowed_tools to inherit the global list.
+    "quick_agent": {
+        "backend": "deepseek",
+        "model": "flash",
+        "effort": "low",
+        "permission_mode": "bypassPermissions",
+        "system_prompt": "You are a Quick Agent for short trivia and focused tasks. Answer concisely. Prefer a few sentences unless the user asks for depth."
+    },
+
     // Environment variables passed to bridge process
     // "env": {},
 

@@ -56,6 +56,13 @@ from .commands import (
     ClaudeCodeViewHistoryCommand,
 )
 
+# Quick Agent (bottom panel)
+from .quick_agent import (
+    ClaudeQuickAgentCommand,
+    ClaudeQuickAgentConfigCommand,
+    ClaudeQuickAgentStopCommand,
+)
+
 # Event listeners
 from .listeners import (
     ClaudeCodeEventListener,

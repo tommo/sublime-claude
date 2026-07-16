@@ -76,8 +76,9 @@ these changes so the bridge process reloads.
 1. Restart ClaudeCode Grok session (reload bridge).
 2. `/goal` activate the objective (TUI/host) if you need complete/blocked.
 3. `scheduler_create(interval="60s", fire_immediately=true, …)` — do **not** delete early.
-4. Expect: `↻ next wakeup at …` banner + a new turn with the cron prompt ~1.5s later
-   (immediate) then every 60s until deleted/completed.
+4. Expect: `↻ cron · next at …` banner with red **Stop** chip + a new turn with the
+   cron prompt ~1.5s later (immediate) then every 60s until Stop / deleted / completed.
+   Stop stays visible mid-turn and in input mode.
 
 ## Anti-patterns
 

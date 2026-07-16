@@ -76,8 +76,20 @@
         "command": "claude_code_start"
     },
     {
-        "caption": "Claude: Switch Session...",
+        "caption": "Claude: Switch Session… (⌘\\)",
         "command": "claude_code_switch"
+    },
+    {
+        "caption": "Claude: Quick Agent (⌘⇧\\ toggle show/hide)",
+        "command": "claude_quick_agent"
+    },
+    {
+        "caption": "Claude: Quick Agent Config…",
+        "command": "claude_quick_agent_config"
+    },
+    {
+        "caption": "Claude: Quick Agent Stop",
+        "command": "claude_quick_agent_stop"
     },
     {
         "caption": "Claude: Fork Session",

@@ -62,6 +62,13 @@ from .pty_cmds import (  # noqa: F401
     ClaudeRevealCliScreenCommand,
     ClaudeCodeToggleTerminalRevealCommand,
 )
+
+# Quick Agent lives in quick_agent.py (panel, not doc view)
+from ..quick_agent import (  # noqa: F401
+    ClaudeQuickAgentCommand,
+    ClaudeQuickAgentConfigCommand,
+    ClaudeQuickAgentStopCommand,
+)
 from .text_cmds import (  # noqa: F401
     ClaudeToggleSubmitModeCommand,
     ClaudeSubmitInputCommand,

@@ -107,6 +107,9 @@ class Session:
         self.working = False
         self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
         self.next_wake_at: Optional[float] = None  # epoch of the pending self-wake (for the wakeup banner)
+        # Quick Agent: lives in a bottom panel (not a doc tab). Lightweight
+        # trivia/Q&A — no session resume list, no inline input region.
+        self.quick_mode: bool = False
         self.current_tool: Optional[str] = None
         self.spinner_frame = 0
         # Session identity
@@ -284,15 +287,25 @@ class Session:
         self.client.start([python_path, bridge_script], env=env)
         self._status("connecting...")
 
-        permission_mode = settings.get("permission_mode", "acceptEdits")
+        # Quick Agent may pin permission / tools; otherwise same as normal session.
+        qa = (settings.get("quick_agent") or {}) if getattr(self, "quick_mode", False) else {}
+        if not isinstance(qa, dict):
+            qa = {}
+        permission_mode = (
+            qa.get("permission_mode")
+            if qa.get("permission_mode")
+            else settings.get("permission_mode", "acceptEdits")
+        )
         self.permission_mode = permission_mode
         # In default mode, don't auto-allow any tools - prompt for all
-        if permission_mode == "default":
+        if isinstance(qa.get("allowed_tools"), list):
+            allowed_tools = list(qa.get("allowed_tools") or [])
+        elif permission_mode == "default":
             allowed_tools = []
         else:
             allowed_tools = settings.get("allowed_tools", [])
 
-        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)}")
+        print(f"[Claude] initialize: permission_mode={permission_mode}, allowed_tools={allowed_tools}, resume={self.resume_id}, fork={self.fork}, profile={self.profile}, default_model={default_model}, subsession_id={getattr(self, 'subsession_id', None)} quick={getattr(self, 'quick_mode', False)}")
         # Get additional working directories from project folders + project settings
         all_folders = self.window.folders()
         secondary_folders = all_folders[1:] if len(all_folders) > 1 else []
@@ -472,9 +485,13 @@ class Session:
             self.output.strip_trailing_status_hints()
         except Exception:
             pass
-        # Persist "open" state (so plugin_loaded can track which sessions had views)
-        self._save_session()
-        # Auto-enter input mode when ready
+        # Persist "open" state (so plugin_loaded can track which sessions had views).
+        # Quick Agent is ephemeral — don't pollute the resume list.
+        if not getattr(self, "quick_mode", False):
+            self._save_session()
+        if getattr(self, "quick_mode", False) and self.output:
+            self.output.set_name(self.name or "⚡ Quick")
+        # Same inline input UX as a normal session
         self._enter_input_with_draft()
 
     def _load_env(self, settings) -> dict:
@@ -1773,11 +1790,33 @@ class Session:
                     view.set_read_only(True)
         self._show_overlay_phantom("\u23f8 Session paused \u2014 press Enter to wake", color="var(--yellowish)")
 
+    def _phantom_set_for(self, attr: str, key: str):
+        """PhantomSet bound to the *current* output view (rebind after soft-hide)."""
+        view = self.output.view if self.output else None
+        if not view or not view.is_valid():
+            return None
+        vid_attr = attr + "_view_id"
+        ps = getattr(self, attr, None)
+        if ps is None or getattr(self, vid_attr, None) != view.id():
+            ps = sublime.PhantomSet(view, key)
+            setattr(self, attr, ps)
+            setattr(self, vid_attr, view.id())
+        return ps
+
+    def reset_phantoms_for_new_view(self) -> None:
+        """Drop cached PhantomSets so the next update targets a new sheet."""
+        for attr in (
+            "_overlay_phantom_set", "_permmode_phantom_set",
+            "_wakeup_phantom_set", "_workflow_phantom_set",
+        ):
+            setattr(self, attr, None)
+            setattr(self, attr + "_view_id", None)
+        if self.output:
+            self.output._media_phantom_set = None
+            self.output._context_phantom_set = None
+
     def _get_overlay_phantom_set(self):
-        if not hasattr(self, '_overlay_phantom_set') or self._overlay_phantom_set is None:
-            if self.output and self.output.view:
-                self._overlay_phantom_set = sublime.PhantomSet(self.output.view, "claude_overlay")
-        return self._overlay_phantom_set
+        return self._phantom_set_for("_overlay_phantom_set", "claude_overlay")
 
     def _show_overlay_phantom(self, html_body: str, color: str = "color(var(--foreground) alpha(0.5))") -> None:
         ps = self._get_overlay_phantom_set()
@@ -1813,10 +1852,7 @@ class Session:
     }
 
     def _get_permmode_phantom_set(self):
-        if not hasattr(self, '_permmode_phantom_set') or self._permmode_phantom_set is None:
-            if self.output and self.output.view:
-                self._permmode_phantom_set = sublime.PhantomSet(self.output.view, "claude_permmode")
-        return self._permmode_phantom_set
+        return self._phantom_set_for("_permmode_phantom_set", "claude_permmode")
 
     def _update_permission_banner(self, show: bool = True) -> None:
         ps = self._get_permmode_phantom_set()
@@ -1836,30 +1872,34 @@ class Session:
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
 
     def _get_wakeup_phantom_set(self):
-        if not hasattr(self, '_wakeup_phantom_set') or self._wakeup_phantom_set is None:
-            if self.output and self.output.view:
-                self._wakeup_phantom_set = sublime.PhantomSet(self.output.view, "claude_wakeup")
-        return self._wakeup_phantom_set
+        return self._phantom_set_for("_wakeup_phantom_set", "claude_wakeup")
+
+    def _wakeup_armed(self) -> bool:
+        nxt = getattr(self, "next_wake_at", None)
+        return bool(nxt and nxt > time.time())
 
     def _update_wakeup_banner(self, show: bool = True) -> None:
-        """Pin '↻ next wakeup at HH:MM' while a self-paced loop is armed.
+        """Pin cron/loop bar with ETA + Stop while a self-wake is armed.
 
-        Shown whenever next_wake_at is in the future — not only in input mode
-        (input-only made scheduled loops look dead mid-turn / after render).
-        Includes a remove control after the hint.
+        Always visible when next_wake_at is in the future (input *and* mid-turn).
+        Stop cancels bridge crons / ScheduleWakeup / Grok client schedule backups.
         """
         ps = self._get_wakeup_phantom_set()
         if not ps or not self.output or not self.output.view:
             return
-        nxt = getattr(self, 'next_wake_at', None)
-        if not (show and nxt and nxt > time.time()):
+        if not (show and self._wakeup_armed()):
             ps.update([])
+            self._stop_wakeup_ticker()
             return
+        nxt = self.next_wake_at
+        remain = max(0, int(nxt - time.time()))
         when = datetime.datetime.fromtimestamp(nxt).strftime("%H:%M")
-        mins = max(0, int((nxt - time.time()) / 60))
-        secs = max(0, int(nxt - time.time()))
-        eta = f"~{mins}m" if mins else f"~{secs}s"
-        label = f"↻ next wakeup at {when} · {eta}"
+        if remain >= 3600:
+            eta = f"~{remain // 3600}h{(remain % 3600) // 60:02d}m"
+        elif remain >= 60:
+            eta = f"~{remain // 60}m{remain % 60:02d}s"
+        else:
+            eta = f"~{remain}s"
         view = self.output.view
         # Prefer just above the input marker when present; else last newline.
         content = view.substr(sublime.Region(0, view.size()))
@@ -1869,12 +1909,20 @@ class Session:
         if pt is None:
             last_nl = content.rfind("\n")
             pt = last_nl if last_nl >= 0 else 0
-        # Clickable remove — cancels cron / ScheduleWakeup / client backup timers.
+        # Stop is the primary control (red chip) — cancel cron / loop.
         html = (
-            f'<body style="margin: 4px 0; color: var(--bluish);">'
-            f'{label}'
-            f' · <a href="cancel" style="color: var(--redish); '
-            f'text-decoration: none;">remove</a>'
+            f'<body id="claude-wakeup" style="margin:6px 0 4px 0;padding:0;'
+            f'font-size:12px;color:var(--bluish);">'
+            f'<span style="color:var(--bluish);">↻ cron · next at {when} · {eta}</span>'
+            f'&nbsp;&nbsp;'
+            f'<a href="stop" style="'
+            f'color:var(--background);'
+            f'background-color:var(--redish);'
+            f'padding:1px 10px;'
+            f'text-decoration:none;'
+            f'font-weight:bold;'
+            f'border-radius:3px;'
+            f'">Stop</a>'
             f'</body>'
         )
         ps.update([sublime.Phantom(
@@ -1883,9 +1931,29 @@ class Session:
             sublime.LAYOUT_BLOCK,
             on_navigate=self._on_wakeup_banner_navigate,
         )])
+        self._ensure_wakeup_ticker()
+
+    def _ensure_wakeup_ticker(self) -> None:
+        """Refresh ETA / re-pin Stop bar every few seconds while armed."""
+        if getattr(self, "_wakeup_ticker_on", False):
+            return
+        self._wakeup_ticker_on = True
+
+        def _tick():
+            self._wakeup_ticker_on = False
+            if not self._wakeup_armed():
+                self._update_wakeup_banner(show=False)
+                return
+            self._update_wakeup_banner(show=True)
+            # _update_wakeup_banner re-arms the ticker via _ensure_wakeup_ticker
+
+        sublime.set_timeout(_tick, 5000)
+
+    def _stop_wakeup_ticker(self) -> None:
+        self._wakeup_ticker_on = False
 
     def _on_wakeup_banner_navigate(self, href: str) -> None:
-        if href == "cancel":
+        if href in ("cancel", "stop", "remove"):
             self.cancel_scheduled_loop()
 
     def cancel_scheduled_loop(self) -> None:
@@ -1893,6 +1961,7 @@ class Session:
         print(f"[Claude] cancel_scheduled_loop backend={self.backend}")
         self.next_wake_at = None
         self.is_looping = False
+        self._stop_wakeup_ticker()
         if self.output:
             self.output._update_title()
             self._update_wakeup_banner(show=False)
@@ -1900,7 +1969,7 @@ class Session:
         if self.client and self.client.is_alive():
             self.client.send("cancel_loop", {}, lambda r: print(
                 f"[Claude] cancel_loop → {r}"))
-        sublime.status_message("Scheduled wakeup removed")
+        sublime.status_message("Cron / scheduled wakeup stopped")
 
     def _show_connecting_phantom(self) -> None:
         self._show_overlay_phantom("◎ Connecting...")
@@ -2752,9 +2821,7 @@ class Session:
         self._render_workflow_detail(task_id)
 
     def _get_workflow_phantom_set(self):
-        if self._workflow_phantom_set is None and self.output and self.output.view:
-            self._workflow_phantom_set = sublime.PhantomSet(self.output.view, "claude_workflow")
-        return self._workflow_phantom_set
+        return self._phantom_set_for("_workflow_phantom_set", "claude_workflow")
 
     def _workflow_anchor_key(self, task_id: str) -> str:
         # Region key must be a valid sublime region name (no spaces).
@@ -3083,6 +3150,9 @@ class Session:
     def _save_session(self) -> None:
         """Save session info to disk for later resume."""
         if not self.session_id:
+            return
+        # Ephemeral panel agent — never pollute the resume list.
+        if getattr(self, "quick_mode", False):
             return
         sessions = load_saved_sessions()
         # Update or add this session — always move to front (most recently active)

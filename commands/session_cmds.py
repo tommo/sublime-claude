@@ -300,6 +300,13 @@ class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
 
         old_session = get_active_session(self.window)
+        # Quick Agent has its own lifecycle (panel) — restart via ensure.
+        if old_session and getattr(old_session, "quick_mode", False):
+            from .. import quick_agent
+            quick_agent.stop_quick_session(self.window)
+            quick_agent.ensure_quick_session(self.window, force_new=True)
+            sublime.status_message("Quick Agent restarted")
+            return
         old_view = None
         backend = None
         profile = None
@@ -598,7 +605,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         project_path = self.window.folders()[0] if self.window.folders() else None
         starred = load_bookmarks(project_path)
 
-        # Get all sessions in this window
+        # All sessions in this window (Quick Agent sheets included — same UX)
         sessions_in_window = []
         for view_id, session in sublime._claude_sessions.items():
             if session.window == self.window:
@@ -623,6 +630,20 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         in_output_view = current_view and (current_view.settings().get("claude_output")
                                            or current_view.settings().get("pty_reveal_owner"))
         current_file = current_view.file_name() if current_view else None
+
+        # Quick Agent — full session sheet with pinned fast model (⌘⇧\)
+        try:
+            from .. import quick_agent as _qa
+            _qa_label = _qa.config_label()
+            _qa_live = _qa.get_quick_session(self.window) is not None
+        except Exception:
+            _qa_label = "trivia / short tasks"
+            _qa_live = False
+        items.append([
+            "⚡ Quick Agent" + (" · open" if _qa_live else ""),
+            f"{_qa_label} · full session UX · ⌘⇧\\",
+        ])
+        actions.append(("quick_agent", None))
 
         # Add "New Session with This File" option when in a non-session file
         if not in_output_view and current_file:
@@ -795,6 +816,9 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         def on_select(idx):
             if idx >= 0:
                 action, data = actions[idx]
+                if action == "quick_agent":
+                    self.window.run_command("claude_quick_agent")
+                    return
                 if action == "switch_backend":
                     # Re-open panel with new backend
                     sublime.set_timeout(lambda: self.run(backend=data), 0)

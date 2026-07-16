@@ -10,6 +10,18 @@
                         "command": "claude_code_start"
                     },
                     {
+                        "caption": "Switch Session…                 ⌘\\",
+                        "command": "claude_code_switch"
+                    },
+                    {
+                        "caption": "Quick Agent (toggle)          ⌘⇧\\",
+                        "command": "claude_quick_agent"
+                    },
+                    {
+                        "caption": "Quick Agent Config…",
+                        "command": "claude_quick_agent_config"
+                    },
+                    {
                         "caption": "Query Claude",
                         "command": "claude_code_query"
                     },

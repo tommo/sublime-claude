@@ -58,7 +58,18 @@ class OutputView:
         self._media_anchor: Dict[str, int] = {}  # abs path -> buffer pt for popup
         self._context_phantom_set = None  # clickable open/reveal chips on 📎 line
 
-    def show(self, focus: bool = True) -> None:
+    def show(self, focus: bool = True, panel: Optional[str] = None) -> None:
+        """Show output as a doc sheet. Optional `panel` binds a bottom panel
+        (rarely used; Quick Agent uses a normal sheet + input mode).
+        """
+        if panel:
+            self._panel_name = panel
+        panel_name = getattr(self, "_panel_name", None)
+
+        if panel_name:
+            self._show_panel(panel_name, focus=focus)
+            return
+
         # If we already have a view, optionally focus it
         if self.view and self.view.is_valid():
             if focus:
@@ -82,7 +93,12 @@ class OutputView:
         )
         try:
             self.view.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
-            self.view.settings().set("color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
+            # Quick Agent overrides with its own warm theme after show()
+            if not self.view.settings().get("claude_quick"):
+                self.view.settings().set(
+                    "color_scheme",
+                    "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
+                )
         except Exception as e:
             print(f"[Claude] Error setting syntax/theme: {e}")
 
@@ -99,6 +115,28 @@ class OutputView:
         elif prev and prev.is_valid() and prev.id() != self.view.id():
             # Undo new_file()'s implicit focus steal
             self.window.focus_view(prev)
+
+    def _show_panel(self, panel_name: str, focus: bool = True) -> None:
+        """Bind this OutputView to a bottom panel (not a document sheet)."""
+        v = self.window.find_output_panel(panel_name)
+        if not v:
+            v = self.window.create_output_panel(panel_name)
+        self.view = v
+        self.view.set_read_only(True)
+        self.view.settings().set("claude_output", True)
+        self.view.settings().set("claude_quick_panel", True)
+        self.view.settings().set("auto_indent", False)
+        self.view.settings().set("word_wrap", True)
+        self.view.settings().set("gutter", False)
+        self.view.settings().set("scroll_past_end", True)
+        try:
+            self.view.assign_syntax("Packages/ClaudeCode/ClaudeOutput.sublime-syntax")
+            self.view.settings().set(
+                "color_scheme", "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme")
+        except Exception as e:
+            print(f"[Claude] quick panel syntax: {e}")
+        if focus:
+            self.window.run_command("show_panel", {"panel": f"output.{panel_name}"})
 
     def set_name(self, name: str) -> None:
         """Update the output view title."""
@@ -528,7 +566,8 @@ class OutputView:
         if not self.view or not self._input_mode:
             return ""
 
-        # Drop the permission-mode / wakeup banners before the input area is removed.
+        # Drop permission-mode banner with the input area. Keep the cron Stop
+        # bar if a loop is still armed — re-pin after input is removed.
         from . import claude_code
         _sess = claude_code.get_session_for_view(self.view)
         if _sess:
@@ -554,6 +593,9 @@ class OutputView:
         self.view.set_read_only(True)
         self._pending_context_region = (0, 0)
         self._refresh_context_phantoms([])
+        # Re-pin cron Stop bar at EOF if a loop is still armed (mid-turn).
+        if _sess and getattr(_sess, "_wakeup_armed", None) and _sess._wakeup_armed():
+            _sess._update_wakeup_banner(show=True)
         return input_text
 
     def get_input_text(self) -> str:
@@ -2726,6 +2768,17 @@ class OutputView:
         if following or not self.current.working:
             sublime.set_timeout(self._refresh_media_phantoms, 10)
 
+        # Keep cron Stop bar pinned after full rewrites (region remaps wipe
+        # phantom anchors otherwise). Cheap — always re-show when armed.
+        try:
+            from . import claude_code
+            _sess = claude_code.get_session_for_view(self.view)
+            if _sess and getattr(_sess, "_wakeup_armed", None) and _sess._wakeup_armed():
+                sublime.set_timeout(
+                    lambda s=_sess: s._update_wakeup_banner(show=True), 15)
+        except Exception:
+            pass
+
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string. Dispatches via TOOL_FORMATTERS registry."""
         return format_tool_detail(self, tool)
@@ -3069,10 +3122,13 @@ class OutputView:
         """
         if not self.view or not self.view.is_valid():
             return
-        if self._media_phantom_set is None:
+        # Rebind PhantomSet after soft-hide recreates the sheet
+        if (self._media_phantom_set is None
+                or getattr(self, "_media_phantom_view_id", None) != self.view.id()):
             try:
                 self._media_phantom_set = sublime.PhantomSet(
                     self.view, "claude_media")
+                self._media_phantom_view_id = self.view.id()
             except Exception as e:
                 print(f"[Claude] media PhantomSet: {e}")
                 return
@@ -3347,9 +3403,11 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return
         try:
-            if self._context_phantom_set is None:
+            if (self._context_phantom_set is None
+                    or getattr(self, "_context_phantom_view_id", None) != self.view.id()):
                 self._context_phantom_set = sublime.PhantomSet(
                     self.view, "claude_context_chips")
+                self._context_phantom_view_id = self.view.id()
         except Exception:
             return
 

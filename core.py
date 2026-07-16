@@ -76,17 +76,36 @@ def get_active_session(window: sublime.Window) -> Optional[Session]:
     """Get session for active view if it's a Claude output, or last active Claude session in window."""
     view = window.active_view()
     if view and view.settings().get("claude_output"):
-        return sublime._claude_sessions.get(view.id())
+        s = sublime._claude_sessions.get(view.id())
+        if s:
+            return s
+    # Prefer a working session in this window (incl. Quick Agent mid-turn)
+    working = None
+    for view_id, session in sublime._claude_sessions.items():
+        if session.window == window and session.working:
+            working = session
+            if not getattr(session, "quick_mode", False):
+                return session
+    if working:
+        return working
     # Check for last active Claude view in this window
     active_view_id = window.settings().get("claude_active_view")
     if active_view_id and active_view_id in sublime._claude_sessions:
         session = sublime._claude_sessions[active_view_id]
-        if session.window == window:
+        if session.window == window and not getattr(session, "quick_mode", False):
             return session
-    # Fallback: return any session in this window
+    # Prefer a non-quick session in this window
     for view_id, session in sublime._claude_sessions.items():
-        if session.window == window:
+        if session.window == window and not getattr(session, "quick_mode", False):
             return session
+    # Quick Agent (panel) when nothing else is active
+    try:
+        from . import quick_agent
+        qs = quick_agent.get_quick_session(window)
+        if qs:
+            return qs
+    except Exception:
+        pass
     return None
 
 
@@ -149,6 +168,8 @@ def _check_auto_sleep():
 
     for view_id, session in list(sublime._claude_sessions.items()):
         if getattr(session, 'sleep_disabled', False):
+            continue
+        if getattr(session, 'quick_mode', False):
             continue
         if (session.initialized
                 and not session.working

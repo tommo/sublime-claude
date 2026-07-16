@@ -145,6 +145,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                 if index < len(views):
                     view = views[index]
             if view and view.settings().get("claude_output"):
+                # Quick Agent soft-hide closes the sheet without killing the bridge
+                if view.settings().get("claude_quick_soft_close"):
+                    return None
                 session = sublime._claude_sessions.get(view.id())
                 if session and (session.initialized or session.is_sleeping):
                     def _ask():
@@ -252,6 +255,10 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         sublime.load_settings("ClaudeOutput.sublime-settings").clear_on_change(
             f"claude_output_{view.id()}"
         )
+        # Soft-hide Quick Agent: sheet goes away, bridge stays in quick_agent registry
+        if view.settings().get("claude_quick_soft_close"):
+            sublime._claude_sessions.pop(view.id(), None)
+            return
         # Clean up session when output view is closed
         if view.id() in sublime._claude_sessions:
             sublime._claude_sessions[view.id()].stop()
@@ -344,6 +351,9 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         Used during ST startup so restoring many claude_output sheets does not
         raise each tab.
         """
+        # Quick Agent sheets are owned by quick_agent.py — never invent a resume orphan.
+        if self.view and self.view.settings().get("claude_quick"):
+            return
         from .session import Session, load_saved_sessions
 
         view = self.view
@@ -440,17 +450,23 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             view.settings().erase("claude_reconnecting")
             return
 
-        # Re-apply backend-specific background color
-        backend = view.settings().get("claude_backend")
-        if backend:
-            backend_themes = {
-                "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-                "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-                "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
-            }
-            theme = backend_themes.get(backend)
-            if theme:
-                view.settings().set("color_scheme", theme)
+        # Re-apply sheet theme (Quick Agent wins over backend tint)
+        if view.settings().get("claude_quick"):
+            view.settings().set(
+                "color_scheme",
+                "Packages/ClaudeCode/ClaudeOutput-quick.hidden-tmTheme",
+            )
+        else:
+            backend = view.settings().get("claude_backend")
+            if backend:
+                backend_themes = {
+                    "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
+                    "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+                    "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
+                }
+                theme = backend_themes.get(backend)
+                if theme:
+                    view.settings().set("color_scheme", theme)
 
         # If we have a session_id, sleep it. Otherwise auto-reconnect (old behavior).
         if resume_id:
