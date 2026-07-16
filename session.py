@@ -1291,6 +1291,16 @@ class Session:
         if self.output.view and not self.window.settings().has("claude_executing_view"):
             self.window.settings().set("claude_executing_view", self.output.view.id())
             self._is_executing_session = True
+        # Multi-slot Quick host: all slots share one view_id — pin the slot id
+        # so quick_done stops *this* agent, not whatever tab is focused.
+        # Set even when output.view is None (inactive slot still streaming).
+        if getattr(self, "quick_mode", False) and self.window:
+            sid = getattr(self, "_quick_slot_id", None)
+            if sid:
+                try:
+                    self.window.settings().set("claude_executing_quick_slot", sid)
+                except Exception:
+                    pass
         # Build prompt with context (may include images), then consume
         full_prompt, images = self._build_prompt_with_context(prompt)
         _, context_names = self.context.take()
@@ -1397,6 +1407,10 @@ class Session:
         if self.output.view and getattr(self, '_is_executing_session', False):
             self.window.settings().erase("claude_executing_view")
             self._is_executing_session = False
+        if getattr(self, "quick_mode", False) and self.window:
+            if self.window.settings().get("claude_executing_quick_slot") == getattr(
+                    self, "_quick_slot_id", None):
+                self.window.settings().erase("claude_executing_quick_slot")
 
         # 1. Determine completion type
         if "error" in result:

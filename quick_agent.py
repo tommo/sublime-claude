@@ -260,10 +260,11 @@ class QuickHost:
         self._counter += 1
         sid = f"q{self._counter}"
         label = name or f"Q{self._counter}"
-        s = self._spawn_session(label)
+        s = self._spawn_session(label, slot_id=sid)
         _attach_focused_doc_context(s, source or _source_view_for_context(self.window))
         slot = QuickSlot(slot_id=sid, session=s, name=label)
         self.slots[sid] = slot
+        s._quick_slot_id = sid  # identity for quick_done (multi-slot host)
         self.active_id = sid
         self._bind_session_to_host(s, clear_buffer=True)
         s.start()
@@ -271,7 +272,7 @@ class QuickHost:
         self._render_tab_bar()
         return slot
 
-    def _spawn_session(self, label: str) -> Session:
+    def _spawn_session(self, label: str, slot_id: str = None) -> Session:
         cfg = load_config()
         backend = (cfg.get("backend") or "deepseek").strip() or "deepseek"
         model = resolve_model_id(cfg)
@@ -289,7 +290,7 @@ class QuickHost:
         s.quick_mode = True
         s.sleep_disabled = True
         s.name = f"⚡ {label} · {config_label(cfg)}"
-        s._quick_slot_id = None  # set after slot created
+        s._quick_slot_id = slot_id
         return s
 
     def _bind_session_to_host(self, session: Session, clear_buffer: bool = False,
@@ -427,10 +428,9 @@ class QuickHost:
         self._render_tab_bar()
 
     def _restart_slot_bridge(self, slot: QuickSlot) -> None:
-        s = slot.session
-        # New session object keeps name
         name = slot.name
-        ns = self._spawn_session(name)
+        ns = self._spawn_session(name, slot_id=slot.slot_id)
+        ns._quick_slot_id = slot.slot_id
         slot.session = ns
         self._bind_session_to_host(ns, clear_buffer=False, restore_content=slot.content)
         ns.start()
@@ -696,44 +696,99 @@ def _empty_fail_session(window) -> Session:
     return s
 
 
+def resolve_quick_session_for_tool(view_id: int = None) -> tuple:
+    """Resolve (host, session) for MCP quick_done.
+
+    Multi-slot hosts share one view_id for all slots. Prefer:
+      1) window setting claude_executing_quick_slot (set when that slot queries)
+      2) the sole working slot on the host for that view
+      3) active slot
+    """
+    host = None
+    if view_id is not None:
+        for h in _hosts.values():
+            try:
+                if h.view and h.view.is_valid() and h.view.id() == view_id:
+                    host = h
+                    break
+            except Exception:
+                continue
+            for sl in h.slots.values():
+                try:
+                    ov = sl.session.output.view if sl.session and sl.session.output else None
+                    if ov and ov.is_valid() and ov.id() == view_id:
+                        host = h
+                        break
+                except Exception:
+                    continue
+            if host:
+                break
+
+    if host is None:
+        try:
+            w = sublime.active_window()
+            host = get_host(w) if w else None
+        except Exception:
+            host = None
+
+    if not host:
+        # Fallback: session registered on view (single-slot legacy)
+        session = None
+        if view_id is not None and hasattr(sublime, "_claude_sessions"):
+            session = sublime._claude_sessions.get(view_id)
+        if session and getattr(session, "quick_mode", False):
+            return None, session
+        return None, None
+
+    session = None
+    # 1) Explicit executing slot (set in Session.query for quick_mode)
+    try:
+        esid = host.window.settings().get("claude_executing_quick_slot") if host.window else None
+    except Exception:
+        esid = None
+    if esid and esid in host.slots:
+        session = host.slots[esid].session
+
+    # 2) Sole working slot (tool call almost always from the busy agent)
+    if session is None:
+        working = [
+            sl for sl in host.slots.values()
+            if sl.session and sl.session.working and sl.status == "live"
+        ]
+        if len(working) == 1:
+            session = working[0].session
+        elif len(working) > 1 and host.active_session and host.active_session.working:
+            session = host.active_session
+
+    # 3) Active
+    if session is None:
+        session = host.active_session
+
+    if session and not getattr(session, "quick_mode", False):
+        return host, None
+    return host, session
+
+
 def complete_quick_from_tool(
     status: str = "completed",
     message: str = "",
     view_id: int = None,
 ) -> dict:
-    """Entry for MCP quick_done — resolve calling quick session and complete."""
-    session = None
-    if view_id:
-        session = sublime._claude_sessions.get(view_id) if hasattr(sublime, "_claude_sessions") else None
-    if not session or not getattr(session, "quick_mode", False):
-        # Try active host in any window matching view
-        for h in _hosts.values():
-            if h.view and h.view.is_valid() and view_id and h.view.id() == view_id:
-                session = h.active_session
-                break
-            if h.active_session and getattr(h.active_session, "quick_mode", False):
-                # Prefer session whose output.view matches
-                if h.active_session.output and h.active_session.output.view:
-                    if view_id and h.active_session.output.view.id() == view_id:
-                        session = h.active_session
-                        break
-    if not session:
-        # Last resort: active window host
-        w = sublime.active_window()
-        h = get_host(w) if w else None
-        if h:
-            session = h.active_session
+    """Entry for MCP quick_done — resolve calling slot and complete it."""
+    host, session = resolve_quick_session_for_tool(view_id=view_id)
     if not session or not getattr(session, "quick_mode", False):
         return {"ok": False, "error": "quick_done only works inside a Quick Agent slot"}
-    h = None
-    for host in _hosts.values():
-        if host.slot_for_session(session):
-            h = host
-            break
-    if h:
-        return h.complete_slot(session, status=status, message=message)
-    # Single-slot legacy path
-    return QuickHost(session.window).complete_slot(session, status=status, message=message)
+    if host:
+        return host.complete_slot(session, status=status, message=message)
+    # Session without host registry entry (should be rare)
+    stop_session_bridge(session)
+    return {
+        "ok": True,
+        "status": normalize_done_status(status),
+        "message": (message or "").strip(),
+        "slot": getattr(session, "_quick_slot_id", None),
+        "bridge_stopped": True,
+    }
 
 
 # ── context / layout (shared) ─────────────────────────────────────────
