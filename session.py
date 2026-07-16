@@ -255,6 +255,7 @@ class Session:
 
         # Stash provider label + resolved model on the view so the output renderer
         # can show them on the @done(…) meta line without reaching into the session.
+        # Also stamp session_id early so ST restart can reconnect before next save.
         if self.output and self.output.view:
             self.output.view.settings().set("claude_backend", self.backend)
             self.output.view.settings().set("claude_provider_label", spec.label or self.backend)
@@ -263,6 +264,10 @@ class Session:
             # Effort may be refined below; placeholder until init_params resolve.
             if getattr(self, "effort", None):
                 self.output.view.settings().set("claude_effort", self.effort)
+            try:
+                self._persist_view_identity()
+            except Exception:
+                pass
 
         # Diagnostic: log resolved spawn config (subsession-vs-standalone matters here)
         _is_subsession = bool(getattr(self, "subsession_id", None))
@@ -463,6 +468,10 @@ class Session:
         if sid:
             self.session_id = sid
             print(f"[Claude] session_id={self.session_id}")
+            try:
+                self._persist_view_identity()
+            except Exception:
+                pass
         # Show loaded MCP servers and agents
         mcp_servers = result.get("mcp_servers", [])
         agents = result.get("agents", [])
@@ -3679,6 +3688,25 @@ class Session:
         self._update_status_bar()
         self._save_session()
 
+    def _persist_view_identity(self) -> None:
+        """Stamp session_id + backend on the view so ST restart can resume.
+
+        Tab-title matching is fragile (truncation, newlines, GM> prefix). View
+        settings survive session restore and are the reliable reconnect key.
+        """
+        sid = self.session_id or self.resume_id
+        if not sid or not self.output or not self.output.view:
+            return
+        try:
+            view = self.output.view
+            if not view.is_valid():
+                return
+            view.settings().set("claude_session_id", sid)
+            if self.backend:
+                view.settings().set("claude_backend", self.backend)
+        except Exception:
+            pass
+
     def _save_session(self) -> None:
         """Save session info to disk for later resume."""
         if not self.session_id:
@@ -3686,6 +3714,8 @@ class Session:
         # Ephemeral panel agent — never pollute the resume list.
         if getattr(self, "quick_mode", False):
             return
+        # Always re-stamp view identity (covers init + rename + sleep)
+        self._persist_view_identity()
         sessions = load_saved_sessions()
         # Update or add this session — always move to front (most recently active)
         entry = None
@@ -3721,6 +3751,9 @@ class Session:
             entry["plan_file"] = self.plan_file
         else:
             entry.pop("plan_file", None)
+        # First-line prompt hint for restore when session_id missing on view
+        if self.name:
+            entry["first_prompt"] = str(self.name).split("\n", 1)[0].strip()[:200]
         sessions.insert(0, entry)
         # Keep last 200 sessions
         sessions = sessions[:200]

@@ -80,10 +80,8 @@ def _startup_strip_composers() -> None:
                     pass
                 if OutputView.strip_composer_tail(v):
                     n += 1
-        if n:
-            print(f"[Claude] startup: stripped composer from {n} sheet(s)")
-    except Exception as e:
-        print(f"[Claude] startup strip: {e}")
+    except Exception:
+        pass
 
 
 def _startup_settle_views() -> None:

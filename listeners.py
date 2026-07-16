@@ -12,6 +12,111 @@ from .session import Session
 from .context_parser import ContextParser, ContextMenuItem, ContextMenuHandler
 
 
+def _normalize_session_name(name: str) -> str:
+    """Collapse whitespace/newlines for stable title ↔ saved-name matching."""
+    if not name:
+        return ""
+    return " ".join(str(name).replace("\r", "\n").split())
+
+
+def _session_names_match(saved_name: str, tab_name: str) -> bool:
+    """True if tab title (possibly truncated) refers to the saved session name."""
+    a = _normalize_session_name(saved_name)
+    b = _normalize_session_name(tab_name)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # Tab titles truncate to ~24 chars (plus backend prefix already stripped)
+    if len(b) >= 8 and a.startswith(b):
+        return True
+    if len(a) >= 8 and b.startswith(a):
+        return True
+    # Multiline prompts used as names: match first line only
+    a0 = str(saved_name or "").split("\n", 1)[0].strip()
+    b0 = str(tab_name or "").split("\n", 1)[0].strip()
+    a0n, b0n = _normalize_session_name(a0), _normalize_session_name(b0)
+    if a0n and b0n and len(min(a0n, b0n, key=len)) >= 8:
+        if a0n == b0n or a0n.startswith(b0n) or b0n.startswith(a0n):
+            return True
+    return False
+
+
+def _find_saved_session_for_view(view, saved_sessions: list):
+    """Resolve a .sessions.json entry (or synthetic) for a restored Claude view.
+
+    Prefer view-persisted claude_session_id (survives ST restart). Fall back to
+    name / first-prompt matching. Returns dict with at least session_id, or None.
+    """
+    if not view:
+        return None
+    settings = view.settings()
+    view_sid = (settings.get("claude_session_id") or "").strip()
+    view_backend = (settings.get("claude_backend") or "").strip() or None
+
+    if view_sid:
+        for saved in saved_sessions:
+            if saved.get("session_id") == view_sid:
+                return saved
+        # Id stamped on view but pruned from the 200-entry list — still resume
+        return {
+            "session_id": view_sid,
+            "backend": view_backend or "claude",
+            "name": None,
+        }
+
+    # Strip status icons / GM> / truncation ellipsis from tab title
+    name = view.name() or ""
+    if name.endswith("…") or name.endswith("..."):
+        name = name[:-1] if name.endswith("…") else name[:-3]
+    try:
+        from .output import strip_title_decoration
+        name = strip_title_decoration(name)
+    except Exception:
+        pass
+    name = name.strip()
+
+    if name and name != "Claude":
+        for saved in saved_sessions:
+            if not saved.get("session_id"):
+                continue
+            # Prefer same backend when the view still has it (avoid claude↔glm mixups)
+            if view_backend and saved.get("backend") and saved.get("backend") != view_backend:
+                continue
+            if _session_names_match(saved.get("name") or "", name):
+                return saved
+        # Second pass without backend filter (backend setting may be missing)
+        if view_backend:
+            for saved in saved_sessions:
+                if not saved.get("session_id"):
+                    continue
+                if _session_names_match(saved.get("name") or "", name):
+                    return saved
+
+    # Buffer first ◎ prompt line
+    try:
+        content = view.substr(sublime.Region(0, min(800, view.size())))
+        m = re.search(r"◎ (.+?) ▶", content)
+        if m:
+            first_prompt = m.group(1).strip()
+            fp_norm = _normalize_session_name(first_prompt)
+            for saved in saved_sessions:
+                if not saved.get("session_id") or not saved.get("query_count", 0):
+                    continue
+                if view_backend and saved.get("backend") and saved.get("backend") != view_backend:
+                    continue
+                sp = saved.get("first_prompt") or ""
+                sn = saved.get("name") or ""
+                if sp and _normalize_session_name(sp) == fp_norm:
+                    return saved
+                if sn and _session_names_match(sn, first_prompt):
+                    return saved
+    except Exception:
+        pass
+
+    return None
+
+
 def settle_active_claude_view(window: sublime.Window) -> None:
     """Ensure the window's active Claude sheet is restored (sleep or live)."""
     if not window:
@@ -344,7 +449,9 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         paint=True (focused sheet): full sleep chrome (overlay, buffer cleanup).
         paint=False (background tab): title + settings only — no focus thrash.
 
-        No more quiet-register-then-later-sleep split.
+        Resume identity: claude_session_id on the view (preferred), else
+        .sessions.json match by name/prompt. Backend comes from the saved
+        entry when the view setting is missing (custom providers e.g. glm).
         """
         # Quick Agent sheets are owned by quick_agent.py
         if self.view and self.view.settings().get("claude_quick"):
@@ -359,53 +466,30 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         view.settings().set("claude_reconnecting", True)
 
         try:
-            name = view.name() or ""
-            name_was_truncated = name.endswith("…")
-            if name_was_truncated:
-                name = name[:-1]
-
-            from .output import strip_title_decoration
-            name = strip_title_decoration(name)
-
-            session_name = None
-            if " - " in name:
-                session_name = name.split(" - ")[0]
-            elif name and name != "Claude":
-                session_name = name
-
-            resume_id = None
             saved_sessions = load_saved_sessions()
+            matched = _find_saved_session_for_view(view, saved_sessions)
 
-            if session_name:
-                for saved in saved_sessions:
-                    saved_name = saved.get("name") or ""
-                    if not saved.get("session_id"):
-                        continue
-                    if saved_name == session_name or saved_name.startswith(session_name):
-                        resume_id = saved.get("session_id")
-                        session_name = saved_name
-                        break
+            resume_id = (matched or {}).get("session_id") if matched else None
+            session_name = (matched or {}).get("name") if matched else None
+            resume_session_at = (matched or {}).get("resume_session_at") if matched else None
 
-            if not resume_id:
-                content = view.substr(sublime.Region(0, min(500, view.size())))
-                m = re.search(r'◎ (.+?) ▶', content)
-                if m:
-                    first_prompt = m.group(1).strip()
-                    for saved in saved_sessions:
-                        fp = saved.get("first_prompt", "")
-                        if fp and fp == first_prompt and saved.get("query_count", 0) > 0:
-                            resume_id = saved.get("session_id")
-                            session_name = saved.get("name") or session_name
-                            break
+            # Backend: view stamp → saved entry → claude. Critical for glm/kimi/…
+            saved_backend = (
+                view.settings().get("claude_backend")
+                or (matched or {}).get("backend")
+                or "claude"
+            )
+            if not session_name:
+                # Best-effort display name from tab
+                raw = view.name() or ""
+                if raw.endswith("…"):
+                    raw = raw[:-1]
+                try:
+                    from .output import strip_title_decoration
+                    session_name = strip_title_decoration(raw) or None
+                except Exception:
+                    session_name = raw or None
 
-            resume_session_at = None
-            if resume_id:
-                for saved in saved_sessions:
-                    if saved.get("session_id") == resume_id:
-                        resume_session_at = saved.get("resume_session_at")
-                        break
-
-            saved_backend = view.settings().get("claude_backend", "claude")
             session = Session(window, resume_id=resume_id, backend=saved_backend)
             session.name = session_name
             session.output.view = view
@@ -414,12 +498,17 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             session._composer_allowed = False
             view.settings().set("claude_sleeping", True)
             view.settings().set("claude_input_mode", False)
+            view.settings().set("claude_backend", saved_backend)
             if resume_session_at:
                 session._pending_resume_at = resume_session_at
 
             # session_id set immediately so is_sleeping is True (no client yet)
             if resume_id:
                 session.session_id = resume_id
+                try:
+                    session._persist_view_identity()
+                except Exception:
+                    pass
 
             sublime._claude_sessions[view.id()] = session
 
@@ -430,16 +519,22 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     "Packages/ClaudeCode/ClaudeOutput-quick.hidden-tmTheme",
                 )
             else:
-                backend = view.settings().get("claude_backend")
-                if backend:
-                    backend_themes = {
-                        "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-                        "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-                        "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
-                    }
-                    theme = backend_themes.get(backend)
-                    if theme:
-                        view.settings().set("color_scheme", theme)
+                backend = saved_backend
+                if backend and backend != "claude":
+                    try:
+                        from . import backends as _backends
+                        spec = _backends.get(backend)
+                        if getattr(spec, "theme", None):
+                            view.settings().set("color_scheme", spec.theme)
+                    except Exception:
+                        backend_themes = {
+                            "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
+                            "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+                            "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
+                        }
+                        theme = backend_themes.get(backend)
+                        if theme:
+                            view.settings().set("color_scheme", theme)
 
             # Soft in-memory reset only (no reenter). Strip ST-restored ◎ if any.
             session.output.reset_active_states(soft=True)
@@ -447,10 +542,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
             if resume_id:
                 session._apply_sleep_ui(touch_buffer=paint)
-                print(
-                    f"[Claude] restore sleeping: view={view.name()!r} "
-                    f"session={session_name!r} id={resume_id[:12]}… paint={paint}"
-                )
             else:
                 session.output.set_name(session.display_name)
                 if paint:
@@ -459,7 +550,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                         color="var(--yellowish)",
                         strong=True,
                     )
-                print(f"[Claude] restore no-id (no auto-start): view={view.name()!r}")
         finally:
             view.settings().erase("claude_reconnecting")
 
@@ -496,6 +586,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         Used when typing/pasting was redirected from history — ST's default
         show(caret) only frames the caret row and leaves the hline off-screen.
+        Question free-text reuses _input_mode: park only, no sticky pad.
         """
         try:
             session.output.focus_composer(force_show=True)

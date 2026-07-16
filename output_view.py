@@ -280,6 +280,17 @@ class OutputView:
         # Leave a single trailing newline when there is prior content.
         self._replace(del_start, size, "\n" if del_start > 0 else "")
 
+    def _finish_buffer_edit(self) -> None:
+        """After plugin buffer writes: keep typeable zones editable."""
+        if not self.view or not self.view.is_valid():
+            return
+        # Sticky ◎ draft and AskUserQuestion free-text both use _input_mode.
+        # Leaving read_only=True after _write/_replace makes typing a no-op.
+        if self._input_mode or getattr(self, "_question_input_mode", False):
+            self.view.set_read_only(False)
+        else:
+            self.view.set_read_only(True)
+
     def _write(self, text: str, pos: Optional[int] = None) -> int:
         """Write text at position (or end). Returns end position."""
         if not self.view or not self.view.is_valid():
@@ -289,7 +300,7 @@ class OutputView:
         if pos is None:
             pos = self.view.size()
         self.view.run_command("claude_insert", {"pos": pos, "text": text})
-        self.view.set_read_only(True)
+        self._finish_buffer_edit()
         return pos + len(text)
 
     def _replace(self, start: int, end: int, text: str) -> int:
@@ -300,7 +311,7 @@ class OutputView:
         self.view.run_command("claude_replace", {
             "start": start, "end": end, "text": text,
         })
-        self.view.set_read_only(True)
+        self._finish_buffer_edit()
         return start + len(text)
 
     def _is_following_tail(self, slack: int = 120) -> bool:
@@ -716,7 +727,8 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return
         try:
-            if not self._input_mode:
+            # Free-text "Other" is not the sticky composer — no hline pad
+            if not self._input_mode or getattr(self, "_question_input_mode", False):
                 if self._pad_phantom_set is not None:
                     self._pad_phantom_set.update([])
                 return
@@ -822,6 +834,7 @@ class OutputView:
         """Focus the sticky ◎ input and scroll to the true view bottom.
 
         Programmatic focus must reveal ◎ + bottom hline pad, not only the caret.
+        AskUserQuestion free-text reuses _input_mode — park caret only (no pad).
         """
         if not self.view or not self.view.is_valid() or not self._input_mode:
             return
@@ -829,8 +842,19 @@ class OutputView:
             win = self.view.window()
             if win:
                 win.focus_view(self.view)
-            caret = self.view.size()
             self.view.set_read_only(False)
+            caret = self.view.size()
+            if getattr(self, "_question_input_mode", False):
+                # Free-text "Other..." — keep caret at type-in end, no sticky chrome
+                self._update_composer_pad_phantom()  # clears pad
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(caret, caret))
+                if force_show:
+                    try:
+                        self.view.show(caret)
+                    except Exception:
+                        pass
+                return
             self.view.sel().clear()
             self.view.sel().add(sublime.Region(caret, caret))
             # Pin pad/hline first so we can scroll past it
@@ -2524,15 +2548,37 @@ class OutputView:
             else:
                 write_at = self.view.size()
 
+        # Preserve free-text "Other" line (lives after the question block)
+        free_text = None
+        free_marker = None
+        if getattr(self, "_question_input_mode", False):
+            regs = self.view.get_regions("claude_question_input_marker")
+            if regs:
+                free_marker = "\n    ▸ "
+                free_text = self.view.substr(
+                    sublime.Region(regs[0].end(), self.view.size()))
+                # Erase marker+typed so orphan wipe / rewrite don't mangle it
+                self._replace(regs[0].begin(), self.view.size(), "")
+            else:
+                q_start = getattr(self, "_question_input_start", None)
+                if q_start is not None and q_start <= self.view.size():
+                    free_marker = "\n    ▸ "
+                    free_text = self.view.substr(
+                        sublime.Region(q_start, self.view.size()))
+                    erase_from = max(0, q_start - len(free_marker))
+                    self._replace(erase_from, self.view.size(), "")
+
         # Drop any orphan ❓ blocks still hanging after write_at (lost regions).
-        tail = self.view.substr(sublime.Region(write_at, self.view.size()))
-        if "❓" in tail:
-            # Only strip if it looks like a previous question UI, not user text.
-            orphan = tail.find("\n  ❓ ")
-            if orphan < 0:
-                orphan = tail.find("  ❓ ")
-            if orphan >= 0:
-                self._replace(write_at + orphan, self.view.size(), "")
+        # Never wipe when free-text mode is active (handled above).
+        if free_text is None:
+            tail = self.view.substr(sublime.Region(write_at, self.view.size()))
+            if "❓" in tail:
+                # Only strip if it looks like a previous question UI, not user text.
+                orphan = tail.find("\n  ❓ ")
+                if orphan < 0:
+                    orphan = tail.find("  ❓ ")
+                if orphan >= 0:
+                    self._replace(write_at + orphan, self.view.size(), "")
 
         end = self._write(text, pos=write_at)
         q_req.region = (write_at, end)
@@ -2542,6 +2588,26 @@ class OutputView:
             [sublime.Region(write_at, end)],
             "", "", sublime.HIDDEN,
         )
+
+        # Re-append free-text line after the rewritten question block
+        if free_marker is not None:
+            self.view.set_read_only(False)
+            marker_start = self.view.size()
+            self.view.run_command("append", {
+                "characters": free_marker + (free_text or ""),
+            })
+            marker_end = marker_start + len(free_marker)
+            self._question_input_start = marker_end
+            self._input_start = marker_end
+            self.view.add_regions(
+                "claude_question_input_marker",
+                [sublime.Region(marker_start, marker_end)],
+                "", "", sublime.HIDDEN,
+            )
+            caret = self.view.size()
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(caret, caret))
+            self.view.set_read_only(False)
 
         import re
         key_regions = []
@@ -2670,13 +2736,28 @@ class OutputView:
         return False
 
     def _question_enter_input_mode(self) -> None:
-        """Enter inline input mode for free-text question answer."""
+        """Enter inline free-text mode for [O] Other... (AskUserQuestion)."""
         if not self.view or not self.pending_question:
             return
 
-        # Append input prompt after question block, prefixed with newline so it
-        # sits on its own line and can be cleanly removed via named region.
+        # Already typing a custom answer — re-focus, don't stack another ▸
+        if getattr(self, "_question_input_mode", False):
+            self.view.set_read_only(False)
+            end = self.view.size()
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(end, end))
+            self.view.show(end)
+            return
+
+        # Append type-in line after the question block
         self.view.set_read_only(False)
+        # Drop sticky-composer pad if it was left over
+        try:
+            if self._pad_phantom_set is not None:
+                self._pad_phantom_set.update([])
+        except Exception:
+            pass
+
         marker_text = "\n    ▸ "
         marker_start = self.view.size()
         self.view.run_command("append", {"characters": marker_text})
@@ -2684,23 +2765,27 @@ class OutputView:
         self._question_input_start = marker_end
         self._question_input_mode = True
 
-        # Track the entire input line as a named region so we can erase it
-        # robustly later regardless of how much text the user types.
+        # Track marker so submit can erase marker + typed text cleanly
         self.view.add_regions(
             "claude_question_input_marker",
             [sublime.Region(marker_start, marker_end)],
             "", "", sublime.HIDDEN,
         )
 
-        # Set standard input mode so keyboard/selection handling works
+        # Reuse input-mode keymaps (Enter → submit_question_input) without
+        # sticky ◎ chrome. Outside-draft redirect parks into this free-text zone.
         self._input_start = self._question_input_start
         self._input_mode = True
         self.view.settings().set("claude_input_mode", True)
+        self.view.settings().set("claude_question_input_mode", True)
 
-        # Move cursor to input position
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(self._question_input_start, self._question_input_start))
-        self.view.show(self._question_input_start)
+        self.view.set_read_only(False)
+        try:
+            self.view.show(self._question_input_start)
+        except Exception:
+            pass
 
     def submit_question_input(self) -> bool:
         """Submit free-text input for question. Returns True if handled."""
@@ -2708,21 +2793,35 @@ class OutputView:
             return False
         if not self.pending_question or not self.view:
             self._question_input_mode = False
+            try:
+                self.view.settings().set("claude_question_input_mode", False)
+            except Exception:
+                pass
             return False
 
-        # Get typed text (region from marker_end to current view end)
-        text = self.view.substr(sublime.Region(self._question_input_start, self.view.size())).strip()
+        # Prefer marker region (survives buffer shifts); fall back to stored pt
+        regions = self.view.get_regions("claude_question_input_marker")
+        if regions:
+            text_start = regions[0].end()
+            erase_start = regions[0].begin()
+        else:
+            text_start = self._question_input_start
+            erase_start = max(0, self._question_input_start - len("\n    ▸ "))
+        text = self.view.substr(sublime.Region(text_start, self.view.size())).strip()
+
+        if not text:
+            # Empty Enter: stay in free-text mode so the field remains usable
+            self.view.set_read_only(False)
+            end = self.view.size()
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(end, end))
+            return True
+
         self._question_input_mode = False
         self._input_mode = False
         self.view.settings().set("claude_input_mode", False)
+        self.view.settings().set("claude_question_input_mode", False)
 
-        # Remove the entire input line: marker region + any typed text after it.
-        # Use the tracked region for robustness; fall back to position math.
-        regions = self.view.get_regions("claude_question_input_marker")
-        if regions:
-            erase_start = regions[0].begin()
-        else:
-            erase_start = max(0, self._question_input_start - len("\n    ▸ "))
         self.view.set_read_only(False)
         self.view.run_command("claude_replace", {
             "start": erase_start,
@@ -2732,13 +2831,12 @@ class OutputView:
         self.view.set_read_only(True)
         self.view.erase_regions("claude_question_input_marker")
 
-        if text:
-            q_req = self.pending_question
-            q = q_req.questions[q_req.current_idx]
-            header = q.get("header", f"Q{q_req.current_idx + 1}")
-            q_req.answers[q.get("question", str(q_req.current_idx))] = text
-            self._clear_question(f"{header} → {text}")
-            self._advance_question()
+        q_req = self.pending_question
+        q = q_req.questions[q_req.current_idx]
+        header = q.get("header", f"Q{q_req.current_idx + 1}")
+        q_req.answers[q.get("question", str(q_req.current_idx))] = text
+        self._clear_question(f"{header} → {text}")
+        self._advance_question()
 
         return True
 
@@ -3216,9 +3314,18 @@ class OutputView:
         elif want_scroll or typing_at_tail:
             self._scroll_to_end(force=True)
 
-        # Keep composer editable after _replace set read_only
-        if was_input and self._input_mode:
+        # Keep typeable zones editable after _replace (sticky ◎ or free-text Other)
+        if self._input_mode or getattr(self, "_question_input_mode", False):
             self.view.set_read_only(False)
+            # Re-sync free-text anchors if the question block was rewritten
+            if getattr(self, "_question_input_mode", False):
+                try:
+                    regs = self.view.get_regions("claude_question_input_marker")
+                    if regs:
+                        self._question_input_start = regs[0].end()
+                        self._input_start = self._question_input_start
+                except Exception:
+                    pass
 
         # Phantoms: skip while pinned mid-history during a live turn (flashy).
         if following or not self.current.working:
