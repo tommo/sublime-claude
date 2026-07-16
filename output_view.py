@@ -32,6 +32,25 @@ class OutputView:
         "background": "⚙",
     }
 
+    # Host/plumbing tools — tracked for lifecycle but never shown in the buffer.
+    # Users should see the answer, not "☐ mcp__sublime__quick_done".
+    _HOST_CONTROL_TOOLS = frozenset({
+        "quick_done",
+        "mcp__sublime__quick_done",
+        "sublime__quick_done",
+    })
+
+    @classmethod
+    def is_host_control_tool(cls, name: str) -> bool:
+        n = (name or "").strip()
+        if not n:
+            return False
+        if n in cls._HOST_CONTROL_TOOLS:
+            return True
+        # use_tool wrappers / server-prefixed variants
+        low = n.lower()
+        return low.endswith("quick_done") or "quick_done" in low
+
     def __init__(self, window: sublime.Window):
         self.window = window
         self.view: Optional[sublime.View] = None
@@ -203,7 +222,11 @@ class OutputView:
         # Truncate to keep tab bar usable
         if len(name) > 24:
             name = name[:23] + "…"
-        self.view.set_name(f"{prefix}{name}")
+        full = f"{prefix}{name}"
+        # set_name on inactive sheets can raise/focus them during multi-tab
+        # restore — only touch the tab when the title actually changes.
+        if self.view.name() != full:
+            self.view.set_name(full)
 
     def strip_trailing_status_hints(self) -> None:
         """Remove reconnect status spam from the view tail.
@@ -418,17 +441,63 @@ class OutputView:
 
     # --- Inline Input ---
 
+    def has_turn_modal_ui(self) -> bool:
+        """True when choice/permission UI owns the bottom of the view (hide ◎)."""
+        if getattr(self, "_question_input_mode", False):
+            return True
+        if self.pending_question and self.pending_question.callback:
+            return True
+        if self.pending_permission and self.pending_permission.callback:
+            return True
+        if self.pending_plan and self.pending_plan.callback:
+            return True
+        return False
+
+    def hide_composer_for_modal(self) -> None:
+        """Park sticky ◎ + split phantom so modal choice UI owns the tail.
+
+        Draft is saved on the session for restore after the modal ends.
+        """
+        if not self.view or not self.view.is_valid():
+            return
+        if self._input_mode:
+            try:
+                from . import claude_code
+                session = claude_code.get_session_for_view(self.view)
+                draft = self.get_input_text()
+                if session is not None and draft is not None:
+                    session.draft_prompt = draft
+            except Exception:
+                pass
+            self.exit_input_mode(keep_text=False)
+        # Even if already out of input mode, drop queue/split chrome
+        try:
+            from . import claude_code
+            session = claude_code.get_session_for_view(self.view)
+            if session:
+                try:
+                    ps = getattr(session, "_queue_phantom_set", None)
+                    if ps:
+                        ps.update([])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if self.view:
+            self.view.settings().set("claude_input_mode", False)
+
     def enter_input_mode(self) -> None:
         """Enter sticky composer (◎ strip at EOF).
 
         Works while the session is streaming — submit queues via queue_prompt.
+        Suppressed while question/permission/plan UI is showing.
         """
         if not self.view or not self.view.is_valid():
             return
         if self._input_mode:
             return
-        # Free-text question UI owns the input region — don't fight it.
-        if getattr(self, "_question_input_mode", False):
+        # Modal choice UI owns the tail — don't stack ◎ under/over it
+        if self.has_turn_modal_ui():
             return
 
         from . import claude_code
@@ -501,14 +570,18 @@ class OutputView:
             self.view.set_read_only(False)
 
         # Build input area (context + marker). Queue + split are phantoms parked
-        # *above* ◎ via LAYOUT_BELOW on the line before the composer — not buffer.
+        # *above* ◎ via LAYOUT_BLOCK on the line before the composer — not buffer.
         # Always end the transcript with a newline so peel-1 is a real line and
         # chrome never anchors on the ◎ line (which put the split under input).
         if self.view.size() == 0:
             self.view.run_command("append", {"characters": "\n"})
         elif self.view.substr(self.view.size() - 1) != "\n":
             self.view.run_command("append", {"characters": "\n"})
+        # Peel = composer start (conversation replace stops here). Spare blank
+        # row lives *inside* the composer so re-renders don't wipe it — keeps
+        # the split phantom off the viewport floor (less shake at bottom).
         self._input_area_start = self.view.size()
+        self.view.run_command("append", {"characters": "\n"})
 
         # Add background task hints
         bg_tools = self.active_background_tools()
@@ -530,15 +603,19 @@ class OutputView:
 
         self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
+        # Spare empty line *below* the composer so ◎ isn't glued to the
+        # viewport floor (scroll padding + room to type).
+        self.view.run_command("append", {"characters": "\n"})
 
         # NOW set input mode - after _input_start is correctly positioned
         # This ensures on_modified won't save wrong content as draft
         self._input_mode = True
         self.view.settings().set("claude_input_mode", True)
 
-        # Move cursor to input position
+        # Caret on the ◎ line (before spare newline), not on the blank row
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
+        self.view.show(self.view.size())  # include spare line in viewport
         self.view.show(self._input_start)
 
         # Clickable open/reveal chips inline after 📎 (same line, not a 2nd row)
@@ -602,14 +679,87 @@ class OutputView:
         return input_text
 
     def get_input_text(self) -> str:
-        """Get current text in input region."""
+        """Get current text in input region (excludes trailing spare blank line)."""
         if not self.view or not self._input_mode:
             return ""
-        return self.view.substr(sublime.Region(self._input_start, self.view.size()))
+        text = self.view.substr(sublime.Region(self._input_start, self.view.size()))
+        # One trailing newline is viewport padding, not part of the prompt.
+        if text.endswith("\n"):
+            text = text[:-1]
+        return text
+
+    def ensure_composer_spare_line(self) -> None:
+        """Keep a single empty line after the draft (bottom padding)."""
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        try:
+            end = self.view.size()
+            start = max(0, int(self._input_start or 0))
+            if end < start:
+                return
+            # Already has trailing newline after composer content
+            if end > start and self.view.substr(end - 1) == "\n":
+                return
+            self.view.set_read_only(False)
+            self.view.run_command("append", {"characters": "\n"})
+        except Exception as e:
+            print(f"[Claude] ensure_composer_spare_line: {e}")
+
+    def set_composer_text(self, text: str) -> None:
+        """Replace draft (after ◎) and keep the spare bottom line."""
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        body = text or ""
+        # Don't double-store the spare newline inside the draft
+        if body.endswith("\n"):
+            body = body[:-1]
+        self.view.set_read_only(False)
+        self.view.run_command("claude_replace", {
+            "start": self._input_start,
+            "end": self.view.size(),
+            "text": body + "\n",
+        })
+        caret = self._input_start + len(body)
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(caret, caret))
 
     def is_input_mode(self) -> bool:
         """Check if currently in input mode."""
         return self._input_mode
+
+    def focus_composer(self, force_show: bool = True) -> None:
+        """Focus the sticky ◎ input and keep it in the viewport.
+
+        Call after queue-submit (or any path that clears the draft while
+        staying in input mode) so the user can type the next message without
+        hunting for a composer scrolled off-screen.
+        """
+        if not self.view or not self.view.is_valid():
+            return
+        if not self._input_mode:
+            return
+        try:
+            self.ensure_composer_spare_line()
+            win = self.view.window()
+            if win:
+                win.focus_view(self.view)
+            pt = max(0, int(self._input_start or 0))
+            # Caret at end of draft, *before* the spare blank line
+            draft = self.get_input_text()
+            caret = pt + len(draft)
+            end = self.view.size()
+            if caret > end:
+                caret = end
+            self.view.set_read_only(False)
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(caret, caret))
+            if force_show:
+                # Include spare line + ◎ in the visible region
+                show_pt = max(0, pt - 1) if pt > 0 else caret
+                self.view.show(sublime.Region(show_pt, end), False)
+                self.view.show(caret, keep_to_left=False, animate=False)
+        except Exception as e:
+            print(f"[Claude] focus_composer: {e}")
 
     def reset_input_mode(self) -> None:
         """Force reset input mode state - use when state gets corrupted."""
@@ -896,28 +1046,24 @@ class OutputView:
                             break
                     if not _open_todos(self.current.todos):
                         self.current.todos_all_done = True
-        elif name == "update_goal":
-            # Single sticky goal — not a multi-item Task list.
-            # completed=true CLEARS the sticky strip (tool line already records
-            # the completion). Progress-only messages only stick if a goal is
-            # already open, or they open a new active goal when message is set.
-            blocked = (tool_input.get("blocked_reason") or "").strip()
-            msg = (tool_input.get("message") or "").strip()
-            if blocked:
-                self.current.goal = GoalState(
-                    status="blocked", message=msg, blocked_reason=blocked)
-            elif tool_input.get("completed") is True:
-                # Done → drop sticky chrome. (Was: status=completed stayed
-                # painted forever as "◎ goal · done …".)
-                self.current.goal = None
-            else:
-                prev = self.current.goal
-                if msg or (prev and prev.status in ("active", "blocked")):
-                    self.current.goal = GoalState(
-                        status="active",
-                        message=msg or (prev.message if prev else ""),
-                        blocked_reason="",
-                    )
+        elif name == "update_goal" or (
+                isinstance(name, str) and name.endswith("update_goal")):
+            # Host GoalTracker drain (deduped if MCP already applied same sig).
+            sess = None
+            try:
+                from . import claude_code
+                sess = claude_code.get_session_for_view(self.view) if self.view else None
+            except Exception:
+                sess = None
+            if sess is not None and hasattr(sess, "apply_goal_update"):
+                blocked = (tool_input.get("blocked_reason") or "").strip()
+                msg = (tool_input.get("message") or "").strip()
+                completed = tool_input.get("completed") is True
+                try:
+                    sess.apply_goal_update(
+                        message=msg, completed=completed, blocked_reason=blocked)
+                except Exception as e:
+                    print(f"[Claude] update_goal drain: {e}")
 
         self._render_current()
 
@@ -1073,10 +1219,19 @@ class OutputView:
             if target is not None:
                 targets = [target]
         if not targets:
-            if self.current:
+            # Don't surface host-control tools as a late-arriving ✔ row
+            if self.current and not self.is_host_control_tool(name):
                 self.current.events.append(ToolCall(
                     name=name, tool_input={}, status=DONE, result=result, id=tool_id))
                 self._render_current()
+            return
+        # Host control: drop entirely (no ☐/✔ line in the answer)
+        if any(self.is_host_control_tool(t.name) for t in targets):
+            for t in targets:
+                try:
+                    self.remove_tool(t)
+                except Exception:
+                    pass
             return
         primary = targets[0]
         for target in targets:
@@ -1217,12 +1372,25 @@ class OutputView:
         """Add response text."""
         if not self.current:
             return
+        if content is None or content == "":
+            return
 
         # Merge with previous text event to avoid per-token line breaks
         if self.current.events and isinstance(self.current.events[-1], str):
             self.current.events[-1] += content
         else:
             self.current.events.append(content)
+        # Re-arm spinner only while the *session* is mid-query. After interrupt
+        # the bridge can still drip 1–2 lines — must not flip working=True again
+        # (that killed ◎: busy mark then idle with no input).
+        if not self.current.working:
+            try:
+                from . import claude_code
+                sess = claude_code.get_session_for_view(self.view) if self.view else None
+                if sess is not None and getattr(sess, "working", False):
+                    self.current.working = True
+            except Exception:
+                pass
         self._render_current()
 
     def meta(self, duration: float, cost: float = None, usage: dict = None) -> None:
@@ -1380,20 +1548,27 @@ class OutputView:
             self._cleared_content = None
             self._scroll_to_end()
 
-    def reset_active_states(self) -> None:
+    def reset_active_states(self, soft: bool = False) -> None:
         """Reset active states when reconnecting after Sublime restart.
 
         Clears pending permissions, marks pending tools as interrupted,
         resets input mode, and resets the view title to remove any stale spinner.
+
+        soft=True (quiet multi-tab restore): in-memory flags only — no buffer
+        edits, no phantoms. Mutating inactive sheets focuses them in ST.
         """
         # Reset input mode state (view settings may persist across restart)
         self.reset_input_mode()
 
-        # Clear permission state
+        # Clear permission state (memory only when soft)
         if self.pending_permission:
-            self._remove_permission_block()
+            if not soft:
+                self._remove_permission_block()
             self.pending_permission = None
         self._permission_queue.clear()
+
+        if soft:
+            return
 
         # Mark any pending tools in current conversation as error
         if self.current:
@@ -1415,7 +1590,6 @@ class OutputView:
             err_sym = self.SYMBOLS["error"]
             content = self.view.substr(sublime.Region(0, self.view.size()))
             marker = f"  {bg_sym} "
-            replacement = f"  {err_sym} "
             idx = 0
             edits: list = []
             while True:
@@ -1431,7 +1605,9 @@ class OutputView:
             if edits:
                 self.view.set_read_only(False)
                 for sym_start, sym_end in reversed(edits):
-                    self.view.run_command("claude_replace", {"start": sym_start, "end": sym_end, "text": err_sym})
+                    self.view.run_command("claude_replace", {
+                        "start": sym_start, "end": sym_end, "text": err_sym,
+                    })
                 self.view.set_read_only(True)
 
     def _remove_permission_block(self) -> None:
@@ -1482,11 +1658,6 @@ class OutputView:
         import time
         self.show(focus=False)  # Don't steal focus from other views
 
-        # IMPORTANT: Ensure input mode is OFF so permission keys (Y/N/S/A) work
-        # Permission keys require claude_input_mode=false in Default.sublime-keymap
-        if self.view:
-            self.view.settings().set("claude_input_mode", False)
-
         # NOTE: Don't call clear_stale_permission here - concurrent permissions are valid
         # Stale permission cleanup is handled by clear_all_permissions() on query completion
 
@@ -1515,8 +1686,9 @@ class OutputView:
             self._permission_queue.append(perm)
             return
 
-        # Show this one
+        # Show this one — hide sticky ◎ so choice UI owns the tail
         self.pending_permission = perm
+        self.hide_composer_for_modal()
         self._render_permission()
         self._scroll_to_end()
 
@@ -1985,16 +2157,13 @@ class OutputView:
                                allowed_prompts: list, callback: Callable[[str], None]) -> None:
         """Show an inline plan approval block."""
         self.show(focus=False)
-
-        if self.view:
-            self.view.settings().set("claude_input_mode", False)
-
         self.pending_plan = PlanApproval(
             id=plan_id,
             plan_file=plan_file,
             allowed_prompts=allowed_prompts,
             callback=callback,
         )
+        self.hide_composer_for_modal()
         self._render_plan_approval()
         self._scroll_to_end()
 
@@ -2127,17 +2296,15 @@ class OutputView:
     # --- Question UI ---
 
     def question_request(self, qid: int, questions: list, callback: Callable) -> None:
-        """Show an inline question block."""
+        """Show an inline question block (hides sticky ◎ while choosing)."""
         self.show(focus=False)
-
-        if self.view:
-            self.view.settings().set("claude_input_mode", False)
-
         self.pending_question = QuestionRequest(
             qid=qid,
             questions=questions,
             callback=callback,
         )
+        # After pending is set so re-entry guards see modal UI
+        self.hide_composer_for_modal()
         self._render_question()
         self._scroll_to_end(force=True)
 
@@ -2622,20 +2789,35 @@ class OutputView:
             else:
                 lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
 
-        # Events in time order (text chunks and tools interleaved)
+        # Events in time order (text chunks and tools interleaved).
+        # Coalesce consecutive str events so a missed merge never becomes
+        # one-character-per-line (and never leaves a trailing newline per token).
         if self.current.events:
             lines.append("\n")
-            for event in self.current.events:
+            i = 0
+            evs = self.current.events
+            n_ev = len(evs)
+            while i < n_ev:
+                event = evs[i]
                 if isinstance(event, str):
-                    # Text chunk
-                    lines.append(event)
-                    if not event.endswith("\n"):
-                        lines.append("\n")
-                elif isinstance(event, ToolCall):
-                    # Tool call
-                    symbol = self.SYMBOLS[event.status]
-                    detail = self._format_tool_detail(event)
-                    lines.append(f"  {symbol} {event.name}{detail}\n")
+                    parts = [event]
+                    i += 1
+                    while i < n_ev and isinstance(evs[i], str):
+                        parts.append(evs[i])
+                        i += 1
+                    block = "".join(parts)
+                    if block:
+                        lines.append(block)
+                        if not block.endswith("\n"):
+                            lines.append("\n")
+                    continue
+                if isinstance(event, ToolCall):
+                    # Host control (e.g. quick_done) — never show plumbing
+                    if not self.is_host_control_tool(event.name):
+                        symbol = self.SYMBOLS[event.status]
+                        detail = self._format_tool_detail(event)
+                        lines.append(f"  {symbol} {event.name}{detail}\n")
+                i += 1
 
         # Working indicator at bottom (animated)
         if self.current.working:
@@ -2665,10 +2847,37 @@ class OutputView:
         if not open_todos:
             self.current.todos_all_done = True
         goal = self.current.goal
-        # Sticky: active/blocked goals stay on the strip when idle so the user
-        # can see the objective in input mode. completed is cleared on
-        # update_goal and never carried to the next turn.
-        show_goal = bool(goal and goal.status in ("active", "blocked"))
+        # Prefer live host tracker when available (source of truth).
+        try:
+            from . import claude_code
+            from .output_models import GoalState, _goal_is_open
+            _sess = claude_code.get_session_for_view(self.view) if self.view else None
+            gt = getattr(_sess, "goal_tracker", None) if _sess else None
+            if gt is not None and gt.is_open():
+                snap = gt.to_ui_dict()
+                goal = GoalState(
+                    status=snap["status"],
+                    message=snap.get("message") or "",
+                    blocked_reason=snap.get("blocked_reason") or "",
+                    objective=snap.get("objective") or "",
+                    phase=snap.get("phase") or "idle",
+                    pause_message=snap.get("pause_message") or "",
+                    token_budget=snap.get("token_budget"),
+                    tokens_used=snap.get("tokens_used"),
+                    verify_runs=int(snap.get("verify_runs") or 0),
+                    verify_max=int(snap.get("verify_max") or 0),
+                    gaps=list(snap.get("gaps") or []),
+                    verifying=bool(snap.get("verifying")),
+                    planning=bool(snap.get("planning")),
+                    goal_id=snap.get("goal_id") or "",
+                )
+                self.current.goal = goal
+            elif gt is not None and not gt.is_open():
+                goal = None
+                self.current.goal = None
+        except Exception:
+            pass
+        show_goal = bool(goal and _goal_is_open(goal))
         show_tasks = False
         show = []
         hidden = 0
@@ -2689,14 +2898,43 @@ class OutputView:
         if show_goal or show_tasks:
             lines.append("\n")
             if show_goal:
-                if goal.status == "blocked":
-                    glabel, body = "blocked", (goal.blocked_reason or goal.message or "")
+                st = goal.status
+                if goal.verifying or goal.phase == "verifying":
+                    glabel = "verifying"
+                elif goal.planning or goal.phase == "planning":
+                    glabel = "planning"
+                elif st == "blocked":
+                    glabel = "blocked"
+                elif st == "budget_limited":
+                    glabel = "budget"
+                elif st in ("user_paused", "infra_paused"):
+                    glabel = "paused"
+                elif st == "active":
+                    glabel = "active"
                 else:
-                    glabel, body = "active", (goal.message or "")
-                # Prefix "◎ goal · <status>" is scoped separately from tasks.
+                    glabel = st
+                body = (
+                    goal.pause_message
+                    or goal.blocked_reason
+                    or goal.message
+                    or goal.objective
+                    or ""
+                )
                 gline = "  ◎ goal · {}".format(glabel)
+                if goal.objective and body != goal.objective:
+                    gline += "  {}".format(
+                        goal.objective.replace("\n", " ").strip()[:80])
                 if body:
-                    gline += "  {}".format(body.replace("\n", " ").strip())
+                    gline += "  — {}".format(body.replace("\n", " ").strip()[:100])
+                extra = []
+                if goal.token_budget:
+                    extra.append("~{}/{}".format(
+                        goal.tokens_used or 0, goal.token_budget))
+                if goal.verify_runs:
+                    extra.append("verify {}/{}".format(
+                        goal.verify_runs, goal.verify_max or "?"))
+                if extra:
+                    gline += "  ({})".format(" · ".join(extra))
                 lines.append(gline + "\n")
             if show_tasks:
                 for todo in show:
@@ -2756,25 +2994,27 @@ class OutputView:
 
         # Re-read view size (may have changed during text building)
         view_size = self.view.size()
-        # Conversation owns events + work strip (task list). Turn-modal UI
-        # (question / plan / permission) is *after* the conversation region.
-        # Sticky ◎ composer is after that. Never extend `end` into either tail.
-        has_trailing_ui = (
-            (self.pending_permission and self.pending_permission.callback) or
-            (self.pending_plan and self.pending_plan.callback) or
-            (self.pending_question and self.pending_question.callback)
-        )
+        # Conversation owns events + work strip. Turn-modal UI and sticky ◎
+        # sit after it. Critical: replace *up to* that boundary every frame so
+        # orphans between tracked region-end and ◎ (old spinner lines, single
+        # chars from a bad prior frame) get wiped — not left forever.
+        # Old bug: end = min(tracked_end, peel) left [tracked_end, peel) intact
+        # → "  ⠼\nj\n  ⠹\nj\n..." cascade while streaming.
         trail = self._trailing_ui_start()
-        if peel is not None:
-            # Composer owns [peel, EOF); conversation must stop before it.
-            end = min(end, peel)
-            if trail is not None:
-                end = min(end, trail)
-        elif trail is not None:
-            end = min(end, trail)
-        elif not has_trailing_ui and end < view_size:
-            # No modal UI / composer — safe to absorb orphaned text after region.
+        boundary = None
+        if peel is not None and peel >= start:
+            boundary = peel
+        if trail is not None and trail >= start:
+            boundary = trail if boundary is None else min(boundary, trail)
+        if boundary is not None:
+            end = boundary
+        else:
+            # No composer / modal — absorb everything after the region
             end = view_size
+        # Never invert the region
+        if end < start:
+            end = start
+        end = min(end, view_size)
 
         # Full-region replace remaps carets and can thrash the viewport while
         # streaming. When the user is reading mid-history (or auto_scroll is
@@ -3316,10 +3556,14 @@ class OutputView:
         safe_disp = _html.escape(disp or os.path.basename(path) or path)
         reveal_href = "reveal:" + path
         popup_href = "popup:" + path
+        edit_href = "edit:" + path
         # No "open in Sublime" — ST image views are useless for generated media.
+        # "edit" pins path as image_edit target + context (sync from preview).
         links = (
             f'<a href="{_html.escape(reveal_href)}">reveal</a>'
             f' · <a href="{_html.escape(popup_href)}">enlarge</a>'
+            f' · <a href="{_html.escape(edit_href)}" title="use as image_edit target">'
+            f'edit</a>'
             f' · <span style="color:color(var(--foreground) alpha(0.5))">'
             f'{safe_disp}</span>'
         )
@@ -3350,10 +3594,15 @@ class OutputView:
         )
 
     def show_media_popup(self, path: str, location: int = -1) -> None:
-        """Larger popup preview (super+click / enlarge link), anchored near image."""
+        """Larger popup preview (super+click / enlarge link), anchored near image.
+
+        Opening the preview also syncs the session edit target (image_edit path).
+        """
         if not self.view or not self.view.is_valid() or not path:
             return
         path = os.path.expanduser(path)
+        # Preview → editing target (so next image_edit can use this path)
+        self._sync_edit_target_from_preview(path, as_context=False, announce=False)
         html = self._media_popup_html(path)
         if not html:
             sublime.status_message(f"Media: {path}")
@@ -3401,8 +3650,10 @@ class OutputView:
             "background-color:var(--background);"
             "color:var(--foreground);font-size:12px;"
         )
+        edit_href = "edit:" + path
         links = (
             f'<a href="{_html.escape(reveal_href)}">reveal</a>'
+            f' · <a href="{_html.escape(edit_href)}">use as edit target</a>'
             f' · <a href="dismiss:">dismiss</a>'
             f'<br><span style="color:color(var(--foreground) alpha(0.55))">'
             f'{safe_disp}</span>'
@@ -3430,10 +3681,33 @@ class OutputView:
             f'(preview too large or unsupported)</div>{links}</body>'
         )
 
+    def _sync_edit_target_from_preview(
+        self,
+        path: str,
+        *,
+        as_context: bool = True,
+        announce: bool = True,
+        line: int = None,
+    ) -> None:
+        """Pin path as session edit target (from media/code preview)."""
+        if not path:
+            return
+        try:
+            from . import claude_code
+            session = claude_code.get_session_for_view(self.view) if self.view else None
+            if session and hasattr(session, "set_edit_target"):
+                session.set_edit_target(
+                    path, as_context=as_context, line=line, announce=announce)
+                return
+        except Exception as e:
+            print(f"[Claude] sync edit target: {e}")
+        # Fallback status only
+        if announce:
+            sublime.status_message(f"Edit target: {os.path.basename(path)}")
+
     def _handle_media_href(self, href: str, fallback_path: str = "",
                            location: int = -1) -> None:
-        """Navigate handler for media phantom/popup links (reveal / enlarge)."""
-        import subprocess
+        """Navigate handler for media phantom/popup links (reveal / enlarge / edit)."""
         if href == "dismiss:" or href.startswith("dismiss"):
             try:
                 self.view.hide_popup()
@@ -3447,6 +3721,16 @@ class OutputView:
             loc = location if location >= 0 else self._media_anchor.get(
                 os.path.expanduser(path), -1)
             self.show_media_popup(path, location=loc)
+            return
+        if href.startswith("edit:"):
+            path = href[5:] or fallback_path
+            path = os.path.expanduser(path)
+            # Explicit pin + context chip so the agent sees the path for image_edit
+            self._sync_edit_target_from_preview(path, as_context=True, announce=True)
+            try:
+                self.view.hide_popup()
+            except Exception:
+                pass
             return
         if href.startswith("reveal:"):
             path = href[7:]
@@ -3476,7 +3760,10 @@ class OutputView:
             sublime.status_message(f"Reveal failed: {e}")
 
     def _open_path(self, path: str, line: int = None) -> None:
-        """Open a code/text file in Sublime; optional 1-based line jump."""
+        """Open a code/text file in Sublime; optional 1-based line jump.
+
+        Also pins the path as the session edit target (preview → edit sync).
+        """
         path = os.path.expanduser(path or "")
         if not path:
             return
@@ -3486,14 +3773,28 @@ class OutputView:
         if os.path.isdir(path):
             self._reveal_path(path)
             return
+        # Opening from transcript/preview = sync editing target (no extra chip
+        # noise — file is already open; as_context=False unless image).
+        try:
+            from .tool_formatters import is_image_path as _is_img
+            is_img = _is_img(path)
+        except Exception:
+            is_img = False
+        self._sync_edit_target_from_preview(
+            path,
+            as_context=is_img,
+            announce=True,
+            line=line,
+        )
         if line and line > 0:
             window.open_file(
                 f"{path}:{line}", sublime.ENCODED_POSITION)
             sublime.status_message(
-                f"Opened {os.path.basename(path)}:{line}")
+                f"Opened {os.path.basename(path)}:{line} · edit target set")
         else:
             window.open_file(path)
-            sublime.status_message(f"Opened {os.path.basename(path)}")
+            sublime.status_message(
+                f"Opened {os.path.basename(path)} · edit target set")
 
     def _refresh_context_phantoms(self, context_items: list) -> None:
         """Clickable chips inline after the buffer 📎 (single line, no duplicate).

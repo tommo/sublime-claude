@@ -72,6 +72,22 @@
         "command": "claude_code_clear_context"
     },
     {
+        "caption": "Claude: Goal Status",
+        "command": "claude_goal_status"
+    },
+    {
+        "caption": "Claude: Goal Pause",
+        "command": "claude_goal_pause"
+    },
+    {
+        "caption": "Claude: Goal Resume",
+        "command": "claude_goal_resume"
+    },
+    {
+        "caption": "Claude: Goal Clear",
+        "command": "claude_goal_clear"
+    },
+    {
         "caption": "Claude: New Session",
         "command": "claude_code_start"
     },

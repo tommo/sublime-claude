@@ -131,11 +131,28 @@ class TestShippedPureHelpers(unittest.TestCase):
         self.assertEqual(self.qa.normalize_done_status("completed"), "completed")
         self.assertEqual(self.qa.normalize_done_status("blocked"), "blocked")
         self.assertEqual(self.qa.normalize_done_status("FAILED"), "blocked")
+        self.assertEqual(self.qa.normalize_done_status("closed"), "closed")
+        self.assertEqual(self.qa.normalize_done_status("dismiss"), "closed")
+        self.assertEqual(self.qa.normalize_done_status("bye"), "closed")
 
-    def test_system_prompt_self_stop_not_update_goal(self):
+    def test_user_wants_close(self):
+        self.assertTrue(self.qa.user_wants_close("close yourself"))
+        self.assertTrue(self.qa.user_wants_close("bye"))
+        self.assertTrue(self.qa.user_wants_close("dismiss"))
+        self.assertTrue(self.qa.user_wants_close("go away"))
+        self.assertFalse(self.qa.user_wants_close("hello"))
+        self.assertFalse(self.qa.user_wants_close("stop"))  # standby, not dismiss
+        self.assertFalse(self.qa.user_wants_close("please close the file foo.py"))
+
+    def test_system_prompt_turn_end_not_update_goal(self):
         p = self.qa.default_system_prompt()
         self.assertIn("quick_done", p)
-        self.assertNotIn("update_goal", p)
+        self.assertIn("closed", p.lower())
+        self.assertIn("one-shot", p.lower())
+        self.assertIn("Do NOT use update_goal", p)
+        merged = self.qa.build_system_prompt({"system_prompt": "Be brief."})
+        self.assertIn("Be brief", merged)
+        self.assertIn("quick_done", merged)
 
     def test_stop_session_bridge(self):
         class FC:
@@ -176,12 +193,34 @@ class TestCompleteSlotHandler(unittest.TestCase):
             def is_alive(self):
                 return not self.stopped
 
+        class FakeTool:
+            def __init__(self, name, status="pending"):
+                self.name = name
+                self.status = status
+                self.result = None
+
+        class FakeCurrent:
+            def __init__(self):
+                self.working = True
+                self.events = [
+                    FakeTool("mcp__sublime__quick_done", status="pending"),
+                ]
+
         class FakeOutput:
             view = None
             _input_mode = False
+            current = None
+            _render_pending = False
+            rendered = False
+
+            def __init__(self):
+                self.current = FakeCurrent()
 
             def is_input_mode(self):
                 return False
+
+            def _do_render(self):
+                self.rendered = True
 
         s = self.Session()
         s.client = FC()
@@ -267,7 +306,7 @@ class TestCompleteSlotHandler(unittest.TestCase):
         self.qa._hosts[host.window.id()] = host
         return host, win_settings
 
-    def test_complete_slot_stops_bridge_and_sets_status(self):
+    def test_complete_slot_stops_bridge_ready_for_next_submit(self):
         host, _ = self._make_host([True])
         slot = host.slots["q1"]
         sess = slot.session
@@ -276,32 +315,67 @@ class TestCompleteSlotHandler(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["slot"], "q1")
-        self.assertTrue(result["bridge_stopped"])
-        self.assertEqual(slot.status, "completed")
+        # One-shot end: bridge stop deferred; ◎ re-arms for next submit
+        self.assertEqual(result["bridge_stopped"], "deferred")
+        self.assertTrue(result.get("ready"))
+        self.assertEqual(slot.status, "live")
         self.assertEqual(slot.status_message, "done ok")
-        self.assertIsNone(sess.client)
         self.assertFalse(sess.working)
-        # client was stopped
+        self.assertFalse(getattr(sess, "_quick_finished", True))
+        # Host-control tool stripped (user never sees ☐ quick_done)
+        self.assertEqual(sess.output.current.events, [])
+        self.assertFalse(sess.output.current.working)
+        self.assertTrue(sess.output.rendered)
+        # Still alive until deferred stop
+        self.assertIsNotNone(sess.client)
+        self.assertFalse(client.stopped)
+        self.qa.stop_session_bridge(sess)
+        self.assertIsNone(sess.client)
         self.assertTrue(client.stopped)
+        # Dead session → not runnable; next submit will spawn
+        self.assertFalse(host.session_is_runnable(sess))
 
-    def test_complete_slot_blocked(self):
+    def test_complete_slot_blocked_still_live(self):
         host, _ = self._make_host([True])
         sess = host.slots["q1"].session
+        client = sess.client
         result = host.complete_slot(sess, status="blocked", message="need human")
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(host.slots["q1"].status, "blocked")
+        # Still live so user can type the missing info
+        self.assertEqual(host.slots["q1"].status, "live")
+        self.assertIsNotNone(sess.client)
+        self.assertFalse(client.stopped)
+
+    def test_complete_slot_closed_defers_dismiss(self):
+        host, _ = self._make_host([True])
+        slot = host.slots["q1"]
+        sess = slot.session
+        client = sess.client
+        result = host.complete_slot(sess, status="closed", message="bye")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "closed")
+        self.assertTrue(result.get("closed"))
+        self.assertFalse(result.get("ready"))
+        self.assertEqual(result["bridge_stopped"], "deferred")
+        self.assertEqual(slot.status, "closed")
+        self.assertTrue(getattr(sess, "_quick_finished", False))
+        # Bridge still alive until deferred dismiss
+        self.assertIsNotNone(sess.client)
+        self.assertFalse(client.stopped)
+        # Drive deferred close_slot path
+        self.qa.stop_session_bridge(sess)
+        host.close_slot("q1")
+        self.assertNotIn("q1", host.slots)
 
     def test_complete_quick_from_tool_uses_executing_slot_not_active(self):
-        """Inactive working slot's quick_done must not stop the focused idle slot."""
+        """Inactive working slot's quick_done must not touch the focused idle slot."""
         host, win_settings = self._make_host([False, True])  # q1 active idle, q2 working
         host.active_id = "q1"
         host.slots["q1"].session.working = False
         host.slots["q2"].session.working = True
-        # Pin executing slot to q2 (as Session.query would)
         win_settings["claude_executing_quick_slot"] = "q2"
 
-        # Fake host view id for resolve
         class V:
             def id(self):
                 return 1001
@@ -310,7 +384,6 @@ class TestCompleteSlotHandler(unittest.TestCase):
                 return True
 
         host.view = V()
-        # complete via tool entry with host view_id
         result = self.qa.complete_quick_from_tool(
             status="completed",
             message="bg done",
@@ -318,12 +391,11 @@ class TestCompleteSlotHandler(unittest.TestCase):
         )
         self.assertTrue(result.get("ok"), result)
         self.assertEqual(result.get("slot"), "q2")
-        self.assertEqual(host.slots["q2"].status, "completed")
-        # active idle slot must remain live
+        self.assertEqual(host.slots["q2"].status, "live")
         self.assertEqual(host.slots["q1"].status, "live")
-        self.assertIsNone(host.slots["q2"].session.client)
-        # q1 bridge still "alive"
+        # q1 untouched; q2 stop deferred (still present until timeout)
         self.assertIsNotNone(host.slots["q1"].session.client)
+        self.assertIsNotNone(host.slots["q2"].session.client)
 
     def test_resolve_prefers_sole_working_slot(self):
         host, win_settings = self._make_host([False, True])
@@ -376,6 +448,21 @@ class TestToolWiringInRepo(unittest.TestCase):
         self.assertIn("s._quick_slot_id = sid", src)
         self.assertIn("claude_executing_quick_slot", src)
         self.assertIn("resolve_quick_session_for_tool", src)
+
+    def test_submit_creates_session_model_in_source(self):
+        src = _read("quick_agent.py")
+        self.assertIn("def submit_prompt", src)
+        self.assertIn("_start_session_with_prompt", src)
+        self.assertIn("_quick_pending_prompt", src)
+        self.assertIn("_finalize_quick_done_tools", src)
+        self.assertIn('status == "closed"', src)
+        self.assertIn("user_wants_close", src)
+        out = _read("output_view.py")
+        self.assertIn("is_host_control_tool", out)
+        cmds = _read("commands/text_cmds.py")
+        self.assertIn("submit_prompt", cmds)
+        sess = _read("session.py")
+        self.assertIn("_quick_pending_prompt", sess)
 
     def test_host_max_enforced_in_source(self):
         src = _read("quick_agent.py")

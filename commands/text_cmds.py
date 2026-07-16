@@ -78,16 +78,76 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             self._handle_command(s, cmd)
             return
 
+        # If working: queue only — leave ◎ open and clear just the submitted
+        # text so the user can keep typing the next message without a full exit.
+        if s.working:
+            s.queue_prompt(text)
+            # Clear only the submitted line; do not exit sticky (preserves peel
+            # + draft path). Next keystrokes are a new message.
+            try:
+                if s.output.is_input_mode() and s.output.view:
+                    # Clear draft but keep spare bottom blank line under ◎
+                    s.output.set_composer_text("")
+                    s.draft_prompt = ""
+                    # Queue phantom can change layout height — refocus + show ◎
+                    try:
+                        s._update_queue_phantom()
+                    except Exception:
+                        pass
+                    s.output.focus_composer(force_show=True)
+                    # Second pass after phantoms/layout settle
+                    def _refocus_after_queue():
+                        if not s.output or not s.output.is_input_mode():
+                            return
+                        s.output.focus_composer(force_show=True)
+                    sublime.set_timeout(_refocus_after_queue, 30)
+                    sublime.set_timeout(_refocus_after_queue, 120)
+                    return
+                s.draft_prompt = ""
+            except Exception as e:
+                print(f"[Claude] queue clear input: {e}")
+                s.output.exit_input_mode(keep_text=False)
+                s.draft_prompt = ""
+                s._input_mode_entered = False
+
+                def _rearm_after_queue():
+                    if s.output and not s.output.is_input_mode():
+                        s._enter_input_with_draft()
+                    if s.output and s.output.is_input_mode():
+                        s.output.focus_composer(force_show=True)
+                sublime.set_timeout(_rearm_after_queue, 30)
+            try:
+                s._update_queue_phantom()
+            except Exception:
+                pass
+            return
+
         s.output.exit_input_mode(keep_text=False)
         s.draft_prompt = ""
         # Allow sticky composer to re-open immediately after submit
         s._input_mode_entered = False
 
-        # If session is working, queue the prompt instead
-        if s.working:
-            s.queue_prompt(text)
-        else:
-            s.query(text)
+        # Quick Agent: message submit *is* start — dead/idle bridge → new session
+        if getattr(s, "quick_mode", False):
+            try:
+                from .. import quick_agent as qa
+                host = qa.get_host(s.window) if s.window else None
+                if host and host.submit_prompt(s, text):
+                    def _rearm_q():
+                        if not s.output or s.output.is_input_mode():
+                            return
+                        # Session object may have been swapped; use host active
+                        cur = host.active_session or s
+                        if getattr(cur, "_quick_pending_prompt", None):
+                            return  # wait for init→query
+                        cur._input_mode_entered = False
+                        cur._enter_input_with_draft()
+                    sublime.set_timeout(_rearm_q, 30)
+                    return
+            except Exception as e:
+                print(f"[Claude] quick submit: {e}")
+
+        s.query(text)
 
         # Sticky EOF composer: re-arm ◎ so the next message can be typed
         # (and queued) while this turn streams.
@@ -106,6 +166,10 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             self._cmd_compact(session)
         elif cmd.name == "context":
             self._cmd_context(session)
+        elif cmd.name == "goal":
+            # Plugin-owned goal harness — do not forward raw /goal to agent
+            # (would double-drive Grok's native harness).
+            session.handle_goal_command(cmd.args)
         else:
             # Unknown command — send as regular prompt to Claude (the CLI's own
             # slash commands like /loop are handled by the engine forwarding
@@ -133,6 +197,34 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             lines.append("")
             session.output.text("\n".join(lines))
         session.output.enter_input_mode()
+
+
+class ClaudeGoalStatusCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        s = get_active_session(self.window)
+        if s:
+            s.handle_goal_command("status")
+
+
+class ClaudeGoalPauseCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        s = get_active_session(self.window)
+        if s:
+            s.handle_goal_command("pause")
+
+
+class ClaudeGoalResumeCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        s = get_active_session(self.window)
+        if s:
+            s.handle_goal_command("resume")
+
+
+class ClaudeGoalClearCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        s = get_active_session(self.window)
+        if s:
+            s.handle_goal_command("clear")
 
 
 class ClaudeInsertCommand(sublime_plugin.TextCommand):
@@ -1409,6 +1501,19 @@ class ClaudeOpenLinkCommand(sublime_plugin.TextCommand):
                 if os.path.isfile(path_with_line):
                     window = self.view.window()
                     if window:
+                        # Sync session edit target from transcript path preview
+                        try:
+                            from .. import claude_code
+                            session = claude_code.get_session_for_view(self.view)
+                            if session and hasattr(session, "set_edit_target"):
+                                session.set_edit_target(
+                                    path_with_line,
+                                    as_context=False,
+                                    line=line_num,
+                                    announce=True,
+                                )
+                        except Exception:
+                            pass
                         if line_num:
                             window.open_file(f"{path_with_line}:{line_num}", sublime.ENCODED_POSITION)
                         else:

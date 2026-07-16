@@ -1,8 +1,8 @@
-"""Quick Agent host — multi-slot (≤3) transient agents in one sheet.
+"""Quick Agent host — multi-slot (≤3) one-shot agents in one sheet.
 
-Each slot owns a short-lived Session (own bridge). One host view per window
-with a phantom tab bar; only the active slot paints the buffer. Soft-hide
-keeps bridges warm. Agents call quick_done to stop their own slot.
+Model: **message submit creates the session** for that request.
+After the agent answers (quick_done), the bridge stops; ◎ stays so the next
+Enter starts a *new* short-lived session. Explicit close hides the panel.
 """
 from __future__ import annotations
 
@@ -27,22 +27,68 @@ def normalize_done_status(status: Optional[str]) -> str:
     s = (status or "completed").strip().lower()
     if s in ("blocked", "error", "failed", "fail"):
         return "blocked"
+    if s in ("closed", "close", "exit", "dismiss", "hide", "quit",
+             "bye", "goodbye", "leave", "shutdown"):
+        return "closed"
     return "completed"
+
+
+# Short user lines that mean "go away" even if the model forgets quick_done.
+_CLOSE_USER_RE = re.compile(
+    r"^\s*("
+    r"close(\s+(yourself|this|quick|session|panel|tab|it|now))?|"
+    r"dismiss(\s+(yourself|this|quick|panel))?|"
+    r"go\s+away|"
+    r"(please\s+)?(leave|exit|quit|hide)(\s+(yourself|now|quick|panel))?|"
+    r"bye|goodbye|see\s+you|shutdown|shut\s+down"
+    r")\s*[.!]?\s*$",
+    re.I,
+)
+
+
+def user_wants_close(text: Optional[str]) -> bool:
+    """True when the user's message is a pure dismiss/close request."""
+    t = (text or "").strip()
+    if not t or len(t) > 100:
+        return False
+    return bool(_CLOSE_USER_RE.match(t))
 
 
 def can_add_slot(n_slots: int, cap: int = MAX_QUICK_SLOTS) -> bool:
     return n_slots < cap
 
 
+def completion_contract() -> str:
+    """Each user message is one short job; next message is a new session."""
+    return (
+        "## After each reply (required)\n"
+        "This is a one-shot: handle *this* message, then call `quick_done`:\n"
+        "- **completed** — done; host stops you. User's next message starts a fresh agent\n"
+        "- **blocked** — need more from the user (say what in message)\n"
+        "- **closed** — user said leave/close/dismiss/bye — host hides the panel\n"
+        "Do NOT use update_goal. Do NOT narrate tool calls. Keep answers short."
+    )
+
+
 def default_system_prompt() -> str:
     return (
-        "You are a Quick Agent for short trivia and focused tasks. "
-        "Answer concisely. Prefer a few sentences unless the user asks for depth. "
-        "When the user's request is fully handled, call the MCP tool "
-        "quick_done (via use_tool / sublime tools) with status='completed' and a "
-        "one-line message summary. If you cannot finish, call quick_done with "
-        "status='blocked' and a short reason. Do not leave the session open waiting."
+        "You are a Quick Agent: one user message → one answer. "
+        "Be concise unless asked for depth.\n\n"
+        + completion_contract()
     )
+
+
+def build_system_prompt(cfg: dict = None) -> str:
+    """User config prompt + always-on completion contract."""
+    cfg = cfg if isinstance(cfg, dict) else {}
+    base = (cfg.get("system_prompt") or default_system_prompt()).strip()
+    contract = completion_contract()
+    # Avoid double-append if config already embeds the contract
+    if "quick_done" in base and "Task completion" in base:
+        return base
+    if "quick_done" in base:
+        return base.rstrip() + "\n\n" + contract
+    return base.rstrip() + "\n\n" + contract
 
 
 def load_config() -> dict:
@@ -277,14 +323,7 @@ class QuickHost:
         backend = (cfg.get("backend") or "deepseek").strip() or "deepseek"
         model = resolve_model_id(cfg)
         effort = (cfg.get("effort") or "low").strip() or "low"
-        system = (cfg.get("system_prompt") or default_system_prompt()).strip()
-        # Always append self-stop hint if not already present
-        if "quick_done" not in system:
-            system = system.rstrip() + "\n\n" + (
-                "When the request is fully handled, call MCP tool quick_done "
-                "with status='completed' and a one-line message. "
-                "If blocked, status='blocked' with reason."
-            )
+        system = build_system_prompt(cfg)
         profile = {"model": model, "effort": effort, "system_prompt": system}
         s = Session(self.window, profile=profile, backend=backend)
         s.quick_mode = True
@@ -323,11 +362,6 @@ class QuickHost:
         def _go(tries=0):
             if self.active_session is not session:
                 return
-            sl = self.slot_for_session(session)
-            if sl and sl.status in ("completed", "blocked"):
-                self._show_done_chrome(sl)
-                self._render_tab_bar()
-                return
             if session.initialized and not session.working:
                 session._input_mode_entered = False
                 if not session.output.is_input_mode():
@@ -347,26 +381,162 @@ class QuickHost:
                 sublime.set_timeout(lambda: _go(tries + 1), 100)
         sublime.set_timeout(lambda: _go(), 50)
 
-    def _show_done_chrome(self, slot: QuickSlot) -> None:
-        """Append a done line if not already present; no bridge."""
-        s = slot.session
-        if not s.output or not s.output.view:
+    def _is_host_control_tool_name(self, name: str) -> bool:
+        n = (name or "").lower()
+        return "quick_done" in n
+
+    def _finalize_quick_done_tools(self, session: Session, message: str = "") -> None:
+        """Strip host-control tool rows + clear busy spinner. Answer stays; plumbing goes.
+
+        Must not raise — complete_slot still has to return the MCP tool result.
+        """
+        if not session or not session.output:
             return
-        glyph = "✓" if slot.status == "completed" else "⚠"
-        line = f"\n  {glyph} quick_done · {slot.status}"
-        if slot.status_message:
-            line += f" · {slot.status_message}"
-        line += "\n"
+        out = session.output
+        cur = getattr(out, "current", None)
+        if not cur:
+            return
         try:
-            # Avoid duplicating if already at end
-            content = s.output.view.substr(sublime.Region(0, s.output.view.size()))
-            if "quick_done ·" in content[-200:]:
-                return
-            s.output.view.set_read_only(False)
-            s.output.view.run_command("append", {"characters": line})
-            s.output.view.set_read_only(True)
+            cur.working = False
+            events = getattr(cur, "events", None)
+            if events is not None:
+                cur.events = [
+                    e for e in events
+                    if not self._is_host_control_tool_name(getattr(e, "name", "") or "")
+                ]
+        except Exception as e:
+            print(f"[Claude] finalize quick_done tools: {e}")
+        try:
+            out._render_pending = False
+            if hasattr(out, "_do_render"):
+                out._do_render()
+            elif hasattr(out, "_render_current"):
+                out._render_current()
         except Exception:
             pass
+
+    def _ready_composer(self, session: Session) -> None:
+        """Re-arm ◎ for the next submit (which will create a new session)."""
+        if not session or not session.output:
+            return
+        try:
+            session._quick_finished = False
+            session.working = False
+            session._input_mode_entered = False
+            if self.active_session is session and self.view and self.view.is_valid():
+                session.output.view = self.view
+                if not session.output.is_input_mode():
+                    session._enter_input_with_draft()
+        except Exception as e:
+            print(f"[Claude] quick ready composer: {e}")
+
+    def session_is_runnable(self, session: Session) -> bool:
+        if not session:
+            return False
+        try:
+            return bool(
+                session.client
+                and session.client.is_alive()
+                and session.initialized
+                and not getattr(session, "_quick_finished", False)
+            )
+        except Exception:
+            return False
+
+    def submit_prompt(self, session: Session, text: str) -> bool:
+        """User hit Enter. If agent is dead/idle, start a new session then run.
+
+        Returns True if handled (including async start+pending). False if caller
+        should fall through (shouldn't happen for quick).
+        """
+        text = (text or "").strip()
+        if not text or not session or not getattr(session, "quick_mode", False):
+            return False
+        slot = self.slot_for_session(session)
+        if not slot:
+            return False
+
+        # Explicit close phrasing while idle — dismiss without spawning
+        if user_wants_close(text) and not self.session_is_runnable(session):
+            try:
+                if session.output and session.output.is_input_mode():
+                    session.output.exit_input_mode(keep_text=False)
+            except Exception:
+                pass
+            self.close_slot(slot.slot_id)
+            return True
+
+        if session.working and self.session_is_runnable(session):
+            session.queue_prompt(text)
+            return True
+
+        if self.session_is_runnable(session):
+            session.query(text)
+            return True
+
+        # Bridge stopped after last turn (or never started) → new session on submit
+        self._start_session_with_prompt(slot, text)
+        return True
+
+    def _start_session_with_prompt(self, slot: "QuickSlot", text: str) -> None:
+        """Spawn a fresh bridge for this slot and run `text` once ready."""
+        # Keep transcript; swap session under the same slot id
+        content = slot.content or ""
+        if self.active_id == slot.slot_id and self.view and self.view.is_valid():
+            try:
+                if slot.session.output and slot.session.output.is_input_mode():
+                    peel = getattr(slot.session.output, "_input_area_start", None)
+                    if peel is not None and peel >= 0:
+                        content = self.view.substr(sublime.Region(0, peel))
+                    else:
+                        content = self.view.substr(sublime.Region(0, self.view.size()))
+                else:
+                    content = self.view.substr(sublime.Region(0, self.view.size()))
+            except Exception:
+                pass
+        content = (content or "").rstrip()
+        if content:
+            content += "\n\n"
+
+        try:
+            stop_session_bridge(slot.session)
+        except Exception:
+            pass
+
+        ns = self._spawn_session(slot.name, slot_id=slot.slot_id)
+        ns._quick_finished = False
+        ns._quick_slot_id = slot.slot_id
+        ns._quick_pending_prompt = text
+        slot.session = ns
+        slot.status = "live"
+        slot.status_message = ""
+        slot.content = content
+        slot.draft = ""
+
+        if self.active_id == slot.slot_id and self.view and self.view.is_valid():
+            self._bind_session_to_host(ns, clear_buffer=True, restore_content=content)
+        ns.start()
+        # Fire pending prompt as soon as init completes (also polled)
+        self._await_pending_prompt(ns)
+        self._render_tab_bar()
+
+    def _await_pending_prompt(self, session: Session) -> None:
+        def _go(tries=0, s=session):
+            if self.slot_for_session(s) is None:
+                return
+            pending = getattr(s, "_quick_pending_prompt", None)
+            if not pending:
+                return
+            if s.initialized and s.client and s.client.is_alive() and not s.working:
+                s._quick_pending_prompt = None
+                try:
+                    s.query(pending)
+                except Exception as e:
+                    print(f"[Claude] quick submit after start: {e}")
+                return
+            if tries < 100:
+                sublime.set_timeout(lambda: _go(tries + 1), 50)
+        sublime.set_timeout(lambda: _go(), 30)
 
     def switch_to(self, slot_id: str) -> None:
         if slot_id not in self.slots or slot_id == self.active_id:
@@ -410,10 +580,6 @@ class QuickHost:
         sublime.set_timeout(_scroll, 10)
         if source:
             _attach_focused_doc_context(s, source)
-        if slot.status in ("completed", "blocked"):
-            self._show_done_chrome(slot)
-            self._render_tab_bar()
-            return
         if s.client and s.client.is_alive() and s.initialized:
             s._input_mode_entered = False
             s._enter_input_with_draft()
@@ -422,9 +588,7 @@ class QuickHost:
             except Exception:
                 pass
         elif not s.client or not s.client.is_alive():
-            # Dead bridge — restart if not done
-            if slot.status == "live":
-                self._restart_slot_bridge(slot)
+            self._restart_slot_bridge(slot)
         self._render_tab_bar()
 
     def _restart_slot_bridge(self, slot: QuickSlot) -> None:
@@ -492,51 +656,129 @@ class QuickHost:
         status: str = "completed",
         message: str = "",
     ) -> dict:
-        """Self-stop: mark slot done/blocked and stop its bridge. Testable."""
+        """Turn complete (stay open) or explicit close (hide/dismiss).
+
+        completed/blocked → strip plumbing, keep bridge, re-arm ◎ (no menu).
+        closed → user asked to leave; defer dismiss so tool_result can flush.
+        """
         status = normalize_done_status(status)
         message = (message or "").strip()
         slot = self.slot_for_session(session)
+
         if not slot:
-            # Not multi-host? Fall back to single-session stop
-            if getattr(session, "quick_mode", False):
-                stop_session_bridge(session)
+            if not getattr(session, "quick_mode", False):
+                return {"ok": False, "error": "not a quick session"}
+            session.working = False
+            self._finalize_quick_done_tools(session, message)
+            if status == "closed":
+                session._quick_finished = True
+                def _stop_legacy(s=session, h=self):
+                    stop_session_bridge(s)
+                    try:
+                        h.soft_hide()
+                    except Exception:
+                        pass
+                sublime.set_timeout(_stop_legacy, 150)
+                return {
+                    "ok": True,
+                    "status": "closed",
+                    "message": message,
+                    "slot": None,
+                    "bridge_stopped": "deferred",
+                    "ready": False,
+                    "closed": True,
+                }
+            session._quick_finished = False
+            def _stop_ready_legacy(s=session):
                 try:
-                    if session.output and session.output.view:
-                        glyph = "✓" if status == "completed" else "⚠"
-                        session.output.view.set_read_only(False)
-                        session.output.view.run_command(
-                            "append",
-                            {"characters": f"\n  {glyph} quick_done · {status}"
-                             + (f" · {message}" if message else "") + "\n"},
-                        )
-                        session.output.view.set_read_only(True)
+                    stop_session_bridge(s)
                 except Exception:
                     pass
-                return {"ok": True, "status": status, "message": message, "slot": None}
-            return {"ok": False, "error": "not a quick session"}
+                self._ready_composer(s)
+            sublime.set_timeout(_stop_ready_legacy, 150)
+            return {
+                "ok": True,
+                "status": status,
+                "message": message,
+                "slot": None,
+                "bridge_stopped": "deferred",
+                "ready": True,
+            }
 
-        slot.status = status
-        slot.status_message = message
-        stop_session_bridge(session)
+        # Strip ☐ quick_done plumbing either way
         session.working = False
-        # Paint status if this slot is active
-        if self.active_id == slot.slot_id and self.view and self.view.is_valid():
-            if session.output:
+        if session.output:
+            if self.view and self.view.is_valid():
                 session.output.view = self.view
-            self._show_done_chrome(slot)
+            self._finalize_quick_done_tools(session, message)
+
+        # ── user asked to leave ──────────────────────────────────────
+        if status == "closed":
+            slot.status = "closed"
+            slot.status_message = message
+            session._quick_finished = True  # block ◎ re-entry on late _on_done
             try:
                 if session.output and session.output.is_input_mode():
                     session.output.exit_input_mode(keep_text=False)
             except Exception:
                 pass
+            sid = slot.slot_id
+
+            def _dismiss(h=self, s=session, slot_id=sid):
+                try:
+                    stop_session_bridge(s)
+                except Exception:
+                    pass
+                # close_slot soft-hides when it was the last tab
+                if slot_id in h.slots:
+                    try:
+                        h.close_slot(slot_id)
+                    except Exception as e:
+                        print(f"[Claude] quick close: {e}")
+                        try:
+                            h.soft_hide()
+                        except Exception:
+                            pass
+            sublime.set_timeout(_dismiss, 150)
+            sublime.status_message("Quick closed")
+            return {
+                "ok": True,
+                "status": "closed",
+                "message": message,
+                "slot": sid,
+                "bridge_stopped": "deferred",
+                "ready": False,
+                "closed": True,
+            }
+
+        # ── normal turn end — stop agent; next Enter creates a new session ──
+        slot.status = "live"
+        slot.status_message = message
+        session._quick_finished = False  # ◎ still allowed (idle shell)
+        # Defer bridge stop so MCP can flush tool_result first
+        def _stop_and_ready(s=session, h=self):
+            try:
+                stop_session_bridge(s)
+            except Exception:
+                pass
+            try:
+                h._ready_composer(s)
+                h._render_tab_bar()
+            except Exception:
+                pass
+        sublime.set_timeout(_stop_and_ready, 150)
         self._render_tab_bar()
-        sublime.status_message(f"Quick · {slot.name}: {status}")
+
+        if status == "blocked" and message:
+            sublime.status_message(f"⚡ {slot.name}: {message}")
+
         return {
             "ok": True,
             "status": status,
             "message": message,
             "slot": slot.slot_id,
-            "bridge_stopped": True,
+            "bridge_stopped": "deferred",
+            "ready": True,  # ◎ re-arms; next submit starts a new session
         }
 
     # ── tab bar ───────────────────────────────────────────────────────
@@ -549,30 +791,24 @@ class QuickHost:
         for sid, sl in self.slots.items():
             label = _html.escape(sl.name)
             busy = sl.session.working if sl.session else False
-            if sl.status == "completed":
-                mark = "✓ "
-            elif sl.status == "blocked":
-                mark = "⚠ "
-            elif busy:
-                mark = "◉ "
+            # Busy only — idle slots have no mark (always ready for next turn)
+            mark = "◉ " if busy else ""
+            active = sid == self.active_id
+            if active:
+                chip_bg = "background-color:color(var(--foreground) alpha(0.18));"
+                label_color = "color:var(--foreground);font-weight:bold;"
             else:
-                mark = ""
-            if sid == self.active_id:
-                style = (
-                    "color:var(--foreground);"
-                    "background-color:color(var(--foreground) alpha(0.18));"
-                    "padding:2px 8px;margin-right:4px;text-decoration:none;"
-                    "font-weight:bold;"
-                )
-            else:
-                style = (
-                    "color:color(var(--foreground) alpha(0.55));"
-                    "padding:2px 8px;margin-right:4px;text-decoration:none;"
-                )
+                chip_bg = "background-color:color(var(--foreground) alpha(0.06));"
+                label_color = "color:color(var(--foreground) alpha(0.55));"
+            # One chip: label + × share the same pill (close is not a free-floating link)
             chips.append(
-                f'<a href="tab:{sid}" style="{style}">{mark}{label}</a>'
-                f'<a href="close:{sid}" style="color:var(--redish);'
-                f'text-decoration:none;margin-right:8px;" title="close">×</a>'
+                f'<span style="{chip_bg}padding:2px 2px 2px 8px;margin-right:6px;">'
+                f'<a href="tab:{sid}" style="{label_color}text-decoration:none;'
+                f'padding:0 2px 0 0;">{mark}{label}</a>'
+                f'<a href="close:{sid}" style="color:color(var(--redish) alpha(0.85));'
+                f'text-decoration:none;padding:0 6px 0 4px;font-weight:bold;" '
+                f'title="close">×</a>'
+                f'</span>'
             )
         # + new if under cap
         if can_add_slot(len(self.slots)):
@@ -587,7 +823,7 @@ class QuickHost:
             )
         html = (
             '<body id="claude-quick-tabs" style="margin:0;padding:4px 0;">'
-            '<div style="padding:2px 4px;">'
+            '<div style="padding:2px 4px;line-height:1.6;">'
             f'{"".join(chips)}'
             '</div></body>'
         )
@@ -604,7 +840,10 @@ class QuickHost:
             print(f"[Claude] quick tab bar: {e}")
 
     def _on_tab_navigate(self, href: str) -> None:
-        if href == "new":
+        if href == "new" or href == "hide":
+            if href == "hide":
+                self.soft_hide()
+                return
             self.add_slot(source=_source_view_for_context(self.window))
             return
         if href.startswith("tab:"):
@@ -780,14 +1019,56 @@ def complete_quick_from_tool(
         return {"ok": False, "error": "quick_done only works inside a Quick Agent slot"}
     if host:
         return host.complete_slot(session, status=status, message=message)
-    # Session without host registry entry (should be rare)
-    stop_session_bridge(session)
+    # Session without host registry
+    st = normalize_done_status(status)
+    session.working = False
+    try:
+        cur = getattr(session.output, "current", None) if session.output else None
+        if cur is not None:
+            cur.working = False
+            events = getattr(cur, "events", None)
+            if events is not None:
+                cur.events = [
+                    e for e in events
+                    if "quick_done" not in (getattr(e, "name", "") or "").lower()
+                ]
+    except Exception:
+        pass
+    if st == "closed":
+        session._quick_finished = True
+        try:
+            import sublime as _sub
+            def _stop(s=session):
+                stop_session_bridge(s)
+            _sub.set_timeout(_stop, 150)
+        except Exception:
+            stop_session_bridge(session)
+        return {
+            "ok": True,
+            "status": "closed",
+            "message": (message or "").strip(),
+            "slot": getattr(session, "_quick_slot_id", None),
+            "bridge_stopped": "deferred",
+            "ready": False,
+            "closed": True,
+        }
+    session._quick_finished = False
+    try:
+        import sublime as _sub
+        def _ready(s=session):
+            s._input_mode_entered = False
+            if s.output and not s.output.is_input_mode():
+                s._enter_input_with_draft()
+        _sub.set_timeout(_ready, 80)
+    except Exception:
+        pass
     return {
         "ok": True,
-        "status": normalize_done_status(status),
+        "status": st,
         "message": (message or "").strip(),
         "slot": getattr(session, "_quick_slot_id", None),
-        "bridge_stopped": True,
+        "bridge_stopped": False,
+        "ready": True,
     }
 
 

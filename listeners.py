@@ -53,17 +53,19 @@ def settle_startup_claude_views() -> None:
                 continue
             ClaudeOutputEventListener(view)._reconnect_orphaned_view(w, quiet=True)
 
+        active = w.active_view()
+        active_id = active.id() if active else None
         for s in list(sublime._claude_sessions.values()):
             if s.window != w:
                 continue
             if not s.output or not s.output.view or not s.output.view.is_valid():
                 continue
+            is_focused = s.output.view.id() == active_id
             if s.is_sleeping:
-                # Title + overlay only; _show_overlay_phantom already skips
-                # view.show() when the sheet is not focused.
-                s._apply_sleep_ui()
+                # Inactive: title/settings only. Full overlay+buffer only when focused.
+                s._apply_sleep_ui(touch_buffer=is_focused)
             else:
-                # Keep tab title in sync (◇ etc.) without focusing.
+                # Keep tab title in sync (◇ etc.); set_name no-ops if unchanged.
                 s.output.set_name(s.display_name)
 
         settle_active_claude_view(w)
@@ -212,10 +214,12 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                     return
                 session.output.enter_input_mode()
                 if session.draft_prompt:
-                    session.output.view.run_command("append", {"characters": session.draft_prompt})
-                    end = session.output.view.size()
-                    session.output.view.sel().clear()
-                    session.output.view.sel().add(sublime.Region(end, end))
+                    if hasattr(session.output, "set_composer_text"):
+                        session.output.set_composer_text(session.draft_prompt)
+                    else:
+                        session.output.view.run_command("append", {
+                            "characters": session.draft_prompt,
+                        })
 
             sublime.set_timeout(refocus, 100)
 
@@ -286,18 +290,23 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not window:
             return
 
-        # ST package load / session restore can fire on_activated for every
-        # matching ViewEventListener sheet — even when it is not the real
-        # active_view. Heavy reconnect UI (set_name / phantoms / show) then
-        # makes each tab "raise" in sequence. Stay quiet unless we truly own focus.
+        # Package reload / session restore: ST can fire on_activated for *every*
+        # claude_output ViewEventListener sheet. Do nothing during the startup
+        # quiet window — no set_name, sel, sleep UI, or registry writes.
+        if in_startup_quiet():
+            return
+
+        # ST can still fire on_activated for non-focused sheets. Stay quiet
+        # unless this view is the window's real active_view — except we still
+        # allow quiet orphan registration is handled only for real active below.
         active = window.active_view()
         is_real_active = bool(active and active.id() == self.view.id())
-        quiet = in_startup_quiet() or not is_real_active
+        if not is_real_active:
+            return
 
         # Mark this as the "active" session for the window only when truly focused
         old_active = window.settings().get("claude_active_view")
-        if is_real_active:
-            window.settings().set("claude_active_view", self.view.id())
+        window.settings().set("claude_active_view", self.view.id())
 
         # Check if this is an orphaned view that needs reconnection
         s = get_session_for_view(self.view)
@@ -306,43 +315,39 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             # register the real Session — do not invent a sleeping orphan.
             if window.settings().get("claude_creating_session"):
                 return
-            self._reconnect_orphaned_view(window, quiet=quiet)
+            self._reconnect_orphaned_view(window, quiet=False)
             s = get_session_for_view(self.view)
-
-        # Live / intentional sessions that truly have focus still get full UX
-        # even during the startup quiet window (New Session mid-reload).
-        if quiet and is_real_active and s and not s.is_sleeping:
-            quiet = False
-
-        if quiet:
-            # No phantom / input / focus. Sleeping tabs still get ⏸ titles.
-            if s and s.is_sleeping:
-                s.output.set_name(s.display_name)
-            return
+            if not s:
+                return
 
         # Update this session's status and title
-        if s:
-            s._update_status_bar()
-            s.output.set_name(s.display_name)
+        s._update_status_bar()
+        s.output.set_name(s.display_name)
 
-            # Sticky composer: enter when idle *or* mid-turn (queue while streaming)
-            if s.initialized and not s.output.is_input_mode():
-                s._enter_input_with_draft()
-            # If already in input mode, ensure cursor is positioned and view is responsive
-            elif s.output.is_input_mode():
-                # Make sure there's a valid cursor position so clicking works
-                # This fixes mouse selection which requires a valid initial cursor state
-                input_start = s.output._input_start
-                sel = self.view.sel()
-                if len(sel) == 0:
-                    # No selection at all - set cursor to input start
-                    self.view.sel().clear()
-                    self.view.sel().add(sublime.Region(input_start, input_start))
+        # First real focus after quiet restore: paint sleep overlay/buffer now
+        if s.is_sleeping:
+            s._apply_sleep_ui(touch_buffer=True)
+        # Sticky composer: enter when idle *or* mid-turn (queue while streaming)
+        elif s.initialized and not s.output.is_input_mode():
+            s._enter_input_with_draft()
+        # If already in input mode, ensure cursor is positioned and view is responsive
+        elif s.output.is_input_mode():
+            # Make sure there's a valid cursor position so clicking works
+            # This fixes mouse selection which requires a valid initial cursor state
+            input_start = s.output._input_start
+            sel = self.view.sel()
+            if len(sel) == 0:
+                # No selection at all - set cursor to input start
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(input_start, input_start))
 
         # Remove active marker from previous active session
         if old_active and old_active != self.view.id() and old_active in sublime._claude_sessions:
             old_session = sublime._claude_sessions[old_active]
-            old_session.output.set_name(old_session.display_name)
+            try:
+                old_session.output.set_name(old_session.display_name)
+            except Exception:
+                pass
 
     def _reconnect_orphaned_view(self, window, quiet: bool = False):
         """Reconnect an orphaned Claude output view on focus.
@@ -434,21 +439,20 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             session._pending_resume_at = resume_session_at
         sublime._claude_sessions[view.id()] = session
 
-        # Reset active states
-        session.output.reset_active_states()
-
-        # Quiet path: registry + sleep title only — no phantom / view.show /
-        # start (those can jostle multi-tab restore). Tab ⏸ is safe and is how
-        # the user sees sleeping state without focusing every sheet.
-        # is_sleeping is derived (session_id + no client + not initialized).
+        # Quiet path: registry only — no buffer edits, set_name, phantoms, or
+        # start. Those raise every sheet during multi-tab restore (ST focuses
+        # views that get selection/buffer mutations or even set_name churn).
         if quiet:
+            session.output.reset_active_states(soft=True)
             if resume_id and not session.session_id:
                 session.session_id = resume_id
             if resume_id:
                 view.settings().set("claude_sleeping", True)
-                session.output.set_name(session.display_name)
             view.settings().erase("claude_reconnecting")
             return
+
+        # Reset active states (full — may patch buffer symbols)
+        session.output.reset_active_states(soft=False)
 
         # Re-apply sheet theme (Quick Agent wins over backend tint)
         if view.settings().get("claude_quick"):
@@ -631,15 +635,17 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 finally:
                     self._in_soft_undo = False
 
-                # Move cursor to end of input area
-                input_end = self.view.size()
+                # End of draft (before spare blank line under ◎)
+                if hasattr(s.output, "ensure_composer_spare_line"):
+                    s.output.ensure_composer_spare_line()
+                draft_end = s.output._input_start + len(s.output.get_input_text())
                 self.view.sel().clear()
-                self.view.sel().add(sublime.Region(input_end, input_end))
+                self.view.sel().add(sublime.Region(draft_end, draft_end))
 
                 # Re-insert at correct position
                 self.view.run_command("insert", {"characters": chars})
 
-                # Show cursor
+                # Show cursor (include spare row)
                 self.view.show(self.view.size())
                 return
 
@@ -661,6 +667,10 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # (question input reuses _input_mode) — it would reappear next prompt.
         if getattr(s.output, "_question_input_mode", False):
             return
+
+        # Keep spare empty line under the composer (padding)
+        if hasattr(s.output, "ensure_composer_spare_line"):
+            s.output.ensure_composer_spare_line()
 
         # Save draft
         input_text = s.output.get_input_text()

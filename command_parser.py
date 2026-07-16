@@ -26,6 +26,7 @@ class CommandParser:
         "clear": "Clear conversation history (local)",
         "compact": "Summarize conversation to reduce context",
         "context": "Show pending context items",
+        "goal": "Goal mode: /goal <obj> [--budget N] | status|pause|resume|clear",
     }
 
     @staticmethod

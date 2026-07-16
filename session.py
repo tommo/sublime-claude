@@ -136,6 +136,9 @@ class Session:
         self.profile_docs: List[str] = []
         # Draft prompt (persists across input panel open/close)
         self.draft_prompt: str = ""
+        # Last path the user previewed / pinned for edits (image_edit, code).
+        # Set from media enlarge/edit links and from opening paths in the transcript.
+        self.edit_target: Optional[str] = None
         self._pending_resume_at: Optional[str] = None  # Set by undo, consumed by next query
         # Background task tracking: task_id → tool_use_id
         self._task_tool_map: Dict[str, str] = {}
@@ -208,6 +211,13 @@ class Session:
         # Plan mode state
         self.plan_mode: bool = False
         self.plan_file: Optional[str] = None
+
+        # Host-owned goal harness (native /goal — all backends)
+        from .goal_tracker import GoalTracker
+        self.goal_tracker = GoalTracker()
+        self._goal_verify_turn: bool = False  # current turn is skeptic
+        self._goal_harness_continue: bool = False  # suppress user-queue steal? no
+        self._goal_skip_continue_once: bool = False  # after user interrupt
 
         # Pending retain content (set by compact_boundary, sent after interrupt)
         self._pending_retain: Optional[str] = None
@@ -491,6 +501,13 @@ class Session:
             self._save_session()
         if getattr(self, "quick_mode", False) and self.output:
             self.output.set_name(self.name or "⚡ Quick")
+        # Submit-created session: run the message that started us
+        pending = getattr(self, "_quick_pending_prompt", None)
+        if getattr(self, "quick_mode", False) and pending:
+            self._quick_pending_prompt = None
+            # Don't open empty ◎ first — query will re-arm sticky composer
+            sublime.set_timeout(lambda p=pending: self.query(p), 0)
+            return
         # Same inline input UX as a normal session
         self._enter_input_with_draft()
 
@@ -782,6 +799,36 @@ class Session:
 
     def add_context_image(self, image_data: bytes, mime_type: str) -> None:
         self.context.add_image(image_data, mime_type)
+
+    def set_edit_target(
+        self,
+        path: str,
+        *,
+        as_context: bool = True,
+        line: int = None,
+        announce: bool = True,
+    ) -> bool:
+        """Pin a path as the session editing target (from media/code preview).
+
+        Used when the user previews a generated image or opens a transcript
+        path — next image_edit / edits can target this without re-finding it.
+        """
+        import os
+        path = os.path.abspath(os.path.expanduser((path or "").strip()))
+        if not path:
+            return False
+        self.edit_target = path
+        if as_context:
+            try:
+                # Image → path ref for image_edit/read_image; code → content chip
+                self.add_context_path(path)
+            except Exception as e:
+                print(f"[Claude] edit target context: {e}")
+        if announce:
+            base = os.path.basename(path)
+            loc = f"{base}:{line}" if line and line > 0 else base
+            sublime.status_message(f"Edit target: {loc}")
+        return True
 
     def clear_context(self) -> None:
         self.context.clear()
@@ -1274,13 +1321,19 @@ class Session:
 
         self.working = True
         self.query_count += 1
-        # The normal submit path already saved the draft via output.prompt().
-        # A silent wake (background subsession/task completing) bypasses that,
-        # so preserve any in-progress input here rather than discarding it.
-        if silent and self.output and self.output.is_input_mode():
-            self.draft_prompt = self.output.get_input_text().strip()
+        self._goal_last_update_sig = None  # allow same progress text next turn
+        # Preserve sticky draft whenever the user is typing mid-stream — including
+        # when a *queued* turn fires. Never wipe ◎ content just because the queue
+        # advanced. Only clear draft on a normal user submit (no sticky open,
+        # not silent, not queue-driven).
+        firing_queue = bool(getattr(self, "_firing_queue", False))
+        if self.output and self.output.is_input_mode():
+            self.draft_prompt = self.output.get_input_text()
+        elif silent or firing_queue:
+            # Keep existing draft_prompt (may already hold sticky text)
+            pass
         else:
-            self.draft_prompt = ""  # Clear draft — query submitted
+            self.draft_prompt = ""  # User-initiated submit already emptied ◎
         self._pending_resume_at = None  # New query advances past any rewind point
         self._input_mode_entered = False  # Reset so input mode can be entered when query completes
 
@@ -1310,6 +1363,9 @@ class Session:
 
         # Use display_prompt for UI if provided, otherwise use full prompt
         ui_prompt = display_prompt if display_prompt else prompt
+        # Quick host may auto-dismiss when user said "close yourself" etc.
+        if getattr(self, "quick_mode", False) and not silent:
+            self._last_user_prompt = (ui_prompt or prompt or "").strip()
 
         # Check if bridge is alive before sending
         if not self.client.is_alive():
@@ -1360,6 +1416,9 @@ class Session:
         if not silent:
             def _sticky():
                 if not self.output or self.output.is_input_mode():
+                    return
+                # Don't reopen ◎ under question / permission / plan UI
+                if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
                     return
                 if getattr(self.output, "_question_input_mode", False):
                     return
@@ -1421,7 +1480,7 @@ class Session:
             completion = "success"
 
         # Interrupt already restored idle UI immediately. Late bridge ack:
-        # just clear the interrupting flag and skip re-rendering.
+        # clear flag and re-arm ◎ if late stream drips wiped the composer.
         if completion == "interrupted" and not self.working:
             self._interrupting = False
             if self._response_callback:
@@ -1431,6 +1490,7 @@ class Session:
                     cb("")
                 except Exception:
                     pass
+            self._ensure_idle_input(reason="late interrupt ack")
             return
 
         # 2. Handle UI for each completion type
@@ -1445,6 +1505,14 @@ class Session:
             if self.output.current:
                 self.output.current.working = False
                 self.output._render_current()
+            try:
+                gt = getattr(self, "goal_tracker", None)
+                if gt and gt.is_active():
+                    gt.pause("infra", f"Turn error: {error_msg}"[:200])
+                    self._goal_verify_turn = False
+                    self.sync_goal_ui()
+            except Exception:
+                pass
         elif completion == "interrupted":
             self._status("interrupted")
             self.output.interrupted()
@@ -1486,24 +1554,53 @@ class Session:
         # 5. GATE: Only process deferred actions on success
         if completion != "success":
             self.working = False
+            if self.output and self.output.current:
+                self.output.current.working = False
             self._clear_deferred_state()
-            sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
+            if not getattr(self, "_quick_finished", False):
+                self._ensure_idle_input(reason=f"completion={completion}")
             return
+
+        # Quick was explicitly closed (status=closed) — no ◎, no queued turns
+        if getattr(self, "_quick_finished", False):
+            self.working = False
+            self._queued_prompts.clear()
+            try:
+                self._update_queue_phantom()
+            except Exception:
+                pass
+            self._inject_pending = False
+            return
+
+        # Safety net: user said "close yourself" but model never called
+        # quick_done(closed). Dismiss after the goodbye turn.
+        if (getattr(self, "quick_mode", False)
+                and completion == "success"
+                and not getattr(self, "_quick_finished", False)):
+            try:
+                from . import quick_agent as qa
+                last = getattr(self, "_last_user_prompt", "") or ""
+                if qa.user_wants_close(last):
+                    host = qa.get_host(self.window) if self.window else None
+                    if host:
+                        host.complete_slot(self, status="closed", message="")
+                    else:
+                        self._quick_finished = True
+                        self.working = False
+                        qa.stop_session_bridge(self)
+                    return
+            except Exception as e:
+                print(f"[Claude] quick auto-close: {e}")
 
         # 5. Process plugin-side queued prompts (sticky composer / queue_prompt).
         # Keep working=True so the next query() owns the busy state.
-        if self._queued_prompts:
-            prompt = self._queued_prompts.pop(0)
-            self._update_queue_phantom()  # drop the fired chip before next turn
-            # Synthetic prompts (bg-task wakes, retain injects, etc.) should
-            # never be rendered as user input — fire them silently with a
-            # short status-bar/background hint.
-            if self._is_synthetic_turn(prompt):
-                first = prompt.lstrip().split("\n", 1)[0][:60]
-                display = f"{BACKGROUND_PREFIX}{first}"
-                self.query(prompt, display_prompt=display, silent=True)
-            else:
-                self.query(prompt, display_prompt=prompt)
+        # Does not clear ◎ draft — user may still be typing the next one.
+        # User queue wins over goal harness continuation.
+        if self._fire_next_queued():
+            return
+
+        # 5b. Host goal harness: verify deferred complete and/or continue.
+        if self._goal_on_turn_success():
             return
 
         # 6. Clear inject_pending - Claude mid-stream inject / bridge queued_inject
@@ -1514,9 +1611,13 @@ class Session:
         self.last_activity = time.time()
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
-    def _clear_deferred_state(self) -> None:
-        """Clear deferred action state. Called on error/interrupt."""
-        self._queued_prompts.clear()
+    def _clear_deferred_state(self, clear_queue: bool = True) -> None:
+        """Clear deferred action state. Called on error/interrupt.
+
+        clear_queue=False on interrupt so user-queued messages survive cancel.
+        """
+        if clear_queue:
+            self._queued_prompts.clear()
         self._pending_bg_notifications.clear()
         self._bg_flush_scheduled = False
         self._inject_pending = False
@@ -1536,6 +1637,51 @@ class Session:
         self._input_mode_entered = False
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
+    def _ensure_idle_input(self, reason: str = "") -> None:
+        """Force ◎ back after interrupt/error — even if a prior enter was wiped.
+
+        Late session updates after cancel can re-render without sticky input and
+        leave `_input_mode_entered=True` so re-entry was skipped (dead UI: idle,
+        no busy mark, no composer — only sleep/reconnect recovered).
+        """
+        if getattr(self, "_quick_finished", False):
+            return
+        if self.working:
+            return
+        if not self.output:
+            return
+        # Clear stuck spinner from post-interrupt text drips
+        try:
+            if self.output.current and self.output.current.working:
+                self.output.current.working = False
+                self.output._render_pending = False
+                self.output._do_render()
+        except Exception:
+            pass
+        self._input_mode_entered = False
+        if self.output.is_input_mode():
+            return
+
+        def _go(tries=0):
+            if self.working or getattr(self, "_quick_finished", False):
+                return
+            if not self.output:
+                return
+            if self.output.is_input_mode():
+                return
+            if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
+                return
+            self._input_mode_entered = False
+            self._enter_input_with_draft()
+            if self.output.is_input_mode():
+                if reason:
+                    print(f"[Claude] idle input restored ({reason})")
+                return
+            if tries < 6:
+                sublime.set_timeout(lambda: _go(tries + 1), 80 + tries * 40)
+
+        sublime.set_timeout(lambda: _go(), 50)
+
     def _enter_input_with_draft(self) -> None:
         """Enter sticky composer and restore draft with cursor at end.
 
@@ -1543,21 +1689,27 @@ class Session:
         """
         if not self.output:
             return
+        # Explicit close — host is dismissing; do not reopen ◎
+        if getattr(self, "_quick_finished", False):
+            return
+        # Question / permission / plan owns the tail
+        if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
+            return
         # Skip if already in input mode
         if self.output.is_input_mode():
+            self._input_mode_entered = True
             return
 
         # Skip if we've already entered input mode after the last query
         # This prevents duplicate entries from multiple callers (on_activated, _on_done, etc.)
         # Still allow re-entry while working after submit cleared the strip.
+        # Exception: if ◎ is gone but flag is set, allow re-entry (post-interrupt drip).
         if self._input_mode_entered and not self.working:
             return
 
         # Queued prompts (e.g. notalone inject while sleeping) take priority
-        # only when idle — don't steal the composer while streaming.
-        if self._queued_prompts and not self.working:
-            prompt = self._queued_prompts.pop(0)
-            self.query(prompt)
+        # only when idle — fire without wiping a draft the user is typing.
+        if not self.working and self._fire_next_queued():
             return
 
         # Stale conversation.working after interrupt: clear when session is idle.
@@ -1587,10 +1739,15 @@ class Session:
             self.last_idle_at = time.time()
 
         if self.draft_prompt and self.output.view:
-            self.output.view.run_command("append", {"characters": self.draft_prompt})
-            end = self.output.view.size()
-            self.output.view.sel().clear()
-            self.output.view.sel().add(sublime.Region(end, end))
+            # Insert draft on the ◎ line; keep spare blank line below
+            try:
+                self.output.set_composer_text(self.draft_prompt)
+            except Exception:
+                self.output.view.run_command("append", {
+                    "characters": self.draft_prompt,
+                })
+                if hasattr(self.output, "ensure_composer_spare_line"):
+                    self.output.ensure_composer_spare_line()
 
 
     def queue_prompt(self, prompt: str) -> None:
@@ -1598,6 +1755,7 @@ class Session:
 
         Sticky-composer / mid-stream: plugin-side queue + phantom chrome above
         ◎ (not transcript lines). Fires from `_on_done` when the turn ends.
+        Does not touch the sticky draft — caller may leave ◎ as-is for more typing.
         """
         prompt = (prompt or "").strip()
         if not prompt:
@@ -1626,24 +1784,60 @@ class Session:
             return
 
         if self.client and self.client.is_alive():
-            self.query(prompt)
+            self._fire_queued_now(prompt)
             return
+
+        # Quick: dead bridge → submit starts a new session (same as Enter)
+        if getattr(self, "quick_mode", False):
+            try:
+                from . import quick_agent as qa
+                host = qa.get_host(self.window) if self.window else None
+                if host and host.submit_prompt(self, prompt):
+                    return
+            except Exception as e:
+                print(f"[Claude] quick queue→start: {e}")
 
         self._queued_prompts.append(prompt)
         self._update_queue_phantom()
 
+    def _fire_next_queued(self) -> bool:
+        """Pop and run the next queued prompt. Preserves ◎ draft. True if fired."""
+        if not self._queued_prompts:
+            return False
+        prompt = self._queued_prompts.pop(0)
+        self._update_queue_phantom()
+        self._fire_queued_now(prompt)
+        return True
+
+    def _fire_queued_now(self, prompt: str) -> None:
+        """Run a queued/follow-up prompt without wiping sticky user input."""
+        # Snapshot sticky draft before query/prompt path
+        if self.output and self.output.is_input_mode():
+            try:
+                self.draft_prompt = self.output.get_input_text()
+            except Exception:
+                pass
+        self._firing_queue = True
+        try:
+            if self._is_synthetic_turn(prompt):
+                first = prompt.lstrip().split("\n", 1)[0][:60]
+                display = f"{BACKGROUND_PREFIX}{first}"
+                self.query(prompt, display_prompt=display, silent=True)
+            else:
+                self.query(prompt, display_prompt=prompt)
+        finally:
+            self._firing_queue = False
+
     def _update_queue_phantom(self) -> None:
-        """Composer chrome *above* ◎: queued chips, then a visible split rule.
+        """Composer chrome *above* ◎: optional queue chips + a hairline split.
 
         Layout (top → bottom, phantoms only):
-          ⏳ queued msg  ×
-          ───────────────
+          ⏳ queued msg  ×   (only when queued)
+          ─ hairline ─
           ◎ input…
 
-        minihtml often drops zero-height border-only divs, so the split is a
-        real text rule with solid color. Anchor on the line *above* ◎ with
-        LAYOUT_BLOCK (same pattern as media tool phantoms: block below that
-        line = between transcript and composer).
+        Keep the split subtle — a thick bar is distracting for every idle ◎.
+        Anchor on the line *above* ◎ with LAYOUT_BLOCK.
         """
         import html as _html
         ps = self._phantom_set_for("_queue_phantom_set", "claude_queue")
@@ -1671,8 +1865,8 @@ class Session:
         q = list(self._queued_prompts or [])
         if q:
             rows.append(
-                '<div style="margin:2px 0 4px 0;font-size:11px;'
-                'color:#888888;">queue</div>'
+                '<div style="margin:0 0 2px 0;font-size:10px;'
+                'color:color(var(--foreground) alpha(0.4));">queue</div>'
             )
             for i, msg in enumerate(q):
                 short = msg.replace("\n", " ").strip()
@@ -1680,22 +1874,22 @@ class Session:
                     short = short[:72] + "…"
                 safe = _html.escape(short)
                 rows.append(
-                    f'<div style="margin:2px 0;padding:2px 8px;'
-                    f'background-color:#2a3040;color:#73d0ff;font-size:12px;">'
+                    f'<div style="margin:1px 0;padding:1px 6px;'
+                    f'background-color:color(var(--foreground) alpha(0.06));'
+                    f'color:var(--bluish);font-size:11px;">'
                     f'⏳ {safe}'
-                    f'&nbsp;<a href="drop:{i}" style="color:#f28779;'
-                    f'text-decoration:none;font-weight:bold;" title="remove">×</a>'
+                    f'&nbsp;<a href="drop:{i}" style="color:var(--redish);'
+                    f'text-decoration:none;" title="remove">×</a>'
                     f'</div>'
                 )
-        # Full-width rule: LAYOUT_BLOCK body stretches; solid bar via padding+bg
-        # (more reliable than a short "────" run or zero-height borders).
+        # Hairline only — not a fat filled bar (padding+bg rendered too thick)
         rows.append(
-            '<div style="margin:6px 0 4px 0;padding:1px 0;'
-            'background-color:#5c6773;">'
-            '<span style="font-size:1px;color:#5c6773;">&nbsp;</span></div>'
+            '<div style="margin:2px 0 1px 0;padding:0;line-height:1;'
+            'font-size:1px;border-top:1px solid '
+            'color(var(--foreground) alpha(0.14));">&nbsp;</div>'
         )
         html = (
-            f'<body id="claude-queue" style="margin:0;padding:2px 0 4px 0;">'
+            f'<body id="claude-queue" style="margin:0;padding:0 0 1px 0;">'
             f'{"".join(rows)}</body>'
         )
         try:
@@ -1759,21 +1953,52 @@ class Session:
             return
 
         self._interrupting = True
-        self._queued_prompts.clear()
+        # Keep user-queued messages — interrupt only cancels the active turn.
+
+        # Goal harness: Esc pauses Active goal so we don't auto-continue.
+        try:
+            gt = getattr(self, "goal_tracker", None)
+            if gt and gt.is_active():
+                gt.pause("user", "Interrupted by user")
+                self._goal_skip_continue_once = True
+                self._goal_verify_turn = False
+                self.sync_goal_ui()
+        except Exception as e:
+            print(f"[Claude] goal interrupt pause: {e}")
 
         # Immediate UI: idle + *[interrupted]* + input. Do NOT leave
         # session.working=True with conversation.working=False (no busy mark
         # and no input — the "dead UI" state after a hung cancel).
         self.working = False
         self.current_tool = None
-        self._clear_deferred_state()
+        self._clear_deferred_state(clear_queue=False)
         try:
             if self.output:
                 self.output.interrupted()
         except Exception:
             pass
         self._status("interrupted")
-        self._enter_input_with_draft()
+        try:
+            self._update_queue_phantom()
+        except Exception:
+            pass
+        # Force ◎ now and again after late stream drips settle.
+        # If queue non-empty, _enter_input_with_draft / settle will fire next.
+        self._ensure_idle_input(reason="interrupt")
+        gen = getattr(self, "_interrupt_gen", 0) + 1
+        self._interrupt_gen = gen
+
+        def _rearm_after_drip(_gen=gen):
+            if getattr(self, "_interrupt_gen", 0) != _gen:
+                return
+            if self.working:
+                return
+            self._ensure_idle_input(reason="post-interrupt settle")
+
+        # Bridge often emits 1–2 more lines after cancel; re-check composer
+        sublime.set_timeout(_rearm_after_drip, 200)
+        sublime.set_timeout(_rearm_after_drip, 600)
+        sublime.set_timeout(_rearm_after_drip, 1200)
 
         if self.client:
             sent = self.client.send("interrupt", {})
@@ -1788,12 +2013,12 @@ class Session:
             else:
                 # Late _on_done from the cancelled query is a no-op for UI;
                 # clear interrupting when it arrives (or after a short grace).
-                gen = getattr(self, "_interrupt_gen", 0) + 1
-                self._interrupt_gen = gen
-
                 def _clear_interrupting(_gen=gen):
                     if getattr(self, "_interrupt_gen", 0) == _gen:
                         self._interrupting = False
+                        # One last re-arm in case a drip wiped ◎ after settle
+                        if not self.working:
+                            self._ensure_idle_input(reason="interrupt flag clear")
 
                 sublime.set_timeout(_clear_interrupting, 3000)
 
@@ -1912,8 +2137,12 @@ class Session:
         except Exception as e:
             print(f"[Claude] _abort_background_tools error: {e}")
 
-    def _apply_sleep_ui(self) -> None:
-        """Apply sleeping state to view UI."""
+    def _apply_sleep_ui(self, *, touch_buffer: bool = True) -> None:
+        """Apply sleeping state to view UI.
+
+        touch_buffer=False: settings + tab title only (multi-tab restore).
+        Buffer edits / selection / phantoms on inactive sheets focus them.
+        """
         if not self.output or not self.output.view:
             return
         if not self.session_id:
@@ -1921,7 +2150,15 @@ class Session:
         view = self.output.view
         view.settings().set("claude_sleeping", True)
         self.output.set_name(self.display_name)
-        self._status("sleeping")
+        # Status bar only if this sheet is focused
+        win = view.window()
+        is_focused = bool(
+            win and win.active_view() and win.active_view().id() == view.id()
+        )
+        if is_focused:
+            self._status("sleeping")
+        if not touch_buffer and not is_focused:
+            return
         if self.output.is_input_mode():
             self.draft_prompt = self.output.get_input_text().strip()
             self.output.exit_input_mode(keep_text=False)
@@ -1935,9 +2172,15 @@ class Session:
                 erase_from = content.rstrip("\n").rfind("\n" + lines[-1])
                 if erase_from >= 0:
                     view.set_read_only(False)
-                    view.run_command("claude_replace", {"start": erase_from, "end": view.size(), "text": ""})
+                    view.run_command("claude_replace", {
+                        "start": erase_from, "end": view.size(), "text": "",
+                    })
                     view.set_read_only(True)
-        self._show_overlay_phantom("\u23f8 Session paused \u2014 press Enter to wake", color="var(--yellowish)")
+        self._show_overlay_phantom(
+            "\u23f8 Session paused \u2014 press Enter to wake",
+            color="var(--yellowish)",
+            strong=True,
+        )
 
     def _phantom_set_for(self, attr: str, key: str):
         """PhantomSet bound to the *current* output view (rebind after soft-hide)."""
@@ -1968,7 +2211,17 @@ class Session:
     def _get_overlay_phantom_set(self):
         return self._phantom_set_for("_overlay_phantom_set", "claude_overlay")
 
-    def _show_overlay_phantom(self, html_body: str, color: str = "color(var(--foreground) alpha(0.5))") -> None:
+    def _show_overlay_phantom(
+        self,
+        html_body: str,
+        color: str = "color(var(--foreground) alpha(0.5))",
+        *,
+        strong: bool = False,
+    ) -> None:
+        """Session-status block at EOF (sleep / connecting / terminal).
+
+        strong=True: full-width split rule + bold banner (session paused).
+        """
         ps = self._get_overlay_phantom_set()
         if not ps or not self.output or not self.output.view:
             return
@@ -1976,14 +2229,42 @@ class Session:
         content = view.substr(sublime.Region(0, view.size()))
         last_nl = content.rfind("\n")
         pt = last_nl if last_nl >= 0 else 0
-        html = f'<body style="margin: 8px 0; color: {color};">{html_body}</body>'
+        if strong:
+            # Full-width hairline (wide block so minihtml spans the pane) +
+            # high-contrast banner so sleep state is hard to miss.
+            line = (
+                f'<div style="margin:0 0 6px 0;padding:0;line-height:1;'
+                f'font-size:1px;height:0;'
+                f'border-top:1px solid color-mix(in srgb, {color} 65%, transparent);'
+                f'width:200em;">&nbsp;</div>'
+            )
+            html = (
+                f'<body id="claude-overlay" style="margin:10px 0 8px 0;padding:0;'
+                f'min-width:40em;">'
+                f'{line}'
+                f'<div style="'
+                f'padding:5px 10px;'
+                f'font-size:13px;font-weight:bold;'
+                f'letter-spacing:0.02em;'
+                f'color:{color};'
+                f'background-color:color-mix(in srgb, {color} 14%, transparent);'
+                f'border-left:3px solid {color};'
+                f'">'
+                f'{html_body}'
+                f'</div>'
+                f'</body>'
+            )
+        else:
+            html = (
+                f'<body id="claude-overlay" style="margin:8px 0;padding:0;'
+                f'color:{color};">{html_body}</body>'
+            )
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
-        view.sel().clear()
-        view.sel().add(sublime.Region(view.size(), view.size()))
-        # Only scroll if this sheet is already focused — show() on inactive
-        # views can still jostle the UI during multi-tab restore.
+        # Selection / show on inactive sheets steals focus during multi-tab restore.
         win = view.window()
         if win and win.active_view() and win.active_view().id() == view.id():
+            view.sel().clear()
+            view.sel().add(sublime.Region(view.size(), view.size()))
             view.show(view.size())
 
     def _clear_overlay_phantom(self) -> None:
@@ -2553,6 +2834,9 @@ class Session:
         tool_id = params.get("id")
         if not name or not name.strip():
             return
+        # Drop late tool starts after interrupt / turn end (☐ rows + busy UI)
+        if not self.working:
+            return
         # A real content event arrived → the retry hint no longer applies.
         self._clear_api_retry_hint()
         # Agent armed a self-wake / cron / Grok scheduler → looping session.
@@ -2633,6 +2917,9 @@ class Session:
 
     def _on_msg_text(self, params: dict) -> None:
         self._clear_api_retry_hint()
+        # Late post-interrupt tokens still paint (text() won't re-arm spinner
+        # when session.working is False). Composer re-arm is handled by
+        # _ensure_idle_input settle timers on interrupt.
         self.output.text(params.get("text", ""))
 
     def _on_msg_turn_usage(self, params: dict) -> None:
@@ -3375,6 +3662,290 @@ class Session:
             or "high"
         ).strip()
 
+    # ── Host goal harness ────────────────────────────────────────────────
+
+    def sync_goal_ui(self) -> None:
+        """Mirror GoalTracker → Conversation.goal and re-render strip."""
+        from .output_models import GoalState, _goal_is_open
+        gt = getattr(self, "goal_tracker", None)
+        if not self.output:
+            return
+        if not gt or not gt.is_open():
+            # Clear sticky on complete/cleared
+            if self.output.current:
+                st = gt.status if gt else "cleared"
+                if st in ("complete", "cleared") or not gt or not gt.goal_id:
+                    self.output.current.goal = None
+                elif gt.status == "complete":
+                    self.output.current.goal = None
+            try:
+                if self.output.current:
+                    if self.output.is_input_mode():
+                        self.output.refresh_preserving_input()
+                    else:
+                        self.output._render_current()
+            except Exception:
+                pass
+            self._update_status_bar()
+            return
+        snap = gt.to_ui_dict()
+        gs = GoalState(
+            status=snap["status"],
+            message=snap.get("message") or "",
+            blocked_reason=snap.get("blocked_reason") or "",
+            objective=snap.get("objective") or "",
+            phase=snap.get("phase") or "idle",
+            pause_message=snap.get("pause_message") or "",
+            token_budget=snap.get("token_budget"),
+            tokens_used=snap.get("tokens_used"),
+            verify_runs=int(snap.get("verify_runs") or 0),
+            verify_max=int(snap.get("verify_max") or 0),
+            gaps=list(snap.get("gaps") or []),
+            verifying=bool(snap.get("verifying")),
+            planning=bool(snap.get("planning")),
+            goal_id=snap.get("goal_id") or "",
+        )
+        if self.output.current:
+            self.output.current.goal = gs if _goal_is_open(gs) else None
+        try:
+            if self.output.current:
+                if self.output.is_input_mode():
+                    self.output.refresh_preserving_input()
+                else:
+                    self.output._render_current()
+        except Exception as e:
+            print(f"[Claude] sync_goal_ui: {e}")
+        self._update_status_bar()
+
+    def apply_goal_update(
+        self,
+        message: str = "",
+        completed: bool = False,
+        blocked_reason: str = "",
+    ) -> dict:
+        """MCP / mirrored native update_goal drain (mid-turn)."""
+        gt = getattr(self, "goal_tracker", None)
+        if gt is None:
+            from .goal_tracker import GoalTracker
+            self.goal_tracker = GoalTracker()
+            gt = self.goal_tracker
+        # Dedup: MCP tool + stream tool_use can both fire for one call
+        sig = (
+            (message or "").strip(),
+            bool(completed),
+            (blocked_reason or "").strip(),
+            int(getattr(self, "query_count", 0) or 0),
+        )
+        if getattr(self, "_goal_last_update_sig", None) == sig:
+            self.sync_goal_ui()
+            return {
+                "ok": True,
+                "deduped": True,
+                "status": gt.status,
+                "summary": "already applied",
+            }
+        self._goal_last_update_sig = sig
+        # Verifier turns must not complete the goal via tool
+        if getattr(self, "_goal_verify_turn", False) and completed:
+            return {
+                "ok": False,
+                "error": "Verifier turn cannot call update_goal(completed=true).",
+                "rejected": True,
+            }
+        result = gt.apply_update(
+            message=message or "",
+            completed=bool(completed),
+            blocked_reason=blocked_reason or "",
+            mid_turn=True,
+        )
+        try:
+            self._goal_refresh_tokens()
+        except Exception:
+            pass
+        self.sync_goal_ui()
+        return result
+
+    def handle_goal_command(self, args: str) -> None:
+        """Handle /goal … (plugin-owned; never forward raw /goal to agent)."""
+        from .goal_tracker import parse_goal_slash
+        from . import goal_prompts
+
+        if getattr(self, "quick_mode", False):
+            self.output.text("\n*Goal mode is not available in Quick Agent.*\n")
+            self._ensure_idle_input(reason="goal/quick")
+            return
+
+        action, payload = parse_goal_slash(args)
+        gt = self.goal_tracker
+
+        if action == "status":
+            self.output.text("\n" + gt.status_summary() + "\n")
+            self.sync_goal_ui()
+            self._ensure_idle_input(reason="goal/status")
+            return
+
+        if action == "pause":
+            if gt.is_active():
+                gt.pause("user", "Paused via /goal pause")
+                self.output.text("\n*Goal paused.*\n")
+            else:
+                self.output.text("\n*" + gt.status_summary() + "*\n")
+            self.sync_goal_ui()
+            self._ensure_idle_input(reason="goal/pause")
+            return
+
+        if action == "clear":
+            gt.clear()
+            self._goal_verify_turn = False
+            self.output.text("\n*Goal cleared.*\n")
+            self.sync_goal_ui()
+            self._ensure_idle_input(reason="goal/clear")
+            return
+
+        if action == "resume":
+            if not gt.is_open():
+                self.output.text("\n*No goal to resume. /goal <objective>*\n")
+                self._ensure_idle_input(reason="goal/resume-empty")
+                return
+            if gt.status in ("complete", "cleared"):
+                self.output.text("\n*Goal already finished. Start a new /goal.*\n")
+                self._ensure_idle_input(reason="goal/resume-done")
+                return
+            gt.resume()
+            self.sync_goal_ui()
+            recap = goal_prompts.resume_recap(gt)
+            self.query(recap, display_prompt="/goal resume")
+            return
+
+        # set objective
+        objective, budget = payload
+        baseline = 0
+        try:
+            k = self._context_tokens_k()
+            if k is not None:
+                baseline = k * 1000
+        except Exception:
+            pass
+        gt.create(objective, token_budget=budget, tokens_baseline=baseline)
+        self._goal_verify_turn = False
+        self._goal_skip_continue_once = False
+        self.sync_goal_ui()
+        rules = goal_prompts.goal_rules(objective)
+        body = rules + "\n\n" + objective
+        disp = f"/goal {objective}"
+        if budget:
+            disp += f" --budget {budget}"
+        self.query(body, display_prompt=disp)
+
+    def _goal_refresh_tokens(self) -> None:
+        gt = getattr(self, "goal_tracker", None)
+        if not gt or not gt.is_open():
+            return
+        k = self._context_tokens_k()
+        if k is not None:
+            gt.set_tokens_used(k * 1000)
+        gt.enforce_budget()
+
+    def _goal_on_turn_success(self) -> bool:
+        """After successful turn: verify and/or continue. True = started next turn."""
+        gt = getattr(self, "goal_tracker", None)
+        if not gt or getattr(self, "quick_mode", False):
+            return False
+
+        # Just finished a verifier turn — apply verdict, then maybe continue
+        if getattr(self, "_goal_verify_turn", False):
+            self._goal_verify_turn = False
+            self._goal_apply_verifier_result()
+            self.sync_goal_ui()
+            if gt.status == "complete":
+                try:
+                    if self.is_looping:
+                        self.cancel_scheduled_loop()
+                except Exception:
+                    pass
+                self.output.text("\n*Goal complete (verified).*\n")
+                self.sync_goal_ui()
+                return False
+            if not gt.should_continue():
+                return False
+            return self._goal_fire_continuation()
+
+        if getattr(self, "_goal_skip_continue_once", False):
+            self._goal_skip_continue_once = False
+            return False
+
+        try:
+            self._goal_refresh_tokens()
+        except Exception:
+            pass
+        if gt.enforce_budget():
+            self.sync_goal_ui()
+            self.output.text("\n*Goal paused: token budget reached.*\n")
+            return False
+
+        if not gt.is_active():
+            self.sync_goal_ui()
+            return False
+
+        # Deferred complete → verifier turn
+        if gt.has_pending_complete():
+            claim = gt.begin_verify()
+            self.sync_goal_ui()
+            if claim is None:
+                # cap hit
+                self.output.text("\n*Goal paused: verification cap.*\n")
+                self.sync_goal_ui()
+                return False
+            return self._goal_fire_verifier(claim)
+
+        if gt.should_continue():
+            return self._goal_fire_continuation()
+        return False
+
+    def _goal_fire_verifier(self, claim: str) -> bool:
+        from . import goal_prompts
+        gt = self.goal_tracker
+        prompt = goal_prompts.verifier_prompt(
+            gt.objective, claim, gaps_prior=gt.gaps or None)
+        self._goal_verify_turn = True
+        self.working = True  # keep busy for next query
+        self.query(prompt, display_prompt="↻ goal verify")
+        return True
+
+    def _goal_apply_verifier_result(self) -> None:
+        from . import goal_prompts
+        gt = self.goal_tracker
+        text = ""
+        if self.output and self.output.current:
+            text = "".join(self.output.current.text_chunks)
+        achieved, gaps = goal_prompts.parse_verifier_verdict(text)
+        gt.apply_verdict(achieved, gaps=gaps, detail=gt.message)
+        if not achieved and gaps:
+            self.output.text(
+                "\n*Verifier: not achieved — " + "; ".join(gaps[:4]) + "*\n")
+
+    def _goal_fire_continuation(self) -> bool:
+        from . import goal_prompts
+        gt = self.goal_tracker
+        if not gt.should_continue():
+            if gt.is_active() and gt.continue_count >= gt.continue_max:
+                gt.pause(
+                    "user",
+                    f"Continue cap ({gt.continue_max}) without verified complete.",
+                )
+                self.sync_goal_ui()
+                self.output.text("\n*Goal paused: continue cap.*\n")
+            return False
+        gt.note_continue()
+        if not gt.is_active():
+            self.sync_goal_ui()
+            return False
+        self.sync_goal_ui()
+        prompt = goal_prompts.continuation_directive(gt)
+        self.working = True
+        self.query(prompt, display_prompt="↻ goal")
+        return True
+
     def _status(self, text: str) -> None:
         """Update status on output view only."""
         if not self.output.view or not self.output.view.is_valid():
@@ -3394,6 +3965,12 @@ class Session:
             ctx_k = self._context_tokens_k()
             if ctx_k is not None:
                 parts.append(f"ctx:{ctx_k}k")
+        gt = getattr(self, "goal_tracker", None)
+        if gt and gt.is_open():
+            chip = gt.status
+            if gt.phase == "verifying":
+                chip = "verifying"
+            parts.append(f"goal:{chip}")
         self.output.view.set_status("claude", f"{label}: {', '.join(parts)}")
 
     def _update_status_bar(self) -> None:

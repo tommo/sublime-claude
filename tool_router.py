@@ -101,6 +101,12 @@ def create_sublime_router() -> ToolRouter:
         f"return quick_done(status={args.get('status', 'completed')!r}, "
         f"message={args.get('message', '')!r})")
 
+    # Host-owned goal harness progress / complete / blocked
+    router.register("update_goal", lambda args:
+        f"return update_goal(message={args.get('message', '')!r}, "
+        f"completed={bool(args.get('completed', False))!r}, "
+        f"blocked_reason={args.get('blocked_reason', '')!r})")
+
     router.register("spawn_session", lambda args:
         f"return spawn_session({args.get('prompt', '')!r}, {args.get('name')!r}, "
         f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('persona_id')}, "

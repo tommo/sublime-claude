@@ -29,9 +29,21 @@ def plugin_loaded() -> None:
     global _PLUGIN_LOADED_AT
     _PLUGIN_LOADED_AT = time.time()
 
-    # Initialize session registry on sublime module (singleton)
-    if not hasattr(sublime, '_claude_sessions'):
-        sublime._claude_sessions = {}
+    # Initialize session registry on sublime module (singleton).
+    # Package reload leaves *stale* Session objects here (old module instance).
+    # Touching them in on_activated (set_name / sleep UI / input) cycles focus
+    # across every Claude sheet. Drop them; reattach is lazy on real focus.
+    prev = getattr(sublime, "_claude_sessions", None) or {}
+    if prev:
+        print(f"[Claude] plugin_loaded: dropping {len(prev)} stale session(s)")
+        for _vid, s in list(prev.items()):
+            try:
+                if getattr(s, "client", None):
+                    s.client = None  # don't block load on shutdown
+            except Exception:
+                pass
+        prev.clear()
+    sublime._claude_sessions = prev if isinstance(prev, dict) else {}
 
     # Start MCP server
     from . import mcp_server
@@ -171,6 +183,14 @@ def _check_auto_sleep():
             continue
         if getattr(session, 'quick_mode', False):
             continue
+        # Host goal harness: don't auto-sleep while a goal is open/active.
+        try:
+            gt = getattr(session, "goal_tracker", None)
+            if gt is not None and gt.is_open() and gt.status in (
+                    "active", "infra_paused"):
+                continue
+        except Exception:
+            pass
         if (session.initialized
                 and not session.working
                 and not session.is_sleeping

@@ -355,6 +355,7 @@ class MCPSocketServer:
             "list_profile_docs": self._list_profile_docs,
             "read_profile_doc": self._read_profile_doc,
             "quick_done": self._quick_done,
+            "update_goal": self._update_goal,
             # Terminal tools (our own PTY terminal)
             "terminal_list": self._terminal_list,
             "terminal_send": self._terminal_send,
@@ -428,6 +429,17 @@ class MCPSocketServer:
         if active_view and active_view.file_name():
             row, col = active_view.rowcol(active_view.sel()[0].begin()) if active_view.sel() else (0, 0)
             lines.append(f"Active: {active_view.file_name()}:{row+1}:{col+1}")
+
+        # Session edit target (set when user previews media / opens path in transcript)
+        try:
+            sid = window.settings().get("claude_active_view")
+            sess = sublime._claude_sessions.get(sid) if (
+                sid and hasattr(sublime, "_claude_sessions")) else None
+            et = getattr(sess, "edit_target", None) if sess else None
+            if et:
+                lines.append(f"Edit target: {et}")
+        except Exception:
+            pass
 
         # Open files (compact list)
         all_views = window.views()
@@ -904,12 +916,63 @@ class MCPSocketServer:
     # ─── Quick Agent ─────────────────────────────────────────────────────
 
     def _quick_done(self, status: str = "completed", message: str = "") -> dict:
-        """End the current Quick Agent slot (self-stop). Not for main sessions."""
+        """End this Quick turn (or close panel if status=closed). Not main sessions."""
         from . import quick_agent as qa
-        return qa.complete_quick_from_tool(
+        result = qa.complete_quick_from_tool(
             status=status,
             message=message,
             view_id=self._caller_view_id,
+        )
+        if result.get("ok"):
+            st = result.get("status", "completed")
+            msg = result.get("message") or ""
+            label = {"completed": "done", "blocked": "blocked", "closed": "closed"}.get(
+                st, st)
+            out = {
+                "ok": True,
+                "status": st,
+                "message": msg,
+                "summary": label + (f": {msg}" if msg else ""),
+                "ready": bool(result.get("ready", st != "closed")),
+            }
+            if result.get("closed"):
+                out["closed"] = True
+            return out
+        return result
+
+    def _update_goal(
+        self,
+        message: str = "",
+        completed: bool = False,
+        blocked_reason: str = "",
+    ) -> dict:
+        """Host goal harness: progress / claim complete / blocked (requires /goal)."""
+        session = None
+        view_id = getattr(self, "_caller_view_id", None)
+        if view_id is not None and hasattr(sublime, "_claude_sessions"):
+            session = sublime._claude_sessions.get(view_id)
+        if session is None:
+            window = self._get_window()
+            if window:
+                vid = window.settings().get("claude_executing_view")
+                if vid is not None and hasattr(sublime, "_claude_sessions"):
+                    session = sublime._claude_sessions.get(vid)
+        if session is None or not hasattr(session, "apply_goal_update"):
+            return {
+                "ok": False,
+                "error": "No session for update_goal. Activate /goal first.",
+                "rejected": True,
+            }
+        if getattr(session, "quick_mode", False):
+            return {
+                "ok": False,
+                "error": "update_goal is not for Quick Agent; use quick_done.",
+                "rejected": True,
+            }
+        return session.apply_goal_update(
+            message=message or "",
+            completed=bool(completed),
+            blocked_reason=blocked_reason or "",
         )
 
     # ─── Session Spawn ────────────────────────────────────────────────────

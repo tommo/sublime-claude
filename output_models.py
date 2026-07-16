@@ -161,15 +161,30 @@ def _open_todos(todos: list) -> list:
 
 @dataclass
 class GoalState:
-    """Grok update_goal — one active autonomous objective (not a Task list)."""
-    status: str = "active"  # active | completed | blocked
+    """Host-owned goal strip snapshot (from GoalTracker, not tool invention)."""
+    status: str = "active"
     message: str = ""
     blocked_reason: str = ""
+    objective: str = ""
+    phase: str = "idle"
+    pause_message: str = ""
+    token_budget: Optional[int] = None
+    tokens_used: Optional[int] = None
+    verify_runs: int = 0
+    verify_max: int = 0
+    gaps: List[str] = field(default_factory=list)
+    verifying: bool = False
+    planning: bool = False
+    goal_id: str = ""
 
 
 def _goal_is_open(goal: Optional["GoalState"]) -> bool:
-    """Carry sticky goal only while still active/blocked (not completed)."""
-    return bool(goal) and goal.status in ("active", "blocked")
+    """Sticky while harness still has an open goal (not complete/cleared)."""
+    if not goal:
+        return False
+    return goal.status in (
+        "active", "user_paused", "blocked", "budget_limited", "infra_paused",
+    )
 
 
 @dataclass
@@ -180,7 +195,7 @@ class Conversation:
     events: List = field(default_factory=list)
     todos: List[TodoItem] = field(default_factory=list)  # current todo state
     todos_all_done: bool = False  # True when all todos completed (don't carry to next)
-    goal: Optional[GoalState] = None  # sticky single goal from update_goal
+    goal: Optional[GoalState] = None  # sticky snapshot from host GoalTracker
     working: bool = True  # True while processing, False when done
     duration: float = 0.0
     has_meta: bool = False  # True after meta() — show @done even if duration is 0

@@ -153,6 +153,17 @@ def _image_edit(view: "OutputView", tool: "ToolCall") -> str:
     prompt = _clip(tool.tool_input.get("prompt", "") if tool.tool_input else "")
     out = f": {prompt}" if prompt else ": edit"
     out += _media_path_suffix(tool)
+    # Surface session edit target (set from media preview) when call has no path
+    if not extract_media_path(getattr(tool, "result", None), tool.tool_input):
+        try:
+            from . import claude_code
+            v = getattr(view, "view", None)
+            sess = claude_code.get_session_for_view(v) if v else None
+            et = getattr(sess, "edit_target", None) if sess else None
+            if et:
+                out += f" · target {media_display_path(et) or et}"
+        except Exception:
+            pass
     return out
 
 

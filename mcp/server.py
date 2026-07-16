@@ -484,21 +484,51 @@ For simple operations, prefer the dedicated tools above.""",
                 },
                 {
                     "name": "quick_done",
-                    "description": """End the current Quick Agent slot when the short task is finished.
-Only valid inside a Quick Agent (⚡) session — not a full Claude/Grok sheet.
-Call with status='completed' and a one-line message when done, or status='blocked' if stuck.
-This stops the slot's bridge so the host can free the slot.""",
+                    "description": """End this one-shot Quick reply (Quick Agent only).
+
+- completed: done — host stops the agent; user's next message starts a fresh session
+- blocked: need more from the user (why in message)
+- closed: user asked leave/close/dismiss — host hides Quick
+Do not use update_goal.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "status": {
                                 "type": "string",
-                                "description": "completed (default) or blocked",
-                                "enum": ["completed", "blocked"]
+                                "description": "completed | blocked | closed",
+                                "enum": ["completed", "blocked", "closed"]
                             },
                             "message": {
                                 "type": "string",
-                                "description": "One-line summary or blocked reason"
+                                "description": "Optional short verdict / blocked reason / goodbye"
+                            }
+                        },
+                        "required": ["status"]
+                    }
+                },
+                {
+                    "name": "update_goal",
+                    "description": """Report progress on the host-owned goal (requires user /goal first).
+
+- message only: progress note
+- completed=true: claim done — host re-verifies; do not assume accepted
+- blocked_reason: after multiple failed attempts (3× pauses the goal)
+
+Do not invent a goal; user activates with /goal <objective>.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Progress note or completion summary"
+                            },
+                            "completed": {
+                                "type": "boolean",
+                                "description": "True only when objective is fully achieved"
+                            },
+                            "blocked_reason": {
+                                "type": "string",
+                                "description": "Why the goal cannot proceed after real attempts"
                             }
                         }
                     }
