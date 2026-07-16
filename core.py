@@ -53,17 +53,44 @@ def plugin_loaded() -> None:
     from . import notalone
     notalone.start()
 
-    # Orphaned claude_output views reconnect lazily on first activation via
-    # ClaudeOutputEventListener._reconnect_orphaned_view (listeners.py).
-    # Order bookmarks attach lazily on view load via ClaudeCodeEventListener.on_load.
-    # After quiet period: sleep ⏸ on all restored sessions; full UX only on active.
+    # 1) Immediately strip leftover ◎ from restored buffers so the composer
+    #    never flashes before sleep restore (ST session restore leaves ◎ in text).
+    # 2) After quiet: register Session objects as sleeping + paint chrome.
     schedule_auto_sleep()
+    sublime.set_timeout(_startup_strip_composers, 0)
+    sublime.set_timeout(_startup_strip_composers, 100)  # ST may still be restoring
     sublime.set_timeout(_startup_settle_views, int(_STARTUP_QUIET_S * 1000) + 50)
 
 
-def _startup_settle_views() -> None:
-    """After session restore, apply sleep UI to all Claude sheets; live UX on active."""
+def _startup_strip_composers() -> None:
+    """First paint: remove sticky ◎ from every Claude sheet before user sees it."""
     try:
+        from .output_view import OutputView
+        n = 0
+        for w in sublime.windows():
+            for v in w.views():
+                if not v.settings().get("claude_output"):
+                    continue
+                if v.settings().get("claude_quick"):
+                    continue
+                v.settings().set("claude_input_mode", False)
+                # Prefer sleeping chrome once we restore; mark early for keymaps
+                if v.settings().get("claude_backend") or v.settings().get("claude_sleeping"):
+                    # Don't force sleeping on brand-new empty sheets
+                    pass
+                if OutputView.strip_composer_tail(v):
+                    n += 1
+        if n:
+            print(f"[Claude] startup: stripped composer from {n} sheet(s)")
+    except Exception as e:
+        print(f"[Claude] startup strip: {e}")
+
+
+def _startup_settle_views() -> None:
+    """Restore all Claude sheets into sleeping Session objects (no dual phase)."""
+    try:
+        # One more strip in case ST finished restoring buffer after first pass
+        _startup_strip_composers()
         from .listeners import settle_startup_claude_views
         settle_startup_claude_views()
     except Exception as e:
@@ -139,6 +166,8 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         old_session.output.set_name(old_session.name or "Claude")
 
     s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend)
+    # New session: composer allowed after init (start sets False until then)
+    s._composer_allowed = True
     # new_file() fires on_activated before we can register — suppress orphan
     # reconnect so we don't attach a sleeping session to this brand-new sheet.
     window.settings().set("claude_creating_session", True)

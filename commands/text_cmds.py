@@ -196,7 +196,7 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
                 lines.append(f"  📎 {item.name}")
             lines.append("")
             session.output.text("\n".join(lines))
-        session.output.enter_input_mode()
+        session.output.enter_input_mode()  # scrolls true bottom via focus_composer
 
 
 class ClaudeGoalStatusCommand(sublime_plugin.WindowCommand):
@@ -1278,8 +1278,12 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
 
         def _ensure_input():
             try:
-                if session.output and not session.output.is_input_mode():
+                if not session.output:
+                    return
+                if not session.output.is_input_mode():
                     session.output.enter_input_mode()
+                elif session.output.is_input_mode():
+                    session.output.focus_composer(force_show=True)
             except Exception:
                 pass
 

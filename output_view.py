@@ -76,6 +76,7 @@ class OutputView:
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
         self._media_anchor: Dict[str, int] = {}  # abs path -> buffer pt for popup
         self._context_phantom_set = None  # clickable open/reveal chips on 📎 line
+        self._pad_phantom_set = None  # invisible height under ◎ (not a gray box)
 
     def show(self, focus: bool = True, panel: Optional[str] = None) -> None:
         """Show output as a doc sheet. Optional `panel` binds a bottom panel
@@ -427,9 +428,9 @@ class OutputView:
         if not self.view or not self.view.is_valid():
             return
 
-        # In input mode, always keep input visible
+        # In input mode, scroll to true bottom (◎ + pad hline), not only caret
         if self._input_mode:
-            self.view.show(self._input_start, keep_to_left=False, animate=False)
+            self._scroll_layout_to_bottom()
             return
 
         if not force and not self._is_following_tail():
@@ -491,17 +492,25 @@ class OutputView:
 
         Works while the session is streaming — submit queues via queue_prompt.
         Suppressed while question/permission/plan UI is showing.
+        Never runs for restored/sleeping sessions (_composer_allowed=False).
         """
         if not self.view or not self.view.is_valid():
             return
         if self._input_mode:
             return
+        # Hard blocks — do not append ◎ only to strip it later
+        if self.view.settings().get("claude_sleeping"):
+            return
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
+        if session is not None:
+            if getattr(session, "is_sleeping", False):
+                return
+            if not getattr(session, "_composer_allowed", True):
+                return
         # Modal choice UI owns the tail — don't stack ◎ under/over it
         if self.has_turn_modal_ui():
             return
-
-        from . import claude_code
-        session = claude_code.get_session_for_view(self.view)
 
         # Stale conversation.working after interrupt: clear when session is idle
         # so we don't leave a stuck "working" turn flag. Streaming is OK — sticky
@@ -511,8 +520,11 @@ class OutputView:
 
         # Additional safety: check if there's a pending render that should complete first
         if self._render_pending:
-            # print(f"[Claude] enter_input_mode: pending render, deferring...")
-            # Schedule input mode entry after pending render completes
+            # Do not schedule a deferred enter while sleeping/blocked
+            if self.view.settings().get("claude_sleeping"):
+                return
+            if session is not None and not getattr(session, "_composer_allowed", True):
+                return
             sublime.set_timeout(self.enter_input_mode, 20)
             return
 
@@ -577,11 +589,8 @@ class OutputView:
             self.view.run_command("append", {"characters": "\n"})
         elif self.view.substr(self.view.size() - 1) != "\n":
             self.view.run_command("append", {"characters": "\n"})
-        # Peel = composer start (conversation replace stops here). Spare blank
-        # row lives *inside* the composer so re-renders don't wipe it — keeps
-        # the split phantom off the viewport floor (less shake at bottom).
+        # Peel = start of ◎ line (no blank row between split hairline and ◎).
         self._input_area_start = self.view.size()
-        self.view.run_command("append", {"characters": "\n"})
 
         # Add background task hints
         bg_tools = self.active_background_tools()
@@ -603,20 +612,16 @@ class OutputView:
 
         self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
-        # Spare empty line *below* the composer so ◎ isn't glued to the
-        # viewport floor (scroll padding + room to type).
-        self.view.run_command("append", {"characters": "\n"})
+        # Bottom breathing room: pad phantom (not a typeable blank line).
 
         # NOW set input mode - after _input_start is correctly positioned
         # This ensures on_modified won't save wrong content as draft
         self._input_mode = True
         self.view.settings().set("claude_input_mode", True)
 
-        # Caret on the ◎ line (before spare newline), not on the blank row
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
-        self.view.show(self.view.size())  # include spare line in viewport
-        self.view.show(self._input_start)
+        self._update_composer_pad_phantom()
 
         # Clickable open/reveal chips inline after 📎 (same line, not a 2nd row)
         items = list(session.pending_context) if session and session.pending_context else []
@@ -632,7 +637,8 @@ class OutputView:
             except Exception:
                 pass
 
-        # print(f"[Claude] enter_input_mode: COMPLETED, view_size={self.view.size()}, _input_mode={self._input_mode}, final_content={repr(self.view.substr(sublime.Region(0, self.view.size())))}")
+        # All enter_input_mode call sites must land at true bottom (◎ + hline)
+        self.focus_composer(force_show=True)
 
     def exit_input_mode(self, keep_text: bool = False) -> str:
         """Exit input mode and return the input text."""
@@ -673,146 +679,251 @@ class OutputView:
         self.view.set_read_only(True)
         self._pending_context_region = (0, 0)
         self._refresh_context_phantoms([])
+        self._update_composer_pad_phantom()
         # Re-pin cron Stop bar at EOF if a loop is still armed (mid-turn).
         if _sess and getattr(_sess, "_wakeup_armed", None) and _sess._wakeup_armed():
             _sess._update_wakeup_banner(show=True)
         return input_text
 
     def get_input_text(self) -> str:
-        """Get current text in input region (excludes trailing spare blank line)."""
+        """Get current text in input region (everything after ◎)."""
         if not self.view or not self._input_mode:
             return ""
-        text = self.view.substr(sublime.Region(self._input_start, self.view.size()))
-        # One trailing newline is viewport padding, not part of the prompt.
-        if text.endswith("\n"):
-            text = text[:-1]
-        return text
+        return self.view.substr(sublime.Region(self._input_start, self.view.size()))
+
+    def draft_end(self) -> int:
+        """End of editable draft (= EOF while composer is open)."""
+        if not self.view or not self._input_mode:
+            return 0
+        return self.view.size()
 
     def ensure_composer_spare_line(self) -> None:
-        """Keep a single empty line after the draft (bottom padding)."""
-        if not self.view or not self.view.is_valid() or not self._input_mode:
+        """Re-pin full-width split + pad under ◎."""
+        self._update_composer_pad_phantom()
+
+    def _composer_hline_cols(self) -> int:
+        """Columns needed for a phantom rule to span the full viewport."""
+        try:
+            vw = float(self.view.viewport_extent()[0])
+            em = float(self.view.em_width() or 8)
+            # +20 so it still covers when the gutter/sidebar changes
+            return max(100, int(vw / max(em, 1.0)) + 20)
+        except Exception:
+            return 200
+
+    def _update_composer_pad_phantom(self) -> None:
+        """Full-width hline under the ◎ draft (viewport-spanning rule)."""
+        if not self.view or not self.view.is_valid():
             return
         try:
-            end = self.view.size()
-            start = max(0, int(self._input_start or 0))
-            if end < start:
+            if not self._input_mode:
+                if self._pad_phantom_set is not None:
+                    self._pad_phantom_set.update([])
                 return
-            # Already has trailing newline after composer content
-            if end > start and self.view.substr(end - 1) == "\n":
-                return
-            self.view.set_read_only(False)
-            self.view.run_command("append", {"characters": "\n"})
+            if self._pad_phantom_set is None:
+                self._pad_phantom_set = sublime.PhantomSet(
+                    self.view, "claude_composer_pad")
+            pt = self.view.size()
+            # minihtml width/border tricks do NOT span the pane. A long
+            # nowrap ─ run sized to the viewport actually does.
+            cols = self._composer_hline_cols()
+            rule = "─" * cols
+            html = (
+                '<body id="claude-pad" style="margin:0;padding:0;">'
+                f'<div style="margin:6px 0 4px 0;padding:0;line-height:1;'
+                f'font-size:11px;letter-spacing:0;'
+                f'white-space:nowrap;'
+                f'color:color(var(--foreground) alpha(0.1));">'
+                f'{rule}</div></body>'
+            )
+            self._pad_phantom_set.update([
+                sublime.Phantom(
+                    sublime.Region(pt, pt),
+                    html,
+                    sublime.LAYOUT_BLOCK,
+                    on_navigate=self._on_composer_pad_navigate,
+                )
+            ])
         except Exception as e:
-            print(f"[Claude] ensure_composer_spare_line: {e}")
+            print(f"[Claude] composer pad: {e}")
+
+    def _on_composer_pad_navigate(self, href: str) -> None:
+        try:
+            if self._input_mode and self.view and self.view.is_valid():
+                self.view.set_read_only(False)
+                self.focus_composer(force_show=True)
+        except Exception as e:
+            print(f"[Claude] pad click: {e}")
 
     def set_composer_text(self, text: str) -> None:
-        """Replace draft (after ◎) and keep the spare bottom line."""
+        """Replace draft after ◎."""
         if not self.view or not self.view.is_valid() or not self._input_mode:
             return
         body = text or ""
-        # Don't double-store the spare newline inside the draft
-        if body.endswith("\n"):
-            body = body[:-1]
         self.view.set_read_only(False)
         self.view.run_command("claude_replace", {
             "start": self._input_start,
             "end": self.view.size(),
-            "text": body + "\n",
+            "text": body,
         })
         caret = self._input_start + len(body)
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(caret, caret))
+        self._update_composer_pad_phantom()
 
     def is_input_mode(self) -> bool:
         """Check if currently in input mode."""
         return self._input_mode
 
-    def focus_composer(self, force_show: bool = True) -> None:
-        """Focus the sticky ◎ input and keep it in the viewport.
+    def _scroll_layout_to_bottom(self) -> None:
+        """Scroll so ◎ + bottom hline are at the foot of the viewport.
 
-        Call after queue-submit (or any path that clears the draft while
-        staying in input mode) so the user can type the next message without
-        hunting for a composer scrolled off-screen.
+        LAYOUT_BLOCK phantoms are not always in layout_extent(); compute bottom
+        from text_to_layout(EOF) plus pad height, then set_viewport_position.
         """
-        if not self.view or not self.view.is_valid():
-            return
-        if not self._input_mode:
+        view = self.view
+        if not view or not view.is_valid():
             return
         try:
-            self.ensure_composer_spare_line()
+            end = view.size()
+            if end > 0:
+                _x, y = view.text_to_layout(end)
+                y = float(y)
+            else:
+                y = 0.0
+            line_h = float(view.line_height() or 16.0)
+            # Bottom pad = full-width ─ rule + small margin (~2 lines)
+            y_from_text = y + line_h * 2.2
+            layout_h = None
+            try:
+                layout_h = float(view.layout_extent()[1])
+            except Exception:
+                pass
+            y_bottom = y_from_text if layout_h is None else max(y_from_text, layout_h)
+            vh = float(view.viewport_extent()[1])
+            vx = float(view.viewport_position()[0])
+            target_y = max(0.0, y_bottom - vh)
+            # show() first can leave caret mid-pane; pin viewport after
+            try:
+                view.show(sublime.Region(end, end), False)
+            except Exception:
+                try:
+                    view.show(end)
+                except Exception:
+                    pass
+            view.set_viewport_position((vx, target_y), False)
+        except Exception:
+            try:
+                self.view.show(self.view.size())
+            except Exception:
+                pass
+
+    def focus_composer(self, force_show: bool = True) -> None:
+        """Focus the sticky ◎ input and scroll to the true view bottom.
+
+        Programmatic focus must reveal ◎ + bottom hline pad, not only the caret.
+        """
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        try:
             win = self.view.window()
             if win:
                 win.focus_view(self.view)
-            pt = max(0, int(self._input_start or 0))
-            # Caret at end of draft, *before* the spare blank line
-            draft = self.get_input_text()
-            caret = pt + len(draft)
-            end = self.view.size()
-            if caret > end:
-                caret = end
+            caret = self.view.size()
             self.view.set_read_only(False)
             self.view.sel().clear()
             self.view.sel().add(sublime.Region(caret, caret))
+            # Pin pad/hline first so we can scroll past it
+            self._update_composer_pad_phantom()
             if force_show:
-                # Include spare line + ◎ in the visible region
-                show_pt = max(0, pt - 1) if pt > 0 else caret
-                self.view.show(sublime.Region(show_pt, end), False)
-                self.view.show(caret, keep_to_left=False, animate=False)
-        except Exception as e:
-            print(f"[Claude] focus_composer: {e}")
+                self._scroll_layout_to_bottom()
+                # Layout/phantom settle — re-pin bottom after ST finishes
+                for ms in (0, 16, 50, 120):
+                    sublime.set_timeout(self._scroll_layout_to_bottom, ms)
+        except Exception:
+            pass
 
-    def reset_input_mode(self) -> None:
-        """Force reset input mode state - use when state gets corrupted."""
+    @staticmethod
+    def strip_composer_tail(view) -> bool:
+        """Remove trailing sticky ◎ strip from a view buffer (no Session needed).
+
+        Call ASAP on startup so restored sheets never flash the composer before
+        sleep restore. Returns True if buffer text was removed.
+        """
+        if not view or not view.is_valid():
+            return False
+        try:
+            view.settings().set("claude_input_mode", False)
+        except Exception:
+            pass
+        content = view.substr(sublime.Region(0, view.size()))
+        if not content:
+            return False
+        lines = content.split("\n")
+        cleanup_start = -1
+        marker = "◎ "
+        for i in range(len(lines) - 1, -1, -1):
+            line = lines[i]
+            stripped = line.strip()
+            is_input_marker = (
+                (line.startswith(marker)
+                 or stripped.startswith("◎")
+                 or stripped.startswith("\u25ce"))
+                and " ▶" not in line
+            )
+            is_context_line = line.startswith(CONTEXT_PREFIX)
+            is_bg_hint = stripped.startswith((BACKGROUND_PREFIX, "✔ ", "✘ "))
+            if is_input_marker or is_context_line or is_bg_hint:
+                cleanup_start = len("\n".join(lines[:i]))
+                if i > 0:
+                    cleanup_start += 1
+                continue
+            elif stripped:
+                break
+        if cleanup_start < 0 or cleanup_start >= view.size():
+            return False
+        try:
+            view.set_read_only(False)
+            view.run_command("claude_replace", {
+                "start": cleanup_start,
+                "end": view.size(),
+                "text": "",
+            })
+            view.set_read_only(True)
+            return True
+        except Exception as e:
+            print(f"[Claude] strip_composer_tail: {e}")
+            return False
+
+    def reset_input_mode(self, *, reenter: bool = False) -> None:
+        """Clear sticky ◎ strip and input-mode flags.
+
+        reenter=True: open a clean composer after (manual Reset Input only).
+        Default reenter=False — sleep/restore must NOT reopen ◎.
+        """
         if not self.view:
             return
 
-        # Try to clean up leftover input markers in view content
-        # Input markers are EXACTLY "◎ " (the marker) possibly followed by user text
-        # Prompt lines are "◎ ... ▶" (have the arrow indicator)
-        content = self.view.substr(sublime.Region(0, self.view.size()))
-        cleanup_start = -1
+        try:
+            if self._pad_phantom_set is not None:
+                self._pad_phantom_set.update([])
+        except Exception:
+            pass
 
-        # Find input area at end - must be input marker (not prompt) or context line
-        lines = content.split('\n')
-        for i in range(len(lines) - 1, -1, -1):
-            line = lines[i]
-            # Input marker line: starts with "◎ " but does NOT contain " ▶" (which prompts have)
-            is_input_marker = line.startswith(self._input_marker) and ' ▶' not in line
-            is_context_line = line.startswith(CONTEXT_PREFIX)
-            if is_input_marker or is_context_line:
-                # Found input area - calculate position to remove
-                cleanup_start = len('\n'.join(lines[:i]))
-                if i > 0:
-                    cleanup_start += 1  # Account for newline before this line
-                # Continue checking for context lines above
-                continue
-            elif line.strip():
-                # Non-empty line that's not input area - stop looking
-                break
-
-        if cleanup_start >= 0 and cleanup_start < self.view.size():
-            self.view.set_read_only(False)
-            self.view.run_command("claude_replace", {
-                "start": cleanup_start,
-                "end": self.view.size(),
-                "text": ""
-            })
-            self.view.set_read_only(True)
+        OutputView.strip_composer_tail(self.view)
 
         self._input_mode = False
         self._input_start = 0
         self._input_area_start = 0
         self.view.settings().set("claude_input_mode", False)
         self.view.set_read_only(True)
-        # Also clear any pending regions that might be stale
         self._pending_context_region = (0, 0)
 
-        # Re-enter input mode after reset to restore a clean, working state
-        # Use a timeout to ensure view state is fully reset before re-entering
-        sublime.set_timeout(self.enter_input_mode, 10)
+        if reenter and not self.view.settings().get("claude_sleeping"):
+            sublime.set_timeout(self.enter_input_mode, 10)
 
     def is_in_input_region(self, point: int) -> bool:
-        """Check if a point is within the editable input region."""
+        """Check if a point is within the editable draft (after ◎)."""
         if not self._input_mode:
             return False
         return point >= self._input_start
@@ -2033,6 +2144,8 @@ class OutputView:
             val = s.get(key)
             if val is not None:
                 self.view.settings().set(key, val)
+        # Room below ◎ without a fake blank buffer line (that broke typing UX)
+        self.view.settings().set("scroll_past_end", True)
 
     def _load_persisted_auto_allow(self) -> set:
         """Load autoAllowedMcpTools from project settings at session start."""
@@ -2696,16 +2809,18 @@ class OutputView:
         self._input_mode = False
         if self.view:
             self.view.settings().set("claude_input_mode", False)
-        self.enter_input_mode()
+        self.enter_input_mode()  # scrolls bottom
         if not self._input_mode or not self.view:
             return
         if draft:
             self.view.set_read_only(False)
             self.view.run_command("append", {"characters": draft})
+            self._update_composer_pad_phantom()
         pos = min(self._input_start + max(0, caret_off), self.view.size())
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(pos, pos))
         self.view.set_read_only(False)
+        self.focus_composer(force_show=True)
 
     def _do_render(self) -> None:
         """Actually perform the render.
@@ -2741,6 +2856,8 @@ class OutputView:
                     if b >= self._input_start:
                         caret_in_composer = True
                         caret_off = b - self._input_start
+                        # Clamp to draft (stale spare-line caret / mid-rewrite)
+                        caret_off = max(0, min(caret_off, len(draft)))
             except Exception:
                 pass
 
@@ -3069,9 +3186,11 @@ class OutputView:
         if was_input:
             self.view.set_read_only(False)
             if not self._input_marker_intact():
-                self._replant_composer(draft, caret_off)
+                self._replant_composer(draft, min(caret_off, len(draft or "")))
             elif caret_in_composer:
-                pos = min(self._input_start + max(0, caret_off), self.view.size())
+                # Keep caret in draft; never past EOF (replant if draft wiped)
+                max_off = max(0, self.view.size() - self._input_start)
+                pos = self._input_start + max(0, min(caret_off, max_off, len(draft or "")))
                 try:
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(pos, pos))
@@ -3118,6 +3237,7 @@ class OutputView:
                     lambda s=_sess: s._update_permission_banner(show=True), 15)
                 sublime.set_timeout(
                     lambda s=_sess: s._update_queue_phantom(), 15)
+                sublime.set_timeout(self._update_composer_pad_phantom, 15)
         except Exception:
             pass
 

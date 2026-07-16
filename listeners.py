@@ -13,60 +13,54 @@ from .context_parser import ContextParser, ContextMenuItem, ContextMenuHandler
 
 
 def settle_active_claude_view(window: sublime.Window) -> None:
-    """Full reconnect + title for the window's active Claude sheet only."""
+    """Ensure the window's active Claude sheet is restored (sleep or live)."""
     if not window:
         return
     view = window.active_view()
     if not view or not view.settings().get("claude_output"):
         return
-    # Force a normal on_activated-style settle (quiet period already ended).
     s = get_session_for_view(view)
     if not s:
-        # Build a listener instance is awkward; call reconnect helper directly.
-        ClaudeOutputEventListener(view)._reconnect_orphaned_view(window, quiet=False)
+        ClaudeOutputEventListener(view)._restore_session(window, paint=True)
         s = get_session_for_view(view)
-    if s:
-        s._update_status_bar()
-        s.output.set_name(s.display_name)
-        if s.is_sleeping:
-            s._apply_sleep_ui()
-        elif s.initialized and not s.working and not s.output.is_input_mode():
-            s._enter_input_with_draft()
+    if not s:
+        return
+    s._update_status_bar()
+    s.output.set_name(s.display_name)
+    if s.is_sleeping:
+        s._apply_sleep_ui(touch_buffer=True)
+    elif s.initialized and not s.working and not s.output.is_input_mode():
+        s._enter_input_with_draft()
 
 
 def settle_startup_claude_views() -> None:
-    """After quiet period: show sleep state on every restored Claude sheet.
+    """After quiet period: one-shot restore of every Claude sheet as sleeping.
 
-    Quiet reconnect registers sessions without title/phantom churn so multi-tab
-    restore does not raise each sheet. Once quiet ends, apply ⏸ titles and
-    sleep overlays on all sleeping sessions — still without focusing them.
-    Only the truly active sheet gets full live UX (input mode / start).
+    Composer tail is already stripped in core._startup_strip_composers (t=0).
+    This only registers Session + sleep chrome — never briefly enter_input.
     """
+    from .output_view import OutputView
     for w in sublime.windows():
-        # Register any orphans that never received on_activated during restore.
+        active = w.active_view()
+        active_id = active.id() if active else None
         for view in w.views():
             if not view.settings().get("claude_output"):
                 continue
-            if get_session_for_view(view):
-                continue
             if w.settings().get("claude_creating_session"):
                 continue
-            ClaudeOutputEventListener(view)._reconnect_orphaned_view(w, quiet=True)
-
-        active = w.active_view()
-        active_id = active.id() if active else None
-        for s in list(sublime._claude_sessions.values()):
-            if s.window != w:
+            if view.settings().get("claude_quick"):
                 continue
-            if not s.output or not s.output.view or not s.output.view.is_valid():
+            # Guarantee no ◎ flash if a late buffer restore re-added it
+            view.settings().set("claude_input_mode", False)
+            OutputView.strip_composer_tail(view)
+            is_focused = view.id() == active_id
+            if get_session_for_view(view):
+                s = get_session_for_view(view)
+                if s and s.is_sleeping:
+                    s._apply_sleep_ui(touch_buffer=is_focused)
                 continue
-            is_focused = s.output.view.id() == active_id
-            if s.is_sleeping:
-                # Inactive: title/settings only. Full overlay+buffer only when focused.
-                s._apply_sleep_ui(touch_buffer=is_focused)
-            else:
-                # Keep tab title in sync (◇ etc.); set_name no-ops if unchanged.
-                s.output.set_name(s.display_name)
+            ClaudeOutputEventListener(view)._restore_session(
+                w, paint=is_focused)
 
         settle_active_claude_view(w)
 
@@ -209,17 +203,19 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             # Focus back to Claude output and re-enter input mode
             def refocus():
                 session.output.show()
-                # set_pending_context already restored input text if input mode was active
-                if session.output.is_input_mode():
-                    return
-                session.output.enter_input_mode()
-                if session.draft_prompt:
+                if not session.output.is_input_mode():
+                    session.output.enter_input_mode()
+                if session.draft_prompt and session.output.is_input_mode():
                     if hasattr(session.output, "set_composer_text"):
                         session.output.set_composer_text(session.draft_prompt)
                     else:
                         session.output.view.run_command("append", {
                             "characters": session.draft_prompt,
                         })
+                # Always scroll true bottom (enter_input_mode alone is not enough
+                # if we were already in input mode)
+                if session.output.is_input_mode():
+                    session.output.focus_composer(force_show=True)
 
             sublime.set_timeout(refocus, 100)
 
@@ -308,14 +304,12 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         old_active = window.settings().get("claude_active_view")
         window.settings().set("claude_active_view", self.view.id())
 
-        # Check if this is an orphaned view that needs reconnection
+        # Orphan after restart: one path — restore as sleeping (or start if new)
         s = get_session_for_view(self.view)
         if not s:
-            # create_session is mid-flight (new_file → on_activated); it will
-            # register the real Session — do not invent a sleeping orphan.
             if window.settings().get("claude_creating_session"):
                 return
-            self._reconnect_orphaned_view(window, quiet=False)
+            self._restore_session(window, paint=True)
             s = get_session_for_view(self.view)
             if not s:
                 return
@@ -324,20 +318,15 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         s._update_status_bar()
         s.output.set_name(s.display_name)
 
-        # First real focus after quiet restore: paint sleep overlay/buffer now
         if s.is_sleeping:
+            # Already restored as sleep; ensure full chrome on real focus
             s._apply_sleep_ui(touch_buffer=True)
-        # Sticky composer: enter when idle *or* mid-turn (queue while streaming)
         elif s.initialized and not s.output.is_input_mode():
             s._enter_input_with_draft()
-        # If already in input mode, ensure cursor is positioned and view is responsive
         elif s.output.is_input_mode():
-            # Make sure there's a valid cursor position so clicking works
-            # This fixes mouse selection which requires a valid initial cursor state
             input_start = s.output._input_start
             sel = self.view.sel()
             if len(sel) == 0:
-                # No selection at all - set cursor to input start
                 self.view.sel().clear()
                 self.view.sel().add(sublime.Region(input_start, input_start))
 
@@ -349,137 +338,134 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             except Exception:
                 pass
 
-    def _reconnect_orphaned_view(self, window, quiet: bool = False):
-        """Reconnect an orphaned Claude output view on focus.
+    def _restore_session(self, window, paint: bool = True) -> None:
+        """Single path: orphan view → Session already in sleeping state.
 
-        quiet=True: register session only (no set_name / phantoms / show / start).
-        Used during ST startup so restoring many claude_output sheets does not
-        raise each tab.
+        paint=True (focused sheet): full sleep chrome (overlay, buffer cleanup).
+        paint=False (background tab): title + settings only — no focus thrash.
+
+        No more quiet-register-then-later-sleep split.
         """
-        # Quick Agent sheets are owned by quick_agent.py — never invent a resume orphan.
+        # Quick Agent sheets are owned by quick_agent.py
         if self.view and self.view.settings().get("claude_quick"):
             return
         from .session import Session, load_saved_sessions
 
         view = self.view
-
-        # Guard against double reconnection
         if view.id() in sublime._claude_sessions:
             return
         if view.settings().get("claude_reconnecting"):
             return
         view.settings().set("claude_reconnecting", True)
 
-        name = view.name()
-        session_name = None
+        try:
+            name = view.name() or ""
+            name_was_truncated = name.endswith("…")
+            if name_was_truncated:
+                name = name[:-1]
 
-        # Strip trailing ellipsis from truncation (captured before prefix-stripping
-        # so prefix-match logic below still knows the name was truncated).
-        name_was_truncated = name.endswith("…")
-        if name_was_truncated:
-            name = name[:-1]
+            from .output import strip_title_decoration
+            name = strip_title_decoration(name)
 
-        # Peel status icons + any stacked backend `ABBR> ` prefixes (covers
-        # custom providers too) so reconnect can't accumulate them.
-        from .output import strip_title_decoration
-        name = strip_title_decoration(name)
+            session_name = None
+            if " - " in name:
+                session_name = name.split(" - ")[0]
+            elif name and name != "Claude":
+                session_name = name
 
-        # Extract session name (before " - " suffix if present)
-        if " - " in name:
-            session_name = name.split(" - ")[0]
-        elif name and name != "Claude":
-            session_name = name
+            resume_id = None
+            saved_sessions = load_saved_sessions()
 
-        # Try to find session_id from saved sessions
-        resume_id = None
-        saved_sessions = load_saved_sessions()
-
-        # Method 1: Match by name (exact or prefix if name was truncated)
-        if session_name:
-            for saved in saved_sessions:
-                saved_name = saved.get("name") or ""
-                if not saved.get("session_id"):
-                    continue
-                if saved_name == session_name or saved_name.startswith(session_name):
-                    resume_id = saved.get("session_id")
-                    session_name = saved_name
-                    break
-
-        # Method 2: Match by first prompt in view content
-        if not resume_id:
-            content = view.substr(sublime.Region(0, min(500, view.size())))
-            m = re.search(r'◎ (.+?) ▶', content)
-            if m:
-                first_prompt = m.group(1).strip()
+            if session_name:
                 for saved in saved_sessions:
-                    fp = saved.get("first_prompt", "")
-                    if fp and fp == first_prompt and saved.get("query_count", 0) > 0:
+                    saved_name = saved.get("name") or ""
+                    if not saved.get("session_id"):
+                        continue
+                    if saved_name == session_name or saved_name.startswith(session_name):
                         resume_id = saved.get("session_id")
-                        session_name = saved.get("name") or session_name
+                        session_name = saved_name
                         break
 
-        # Check for pending rewind point
-        resume_session_at = None
-        if resume_id:
-            for saved in saved_sessions:
-                if saved.get("session_id") == resume_id:
-                    resume_session_at = saved.get("resume_session_at")
-                    break
+            if not resume_id:
+                content = view.substr(sublime.Region(0, min(500, view.size())))
+                m = re.search(r'◎ (.+?) ▶', content)
+                if m:
+                    first_prompt = m.group(1).strip()
+                    for saved in saved_sessions:
+                        fp = saved.get("first_prompt", "")
+                        if fp and fp == first_prompt and saved.get("query_count", 0) > 0:
+                            resume_id = saved.get("session_id")
+                            session_name = saved.get("name") or session_name
+                            break
 
-        print(f"[Claude] reconnect: view={view.name()!r}, session={session_name!r}, "
-              f"resume_id={resume_id}, quiet={quiet}")
-
-        # Create session in sleeping state — user wakes with Enter or Wake command
-        saved_backend = view.settings().get("claude_backend", "claude")
-        session = Session(window, resume_id=resume_id, backend=saved_backend)
-        session.name = session_name
-        session.output.view = view
-        session.draft_prompt = ""
-        if resume_session_at:
-            session._pending_resume_at = resume_session_at
-        sublime._claude_sessions[view.id()] = session
-
-        # Quiet path: registry only — no buffer edits, set_name, phantoms, or
-        # start. Those raise every sheet during multi-tab restore (ST focuses
-        # views that get selection/buffer mutations or even set_name churn).
-        if quiet:
-            session.output.reset_active_states(soft=True)
-            if resume_id and not session.session_id:
-                session.session_id = resume_id
+            resume_session_at = None
             if resume_id:
-                view.settings().set("claude_sleeping", True)
+                for saved in saved_sessions:
+                    if saved.get("session_id") == resume_id:
+                        resume_session_at = saved.get("resume_session_at")
+                        break
+
+            saved_backend = view.settings().get("claude_backend", "claude")
+            session = Session(window, resume_id=resume_id, backend=saved_backend)
+            session.name = session_name
+            session.output.view = view
+            session.draft_prompt = ""
+            # BEFORE any UI: forbid ◎. Never add-then-strip.
+            session._composer_allowed = False
+            view.settings().set("claude_sleeping", True)
+            view.settings().set("claude_input_mode", False)
+            if resume_session_at:
+                session._pending_resume_at = resume_session_at
+
+            # session_id set immediately so is_sleeping is True (no client yet)
+            if resume_id:
+                session.session_id = resume_id
+
+            sublime._claude_sessions[view.id()] = session
+
+            # Theme (no focus side effects)
+            if view.settings().get("claude_quick"):
+                view.settings().set(
+                    "color_scheme",
+                    "Packages/ClaudeCode/ClaudeOutput-quick.hidden-tmTheme",
+                )
+            else:
+                backend = view.settings().get("claude_backend")
+                if backend:
+                    backend_themes = {
+                        "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
+                        "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
+                        "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
+                    }
+                    theme = backend_themes.get(backend)
+                    if theme:
+                        view.settings().set("color_scheme", theme)
+
+            # Soft in-memory reset only (no reenter). Strip ST-restored ◎ if any.
+            session.output.reset_active_states(soft=True)
+            session._strip_sticky_composer()
+
+            if resume_id:
+                session._apply_sleep_ui(touch_buffer=paint)
+                print(
+                    f"[Claude] restore sleeping: view={view.name()!r} "
+                    f"session={session_name!r} id={resume_id[:12]}… paint={paint}"
+                )
+            else:
+                session.output.set_name(session.display_name)
+                if paint:
+                    session._show_overlay_phantom(
+                        "\u23f8 No session to resume \u2014 Restart Session or close",
+                        color="var(--yellowish)",
+                        strong=True,
+                    )
+                print(f"[Claude] restore no-id (no auto-start): view={view.name()!r}")
+        finally:
             view.settings().erase("claude_reconnecting")
-            return
 
-        # Reset active states (full — may patch buffer symbols)
-        session.output.reset_active_states(soft=False)
-
-        # Re-apply sheet theme (Quick Agent wins over backend tint)
-        if view.settings().get("claude_quick"):
-            view.settings().set(
-                "color_scheme",
-                "Packages/ClaudeCode/ClaudeOutput-quick.hidden-tmTheme",
-            )
-        else:
-            backend = view.settings().get("claude_backend")
-            if backend:
-                backend_themes = {
-                    "codex": "Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
-                    "copilot": "Packages/ClaudeCode/ClaudeOutput-copilot.hidden-tmTheme",
-                    "pi": "Packages/ClaudeCode/ClaudeOutput.hidden-tmTheme",
-                }
-                theme = backend_themes.get(backend)
-                if theme:
-                    view.settings().set("color_scheme", theme)
-
-        # If we have a session_id, sleep it. Otherwise auto-reconnect (old behavior).
-        if resume_id:
-            session._apply_sleep_ui()
-        else:
-            session.start(resume_session_at=resume_session_at)
-
-        # Clear reconnecting flag
-        view.settings().erase("claude_reconnecting")
+    # Back-compat alias
+    def _reconnect_orphaned_view(self, window, quiet: bool = False):
+        self._restore_session(window, paint=not quiet)
 
     # Buffer-mutating commands that must stay inside the ◎ input region.
     # Everything else (Cmd+D find_under_expand, multi-cursor, find, nav) is
@@ -496,6 +482,36 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         "upper_case", "lower_case", "title_case", "swap_case",
     })
 
+    def _park_caret_in_draft(self, session) -> int:
+        """Move caret to end of ◎ draft. No scroll. Returns draft-end point."""
+        view = self.view
+        view.set_read_only(False)
+        end = view.size()
+        view.sel().clear()
+        view.sel().add(sublime.Region(end, end))
+        return end
+
+    def _focus_draft_bottom(self, session) -> None:
+        """Park caret in draft and scroll so ◎ + bottom hline are in view.
+
+        Used when typing/pasting was redirected from history — ST's default
+        show(caret) only frames the caret row and leaves the hline off-screen.
+        """
+        try:
+            session.output.focus_composer(force_show=True)
+        except Exception:
+            self._park_caret_in_draft(session)
+
+    def _sel_outside_draft(self, session) -> bool:
+        """True if any selection touches conversation history (before ◎)."""
+        if not session.output.is_input_mode():
+            return False
+        input_start = session.output._input_start
+        for region in self.view.sel():
+            if region.begin() < input_start or region.end() < input_start:
+                return True
+        return False
+
     def on_text_command(self, command_name, args):
         """Intercept text commands to restrict edits in input mode."""
         s = get_session_for_view(self.view)
@@ -506,39 +522,86 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # in input mode (otherwise ST paste hits a read-only history region
         # and image clipboards are dropped).
         if command_name in ("paste", "paste_and_indent"):
+            if s.output.is_input_mode() and self._sel_outside_draft(s):
+                # Redirect paste into draft and reveal ◎ + bottom pad
+                self._focus_draft_bottom(s)
             return ("claude_paste_image", {})
 
         if not s.output.is_input_mode():
+            return None
+
+        # Click in empty space under ◎ (scroll_past_end) → focus composer.
+        if command_name == "drag_select":
+            args = args or {}
+            sublime.set_timeout(
+                lambda a=dict(args), sess=s: self._focus_composer_if_click_below(sess, a),
+                0,
+            )
             return None
 
         # Plugin / navigation / selection / find — never block (Cmd+D etc.)
         if command_name.startswith("claude_"):
             return None
         if command_name not in self._INPUT_EDIT_COMMANDS:
-            # Allow find_under_expand, drag_select, move, copy, select_*, …
             return None
 
-        # Edit commands: keep them inside the input region only
-        input_start = s.output._input_start
-        sel = self.view.sel()
+        # Edit outside ◎ draft → rewrite into draft (never leave text in history)
+        if not self._sel_outside_draft(s):
+            return None
 
-        for region in sel:
-            if region.begin() < input_start or region.end() < input_start:
-                # Typing outside history → jump to input and allow insert
-                if command_name == "insert":
-                    input_end = self.view.size()
-                    self.view.sel().clear()
-                    self.view.sel().add(sublime.Region(input_end, input_end))
-                    self.view.show(input_end)
-                    return None
+        _delete_cmds = (
+            "left_delete", "right_delete", "delete_word", "delete_to_mark",
+            "cut",
+        )
+        # Moving sel alone is not enough — ST still applies insert at the old
+        # region. Re-dispatch after parking caret; scroll to true bottom so the
+        # hline pad is visible (show(caret) alone only frames the caret row).
+        if command_name == "insert":
+            self._focus_draft_bottom(s)
+            chars = (args or {}).get("characters", "")
+            return ("insert", {"characters": chars})
+        if command_name == "insert_snippet":
+            self._focus_draft_bottom(s)
+            return ("insert_snippet", args or {})
+        if command_name in _delete_cmds:
+            # Block delete in history; park caret only — no viewport thrash
+            self._park_caret_in_draft(s)
+            return ("noop", {})
 
-                # Block destructive edits over conversation history
-                print(
-                    f"[Claude] BLOCKING {command_name} at {region.begin()}, "
-                    f"input_start={input_start}")
-                return ("noop", {})
+        self._park_caret_in_draft(s)
+        return ("noop", {})
 
-        return None
+    def _focus_composer_if_click_below(self, session, args: dict) -> None:
+        """If mouse click is on/below the ◎ line, put caret in the draft."""
+        try:
+            if not session or not session.output or not session.output.is_input_mode():
+                return
+            view = self.view
+            if not view or not view.is_valid():
+                return
+            input_start = session.output._input_start
+            event = (args or {}).get("event") or {}
+            click_y = None
+            if "y" in event:
+                try:
+                    layout = view.window_to_layout((event.get("x", 0), event["y"]))
+                    click_y = float(layout[1])
+                except Exception:
+                    click_y = None
+            if click_y is not None:
+                try:
+                    _lx, input_y = view.text_to_layout(input_start)
+                    if click_y + 1.0 >= float(input_y):
+                        session.output.focus_composer(force_show=True)
+                        return
+                except Exception:
+                    pass
+            # Fallback: caret landed in draft / EOF after click
+            sel = view.sel()
+            if sel and sel[0].begin() >= input_start:
+                session.output.focus_composer(force_show=True)
+        except Exception:
+            pass
 
     def on_selection_modified(self):
         """Dynamically toggle read_only based on cursor position to protect conversation history."""
@@ -582,8 +645,6 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
             input_start = s.output._input_start
             sel = self.view.sel()
-
-            # Check if cursor is outside input area
             for region in sel:
                 if region.begin() < input_start:
                     return True
@@ -618,61 +679,52 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not s.output.is_input_mode():
             return
 
-        # Handle insert command - check if typing happened outside input area
-        if command == "insert" and "characters" in args and len(self.view.sel()) == 1:
+        # Safety net: if an insert still landed in history (on_text_command miss),
+        # pull it into the draft and scroll to true bottom (◎ + hline).
+        if command == "insert" and args and "characters" in args and len(self.view.sel()) == 1:
+            chars = args["characters"]
             input_start = s.output._input_start
             current_cursor = self.view.sel()[0].end()
-
-            # If the insert happened before input area, redirect it
-            chars = args["characters"]
             insert_pos = max(current_cursor - len(chars), 0)
 
             if insert_pos < input_start:
-                # Undo the insert (guard against recursion)
                 self._in_soft_undo = True
                 try:
                     self.view.run_command("soft_undo")
                 finally:
                     self._in_soft_undo = False
-
-                # End of draft (before spare blank line under ◎)
-                if hasattr(s.output, "ensure_composer_spare_line"):
-                    s.output.ensure_composer_spare_line()
-                draft_end = s.output._input_start + len(s.output.get_input_text())
-                self.view.sel().clear()
-                self.view.sel().add(sublime.Region(draft_end, draft_end))
-
-                # Re-insert at correct position
-                self.view.run_command("insert", {"characters": chars})
-
-                # Show cursor (include spare row)
-                self.view.show(self.view.size())
+                self._focus_draft_bottom(s)
+                # Avoid re-entering on_modified recursion on the re-insert
+                self._in_soft_undo = True
+                try:
+                    self.view.run_command("insert", {"characters": chars})
+                finally:
+                    self._in_soft_undo = False
+                s.draft_prompt = s.output.get_input_text()
                 return
 
-        # Soft-undo buffer edits that landed in history (not selection/find).
-        # find_under_expand / multi-cursor must not be reverted here.
+        # Soft-undo other edits that landed in history
         elif command and not command.startswith("claude"):
-            if command not in self._INPUT_EDIT_COMMANDS:
-                # Non-edit (selection, nav, find) — leave alone
-                pass
-            else:
+            if command in self._INPUT_EDIT_COMMANDS:
                 input_start = s.output._input_start
-                if len(self.view.sel()) > 0:
-                    for region in self.view.sel():
-                        if region.begin() < input_start:
-                            self.view.run_command("soft_undo")
-                            return
+                if any(r.begin() < input_start for r in self.view.sel()):
+                    self._in_soft_undo = True
+                    try:
+                        self.view.run_command("soft_undo")
+                    finally:
+                        self._in_soft_undo = False
+                    # Undo-only path: park without scroll thrash (deletes etc.)
+                    self._park_caret_in_draft(s)
+                    s.draft_prompt = s.output.get_input_text()
+                    return
 
         # Don't capture an AskUserQuestion free-text answer as the prompt draft
         # (question input reuses _input_mode) — it would reappear next prompt.
         if getattr(s.output, "_question_input_mode", False):
             return
 
-        # Keep spare empty line under the composer (padding)
-        if hasattr(s.output, "ensure_composer_spare_line"):
-            s.output.ensure_composer_spare_line()
-
-        # Save draft
+        # Save draft. Do NOT re-pin full-width pad on every keystroke/delete —
+        # that recreates a huge LAYOUT_BLOCK and jolts the viewport.
         input_text = s.output.get_input_text()
         s.draft_prompt = input_text
 

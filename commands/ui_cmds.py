@@ -312,7 +312,8 @@ class ClaudeCodeResetInputCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
         if s:
-            s.output.reset_input_mode()
+            # Re-open clean ◎ after strip (not used by sleep/restore)
+            s.output.reset_input_mode(reenter=True)
             sublime.status_message("Input mode reset")
 
 

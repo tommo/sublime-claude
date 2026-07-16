@@ -219,10 +219,16 @@ class Session:
         self._goal_harness_continue: bool = False  # suppress user-queue steal? no
         self._goal_skip_continue_once: bool = False  # after user interrupt
 
+        # Composer allowed only after live init/wake — never during restore/sleep.
+        # Prevents enter_input_mode from flashing ◎ on package load / ST restart.
+        self._composer_allowed: bool = True
+
         # Pending retain content (set by compact_boundary, sent after interrupt)
         self._pending_retain: Optional[str] = None
 
     def start(self, resume_session_at: str = None) -> None:
+        # Live bridge starting — still no ◎ until _on_init succeeds
+        self._composer_allowed = False
         self._show_connecting_phantom()
 
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -439,6 +445,9 @@ class Session:
             # Still enter input mode so the user can interact with the error view
             self.working = False
             self._input_mode_entered = False
+            self._composer_allowed = True
+            if self.output and self.output.view:
+                self.output.view.settings().erase("claude_sleeping")
             sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 200)
             return
         self._clear_overlay_phantom()
@@ -505,9 +514,16 @@ class Session:
         pending = getattr(self, "_quick_pending_prompt", None)
         if getattr(self, "quick_mode", False) and pending:
             self._quick_pending_prompt = None
+            self._composer_allowed = True
+            if self.output and self.output.view:
+                self.output.view.settings().erase("claude_sleeping")
             # Don't open empty ◎ first — query will re-arm sticky composer
             sublime.set_timeout(lambda p=pending: self.query(p), 0)
             return
+        # Live agent ready — composer is allowed now (not during restore/sleep)
+        self._composer_allowed = True
+        if self.output and self.output.view:
+            self.output.view.settings().erase("claude_sleeping")
         # Same inline input UX as a normal session
         self._enter_input_with_draft()
 
@@ -1480,7 +1496,7 @@ class Session:
             completion = "success"
 
         # Interrupt already restored idle UI immediately. Late bridge ack:
-        # clear flag and re-arm ◎ if late stream drips wiped the composer.
+        # clear flag, flush any held queue, re-arm ◎ if drips wiped composer.
         if completion == "interrupted" and not self.working:
             self._interrupting = False
             if self._response_callback:
@@ -1490,6 +1506,9 @@ class Session:
                     cb("")
                 except Exception:
                     pass
+            # Do not clear_queue — interrupt kept user messages; fire next.
+            if self._fire_next_queued():
+                return
             self._ensure_idle_input(reason="late interrupt ack")
             return
 
@@ -1551,12 +1570,20 @@ class Session:
             self.query(retain_content, display_prompt="[retain context]")
             return
 
-        # 5. GATE: Only process deferred actions on success
+        # 5. GATE: deferred queue only on success — except interrupt keeps
+        # user-queued messages (clear_queue=False) and flushes the next one.
         if completion != "success":
             self.working = False
             if self.output and self.output.current:
                 self.output.current.working = False
-            self._clear_deferred_state()
+            if completion == "interrupted":
+                self._clear_deferred_state(clear_queue=False)
+                if not getattr(self, "_quick_finished", False):
+                    if self._fire_next_queued():
+                        return
+                    self._ensure_idle_input(reason="completion=interrupted")
+                return
+            self._clear_deferred_state(clear_queue=True)
             if not getattr(self, "_quick_finished", False):
                 self._ensure_idle_input(reason=f"completion={completion}")
             return
@@ -1643,12 +1670,21 @@ class Session:
         Late session updates after cancel can re-render without sticky input and
         leave `_input_mode_entered=True` so re-entry was skipped (dead UI: idle,
         no busy mark, no composer — only sleep/reconnect recovered).
+
+        Also flushes plugin-side queued prompts when idle — sticky ◎ was often
+        already open mid-turn, so the old early-return never reached
+        `_enter_input_with_draft` (which is what used to fire the queue).
         """
         if getattr(self, "_quick_finished", False):
             return
         if self.working:
             return
         if not self.output:
+            return
+        # Held across Esc: run next queued turn before re-opening ◎.
+        if self._fire_next_queued():
+            if reason:
+                print(f"[Claude] flushed queue after idle ({reason})")
             return
         # Clear stuck spinner from post-interrupt text drips
         try:
@@ -1666,6 +1702,9 @@ class Session:
             if self.working or getattr(self, "_quick_finished", False):
                 return
             if not self.output:
+                return
+            # Queue may have been filled between tries
+            if self._fire_next_queued():
                 return
             if self.output.is_input_mode():
                 return
@@ -1689,15 +1728,26 @@ class Session:
         """
         if not self.output:
             return
+        # Restore/sleep: never open ◎ (would flash then strip — wrong design)
+        if not getattr(self, "_composer_allowed", True):
+            return
+        if self.is_sleeping:
+            return
+        if self.output.view and self.output.view.settings().get("claude_sleeping"):
+            return
         # Explicit close — host is dismissing; do not reopen ◎
         if getattr(self, "_quick_finished", False):
             return
         # Question / permission / plan owns the tail
         if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
             return
-        # Skip if already in input mode
+        # Already in input mode — still scroll to true bottom (callsite coverage)
         if self.output.is_input_mode():
             self._input_mode_entered = True
+            try:
+                self.output.focus_composer(force_show=True)
+            except Exception:
+                pass
             return
 
         # Skip if we've already entered input mode after the last query
@@ -1705,6 +1755,11 @@ class Session:
         # Still allow re-entry while working after submit cleared the strip.
         # Exception: if ◎ is gone but flag is set, allow re-entry (post-interrupt drip).
         if self._input_mode_entered and not self.working:
+            try:
+                if self.output.is_input_mode():
+                    self.output.focus_composer(force_show=True)
+            except Exception:
+                pass
             return
 
         # Queued prompts (e.g. notalone inject while sleeping) take priority
@@ -1716,13 +1771,16 @@ class Session:
         if self.output.current and self.output.current.working and not self.working:
             self.output.current.working = False
 
-        self.output.enter_input_mode()
+        self.output.enter_input_mode()  # ends with focus_composer → scroll bottom
 
         # Check if enter_input_mode actually succeeded (might have deferred)
         if not self.output.is_input_mode():
             # Retry once after pending render / race settles.
             def _retry():
-                if not self.output or self.output.is_input_mode():
+                if not self.output:
+                    return
+                if self.output.is_input_mode():
+                    self.output.focus_composer(force_show=True)
                     return
                 if self.output.current and self.output.current.working and not self.working:
                     self.output.current.working = False
@@ -1739,7 +1797,7 @@ class Session:
             self.last_idle_at = time.time()
 
         if self.draft_prompt and self.output.view:
-            # Insert draft on the ◎ line; keep spare blank line below
+            # Insert draft on the ◎ line; re-scroll after draft changes layout
             try:
                 self.output.set_composer_text(self.draft_prompt)
             except Exception:
@@ -1748,6 +1806,10 @@ class Session:
                 })
                 if hasattr(self.output, "ensure_composer_spare_line"):
                     self.output.ensure_composer_spare_line()
+            try:
+                self.output.focus_composer(force_show=True)
+            except Exception:
+                pass
 
 
     def queue_prompt(self, prompt: str) -> None:
@@ -1882,14 +1944,14 @@ class Session:
                     f'text-decoration:none;" title="remove">×</a>'
                     f'</div>'
                 )
-        # Hairline only — not a fat filled bar (padding+bg rendered too thick)
+        # Hairline flush above ◎ — no bottom margin (avoids empty-line gap)
         rows.append(
-            '<div style="margin:2px 0 1px 0;padding:0;line-height:1;'
+            '<div style="margin:1px 0 0 0;padding:0;line-height:1;'
             'font-size:1px;border-top:1px solid '
             'color(var(--foreground) alpha(0.14));">&nbsp;</div>'
         )
         html = (
-            f'<body id="claude-queue" style="margin:0;padding:0 0 1px 0;">'
+            f'<body id="claude-queue" style="margin:0;padding:0;">'
             f'{"".join(rows)}</body>'
         )
         try:
@@ -1982,8 +2044,8 @@ class Session:
             self._update_queue_phantom()
         except Exception:
             pass
-        # Force ◎ now and again after late stream drips settle.
-        # If queue non-empty, _enter_input_with_draft / settle will fire next.
+        # Flush held queue and/or restore ◎. (Sticky mid-turn ◎ used to block
+        # the enter_input path that fired the queue.)
         self._ensure_idle_input(reason="interrupt")
         gen = getattr(self, "_interrupt_gen", 0) + 1
         self._interrupt_gen = gen
@@ -1993,9 +2055,10 @@ class Session:
                 return
             if self.working:
                 return
+            # Retry flush if first attempt raced the bridge still canceling
             self._ensure_idle_input(reason="post-interrupt settle")
 
-        # Bridge often emits 1–2 more lines after cancel; re-check composer
+        # Bridge often emits 1–2 more lines after cancel; re-check composer/queue
         sublime.set_timeout(_rearm_after_drip, 200)
         sublime.set_timeout(_rearm_after_drip, 600)
         sublime.set_timeout(_rearm_after_drip, 1200)
@@ -2137,11 +2200,35 @@ class Session:
         except Exception as e:
             print(f"[Claude] _abort_background_tools error: {e}")
 
-    def _apply_sleep_ui(self, *, touch_buffer: bool = True) -> None:
-        """Apply sleeping state to view UI.
+    def _strip_sticky_composer(self) -> None:
+        """Remove leftover ◎ draft strip after restart + clear input-mode flags.
 
-        touch_buffer=False: settings + tab title only (multi-tab restore).
-        Buffer edits / selection / phantoms on inactive sheets focus them.
+        ST session restore leaves buffer text and often setting.claude_input_mode
+        still true — that looks like a live composer on a sleeping sheet.
+        """
+        if not self.output or not self.output.view:
+            return
+        try:
+            if self.output.is_input_mode():
+                try:
+                    self.draft_prompt = self.output.get_input_text().strip()
+                except Exception:
+                    pass
+            # Always clear flags + strip ◎…/📎 tail (not only bare marker)
+            self.output.reset_input_mode()
+        except Exception as e:
+            print(f"[Claude] strip sticky composer: {e}")
+            try:
+                self.output.view.settings().set("claude_input_mode", False)
+                self.output._input_mode = False
+            except Exception:
+                pass
+
+    def _apply_sleep_ui(self, *, touch_buffer: bool = True) -> None:
+        """Apply sleeping state: no composer, ⏸ title, optional pause overlay.
+
+        Always strips sticky ◎ residue (restart leaves it in the buffer).
+        touch_buffer / focus only gates the heavy overlay phantom.
         """
         if not self.output or not self.output.view:
             return
@@ -2149,33 +2236,29 @@ class Session:
             return
         view = self.output.view
         view.settings().set("claude_sleeping", True)
+        view.settings().set("claude_input_mode", False)
         self.output.set_name(self.display_name)
-        # Status bar only if this sheet is focused
+        # Always remove ◎ strip — this is what looked like "input on restart"
+        self._strip_sticky_composer()
+        # Drop queue hairline / chips (they only make sense with ◎ open)
+        try:
+            self._update_queue_phantom()
+        except Exception:
+            pass
+        try:
+            self._update_permission_banner(show=False)
+        except Exception:
+            pass
+
         win = view.window()
         is_focused = bool(
             win and win.active_view() and win.active_view().id() == view.id()
         )
         if is_focused:
             self._status("sleeping")
+        # Overlay can jostle focus on background tabs — only when painting
         if not touch_buffer and not is_focused:
             return
-        if self.output.is_input_mode():
-            self.draft_prompt = self.output.get_input_text().strip()
-            self.output.exit_input_mode(keep_text=False)
-        else:
-            # Clean stale input marker from view content (e.g. after restart)
-            # Only remove if the last non-empty line is exactly the marker
-            content = view.substr(sublime.Region(0, view.size()))
-            lines = content.rstrip("\n").split("\n")
-            if lines and lines[-1].strip() == "\u25ce":
-                # Find the start of this last marker line
-                erase_from = content.rstrip("\n").rfind("\n" + lines[-1])
-                if erase_from >= 0:
-                    view.set_read_only(False)
-                    view.run_command("claude_replace", {
-                        "start": erase_from, "end": view.size(), "text": "",
-                    })
-                    view.set_read_only(True)
         self._show_overlay_phantom(
             "\u23f8 Session paused \u2014 press Enter to wake",
             color="var(--yellowish)",
@@ -2207,6 +2290,7 @@ class Session:
         if self.output:
             self.output._media_phantom_set = None
             self.output._context_phantom_set = None
+            self.output._pad_phantom_set = None
 
     def _get_overlay_phantom_set(self):
         return self._phantom_set_for("_overlay_phantom_set", "claude_overlay")
@@ -2434,6 +2518,8 @@ class Session:
             view.sel().clear()
             view.sel().add(end)
             view.show(end)
+        # Composer opens only after bridge init succeeds (_on_init)
+        self._composer_allowed = False
         self.resume_id = self.session_id
         self.fork = False
         resume_at = self._pending_resume_at
