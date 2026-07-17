@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), and any **Anthropic-compatible** provider (DeepSeek, GLM, Kimi, Qwen, OpenRouter, …).
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), [Grok Build](https://x.ai/) / [Kimi Code](https://moonshotai.github.io/kimi-code/) via **Agent Client Protocol (ACP)**, and any **Anthropic-compatible** provider (DeepSeek, GLM, Moonshot, Qwen, OpenRouter, …).
 
 ## Requirements
 
@@ -10,6 +10,8 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex C
   - Claude Code CLI + `claude-agent-sdk`
   - Codex CLI
   - GitHub Copilot CLI via `github-copilot-sdk`
+  - Grok Build CLI (`grok agent stdio` ACP)
+  - **Kimi Code CLI** (`kimi acp` ACP) — native path; see below
   - Custom Anthropic-compatible provider — base URL + API key (uses the Claude bridge)
 
 ```bash
@@ -25,9 +27,17 @@ codex  # Follow prompts to authenticate
 # GitHub Copilot CLI (optional)
 pip install github-copilot-sdk  # Bundles CLI binary
 
+# Kimi Code (optional, native ACP)
+# Install Kimi Code so `kimi` is on PATH (or set KIMI_BIN).
+# Default binary often at ~/.kimi-code/bin/kimi
+kimi login
+kimi doctor
+
 # Custom Anthropic-compatible provider (optional) — no extra install,
 # configure under settings.custom_providers (see Custom Providers below).
 ```
+
+**Kimi Code ACP vs custom Moonshot/Kimi provider:** Command Palette **Kimi Code: New Session** runs the **Agent Client Protocol** agent (`kimi acp` via `bridge/kimi_main.py`). That is separate from adding a Moonshot/Kimi entry under `settings.custom_providers` (Anthropic-compatible `base_url` + API key on the Claude `main.py` bridge). Use ACP for first-class Kimi Code; use custom_providers only when you want the Claude Code SDK talking to an Anthropic-compat endpoint.
 
 **Note:** Authenticate your chosen CLI before using this plugin. If you see connection errors, run the CLI in terminal to login.
 

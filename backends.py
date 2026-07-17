@@ -279,6 +279,23 @@ def _grok_available() -> bool:
     return bool(os.environ.get("GROK_BIN") or shutil.which("grok"))
 
 
+def _kimi_available() -> bool:
+    """Native Kimi Code ACP: `kimi` / KIMI_BIN / ~/.kimi-code/bin/kimi."""
+    try:
+        from . import kimi_backend
+        return bool(kimi_backend.kimi_available())
+    except Exception:
+        try:
+            import kimi_backend  # type: ignore
+            return bool(kimi_backend.kimi_available())
+        except Exception:
+            return bool(
+                os.environ.get("KIMI_BIN")
+                or shutil.which("kimi")
+                or os.path.isfile(os.path.expanduser("~/.kimi-code/bin/kimi"))
+            )
+
+
 BACKENDS: Dict[str, BackendSpec] = {
     "pi": BackendSpec(
         name="pi",
@@ -307,6 +324,21 @@ BACKENDS: Dict[str, BackendSpec] = {
             ("grok-composer-2.5-fast", "Composer 2.5"),
         ],
         available=_grok_available,
+        pinned=True,
+    ),
+    # Native Kimi Code via ACP (`kimi acp`). Separate from custom_providers
+    # Moonshot/Kimi Anthropic-compat base_url entries (those use main.py).
+    "kimi": BackendSpec(
+        name="kimi",
+        label="Kimi Code",
+        abbrev="KM",
+        bridge_script="kimi_main.py",
+        fallback_model="kimi-code/kimi-for-coding",
+        default_models=[
+            ("kimi-code/kimi-for-coding", "K2.7 Coding (default)"),
+            ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
+        ],
+        available=_kimi_available,
         pinned=True,
     ),
     # xAI via Anthropic-compat proxy + Claude Code bridge (legacy path).

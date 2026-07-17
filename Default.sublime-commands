@@ -32,6 +32,10 @@
         "command": "grok_cc_start"
     },
     {
+        "caption": "Kimi Code: New Session",
+        "command": "kimi_start"
+    },
+    {
         "caption": "DeepSeek: New Session",
         "command": "deep_seek_start"
     },

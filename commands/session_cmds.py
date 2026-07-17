@@ -287,6 +287,34 @@ class GrokStartCommand(sublime_plugin.WindowCommand):
         create_session(self.window, backend="grok")
 
 
+class KimiStartCommand(sublime_plugin.WindowCommand):
+    """Start a native Kimi Code session via ACP (`kimi acp`)."""
+    def run(self) -> None:
+        try:
+            from .. import kimi_backend
+            ok = kimi_backend.kimi_available()
+            bin_path = kimi_backend.resolve_kimi_bin()
+        except Exception:
+            import shutil
+            ok = bool(
+                os.environ.get("KIMI_BIN")
+                or shutil.which("kimi")
+                or os.path.isfile(os.path.expanduser("~/.kimi-code/bin/kimi"))
+            )
+            bin_path = "kimi"
+        if not ok:
+            sublime.error_message(
+                "Kimi Code CLI not found.\n\n"
+                "Install Kimi Code so `kimi` is on PATH, or set KIMI_BIN.\n"
+                "Default install: ~/.kimi-code/bin/kimi\n"
+                "Then run `kimi login` once.\n\n"
+                "Note: this is native ACP (`kimi acp`), not a custom_providers "
+                "Moonshot Anthropic base_url entry."
+            )
+            return
+        create_session(self.window, backend="kimi")
+
+
 class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
     """Open input for query (focuses output and enters input mode)."""
     def run(self) -> None:

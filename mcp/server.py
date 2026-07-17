@@ -345,7 +345,7 @@ def handle_request(request: dict) -> dict:
                 # ─── Session Tools ────────────────────────────────────────
                 {
                     "name": "list_backends",
-                    "description": "List backends available for spawn_session's `backend` argument — built-ins (claude, codex, copilot, pi, dsr, grok, grok_cc) plus any custom Anthropic-compatible providers, each with live availability (auth/CLI resolved), kind, bridge family, and models. Call this before spawn_session to pick a valid backend instead of guessing. Also reports the default backend and the fork-family rule (fork_current only works within the same bridge family).",
+                    "description": "List backends available for spawn_session's `backend` argument — built-ins (claude, codex, copilot, pi, dsr, grok, grok_cc, kimi) plus any custom Anthropic-compatible providers, each with live availability (auth/CLI resolved), kind, bridge family, and models. Call this before spawn_session to pick a valid backend instead of guessing. Also reports the default backend and the fork-family rule (fork_current only works within the same bridge family).",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
@@ -531,6 +531,45 @@ Do not invent a goal; user activates with /goal <objective>.""",
                                 "description": "Why the goal cannot proceed after real attempts"
                             }
                         }
+                    }
+                },
+                {
+                    "name": "goal_verdict",
+                    "description": """Submit the host skeptic verdict during goal verify turns only.
+
+Use after inspecting evidence with real tools. Host prefers this structured
+result over free-text VERDICT lines.
+
+- achieved=true only if every plan criterion is proven; requires non-empty evidence[]
+- achieved=false with gaps[] listing what is missing (default / fail-closed)
+- Do not use for normal implementer progress (use update_goal instead)""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "achieved": {
+                                "type": "boolean",
+                                "description": "True only if fully proven against the plan"
+                            },
+                            "evidence": {
+                                "description": "List of concrete proofs (paths, tests, command outputs). Required when achieved=true.",
+                                "oneOf": [
+                                    {"type": "array", "items": {"type": "string"}},
+                                    {"type": "string"}
+                                ]
+                            },
+                            "gaps": {
+                                "description": "What's still missing (required when achieved=false).",
+                                "oneOf": [
+                                    {"type": "array", "items": {"type": "string"}},
+                                    {"type": "string"}
+                                ]
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "One-line summary"
+                            }
+                        },
+                        "required": ["achieved"]
                     }
                 },
                 # Plugin self-debug (devtools) is intentionally NOT listed here —

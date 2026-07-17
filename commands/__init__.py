@@ -7,6 +7,7 @@ from .session_cmds import (  # noqa: F401
     PiStartCommand,
     DsrStartCommand,
     GrokStartCommand,
+    KimiStartCommand,
     ClaudeCodeQueryCommand,
     ClaudeCodeRestartCommand,
     ClaudeCodeCopySessionIdCommand,
