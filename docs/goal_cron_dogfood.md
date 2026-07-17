@@ -10,9 +10,18 @@ sublime-claude owns the harness for **all backends** (Claude + Grok):
 | Piece | Owner |
 |-------|--------|
 | `/goal <objective> [--budget N]` | Plugin (never forwarded as agent slash) |
+| **Planning** | Host expands a structured plan **before** execute |
+| Plan path | `{project}/.claude/goals/{goal_id}/plan.md` (plugin-owned) |
 | `update_goal` MCP | Plugin drain → `GoalTracker` |
-| Continuation | Host `query` after successful turn while Active |
-| Complete | Deferred → **verifier turn** → Achieved only |
+| Continuation | Host `query` while `phase=executing` and plan ready |
+| Complete | Deferred → **plan-grounded verifier** → Achieved only |
+
+### Lifecycle
+
+1. **planning** — `/goal` creates the tracker; host materializes plan (Acceptance criteria + Verification plan, Grok-compatible sections). Continue loop is **off**.
+2. **executing** — plan accepted; implementer kickoff + host continues until claim/pause.
+3. **verifying** — `update_goal(completed=true)` → host verifier judges against the **plan**, not claim prose alone.
+4. **complete / clear** — plan body cleared so a stale plan is not treated as active.
 
 Commands:
 
@@ -27,10 +36,10 @@ Commands:
 Model tools:
 
 - `update_goal(message="…")` — progress  
-- `update_goal(completed=true, message="…")` — claim done (host re-checks)  
+- `update_goal(completed=true, message="…")` — claim done (host re-checks vs plan)  
 - `update_goal(blocked_reason="…")` — after real failures (3× → blocked pause)
 
-Without an active `/goal`, complete/blocked are **rejected** (no sticky invent from tool alone).
+Without an active `/goal`, complete/blocked are **rejected** (no sticky invent from tool alone). Complete is also rejected while still planning / without a plan.
 
 ## Why pair with cron (optional)
 

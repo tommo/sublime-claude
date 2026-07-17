@@ -816,9 +816,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             return
 
         # Save draft. Whitespace-only (legacy spare ``\\n``) → empty so we never
-        # rehydrate blank rows under ◎. Do NOT re-pin pad every keystroke.
+        # rehydrate blank rows under ◎.
         input_text = s.output.get_input_text()
         s.draft_prompt = "" if not input_text.strip() else input_text
+
+        # Re-pin bottom split under the last draft line (Enter must move it one
+        # row — size()-1 stayed on the previous line after a trailing \\n).
+        try:
+            s.output._update_composer_pad_phantom()
+        except Exception:
+            pass
 
         # Check for @ trigger at cursor
         sel = self.view.sel()

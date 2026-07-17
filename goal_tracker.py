@@ -5,6 +5,7 @@ host owns verification and continuation. Pure Python, no Sublime imports.
 """
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -36,7 +37,11 @@ class GoalEvent:
 
 @dataclass
 class GoalTracker:
-    """Single active goal per session."""
+    """Single active goal per session.
+
+    Lifecycle: create → planning (no implementer continue) → accept_plan →
+    executing (continue loop) → verifying (on complete claim) → complete/clear.
+    """
     goal_id: str = ""
     objective: str = ""
     status: str = "cleared"  # no goal until create
@@ -55,6 +60,7 @@ class GoalTracker:
     continue_count: int = 0
     continue_max: int = DEFAULT_CONTINUE_MAX
     plan_path: str = ""
+    plan_body: str = ""  # host-owned plan markdown (contract)
     history: List[GoalEvent] = field(default_factory=list)
     created_at: float = 0.0
 
@@ -69,9 +75,26 @@ class GoalTracker:
     def is_paused(self) -> bool:
         return self.status in PAUSED
 
+    def has_plan(self) -> bool:
+        """True when a structured plan is ready for execute/verify."""
+        body = (self.plan_body or "").strip()
+        if not body:
+            return False
+        try:
+            from .goal_plan import plan_has_required_sections
+        except ImportError:
+            from goal_plan import plan_has_required_sections  # type: ignore
+        return plan_has_required_sections(body)
+
     def should_continue(self) -> bool:
-        """Host may inject a continuation turn after successful idle."""
-        if not self.is_active() or self.phase == "verifying":
+        """Host may inject implementer continuation only after plan is ready."""
+        if not self.is_active():
+            return False
+        if self.phase in ("planning", "verifying"):
+            return False
+        if self.phase != "executing":
+            return False
+        if not self.has_plan():
             return False
         if self.continue_count >= self.continue_max:
             return False
@@ -100,7 +123,8 @@ class GoalTracker:
         self.goal_id = uuid.uuid4().hex[:12]
         self.objective = obj
         self.status = "active"
-        self.phase = "executing"
+        # Host plan expansion first — implementer continue blocked until accept_plan
+        self.phase = "planning"
         self.token_budget = token_budget
         self.tokens_baseline = max(0, int(tokens_baseline or 0))
         self.tokens_used = 0
@@ -114,9 +138,34 @@ class GoalTracker:
         self.pending_completed_message = None
         self.continue_count = 0
         self.plan_path = plan_path or ""
+        self.plan_body = ""
         self.created_at = time.time()
         self.history = []
         self._push("goal_created", obj[:200])
+        self._push("planning_started", self.goal_id)
+
+    def accept_plan(self, plan_md: str, plan_path: str = "") -> Dict[str, Any]:
+        """Host materializes plan → executing. Returns ok/error dict."""
+        body = (plan_md or "").strip()
+        if not self.is_open() or not self.is_active():
+            return {"ok": False, "error": "No active goal to accept plan for."}
+        try:
+            from .goal_plan import plan_has_required_sections
+        except ImportError:
+            from goal_plan import plan_has_required_sections  # type: ignore
+        if not plan_has_required_sections(body):
+            return {
+                "ok": False,
+                "error": "Plan missing required sections "
+                "(## Acceptance criteria, ## Verification plan).",
+            }
+        self.plan_body = body if body.endswith("\n") else body + "\n"
+        if plan_path:
+            self.plan_path = plan_path
+        self.phase = "executing"
+        self.message = "Plan accepted — executing"
+        self._push("plan_accepted", (self.plan_path or "in-memory")[:200])
+        return {"ok": True, "phase": self.phase, "plan_path": self.plan_path}
 
     def clear(self) -> None:
         self._push("goal_cleared", self.goal_id)
@@ -136,6 +185,7 @@ class GoalTracker:
         self.pending_completed_message = None
         self.continue_count = 0
         self.plan_path = ""
+        self.plan_body = ""
 
     def pause(self, reason: str = "user", message: str = "") -> None:
         if not self.is_open():
@@ -147,6 +197,7 @@ class GoalTracker:
             "infra": "infra_paused",
         }
         self.status = status_map.get(reason, "user_paused")
+        # Preserve whether we had a plan so resume returns to correct phase
         self.phase = "idle"
         self.pause_message = (message or "").strip()
         self.pending_completed_message = None
@@ -159,9 +210,10 @@ class GoalTracker:
             self.blocked_streak = 0
             self.blocked_reason = ""
         self.status = "active"
-        self.phase = "executing"
+        # Resume into planning if plan never accepted; else executing
+        self.phase = "executing" if self.has_plan() else "planning"
         self.pause_message = ""
-        self._push("goal_resumed")
+        self._push("goal_resumed", self.phase)
         return True
 
     def complete(self, message: str = "") -> None:
@@ -170,6 +222,9 @@ class GoalTracker:
         if message:
             self.message = message.strip()
         self.pending_completed_message = None
+        # Drop plan contract so stale plans are not treated as still active
+        self.plan_body = ""
+        self.plan_path = ""
         self._push("goal_completed", self.message[:200])
 
     def set_tokens_used(self, absolute_tokens: int) -> None:
@@ -253,6 +308,13 @@ class GoalTracker:
             }
 
         if completed:
+            if self.phase == "planning" or not self.has_plan():
+                return {
+                    "ok": False,
+                    "error": "No plan ready; host must finish planning before complete.",
+                    "rejected": True,
+                    "phase": self.phase,
+                }
             claim = msg or self.message or "claimed complete"
             if mid_turn:
                 self.pending_completed_message = claim
@@ -297,6 +359,10 @@ class GoalTracker:
     def begin_verify(self) -> Optional[str]:
         """Move pending complete into verifying phase. Returns claim msg or None."""
         if not self.has_pending_complete() or not self.is_active():
+            return None
+        if not self.has_plan():
+            self.pending_completed_message = None
+            self._push("verify_rejected_no_plan")
             return None
         if self.verify_runs >= self.verify_max:
             self.pause(
@@ -373,6 +439,12 @@ class GoalTracker:
             lines.append(f"  pause: {self.pause_message}")
         if self.gaps:
             lines.append("  gaps: " + "; ".join(self.gaps[:5]))
+        if self.plan_path:
+            lines.append(f"  plan: {self.plan_path}")
+        elif self.has_plan():
+            lines.append("  plan: (in-memory)")
+        elif self.phase == "planning":
+            lines.append("  plan: pending host expansion")
         return "\n".join(lines)
 
     def to_ui_dict(self) -> Dict[str, Any]:
@@ -392,6 +464,8 @@ class GoalTracker:
             "gaps": list(self.gaps),
             "verifying": self.phase == "verifying",
             "planning": self.phase == "planning",
+            "has_plan": self.has_plan(),
+            "plan_path": self.plan_path,
         }
 
     def to_json(self) -> Dict[str, Any]:
@@ -426,7 +500,15 @@ class GoalTracker:
         g.pending_completed_message = str(pcm) if pcm is not None else None
         g.continue_count = int(data.get("continue_count") or 0)
         g.plan_path = str(data.get("plan_path") or "")
+        g.plan_body = str(data.get("plan_body") or "")
         g.created_at = float(data.get("created_at") or 0)
+        # Reload plan body from disk if path set and body empty
+        if g.plan_path and not g.plan_body and os.path.isfile(g.plan_path):
+            try:
+                with open(g.plan_path, "r", encoding="utf-8") as f:
+                    g.plan_body = f.read()
+            except Exception:
+                pass
         hist = []
         for h in (data.get("history") or [])[-HISTORY_MAX:]:
             if isinstance(h, dict):

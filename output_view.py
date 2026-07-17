@@ -761,12 +761,36 @@ class OutputView:
         except Exception:
             return 400
 
-    def _update_composer_pad_phantom(self) -> None:
-        """Hairline under the ◎ line — LAYOUT_BELOW, not a blank buffer row.
+    def _composer_last_line_pt(self) -> int:
+        """Buffer point on the last *visual* line of the composer (incl. empty).
 
-        LAYOUT_BLOCK reserved a full empty row under ◎ (looked like spare
-        newlines). LAYOUT_BELOW draws under the marker line without inventing
-        typeable empty rows.
+        Anchoring at size()-1 is wrong when the draft ends with ``\\n``: that
+        char still belongs to the previous line, so Enter did not move the
+        bottom split until a second newline/char. ``view.line(size())`` is the
+        empty last line after a trailing newline — pad must follow that.
+        """
+        view = self.view
+        end = view.size()
+        if end <= 0:
+            return 0
+        try:
+            # Prefer last line of the draft region when in input mode
+            start = int(getattr(self, "_input_start", 0) or 0)
+            start = max(0, min(start, end))
+            # line() at EOF: if buffer ends with \\n this is the blank line
+            last = view.line(end)
+            if last.begin() >= start:
+                return last.begin()
+            # Draft empty / same line as ◎
+            return max(start - 1, 0) if start > 0 else 0
+        except Exception:
+            return max(0, end - 1)
+
+    def _update_composer_pad_phantom(self) -> None:
+        """Hairline under the last composer line (◎ or last draft line).
+
+        LAYOUT_BELOW on the last line — not size()-1 (trailing newline stayed
+        on the previous line and needed two Enters to drop one row).
         """
         if not self.view or not self.view.is_valid():
             return
@@ -779,10 +803,7 @@ class OutputView:
             if self._pad_phantom_set is None:
                 self._pad_phantom_set = sublime.PhantomSet(
                     self.view, "claude_composer_pad")
-            # Under the last line of the composer (◎ or last draft line) — not a
-            # separate empty buffer row (LAYOUT_BLOCK did that).
-            end = self.view.size()
-            pt = max(0, end - 1) if end > 0 else 0
+            pt = self._composer_last_line_pt()
             w = self._composer_pad_width_px()
             html = (
                 '<body id="claude-pad" style="margin:0;padding:0;">'

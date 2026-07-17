@@ -3981,9 +3981,13 @@ class Session:
             return
 
         if action == "clear":
+            # Stale plan must not remain "active" after clear
+            old_path = (gt.plan_path or "").strip()
             gt.clear()
             self._goal_verify_turn = False
             self.output.text("\n*Goal cleared.*\n")
+            if old_path:
+                self.output.text(f"  (plan was: {old_path})\n")
             self.sync_goal_ui()
             self._ensure_idle_input(reason="goal/clear")
             return
@@ -3998,12 +4002,21 @@ class Session:
                 self._ensure_idle_input(reason="goal/resume-done")
                 return
             gt.resume()
+            # Still planning (no plan) → re-materialize host plan before execute
+            if gt.phase == "planning" or not gt.has_plan():
+                try:
+                    self._goal_materialize_host_plan()
+                except Exception as e:
+                    self.output.text(f"\n*Goal plan re-materialize failed: {e}*\n")
+                    self.sync_goal_ui()
+                    self._ensure_idle_input(reason="goal/resume-plan-fail")
+                    return
             self.sync_goal_ui()
             recap = goal_prompts.resume_recap(gt)
             self.query(recap, display_prompt="/goal resume")
             return
 
-        # set objective
+        # set objective → planning → host plan materialization → execute
         objective, budget = payload
         baseline = 0
         try:
@@ -4016,11 +4029,23 @@ class Session:
         self._goal_verify_turn = False
         self._goal_skip_continue_once = False
         self.sync_goal_ui()
-        rules = goal_prompts.goal_rules(objective)
-        body = rules + "\n\n" + objective
         disp = f"/goal {objective}"
         if budget:
             disp += f" --budget {budget}"
+        # Host-owned plan expand (phase=planning until accept)
+        try:
+            plan_path = self._goal_materialize_host_plan()
+            self.output.text(
+                f"\n*Goal planning complete* — plan: `{plan_path or 'in-memory'}`\n"
+            )
+        except Exception as e:
+            print(f"[Claude] goal plan materialize: {e}")
+            self.output.text(f"\n*Goal planning failed: {e}*\n")
+            self.sync_goal_ui()
+            self._ensure_idle_input(reason="goal/plan-fail")
+            return
+        self.sync_goal_ui()
+        body = goal_prompts.implementer_kickoff(gt)
         self.query(body, display_prompt=disp)
 
     def _goal_refresh_tokens(self) -> None:
@@ -4031,6 +4056,44 @@ class Session:
         if k is not None:
             gt.set_tokens_used(k * 1000)
         gt.enforce_budget()
+
+    def _goal_project_root(self) -> Optional[str]:
+        try:
+            folders = self.window.folders() if self.window else None
+            if folders:
+                return folders[0]
+        except Exception:
+            pass
+        try:
+            return self._cwd()
+        except Exception:
+            return None
+
+    def _goal_materialize_host_plan(self) -> str:
+        """Host-owned plan expansion: write structured plan, accept → executing.
+
+        Path convention: ``{project}/.claude/goals/{goal_id}/plan.md``
+        (plugin-owned; differs from Grok Build session ``goal/plan.md``).
+        Returns plan_path (or empty string if in-memory only).
+        """
+        from . import goal_plan
+        gt = self.goal_tracker
+        if not gt or not gt.goal_id:
+            raise RuntimeError("no goal")
+        plan_md = goal_plan.materialize_plan(
+            gt.objective, goal_kind="code-change", goal_id=gt.goal_id)
+        root = self._goal_project_root()
+        path = goal_plan.default_plan_path(root, gt.goal_id)
+        try:
+            path = goal_plan.write_plan_file(path, plan_md)
+        except Exception as e:
+            # Still accept in-memory so offline/no-cwd paths work
+            print(f"[Claude] goal plan write failed ({path}): {e}")
+            path = ""
+        ack = gt.accept_plan(plan_md, plan_path=path)
+        if not ack.get("ok"):
+            raise RuntimeError(ack.get("error") or "accept_plan failed")
+        return path
 
     def _goal_on_turn_success(self) -> bool:
         """After successful turn: verify and/or continue. True = started next turn."""
@@ -4108,8 +4171,13 @@ class Session:
     def _goal_fire_verifier(self, claim: str) -> bool:
         from . import goal_prompts
         gt = self.goal_tracker
+        # Plan-grounded verify (criteria from host plan, not claim alone)
         prompt = goal_prompts.verifier_prompt(
-            gt.objective, claim, gaps_prior=gt.gaps or None)
+            gt.objective,
+            claim,
+            gaps_prior=gt.gaps or None,
+            plan_body=getattr(gt, "plan_body", "") or "",
+        )
         self._goal_verify_turn = True
         self.working = True  # keep busy for next query
         self.query(prompt, display_prompt="↻ goal verify")
@@ -4130,6 +4198,9 @@ class Session:
     def _goal_fire_continuation(self) -> bool:
         from . import goal_prompts
         gt = self.goal_tracker
+        # Never continue while still planning / without a plan contract
+        if gt.phase == "planning" or not gt.has_plan():
+            return False
         if not gt.should_continue():
             if gt.is_active() and gt.continue_count >= gt.continue_max:
                 gt.pause(
