@@ -631,27 +631,13 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                                            or current_view.settings().get("pty_reveal_owner"))
         current_file = current_view.file_name() if current_view else None
 
-        # Quick Agent host — ≤3 transient slots (⌘⇧\)
-        try:
-            from .. import quick_agent as _qa
-            _qa_label = _qa.config_label()
-            _qa_live = _qa.get_quick_session(self.window) is not None
-            _h = _qa.get_host(self.window)
-            _n = len(_h.slots) if _h else 0
-        except Exception:
-            _qa_label = "trivia / short tasks"
-            _qa_live = False
-            _n = 0
-        items.append([
-            "⚡ Quick Agent" + (f" · {_n}/3" if _qa_live else ""),
-            f"{_qa_label} · multi-slot host · ⌘⇧\\",
-        ])
-        actions.append(("quick_agent", None))
-
-        # Add "New Session with This File" option when in a non-session file
+        # Top item when editing a file: new session with that file as context
         if not in_output_view and current_file:
             filename = os.path.basename(current_file)
-            items.append([f"📎 {backend_prefix}New with ctx:{filename}", "Create session with this file as context"])
+            items.append([
+                f"📎 {backend_prefix}New with ctx:{filename}",
+                "Create session with this file as context",
+            ])
             actions.append(("new_with_file", current_file))
 
         if active_session and not in_output_view:
