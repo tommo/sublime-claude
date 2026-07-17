@@ -16,7 +16,7 @@ Socket protocol (newline JSON on MCP_SOCKET_PATH):
   {"op":"debug","action":"ping"|"snapshot"|"sessions"|"composer"|"log"|"event"|"reload"|"help", ...}
   {"code":"..."}   # existing eval path
 
-Also exposed as MCP tools: debug_snapshot, debug_sessions, debug_composer, debug_log, debug_reload.
+Host-only for plugin authors (CLI / socket). Not advertised in agent MCP tools/list.
 """
 from __future__ import annotations
 

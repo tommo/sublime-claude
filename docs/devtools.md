@@ -6,8 +6,9 @@ Self-debug surface for **agents and humans** while Sublime Text is running with 
 |---------|--------|
 | **CLI** | `python3 devtools_cli.py <action> …` (from package root) |
 | **Socket** | `/tmp/sublime_claude_mcp.sock` — `{"op":"debug","action":…}` |
-| **MCP** (in-session) | `debug_*` tools via sublime MCP server |
 | **Command Palette** | `Claude: Devtools …` |
+
+**Not exposed to in-session agents.** Plugin-dev tools are omitted from the sublime MCP `tools/list` so product agents do not burn tokens on them. Use the CLI/socket from outside ST (or Command Palette) only.
 
 Source: `devtools.py`, `devtools_cli.py`, `package_reloader.py`.
 
@@ -206,19 +207,11 @@ CLI prefers `op=debug`; if the live plugin predates that handler, it **hot-impor
 
 ---
 
-## MCP tools (agent inside a Claude sheet)
+## Not in agent MCP
 
-| Tool | Purpose |
-|------|---------|
-| `debug_ping` | Liveness + counts |
-| `debug_sessions` | All host sessions |
-| `debug_snapshot` | Full dump (`view_id` optional) |
-| `debug_composer` | ◎ / pad / viewport |
-| `debug_log` | Ring + files |
-| `debug_reload` | Schedule soft/hard reload (`mode`) |
-| `debug_goal` | `/goal` harness (`args`, `view_id`) |
-
-These go through the same host functions as the CLI.
+`debug_*` handlers still exist on the host for the CLI/socket path, but they are
+**not** advertised in `mcp/server.py` `tools/list`. In-session agents only see
+product tools (`list_sessions`, `update_goal`, terminal, etc.).
 
 ---
 
@@ -321,7 +314,7 @@ python3 devtools_cli.py sessions
 
 1. **Sublime must be running** — no socket ⇒ `ping` fails.
 2. **Soft reload clears live Session objects** — settle + wake as needed.
-3. **`list_sessions` MCP tool ≠ `debug_sessions`** — the former is only MCP-spawned subsessions; use `sessions` / `debug_sessions` for all host sheets.
+3. **`list_sessions` MCP tool ≠ CLI `sessions`** — MCP lists only spawned subsessions; CLI `sessions` dumps all host sheets.
 4. **Goal needs a live bridge** — wake and wait for `initialized` before `goal 'objective'`.
 5. **Hot-reload of only `devtools` via CLI** is fine for dump helpers; **product code** (session, listeners, goal) needs full `reload`.
 6. **Hard reload** briefly disables the whole package (menus/commands go away until re-enable).

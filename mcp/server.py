@@ -533,60 +533,8 @@ Do not invent a goal; user activates with /goal <objective>.""",
                         }
                     }
                 },
-                # ─── Plugin self-debug (devtools) ─────────────────────────
-                {
-                    "name": "debug_ping",
-                    "description": "Ping the live ClaudeCode plugin (socket + session count). Use when debugging the plugin itself.",
-                    "inputSchema": {"type": "object", "properties": {}}
-                },
-                {
-                    "name": "debug_sessions",
-                    "description": "Dump ALL host Claude/Codex/… sessions (not only MCP subsessions): working, backend, goal phase, composer flags, view size.",
-                    "inputSchema": {"type": "object", "properties": {}}
-                },
-                {
-                    "name": "debug_snapshot",
-                    "description": "Full plugin debug snapshot: windows, all sessions, focused session deep dump, composer geometry, goal state. Prefer this when fixing sticky ◎ / focus / goal bugs.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "view_id": {
-                                "type": "integer",
-                                "description": "Optional session view_id (default: active / focused Claude sheet)"
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "debug_composer",
-                    "description": "Sticky ◎ / pad / viewport dump for a session: input_mode, marker pt, layout extent, trailing empties, regions.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "view_id": {
-                                "type": "integer",
-                                "description": "Optional session view_id"
-                            }
-                        }
-                    }
-                },
-                {
-                    "name": "debug_log",
-                    "description": "Tail the plugin devtools ring buffer + claude_devtools.log + bridge log.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "tail": {
-                                "type": "integer",
-                                "description": "How many ring events (default 80)"
-                            },
-                            "grep": {
-                                "type": "string",
-                                "description": "Optional substring filter"
-                            }
-                        }
-                    }
-                },
+                # Plugin self-debug (devtools) is intentionally NOT listed here —
+                # host-only via devtools_cli.py / socket op=debug (no agent tokens).
                 # ─── Terminal Tools ──────────────────────────────────────────
                 # For interactive/long-running processes (dev servers, REPLs, watch modes).
                 {
