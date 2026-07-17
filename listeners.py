@@ -305,9 +305,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             session.add_context_file(path, content)
             sublime.status_message(f"Added context: {path.split('/')[-1]}")
 
-            # Focus back to Claude output and re-enter input mode
+            # Focus back to Claude output (user just added context from a file)
             def refocus():
-                session.output.show()
+                session.output.show(focus=True)
                 if not session.output.is_input_mode():
                     session.output.enter_input_mode()
                 if session.draft_prompt and session.output.is_input_mode():
@@ -317,10 +317,9 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                         session.output.view.run_command("append", {
                             "characters": session.draft_prompt,
                         })
-                # Always scroll true bottom (enter_input_mode alone is not enough
-                # if we were already in input mode)
                 if session.output.is_input_mode():
-                    session.output.focus_composer(force_show=True)
+                    session.output.focus_composer(
+                        force_show=True, steal_focus=True)
 
             sublime.set_timeout(refocus, 100)
 
@@ -621,7 +620,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if not s.output.is_input_mode():
             return None
 
-        # Click in empty space under ◎ (scroll_past_end) → focus composer.
+        # Click on/below ◎ (pad hairline or near EOF) → focus composer.
         if command_name == "drag_select":
             args = args or {}
             sublime.set_timeout(
@@ -683,14 +682,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 try:
                     _lx, input_y = view.text_to_layout(input_start)
                     if click_y + 1.0 >= float(input_y):
-                        session.output.focus_composer(force_show=True)
+                        session.output.focus_composer(
+                            force_show=True, steal_focus=True)
                         return
                 except Exception:
                     pass
             # Fallback: caret landed in draft / EOF after click
             sel = view.sel()
             if sel and sel[0].begin() >= input_start:
-                session.output.focus_composer(force_show=True)
+                session.output.focus_composer(
+                    force_show=True, steal_focus=True)
         except Exception:
             pass
 
@@ -814,10 +815,10 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         if getattr(s.output, "_question_input_mode", False):
             return
 
-        # Save draft. Do NOT re-pin full-width pad on every keystroke/delete —
-        # that recreates a huge LAYOUT_BLOCK and jolts the viewport.
+        # Save draft. Whitespace-only (legacy spare ``\\n``) → empty so we never
+        # rehydrate blank rows under ◎. Do NOT re-pin pad every keystroke.
         input_text = s.output.get_input_text()
-        s.draft_prompt = input_text
+        s.draft_prompt = "" if not input_text.strip() else input_text
 
         # Check for @ trigger at cursor
         sel = self.view.sel()

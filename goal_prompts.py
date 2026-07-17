@@ -27,9 +27,21 @@ Rules:
    - update_goal(completed=true, message="…") ONLY when fully achieved
      (the host re-checks; do not assume complete is accepted)
    - update_goal(blocked_reason="…") only after multiple failed attempts
-5. Prefer MCP sublime `update_goal` (not unrelated tools). Do not call quick_done.
+5. Prefer MCP sublime `update_goal` for harness status (not quick_done).
 6. {plan}
 7. When blocked three times the host will pause the goal.
+
+Parallelism (use it — do not default to solo serial work):
+8. When the objective has independent workstreams, fan out with subagents
+   instead of doing everything yourself in one long serial chain.
+9. Prefer the platform Task / Agent tools (Explore, general-purpose, Plan, …)
+   for research, parallel edits, isolated spikes, and verification side-quests.
+10. Use MCP sublime `spawn_session` when a separate full session helps
+    (different backend/profile, long-running branch of work, wait_for_completion
+    for a dedicated worker). You remain the orchestrator: integrate results,
+    own the objective, and only you call update_goal(completed=true).
+11. Do not spawn for trivial one-file tweaks. Do spawn when parallel work would
+    clearly cut wall time or keep context focused.
 
 Work until the objective is done or truly blocked.
 </goal-mode>
@@ -54,6 +66,9 @@ OBJECTIVE: {tracker.objective}
 Continue implementing and verifying. Call update_goal(message=…) for progress.
 When fully done: update_goal(completed=true, message=summary of evidence).
 If stuck after real attempts: update_goal(blocked_reason=…).
+
+If remaining work is parallelizable, use Task/Agent subagents or
+spawn_session — do not grind independent strands serially by default.
 """
 
 

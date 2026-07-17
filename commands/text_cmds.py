@@ -84,7 +84,7 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         # Caret in history: focus ◎, don't submit
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(force_show=True)
+                s.output.focus_composer(force_show=True, steal_focus=True)
             except Exception:
                 pass
             return
@@ -310,7 +310,7 @@ class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
         # Outside ◎: focus composer instead of a no-op / history edit
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(force_show=True)
+                s.output.focus_composer(force_show=True, steal_focus=True)
             except Exception:
                 pass
             return
@@ -1321,7 +1321,8 @@ class ClaudePasteImageCommand(sublime_plugin.TextCommand):
                 if not session.output.is_input_mode():
                     session.output.enter_input_mode()
                 elif session.output.is_input_mode():
-                    session.output.focus_composer(force_show=True)
+                    session.output.focus_composer(
+                        force_show=True, steal_focus=True)
             except Exception:
                 pass
 

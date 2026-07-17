@@ -1403,7 +1403,9 @@ class Session:
         self._interrupting = False
 
         if not silent:
-            self.output.show()
+            # Never steal focus on every turn — user may be editing another file
+            # while the agent streams / goal continues.
+            self.output.show(focus=False)
             # Auto-name session from first prompt if not already named
             if not self.name:
                 self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
@@ -1750,11 +1752,13 @@ class Session:
         # Question / permission / plan owns the tail
         if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
             return
-        # Already in input mode — still scroll to true bottom (callsite coverage)
+        # Already in input mode — re-pin scroll only if this sheet is focused
+        # (never focus_view: that stole the editor from other files).
         if self.output.is_input_mode():
             self._input_mode_entered = True
             try:
-                self.output.focus_composer(force_show=True)
+                if self.output._view_is_focused():
+                    self.output.focus_composer(force_show=True, steal_focus=False)
             except Exception:
                 pass
             return
@@ -1765,8 +1769,8 @@ class Session:
         # Exception: if ◎ is gone but flag is set, allow re-entry (post-interrupt drip).
         if self._input_mode_entered and not self.working:
             try:
-                if self.output.is_input_mode():
-                    self.output.focus_composer(force_show=True)
+                if self.output.is_input_mode() and self.output._view_is_focused():
+                    self.output.focus_composer(force_show=True, steal_focus=False)
             except Exception:
                 pass
             return
@@ -1789,7 +1793,8 @@ class Session:
                 if not self.output:
                     return
                 if self.output.is_input_mode():
-                    self.output.focus_composer(force_show=True)
+                    if self.output._view_is_focused():
+                        self.output.focus_composer(force_show=True, steal_focus=False)
                     return
                 if self.output.current and self.output.current.working and not self.working:
                     self.output.current.working = False
@@ -1806,17 +1811,28 @@ class Session:
             self.last_idle_at = time.time()
 
         if self.draft_prompt and self.output.view:
-            # Insert draft on the ◎ line; re-scroll after draft changes layout
+            # Insert draft on the ◎ line; drop whitespace-only legacy spare ``\\n``
+            draft = self.draft_prompt
+            if not str(draft).strip():
+                draft = ""
+                self.draft_prompt = ""
             try:
-                self.output.set_composer_text(self.draft_prompt)
+                self.output.set_composer_text(draft)
             except Exception:
-                self.output.view.run_command("append", {
-                    "characters": self.draft_prompt,
-                })
+                if draft:
+                    self.output.view.run_command("append", {
+                        "characters": draft,
+                    })
                 if hasattr(self.output, "ensure_composer_spare_line"):
                     self.output.ensure_composer_spare_line()
             try:
-                self.output.focus_composer(force_show=True)
+                if self.output._view_is_focused():
+                    self.output.focus_composer(force_show=True, steal_focus=False)
+            except Exception:
+                pass
+        elif self.output and self.output.is_input_mode():
+            try:
+                self.output.collapse_empty_composer_tail()
             except Exception:
                 pass
 
@@ -2356,17 +2372,22 @@ class Session:
         last_nl = content.rfind("\n")
         pt = last_nl if last_nl >= 0 else 0
         if strong:
-            # Full-width hairline (wide block so minihtml spans the pane) +
-            # high-contrast banner so sleep state is hard to miss.
+            # High-contrast banner. Avoid width:200em / min-width:40em — those
+            # inflate layout_extent and create a huge horizontal scroll range.
+            try:
+                vw = int(float(view.viewport_extent()[0])) - 8
+                w = max(80, vw)
+            except Exception:
+                w = 400
             line = (
                 f'<div style="margin:0 0 6px 0;padding:0;line-height:1;'
-                f'font-size:1px;height:0;'
+                f'font-size:1px;height:0;max-width:{w}px;width:{w}px;'
                 f'border-top:1px solid color-mix(in srgb, {color} 65%, transparent);'
-                f'width:200em;">&nbsp;</div>'
+                f'">&nbsp;</div>'
             )
             html = (
                 f'<body id="claude-overlay" style="margin:10px 0 8px 0;padding:0;'
-                f'min-width:40em;">'
+                f'max-width:{w}px;">'
                 f'{line}'
                 f'<div style="'
                 f'padding:5px 10px;'
@@ -2422,10 +2443,16 @@ class Session:
             return
         label, color = info
         view = self.output.view
-        content = view.substr(sublime.Region(0, view.size()))
-        last_nl = content.rfind("\n")
-        pt = last_nl if last_nl >= 0 else 0
-        html = f'<body style="margin: 4px 0; color: {color};">{label}</body>'
+        # Anchor above ◎ (peel-1), not last ``\\n`` — trailing draft blanks used
+        # to push this banner under empty rows below the marker.
+        peel = getattr(self.output, "_input_area_start", None)
+        if peel is None or peel < 0:
+            peel = getattr(self.output, "_input_start", None)
+        if peel is None or peel < 0:
+            peel = view.size()
+        peel = min(max(0, int(peel)), view.size())
+        pt = max(0, peel - 1) if peel > 0 else 0
+        html = f'<body style="margin: 2px 0; color: {color};">{label}</body>'
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
 
     def _get_wakeup_phantom_set(self):
@@ -3221,14 +3248,10 @@ class Session:
         else:
             self.output.remove_tool(tool)
         self._bg_tools.pop(tool_use_id, None)
-        # The input area's ⚙ background hint is static text rendered at
-        # enter_input_mode; re-render it so the now-finished tool drops out
-        # (otherwise a stale ⚙ lingers above the prompt).
-        if not self.working and self.output._input_mode:
-            self.draft_prompt = self.output.get_input_text()
-            self.output.exit_input_mode(keep_text=False)
-            self._input_mode_entered = False
-            self._enter_input_with_draft()
+        # Do NOT exit+re-enter sticky ◎ here. That rebuilt the queue hairline /
+        # pad phantoms every bg-task finish and made the composer jump (and
+        # inflated scroll range). Stale ⚙ hints above ◎ clear on next natural
+        # enter_input / turn end.
 
     def _on_sys_task_started(self, data: dict) -> None:
         task_id = data.get("task_id", "")
@@ -3281,6 +3304,8 @@ class Session:
         if not is_bg:
             print(f"[Claude] orphan task_notification (idle session) — waking parent: {tool_use_id}")
         # Read output first — it decides whether the tool line is worth keeping.
+        # Cap size: bridge logs show 15–30k task dumps (GLM agent reports) which
+        # bloat wake prompts and the session scroll range when echoed.
         output = ""
         output_file = data.get("output_file", "")
         if output_file:
@@ -3289,10 +3314,19 @@ class Session:
                     output = f.read().strip()
             except Exception as e:
                 print(f"[Claude] task notification output read failed ({output_file}): {e}")
+        _MAX_BG_OUT = 8000
+        if len(output) > _MAX_BG_OUT:
+            output = (
+                output[:_MAX_BG_OUT]
+                + f"\n…[truncated {len(output) - _MAX_BG_OUT} chars; full: {output_file}]"
+            )
         # Keep ✓ only for a completed task with a real surfaced result.
         self._finalize_bg_tool(tool_use_id, keep=(status == "completed" and bool(output)))
         self._bg_tools.pop(tool_use_id, None)
         summary = data.get("summary", "")
+        # Prefer short summary for header; long summary alone also blows scroll
+        if summary and len(summary) > 400:
+            summary = summary[:400] + "…"
         header = f"{summary} [{status}]" if status != "completed" else summary
         block = (
             f"<task-notification>{header}\n{output}</task-notification>"
@@ -4015,8 +4049,25 @@ class Session:
                         self.cancel_scheduled_loop()
                 except Exception:
                     pass
+                # Clear busy *before* host status text — otherwise text() can
+                # re-arm conversation.working while session.working is still True
+                # and leave a stuck ⠼ after verified complete.
+                self.working = False
+                if self.output and self.output.current:
+                    self.output.current.working = False
                 self.output.text("\n*Goal complete (verified).*\n")
+                if self.output and self.output.current:
+                    self.output.current.working = False
+                    try:
+                        self.output._render_pending = False
+                        self.output._do_render()
+                    except Exception:
+                        self.output._render_current()
                 self.sync_goal_ui()
+                try:
+                    self.output.set_name(self.display_name)
+                except Exception:
+                    pass
                 return False
             if not gt.should_continue():
                 return False
