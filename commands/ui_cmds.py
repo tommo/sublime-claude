@@ -583,4 +583,89 @@ class ClaudeCodeTogglePermissionModeCommand(sublime_plugin.WindowCommand):
         self.window.show_quick_panel(items, on_select, selected_index=current_idx)
 
 
+# --- Plugin self-debug (devtools) ---
+
+class ClaudeDevtoolsSnapshotCommand(sublime_plugin.WindowCommand):
+    """Dump host debug snapshot to a scratch view + clipboard."""
+
+    def run(self, view_id: int = None) -> None:
+        from .. import devtools
+        import json
+
+        if view_id is None:
+            s = get_active_session(self.window)
+            if s and s.output and s.output.view:
+                view_id = s.output.view.id()
+        data = devtools.snapshot(view_id)
+        text = json.dumps(data, indent=2, default=str)
+        sublime.set_clipboard(text)
+        v = self.window.new_file()
+        v.set_name("Claude Devtools Snapshot")
+        v.set_scratch(True)
+        v.set_syntax_file("Packages/JavaScript/JSON.sublime-syntax")
+        v.run_command("append", {"characters": text})
+        sublime.status_message("Claude devtools: snapshot copied + opened")
+
+
+class ClaudeDevtoolsSessionsCommand(sublime_plugin.WindowCommand):
+    def run(self) -> None:
+        from .. import devtools
+        import json
+
+        data = devtools.sessions_dump()
+        text = json.dumps(data, indent=2, default=str)
+        sublime.set_clipboard(text)
+        v = self.window.new_file()
+        v.set_name("Claude Devtools Sessions")
+        v.set_scratch(True)
+        v.set_syntax_file("Packages/JavaScript/JSON.sublime-syntax")
+        v.run_command("append", {"characters": text})
+        sublime.status_message(f"Claude devtools: {data.get('count', 0)} session(s)")
+
+
+class ClaudeDevtoolsComposerCommand(sublime_plugin.WindowCommand):
+    def run(self, view_id: int = None) -> None:
+        from .. import devtools
+        import json
+
+        if view_id is None:
+            s = get_active_session(self.window)
+            if s and s.output and s.output.view:
+                view_id = s.output.view.id()
+        data = devtools.composer_dump(view_id)
+        text = json.dumps(data, indent=2, default=str)
+        sublime.set_clipboard(text)
+        v = self.window.new_file()
+        v.set_name("Claude Devtools Composer")
+        v.set_scratch(True)
+        v.set_syntax_file("Packages/JavaScript/JSON.sublime-syntax")
+        v.run_command("append", {"characters": text})
+        sublime.status_message("Claude devtools: composer dump")
+
+
+class ClaudeDevtoolsLogCommand(sublime_plugin.WindowCommand):
+    def run(self, tail: int = 120) -> None:
+        from .. import devtools
+        import json
+
+        data = devtools.log_tail(tail=tail)
+        text = json.dumps(data, indent=2, default=str)
+        v = self.window.new_file()
+        v.set_name("Claude Devtools Log")
+        v.set_scratch(True)
+        v.set_syntax_file("Packages/JavaScript/JSON.sublime-syntax")
+        v.run_command("append", {"characters": text})
+        sublime.status_message(f"Claude devtools log → {data.get('log_path')}")
+
+
+class ClaudeDevtoolsReloadCommand(sublime_plugin.WindowCommand):
+    """Soft-reload ClaudeCode package without restarting Sublime."""
+
+    def run(self, mode: str = "soft") -> None:
+        from .. import devtools
+        r = devtools.reload_plugin(mode=mode or "soft")
+        sublime.status_message(f"Claude: reload scheduled ({r.get('mode', mode)})")
+        print(f"[Claude] reload scheduled: {r}")
+
+
 # --- Input Mode Commands ---

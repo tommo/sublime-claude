@@ -54,6 +54,11 @@ from .commands import (
     ClaudeCodeSaveCheckpointCommand,
     ClaudeCodeUsageCommand,
     ClaudeCodeViewHistoryCommand,
+    ClaudeDevtoolsSnapshotCommand,
+    ClaudeDevtoolsSessionsCommand,
+    ClaudeDevtoolsComposerCommand,
+    ClaudeDevtoolsLogCommand,
+    ClaudeDevtoolsReloadCommand,
 )
 
 # Quick Agent host (multi-slot)

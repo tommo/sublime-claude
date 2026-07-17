@@ -42,12 +42,37 @@ def plugin_loaded() -> None:
                     s.client = None  # don't block load on shutdown
             except Exception:
                 pass
+            # Clear sleep/connect phantoms while we still have a view ref —
+            # PhantomSet GC does not always remove HTML from the buffer.
+            try:
+                v = s.output.view if getattr(s, "output", None) else None
+                if v and v.is_valid():
+                    from .session import clear_claude_view_phantoms
+                    clear_claude_view_phantoms(v)
+            except Exception:
+                pass
         prev.clear()
     sublime._claude_sessions = prev if isinstance(prev, dict) else {}
+
+    # Also sweep every Claude sheet (covers orphans not in the registry)
+    try:
+        from .session import clear_all_claude_phantoms
+        n = clear_all_claude_phantoms()
+        if n:
+            print(f"[Claude] plugin_loaded: cleared phantoms on Claude views ({n} keys)")
+    except Exception as e:
+        print(f"[Claude] plugin_loaded: phantom clear: {e}")
 
     # Start MCP server
     from . import mcp_server
     mcp_server.start()
+
+    # Plugin self-debug surface (socket op=debug + ring log)
+    try:
+        from . import devtools
+        devtools.start()
+    except Exception as e:
+        print(f"[Claude] devtools start failed: {e}")
 
     # Start global notalone client (receives all injects for sublime.* sessions)
     from . import notalone
@@ -63,9 +88,10 @@ def plugin_loaded() -> None:
 
 
 def _startup_strip_composers() -> None:
-    """First paint: remove sticky ◎ from every Claude sheet before user sees it."""
+    """First paint: remove sticky ◎ + orphan phantoms before user sees them."""
     try:
         from .output_view import OutputView
+        from .session import clear_claude_view_phantoms
         n = 0
         for w in sublime.windows():
             for v in w.views():
@@ -78,6 +104,8 @@ def _startup_strip_composers() -> None:
                 if v.settings().get("claude_backend") or v.settings().get("claude_sleeping"):
                     # Don't force sleeping on brand-new empty sheets
                     pass
+                # Drop pre-reload sleep/queue banners (re-painted by settle)
+                clear_claude_view_phantoms(v)
                 if OutputView.strip_composer_tail(v):
                     n += 1
     except Exception:
@@ -97,6 +125,20 @@ def _startup_settle_views() -> None:
 
 def plugin_unloaded() -> None:
     """Called when plugin is unloaded. Stop MCP server and notalone client."""
+    # Clear phantoms while views are still valid — prevents sticky sleep banner
+    # after soft package reload (Session refs die; HTML can remain).
+    try:
+        from .session import clear_all_claude_phantoms
+        clear_all_claude_phantoms()
+    except Exception:
+        pass
+
+    try:
+        from . import devtools
+        devtools.stop()
+    except Exception:
+        pass
+
     from . import mcp_server
     mcp_server.stop()
 

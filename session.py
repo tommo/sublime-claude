@@ -17,6 +17,111 @@ from . import cc_launch
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
 
+# PhantomSet keys owned by ClaudeCode.
+#
+# Critical: PhantomSet objects must stay alive. On package reload, Session
+# drops its refs → PhantomSet GC → ST can *orphan* LAYOUT_BLOCK phantoms on
+# the view (sleep banner stacks once per reload). Keys alone are not enough
+# if the set is collected. Registry lives on the `sublime` module so it
+# survives soft package reload.
+CLAUDE_PHANTOM_KEYS = (
+    "claude_overlay",        # sleep / connecting / terminal banner
+    "claude_queue",          # sticky queue hairline
+    "claude_permmode",       # permission-mode banner
+    "claude_wakeup",         # cron / loop wakeup ticker
+    "claude_workflow",       # workflow strip
+    "claude_media",          # inline image previews (output_view)
+    "claude_context",        # 📎 chips (output_view)
+    "claude_pad",            # legacy pad key
+    "claude_composer_pad",   # composer pad under ◎ (output_view real key)
+)
+
+
+def _phantom_registry() -> dict:
+    reg = getattr(sublime, "_claude_phantom_registry", None)
+    if not isinstance(reg, dict):
+        reg = {}
+        sublime._claude_phantom_registry = reg  # type: ignore[attr-defined]
+    return reg
+
+
+def keyed_phantom_set(view: sublime.View, key: str):
+    """Return the single long-lived PhantomSet for (view, key).
+
+    Always reuse the same object so update([]) / update([…]) replace phantoms
+    instead of stacking orphans across package reloads.
+    """
+    if not view or not view.is_valid() or not key:
+        return None
+    reg = _phantom_registry()
+    k = (view.id(), key)
+    ps = reg.get(k)
+    if ps is not None:
+        return ps
+    try:
+        ps = sublime.PhantomSet(view, key)
+    except Exception:
+        return None
+    reg[k] = ps
+    return ps
+
+
+def clear_claude_view_phantoms(view: sublime.View, keys=None) -> int:
+    """Empty Claude phantoms on a view (registry set + erase_phantoms).
+
+    ``view.erase_phantoms(key)`` is required for orphans left after PhantomSet
+    GC on package reload — ``PhantomSet.update([])`` alone cannot touch them
+    once the original set is gone, which produced stacked sleep banners.
+    """
+    if not view or not view.is_valid():
+        return 0
+    n = 0
+    for key in (keys or CLAUDE_PHANTOM_KEYS):
+        try:
+            if hasattr(view, "erase_phantoms"):
+                view.erase_phantoms(key)
+            ps = keyed_phantom_set(view, key)
+            if ps is not None:
+                ps.update([])
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def clear_all_claude_phantoms() -> int:
+    """Clear phantoms on every Claude output sheet (plugin load / unload)."""
+    total = 0
+    try:
+        for w in sublime.windows():
+            for v in w.views():
+                if not v.settings().get("claude_output"):
+                    continue
+                total += clear_claude_view_phantoms(v)
+    except Exception as e:
+        print(f"[Claude] clear_all_claude_phantoms: {e}")
+    return total
+
+
+def prune_phantom_registry() -> None:
+    """Drop registry entries for closed views (keep sets for live sheets)."""
+    reg = _phantom_registry()
+    live = set()
+    try:
+        for w in sublime.windows():
+            for v in w.views():
+                live.add(v.id())
+    except Exception:
+        return
+    dead = [k for k in reg if k[0] not in live]
+    for k in dead:
+        try:
+            reg[k].update([])
+        except Exception:
+            pass
+        reg.pop(k, None)
+
+
 # @suffix → max context tokens (stripped from model ID before sending to bridge)
 _CONTEXT_LIMITS = {
     "@400k": 400000,
@@ -2298,7 +2403,18 @@ class Session:
         self.output.set_name(self.display_name)
         # Always remove ◎ strip — this is what looked like "input on restart"
         self._strip_sticky_composer()
-        # Drop queue hairline / chips (they only make sense with ◎ open)
+        # Composer pad + queue only make sense with ◎; wrong pad key used to
+        # leave LAYOUT_BELOW height. Also drop spare blank lines under @done
+        # that made a huge void above the sleep banner.
+        try:
+            clear_claude_view_phantoms(
+                view,
+                keys=("claude_composer_pad", "claude_pad", "claude_queue"),
+            )
+            if getattr(self.output, "_pad_phantom_set", None) is not None:
+                self.output._pad_phantom_set.update([])
+        except Exception:
+            pass
         try:
             self._update_queue_phantom()
         except Exception:
@@ -2307,6 +2423,12 @@ class Session:
             self._update_permission_banner(show=False)
         except Exception:
             pass
+        if touch_buffer:
+            try:
+                from .output_view import OutputView
+                OutputView.collapse_trailing_blank_lines(view, keep=1)
+            except Exception:
+                pass
 
         win = view.window()
         is_focused = bool(
@@ -2317,6 +2439,7 @@ class Session:
         # Overlay can jostle focus on background tabs — only when painting
         if not touch_buffer and not is_focused:
             return
+        # Single banner only (registry set replaces; no stack per reload).
         self._show_overlay_phantom(
             "\u23f8 Session paused \u2014 press Enter to wake",
             color="var(--yellowish)",
@@ -2324,20 +2447,18 @@ class Session:
         )
 
     def _phantom_set_for(self, attr: str, key: str):
-        """PhantomSet bound to the *current* output view (rebind after soft-hide)."""
+        """PhantomSet for this view+key via process-global registry (reload-safe)."""
         view = self.output.view if self.output else None
         if not view or not view.is_valid():
             return None
-        vid_attr = attr + "_view_id"
-        ps = getattr(self, attr, None)
-        if ps is None or getattr(self, vid_attr, None) != view.id():
-            ps = sublime.PhantomSet(view, key)
-            setattr(self, attr, ps)
-            setattr(self, vid_attr, view.id())
+        ps = keyed_phantom_set(view, key)
+        # Keep session attr as alias so older call sites still see a set
+        setattr(self, attr, ps)
+        setattr(self, attr + "_view_id", view.id())
         return ps
 
     def reset_phantoms_for_new_view(self) -> None:
-        """Drop cached PhantomSets so the next update targets a new sheet."""
+        """Clear session-local aliases (registry keeps the real PhantomSets)."""
         for attr in (
             "_overlay_phantom_set", "_permmode_phantom_set",
             "_wakeup_phantom_set", "_workflow_phantom_set",
@@ -2363,17 +2484,36 @@ class Session:
         """Session-status block at EOF (sleep / connecting / terminal).
 
         strong=True: full-width split rule + bold banner (session paused).
+        Always replaces via the long-lived registry set — never stacks.
         """
-        ps = self._get_overlay_phantom_set()
-        if not ps or not self.output or not self.output.view:
+        if not self.output or not self.output.view:
             return
         view = self.output.view
+        ps = keyed_phantom_set(view, "claude_overlay")
+        if not ps:
+            return
+        self._overlay_phantom_set = ps
+        self._overlay_phantom_set_view_id = view.id()
+        # Anchor on last non-empty line (not EOF after blank run) so LAYOUT_BLOCK
+        # does not sit under a tall void of spare newlines / pad leftovers.
         content = view.substr(sublime.Region(0, view.size()))
-        last_nl = content.rfind("\n")
-        pt = last_nl if last_nl >= 0 else 0
+        pt = view.size()
+        try:
+            stripped = content.rstrip("\n")
+            if stripped:
+                # Point at end of last non-empty line
+                pt = len(stripped)
+                # Prefer start of that line for BLOCK layout (below the line)
+                pt = view.line(pt - 1 if pt > 0 else 0).begin()
+            else:
+                pt = 0
+        except Exception:
+            last_nl = content.rfind("\n")
+            pt = last_nl if last_nl >= 0 else 0
         if strong:
             # High-contrast banner. Avoid width:200em / min-width:40em — those
             # inflate layout_extent and create a huge horizontal scroll range.
+
             try:
                 vw = int(float(view.viewport_extent()[0])) - 8
                 w = max(80, vw)
@@ -2406,6 +2546,13 @@ class Session:
                 f'<body id="claude-overlay" style="margin:8px 0;padding:0;'
                 f'color:{color};">{html_body}</body>'
             )
+        # erase_phantoms kills stacked orphans from prior reloads; then one banner.
+        try:
+            if hasattr(view, "erase_phantoms"):
+                view.erase_phantoms("claude_overlay")
+            ps.update([])
+        except Exception:
+            pass
         ps.update([sublime.Phantom(sublime.Region(pt, pt), html, sublime.LAYOUT_BLOCK)])
         # Selection / show on inactive sheets steals focus during multi-tab restore.
         win = view.window()
@@ -2415,9 +2562,12 @@ class Session:
             view.show(view.size())
 
     def _clear_overlay_phantom(self) -> None:
-        ps = self._get_overlay_phantom_set()
-        if ps:
-            ps.update([])
+        """Remove sleep/connecting banner via long-lived registry set."""
+        view = self.output.view if self.output else None
+        if view and view.is_valid():
+            clear_claude_view_phantoms(view, keys=("claude_overlay",))
+        self._overlay_phantom_set = None
+        self._overlay_phantom_set_view_id = None
 
     # Permission-mode banner: a persistent, color-coded line pinned at the input
     # area whenever the agent runs more autonomously than baseline, so "it's
@@ -2572,7 +2722,24 @@ class Session:
 
     def wake(self) -> None:
         """Wake a sleeping session — re-spawn bridge with resume."""
+        # Always strip sleep/connect chrome first. After soft package reload the
+        # old PhantomSet is gone but the HTML banner can still sit on the view;
+        # early-return paths must not leave "Session paused" over a live sheet.
+        if self.output and self.output.view:
+            clear_claude_view_phantoms(
+                self.output.view,
+                keys=("claude_overlay", "claude_queue", "claude_permmode"),
+            )
+            self._overlay_phantom_set = None
+            self._overlay_phantom_set_view_id = None
         if self.client or self.initialized:
+            # Stale sleep chrome after reload while already live
+            if self.output and self.output.view:
+                self.output.view.settings().erase("claude_sleeping")
+                try:
+                    self.output.set_name(self.display_name)
+                except Exception:
+                    pass
             return
         if not self.session_id:
             return

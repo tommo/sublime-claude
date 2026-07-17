@@ -56,6 +56,11 @@ from .ui_cmds import (  # noqa: F401
     ClaudeGarageSearchCommand,
     ClaudeCodeAddMcpCommand,
     ClaudeCodeTogglePermissionModeCommand,
+    ClaudeDevtoolsSnapshotCommand,
+    ClaudeDevtoolsSessionsCommand,
+    ClaudeDevtoolsComposerCommand,
+    ClaudeDevtoolsLogCommand,
+    ClaudeDevtoolsReloadCommand,
 )
 from .pty_cmds import (  # noqa: F401
     ClaudeCodePtyStartCommand,

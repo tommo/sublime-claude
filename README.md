@@ -48,6 +48,25 @@ pip install github-copilot-sdk  # Bundles CLI binary
 
 2. Configure your Python path if needed (see Settings below)
 
+### Plugin Devtools (agent self-debug)
+
+While Sublime is running, agents can inspect live sessions / sticky ◎ / goals, reload
+the package without restarting ST, and drive host `/goal` from the CLI:
+
+```bash
+python3 devtools_cli.py install   # ensure Packages/ClaudeCode symlink
+python3 devtools_cli.py ping
+python3 devtools_cli.py sessions
+python3 devtools_cli.py snapshot
+python3 devtools_cli.py composer [view_id]
+python3 devtools_cli.py log --tail 80
+python3 devtools_cli.py reload --wait 3
+python3 devtools_cli.py goal status --view-id N
+```
+
+Command Palette: **Claude: Devtools Snapshot / Sessions / Composer / Log / Reload**.  
+**Usage doc (kept):** [docs/devtools.md](docs/devtools.md).
+
 ## Usage
 
 ### Commands

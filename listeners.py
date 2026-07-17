@@ -539,6 +539,12 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             session.output.reset_active_states(soft=True)
             session._strip_sticky_composer()
 
+            # Kill orphan phantoms from pre-reload Session (sleep banner sticks
+            # if PhantomSet was GC'd without update([])).
+            from .session import clear_claude_view_phantoms
+            clear_claude_view_phantoms(view)
+            session.reset_phantoms_for_new_view()
+
             if resume_id:
                 session._apply_sleep_ui(touch_buffer=paint)
             else:

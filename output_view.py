@@ -743,6 +743,42 @@ class OutputView:
         except Exception:
             pass
 
+    @staticmethod
+    def collapse_trailing_blank_lines(view, keep: int = 1) -> bool:
+        """Trim EOF blank lines left after ◎ strip / streaming (sleep chrome gap).
+
+        keep=1 → single trailing newline after last non-empty line. Returns True
+        if the buffer changed.
+        """
+        if not view or not view.is_valid():
+            return False
+        try:
+            keep = max(0, min(int(keep), 3))
+            size = view.size()
+            if size <= 0:
+                return False
+            # Only inspect a tail window — full-buffer rstrip is fine for size
+            # but avoid rewriting the whole transcript.
+            content = view.substr(sublime.Region(0, size))
+            stripped = content.rstrip("\n")
+            if not stripped:
+                return False
+            target_tail = "\n" * keep
+            new_size = len(stripped) + len(target_tail)
+            if new_size == size and content.endswith(target_tail):
+                return False
+            view.set_read_only(False)
+            view.run_command("claude_replace", {
+                "start": len(stripped),
+                "end": size,
+                "text": target_tail,
+            })
+            view.set_read_only(True)
+            return True
+        except Exception as e:
+            print(f"[Claude] collapse_trailing_blank_lines: {e}")
+            return False
+
     def ensure_composer_spare_line(self) -> None:
         """Re-pin hairline under ◎ (no blank buffer rows)."""
         self.collapse_empty_composer_tail()
@@ -1041,6 +1077,9 @@ class OutputView:
         try:
             if self._pad_phantom_set is not None:
                 self._pad_phantom_set.update([])
+            if self.view and self.view.is_valid() and hasattr(self.view, "erase_phantoms"):
+                self.view.erase_phantoms("claude_composer_pad")
+                self.view.erase_phantoms("claude_pad")
         except Exception:
             pass
         # Queue hairline lives on the session PhantomSet — clear it too
@@ -1057,6 +1096,8 @@ class OutputView:
             pass
 
         OutputView.strip_composer_tail(self.view)
+        # Spare newlines under transcript (composer void) — sleep/restore
+        OutputView.collapse_trailing_blank_lines(self.view, keep=1)
 
         self._input_mode = False
         self._input_start = 0
@@ -1180,6 +1221,13 @@ class OutputView:
             # self.current. Debounced _render_current races with queued follow-up
             # queries and leaves a stale ⠋/⠧ under the previous @done.
             self.current.working = False
+            # Goal strip is *live* chrome (like the spinner), not history.
+            # Leaving it in the frozen region stacked "◎ goal · …" once per
+            # user submit *and* per host phase-switch prompt (plan/verify).
+            # Carry GoalState onto the next Conversation; re-render without it.
+            if _goal_is_open(self.current.goal):
+                prev_goal = self.current.goal
+            self.current.goal = None
             self._render_pending = False
             try:
                 self._do_render()
@@ -1196,8 +1244,6 @@ class OutputView:
             # Carry only still-open todos (drop completed/cancelled leftovers).
             if not self.current.todos_all_done:
                 prev_todos = _open_todos(self.current.todos)
-            if _goal_is_open(self.current.goal):
-                prev_goal = self.current.goal
 
         # Start new
         self.current = Conversation(
@@ -3186,10 +3232,11 @@ class OutputView:
         # Distinct line prefixes → different colors via ClaudeOutput.sublime-syntax
         # (claude.goal.* vs claude.task.*). No dual ───── banners.
         #
-        # Goal is sticky while active/blocked — keep it visible between turns
-        # (idle / input mode), not only while busy. Tasks stay working-only so
-        # @done history does not leave a task-list "corpse". Open todos/goals
-        # still carry into the next Conversation via prompt().
+        # Goal is sticky on the *live* conversation (working or idle after @done)
+        # so status stays visible between user turns. prompt() strips goal from
+        # the prior region before freezing history — otherwise every submit and
+        # host phase-switch left a permanent "◎ goal ·" corpse in the buffer.
+        # Tasks stay working-only so @done history has no task-list corpse.
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
             self.current.todos_all_done = True

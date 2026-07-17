@@ -173,13 +173,24 @@ class MCPSocketServer:
             code = request.get("code", "")
             tool = request.get("tool")
             view_id = request.get("view_id")  # Caller's view_id from mcp/server.py
+            # Devtools / agent debug ops (no project .py file needed)
+            op = request.get("op")
 
             result = {"result": None, "error": None}
             done = threading.Event()
 
             def do_eval():
                 try:
-                    result["result"] = self._eval(code, tool, caller_view_id=view_id)
+                    if op == "debug":
+                        from . import devtools
+                        action = request.get("action") or "help"
+                        kwargs = {
+                            k: v for k, v in request.items()
+                            if k not in ("op", "action", "code", "tool")
+                        }
+                        result["result"] = devtools.dispatch(action, **kwargs)
+                    else:
+                        result["result"] = self._eval(code, tool, caller_view_id=view_id)
                     done.set()
                 except Exception as e:
                     result["error"] = str(e)
@@ -376,6 +387,15 @@ class MCPSocketServer:
             "lsp_symbols": self._lsp_symbols,
             "lsp_workspace_symbols": self._lsp_workspace_symbols,
             "lsp_diagnostics": self._lsp_diagnostics,
+            # Plugin self-debug (devtools)
+            "debug_ping": self._debug_ping,
+            "debug_snapshot": self._debug_snapshot,
+            "debug_sessions": self._debug_sessions,
+            "debug_composer": self._debug_composer,
+            "debug_log": self._debug_log,
+            "debug_dispatch": self._debug_dispatch,
+            "debug_reload": self._debug_reload,
+            "debug_goal": self._debug_goal,
         }
 
         # Add context variables
@@ -1233,6 +1253,40 @@ class MCPSocketServer:
         if not lines:
             return {"summary": "No subsessions", "sessions": []}
         return {"summary": "\n".join(lines), "sessions": sessions, "count": len(sessions)}
+
+    # ─── Plugin self-debug (devtools) ─────────────────────────────────────────
+
+    def _debug_ping(self) -> dict:
+        from . import devtools
+        return devtools.ping()
+
+    def _debug_snapshot(self, view_id: int = None) -> dict:
+        from . import devtools
+        return devtools.snapshot(view_id)
+
+    def _debug_sessions(self) -> dict:
+        from . import devtools
+        return devtools.sessions_dump()
+
+    def _debug_composer(self, view_id: int = None) -> dict:
+        from . import devtools
+        return devtools.composer_dump(view_id)
+
+    def _debug_log(self, tail: int = 80, grep: str = None) -> dict:
+        from . import devtools
+        return devtools.log_tail(tail=tail, grep=grep)
+
+    def _debug_dispatch(self, action: str = "help", **kwargs) -> dict:
+        from . import devtools
+        return devtools.dispatch(action, **kwargs)
+
+    def _debug_reload(self, mode: str = "soft") -> dict:
+        from . import devtools
+        return devtools.reload_plugin(mode=mode)
+
+    def _debug_goal(self, args: str = "status", view_id: int = None) -> dict:
+        from . import devtools
+        return devtools.goal_command(args=args, view_id=view_id)
 
     def _read_session_output(self, view_id: int, lines: int = None, max_chars: int = 30000) -> dict:
         """Read conversation output from a session's view.

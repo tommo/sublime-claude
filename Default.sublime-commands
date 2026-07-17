@@ -88,6 +88,31 @@
         "command": "claude_goal_clear"
     },
     {
+        "caption": "Claude: Devtools Snapshot",
+        "command": "claude_devtools_snapshot"
+    },
+    {
+        "caption": "Claude: Devtools Sessions",
+        "command": "claude_devtools_sessions"
+    },
+    {
+        "caption": "Claude: Devtools Composer",
+        "command": "claude_devtools_composer"
+    },
+    {
+        "caption": "Claude: Devtools Log",
+        "command": "claude_devtools_log"
+    },
+    {
+        "caption": "Claude: Devtools Reload Package",
+        "command": "claude_devtools_reload"
+    },
+    {
+        "caption": "Claude: Devtools Reload Package (hard)",
+        "command": "claude_devtools_reload",
+        "args": {"mode": "hard"}
+    },
+    {
         "caption": "Claude: New Session",
         "command": "claude_code_start"
     },

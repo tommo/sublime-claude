@@ -107,6 +107,26 @@ def create_sublime_router() -> ToolRouter:
         f"completed={bool(args.get('completed', False))!r}, "
         f"blocked_reason={args.get('blocked_reason', '')!r})")
 
+    # Plugin self-debug (agent ↔ live Sublime)
+    router.register("debug_ping", simple_call_handler("debug_ping"))
+    router.register("debug_sessions", simple_call_handler("debug_sessions"))
+    router.register("debug_snapshot", lambda args:
+        f"return debug_snapshot({args.get('view_id')!r})"
+        if args.get("view_id") is not None else
+        "return debug_snapshot()")
+    router.register("debug_composer", lambda args:
+        f"return debug_composer({args.get('view_id')!r})"
+        if args.get("view_id") is not None else
+        "return debug_composer()")
+    router.register("debug_log", lambda args:
+        f"return debug_log(tail={args.get('tail', 80)!r}, "
+        f"grep={args.get('grep')!r})")
+    router.register("debug_reload", lambda args:
+        f"return debug_reload(mode={args.get('mode', 'soft')!r})")
+    router.register("debug_goal", lambda args:
+        f"return debug_goal(args={args.get('args', 'status')!r}, "
+        f"view_id={args.get('view_id')!r})")
+
     router.register("spawn_session", lambda args:
         f"return spawn_session({args.get('prompt', '')!r}, {args.get('name')!r}, "
         f"{args.get('profile')!r}, {args.get('checkpoint')!r}, {args.get('persona_id')}, "
