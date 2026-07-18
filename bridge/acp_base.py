@@ -1517,15 +1517,80 @@ class AcpBridge(BaseBridge):
             "env": [],
         }]
 
+    def _is_agent_busy_error(self, e: BaseException) -> bool:
+        msg = str(e).lower()
+        return (
+            "agent_busy" in msg
+            or "another turn" in msg
+            or "turn is active" in msg
+            or "cannot launch a new turn" in msg
+        )
+
+    async def _cancel_agent_turn(
+        self,
+        *,
+        reason: str = "",
+        wait_s: float = 2.0,
+        settle_s: float = 0.3,
+        force_local: bool = True,
+    ) -> None:
+        """session/cancel + wait until local prompt future settles.
+
+        Kimi rejects a new session/prompt while its agent-side turn is still
+        active (``turn.agent_busy``). Forcing the local future after 350ms
+        idles the UI but leaves the agent busy — next Esc-then-type fails.
+        """
+        fut = self._prompt_fut
+        active = fut is not None and not fut.done()
+        if not active and self._query_req_id is None:
+            return
+        self._prompt_cancelled = True
+        self._cancel_in_flight = True
+        if self.session_id is not None:
+            try:
+                await self._notify_acp(
+                    "session/cancel", {"sessionId": self.session_id})
+                self.file_log(
+                    f"cancel_agent_turn: session/cancel ({reason})")
+            except Exception as e:
+                self.log(f"session/cancel failed ({reason}): {e}")
+        fut = self._prompt_fut
+        if fut is not None and not fut.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(fut), timeout=wait_s)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            if force_local and not fut.done():
+                fut.set_result({"stopReason": "cancelled"})
+                self.file_log(
+                    f"cancel_agent_turn: forced local fut ({reason})")
+        # Agent-side turn teardown lag (Kimi turn IDs)
+        if settle_s > 0:
+            try:
+                await asyncio.sleep(settle_s)
+            except Exception:
+                pass
+
     async def handle_query(self, req_id: Optional[int],
                             params: dict) -> None:
         if self.session_id is None:
             send_error(req_id, -32000, "session not initialized")
             return
-        # A new query supersedes any prior in-flight prompt.
+        # A new query must not overlap an agent turn (Kimi: turn.agent_busy).
         if self._query_req_id is not None and self._query_req_id != req_id:
             self.file_log(
                 f"query: superseding in-flight req {self._query_req_id}")
+            await self._cancel_agent_turn(
+                reason="supersede", wait_s=2.0, settle_s=0.35)
+        elif self._prompt_fut is not None and not self._prompt_fut.done():
+            await self._cancel_agent_turn(
+                reason="stale_prompt", wait_s=2.0, settle_s=0.35)
+        elif self._cancel_in_flight:
+            # Just interrupted — brief settle before new prompt
+            try:
+                await asyncio.sleep(0.25)
+            except Exception:
+                pass
         prompt = params.get("prompt") or params.get("text") or ""
         images = params.get("images") or []
         if not isinstance(images, list):
@@ -1536,7 +1601,19 @@ class AcpBridge(BaseBridge):
         self._cancel_in_flight = False
         turn_t0 = time.time()
         try:
-            result = await self._send_prompt(prompt_blocks) or {}
+            try:
+                result = await self._send_prompt(prompt_blocks) or {}
+            except Exception as e:
+                if self._is_agent_busy_error(e) and not self._prompt_cancelled:
+                    self.file_log(
+                        f"query: agent_busy — cancel+retry once: {e}")
+                    await self._cancel_agent_turn(
+                        reason="busy_retry", wait_s=2.5, settle_s=0.5)
+                    self._prompt_cancelled = False
+                    self._cancel_in_flight = False
+                    result = await self._send_prompt(prompt_blocks) or {}
+                else:
+                    raise
             stop_reason = result.get("stopReason", "end_turn")
             cancelled = (
                 self._prompt_cancelled
@@ -1757,6 +1834,10 @@ class AcpBridge(BaseBridge):
 
         Idempotent: extra Esc presses must NOT re-send session/cancel after
         the turn already ended (Grok logs ChatStateActor dead / channel_dropped).
+
+        Kimi: cancel alone is not enough if we force the local future too
+        early — agent keeps turn.agent_busy. Wait longer before force; next
+        query also re-settles via _cancel_agent_turn.
         """
         fut = self._prompt_fut
         active = fut is not None and not fut.done()
@@ -1772,10 +1853,6 @@ class AcpBridge(BaseBridge):
             send_result(req_id, {"status": "interrupted"})
             return
 
-        first_cancel = not self._prompt_cancelled
-        self._prompt_cancelled = True
-        self._cancel_in_flight = True
-
         # Kill client-side terminals so terminal/wait_for_exit unblocks.
         for tid in list(self._terminals):
             try:
@@ -1783,30 +1860,10 @@ class AcpBridge(BaseBridge):
             except Exception:
                 pass
 
-        # One session/cancel per turn only.
-        if first_cancel and self.session_id is not None:
-            try:
-                await self._notify_acp(
-                    "session/cancel", {"sessionId": self.session_id})
-            except Exception as e:
-                self.log(f"session/cancel notify failed: {e}")
-        elif not first_cancel:
-            self.file_log("interrupt: skip duplicate session/cancel")
+        # Cancel + wait (longer than old 0.35s force — Kimi turn teardown).
+        await self._cancel_agent_turn(
+            reason="interrupt", wait_s=1.5, settle_s=0.2, force_local=True)
 
-        # Unblock local await if the agent is slow/stuck (e.g. terminal wait).
-        # Prefer resolving with cancelled so handle_query takes the normal path.
-        fut = self._prompt_fut
-        if fut is not None and not fut.done():
-            # Brief grace for agent stopReason=cancelled, then force so the
-            # plugin query RPC always completes (otherwise UI never idles).
-            try:
-                await asyncio.wait_for(asyncio.shield(fut), timeout=0.35)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            if not fut.done():
-                fut.set_result({"stopReason": "cancelled"})
-                self.file_log(
-                    "interrupt: forced local prompt future to cancelled")
         # Unblock any permission waiters so they don't keep the turn alive.
         for pid, pfut in list(self.pending_permissions.items()):
             if pfut and not pfut.done():

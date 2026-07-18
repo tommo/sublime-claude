@@ -98,10 +98,11 @@ class TestHostPlan(unittest.TestCase):
 1. Write `evidence/demo_ok.txt` with one line goal-demo-ok
 2. Leave product sources unchanged
 ## Verification Plan
-1. `test -f evidence/demo_ok.txt` exits 0
-2. `grep -qx goal-demo-ok evidence/demo_ok.txt`
+1. `gating`: `grep -qx goal-demo-ok evidence/demo_ok.txt` exits 0
+2. `gating`: `git status --porcelain` clean outside evidence
 ## Task Checklist
 - [ ] write evidence
+- [ ] run verification
 """
         self.assertTrue(plan_has_required_sections(md))
         secs = parse_plan_sections(md)
@@ -116,13 +117,60 @@ class TestHostPlan(unittest.TestCase):
 1. **Demo marker**: `/tmp/goal-demo/evidence/demo_ok.txt` exists with line `goal-demo-ok`
 2. **No product churn**: git status clean outside the goal evidence dir
 ## Verification plan
-1. `gating`: `test -f /tmp/goal-demo/evidence/demo_ok.txt` exits 0
-2. `gating`: `grep -qx goal-demo-ok /tmp/goal-demo/evidence/demo_ok.txt`
+1. `gating`: `grep -qx goal-demo-ok /tmp/goal-demo/evidence/demo_ok.txt` exits 0
+2. `gating`: `git status --porcelain` has no product-tree changes
 ## Task checklist
 - [ ] mkdir evidence and write marker
 - [ ] run verification commands
 """
         self.assertEqual(plan_quality_issues(md, "demo goal usage, no code"), [])
+
+    def test_soft_existence_only_verification_rejected(self):
+        md = """# Plan: ship auth
+## Acceptance criteria
+1. Marker at `.claude/goals/x/evidence/ok.txt`
+2. Plan file present
+## Verification plan
+1. `gating`: `test -f .claude/goals/x/evidence/ok.txt`
+2. `gating`: file exists demo_ok
+## Task checklist
+- [ ] write marker
+- [ ] claim done
+"""
+        issues = plan_quality_issues(md, "ship authentication module")
+        self.assertTrue(any("soft" in i.lower() or "substantive" in i.lower()
+                            for i in issues), issues)
+
+    def test_baseline_freeze_blocks_thinned_complete(self):
+        from goal_plan import complete_claim_preflight, sample_concrete_plan
+        g = GoalTracker()
+        g.create("ship widget feature")
+        plan = sample_concrete_plan("ship widget feature", g.goal_id, checklist_done=True)
+        ack = g.accept_plan(plan, plan_path="/tmp/not-used-plan.md")
+        self.assertTrue(ack.get("ok"))
+        self.assertTrue((g.plan_baseline or "").strip())
+        # Hostile thinned disk rewrite
+        thinned = """# Plan: ship widget feature
+## Acceptance criteria
+1. something vaguely done
+## Verification plan
+1. looks fine
+## Task checklist
+- [x] all done
+"""
+        # Host body stays frozen; preflight vs baseline if body somehow thinned
+        bad = complete_claim_preflight(
+            "ship widget fully done with tests",
+            thinned,
+            "ship widget feature",
+            plan_baseline=g.plan_baseline,
+        )
+        self.assertTrue(bad, "thinned plan must not pass preflight")
+        self.assertTrue(
+            any("thinned" in i.lower() or "frozen" in i.lower() or "missing" in i.lower()
+                for i in bad),
+            bad,
+        )
 
     def test_schema_prompt_names_required_headings(self):
         from goal_plan import plan_schema_for_prompt
@@ -165,6 +213,21 @@ class TestTrackerLifecycle(unittest.TestCase):
         self.assertEqual(g.phase, "executing")
         self.assertTrue(g.has_plan())
         self.assertTrue(g.should_continue())
+
+    def test_accept_after_user_pause_mid_planning(self):
+        """Esc pauses mid-plan; valid plan.md must still accept (auto-resume)."""
+        g = GoalTracker()
+        g.create("ship widget feature")
+        self.assertEqual(g.phase, "planning")
+        g.pause("user", "Interrupted by user")
+        self.assertEqual(g.status, "user_paused")
+        self.assertEqual(g.phase, "planning")  # not wiped to idle forever
+        md = sample_concrete_plan("ship widget feature", goal_id=g.goal_id)
+        ack = g.accept_plan(md, plan_path="/tmp/plan-paused.md")
+        self.assertTrue(ack.get("ok"), ack)
+        self.assertEqual(g.status, "active")
+        self.assertEqual(g.phase, "executing")
+        self.assertTrue(g.has_plan())
 
     def test_reject_bad_plan(self):
         g = GoalTracker()

@@ -294,6 +294,34 @@ class TestSkepticCannotOwnComplete(unittest.TestCase):
         self.assertTrue(r.get("rejected"))
 
 
+class TestVerdictDedup(unittest.TestCase):
+    def test_later_not_achieved_does_not_overwrite_achieved(self):
+        g = GoalTracker()
+        g.create("ship widget")
+        plan = sample_concrete_plan("ship widget", g.goal_id, checklist_done=True)
+        g.accept_plan(plan)
+        g.apply_update(completed=True, message="fully done with tests", mid_turn=True)
+        g.begin_verify()
+        r1 = g.record_tool_verdict(
+            achieved=True,
+            evidence=["pytest tests/test_goal_feature.py exit 0"],
+            gaps=[],
+            message="ok",
+        )
+        self.assertTrue(r1.get("achieved"))
+        r2 = g.record_tool_verdict(
+            achieved=False,
+            evidence=[],
+            gaps=["not achieved (tool)"],
+            message="soft",
+        )
+        self.assertTrue(r2.get("deduped"))
+        self.assertTrue(r2.get("achieved"))
+        v = g.take_tool_verdict()
+        self.assertTrue(v["achieved"])
+        self.assertGreaterEqual(len(v["evidence"]), 1)
+
+
 class TestNoDualBannerRace(unittest.TestCase):
     """apply_verdict(True) mid-turn must not be undone by finish fail-closed."""
 

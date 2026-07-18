@@ -2235,6 +2235,9 @@ class Session:
                 gt.pause("user", "Interrupted by user")
                 self._goal_skip_continue_once = True
                 self._goal_verify_turn = False
+                # Stop planner auto-replan after Esc (otherwise accept fails
+                # "not active" and host loops re-plan forever).
+                self._goal_planning_turn = False
                 self.sync_goal_ui()
         except Exception as e:
             print(f"[Claude] goal interrupt pause: {e}")
@@ -4328,8 +4331,9 @@ class Session:
             return {
                 "ok": False,
                 "error": ack.get("error") or "accept_plan failed",
-                "issues": ack.get("issues") or [],
+                "issues": ack.get("issues") or [ack.get("error") or "accept failed"],
                 "path": path,
+                "host_state": bool(ack.get("host_state")),
             }
         return {"ok": True, "path": path}
 
@@ -4396,9 +4400,20 @@ class Session:
         if gt.phase == "verifying" and gt.is_active():
             return self._goal_finish_verify_cycle()
 
+        # Esc / skip: do not accept or re-plan while user paused mid-flight
+        if getattr(self, "_goal_skip_continue_once", False):
+            self._goal_skip_continue_once = False
+            self._goal_planning_turn = False
+            return False
+
         # Planning turn: accept real plan from disk, else re-prompt planner
         if gt.phase == "planning" or getattr(self, "_goal_planning_turn", False):
             self._goal_planning_turn = False
+            # Paused mid-plan but plan.md may already be valid — resume first
+            if gt.is_open() and not gt.is_active() and not gt.has_plan():
+                if gt.status in ("user_paused", "infra_paused"):
+                    gt.resume()
+                    self.sync_goal_ui()
             result = self._goal_try_accept_plan_from_disk()
             self.sync_goal_ui()
             if result.get("ok"):
@@ -4414,11 +4429,28 @@ class Session:
                 )
                 return True
             issues = result.get("issues") or [result.get("error") or "plan invalid"]
-            # Surface full gate reasons in the sheet (schema, not one vague word)
+            err = str(result.get("error") or "")
+            host_state = bool(result.get("host_state")) or any(
+                "not active" in str(i).lower()
+                or "host state" in str(i).lower()
+                or "no open goal" in str(i).lower()
+                for i in issues
+            ) or "not active" in err.lower() or "no open goal" in err.lower()
             detail = "; ".join(str(i) for i in issues[:6])
+            path = result.get("path") or gt.plan_path or ""
+            if host_state:
+                # Do NOT loop re-plan — that was the Esc/pause friction disaster
+                self.output.text(
+                    f"\n*Plan accept blocked* (host state, not schema) — {detail}\n"
+                    f"  path: `{path}`\n"
+                    "  Use `/goal resume` (or start `/goal …` again), then continue.\n"
+                )
+                self.sync_goal_ui()
+                return False
+            # Real quality failures → re-plan with schema
             self.output.text(
                 f"\n*Plan rejected* (schema/quality gate) — {detail}\n"
-                f"  path: `{result.get('path') or gt.plan_path or ''}`\n"
+                f"  path: `{path}`\n"
                 "  Host re-sends full plan.md schema to the planner.\n"
             )
             from . import goal_prompts
@@ -4435,10 +4467,6 @@ class Session:
         if getattr(self, "_goal_verify_turn", False):
             self._goal_verify_turn = False
             return self._goal_finish_verify_cycle()
-
-        if getattr(self, "_goal_skip_continue_once", False):
-            self._goal_skip_continue_once = False
-            return False
 
         try:
             self._goal_refresh_tokens()

@@ -202,7 +202,8 @@ class GoalTracker:
     continue_count: int = 0
     continue_max: int = DEFAULT_CONTINUE_MAX
     plan_path: str = ""
-    plan_body: str = ""  # host-owned plan markdown (contract)
+    plan_body: str = ""  # host-owned plan markdown (live checklist marks)
+    plan_baseline: str = ""  # immutable AC/VS/items text at accept
     history: List[GoalEvent] = field(default_factory=list)
     created_at: float = 0.0
 
@@ -337,16 +338,48 @@ class GoalTracker:
         self.continue_count = 0
         self.plan_path = plan_path or ""
         self.plan_body = ""
+        self.plan_baseline = ""
         self.created_at = time.time()
         self.history = []
         self._push("goal_created", obj[:200])
         self._push("planning_started", self.goal_id)
 
     def accept_plan(self, plan_md: str, plan_path: str = "") -> Dict[str, Any]:
-        """Host materializes plan → executing. Returns ok/error dict."""
+        """Host freezes plan contract → executing. Returns ok/error dict.
+
+        ``plan_baseline`` is an immutable copy of AC/verification/checklist text.
+        Disk plan.md may only flip checklist ``[x]`` marks thereafter.
+
+        If the goal is merely user/infra-paused mid-planning (Esc during plan
+        write), auto-resume so a valid plan.md is not stuck in a re-plan loop.
+        """
         body = (plan_md or "").strip()
-        if not self.is_open() or not self.is_active():
-            return {"ok": False, "error": "No active goal to accept plan for."}
+        if not self.is_open():
+            return {
+                "ok": False,
+                "error": "No open goal to accept plan for (cleared or never /goal).",
+                "host_state": True,
+            }
+        if not self.is_active():
+            # Esc pauses to user_paused + phase idle while planner still wrote plan.md
+            if self.status in ("user_paused", "infra_paused") and not self.has_plan():
+                self.resume()
+            elif self.status in ("user_paused", "infra_paused") and self.phase in (
+                    "planning", "idle"):
+                # Mid-plan pause: resume into planning then accept elevates to executing
+                self.resume()
+            if not self.is_active():
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Goal is {self.status}, not active — "
+                        f"/goal resume before accept (not a plan schema error)."
+                    ),
+                    "host_state": True,
+                    "issues": [
+                        f"host state: goal {self.status}; /goal resume",
+                    ],
+                }
         try:
             from .goal_plan import plan_has_required_sections
         except ImportError:
@@ -358,9 +391,9 @@ class GoalTracker:
                 "(## Acceptance criteria, ## Verification plan).",
             }
         try:
-            from .goal_plan import plan_quality_issues
+            from .goal_plan import plan_quality_issues, write_plan_baseline
         except ImportError:
-            from goal_plan import plan_quality_issues  # type: ignore
+            from goal_plan import plan_quality_issues, write_plan_baseline  # type: ignore
         quality = plan_quality_issues(body, self.objective)
         if quality:
             return {
@@ -368,13 +401,24 @@ class GoalTracker:
                 "error": "Plan rejected: " + "; ".join(quality[:4]),
                 "issues": quality,
             }
-        self.plan_body = body if body.endswith("\n") else body + "\n"
+        frozen = body if body.endswith("\n") else body + "\n"
+        self.plan_body = frozen
+        self.plan_baseline = frozen
         if plan_path:
             self.plan_path = plan_path
+            try:
+                write_plan_baseline(plan_path, frozen)
+            except Exception:
+                pass
         self.phase = "executing"
-        self.message = "Plan accepted — executing"
+        self.message = "Plan accepted — contract frozen"
         self._push("plan_accepted", (self.plan_path or "in-memory")[:200])
-        return {"ok": True, "phase": self.phase, "plan_path": self.plan_path}
+        return {
+            "ok": True,
+            "phase": self.phase,
+            "plan_path": self.plan_path,
+            "baseline": True,
+        }
 
     def clear(self) -> None:
         self._push("goal_cleared", self.goal_id)
@@ -396,6 +440,7 @@ class GoalTracker:
         self.continue_count = 0
         self.plan_path = ""
         self.plan_body = ""
+        self.plan_baseline = ""
 
     def pause(self, reason: str = "user", message: str = "") -> None:
         if not self.is_open():
@@ -407,8 +452,12 @@ class GoalTracker:
             "infra": "infra_paused",
         }
         self.status = status_map.get(reason, "user_paused")
-        # Preserve whether we had a plan so resume returns to correct phase
-        self.phase = "idle"
+        # Remember plan vs no-plan so resume re-enters the right phase.
+        # Do NOT wipe planning → idle in a way that loses "still need plan".
+        if self.has_plan():
+            self.phase = "idle"
+        else:
+            self.phase = "planning"
         self.pause_message = (message or "").strip()
         self.pending_completed_message = None
         self._push("goal_paused", f"{self.status}: {self.pause_message}"[:200])
@@ -435,6 +484,7 @@ class GoalTracker:
         # Drop plan contract so stale plans are not treated as still active
         self.plan_body = ""
         self.plan_path = ""
+        self.plan_baseline = ""
         self._push("goal_completed", self.message[:200])
 
     def set_tokens_used(self, absolute_tokens: int) -> None:
@@ -533,7 +583,12 @@ class GoalTracker:
                 from .goal_plan import complete_claim_preflight
             except ImportError:
                 from goal_plan import complete_claim_preflight  # type: ignore
-            pre = complete_claim_preflight(claim, self.plan_body, self.objective)
+            pre = complete_claim_preflight(
+                claim,
+                self.plan_body,
+                self.objective,
+                plan_baseline=self.plan_baseline or self.plan_body,
+            )
             if pre:
                 self._push("complete_rejected_preflight", pre[0][:200])
                 return {
@@ -655,13 +710,51 @@ class GoalTracker:
             except ImportError:
                 from goal_plan import complete_claim_preflight  # type: ignore
             claim = (message or self.message or "").strip()
-            pre = complete_claim_preflight(claim, self.plan_body, self.objective)
+            pre = complete_claim_preflight(
+                claim,
+                self.plan_body,
+                self.objective,
+                plan_baseline=self.plan_baseline or self.plan_body,
+            )
             if pre:
                 achieved = False
                 gp = gp + [f"Host: {p}" for p in pre[:4]]
         else:
             if not gp:
                 gp = ["not achieved (tool)"]
+        # One verify run, one decisive verdict. Do not let a later soft
+        # not_achieved (or empty re-call) overwrite a stronger achieved.
+        prev = self.pending_tool_verdict
+        if prev and prev.get("achieved") and not achieved:
+            self._push(
+                "tool_verdict_ignored",
+                f"keep achieved; ignore later not_achieved gaps={len(gp)}",
+            )
+            return {
+                "ok": True,
+                "recorded": False,
+                "deduped": True,
+                "achieved": True,
+                "evidence_count": len(prev.get("evidence") or []),
+                "gaps": list(prev.get("gaps") or []),
+                "message": (
+                    "Prior achieved verdict already recorded this verify run; "
+                    "later not_achieved ignored."
+                ),
+            }
+        if prev and prev.get("achieved") and achieved:
+            # Keep the richer evidence set
+            if len(ev) < len(prev.get("evidence") or []):
+                self._push("tool_verdict_ignored", "keep earlier achieved with more evidence")
+                return {
+                    "ok": True,
+                    "recorded": False,
+                    "deduped": True,
+                    "achieved": True,
+                    "evidence_count": len(prev.get("evidence") or []),
+                    "gaps": [],
+                    "message": "Earlier achieved verdict with more evidence kept.",
+                }
         self.pending_tool_verdict = {
             "achieved": bool(achieved),
             "evidence": ev,
@@ -809,12 +902,31 @@ class GoalTracker:
         g.continue_count = int(data.get("continue_count") or 0)
         g.plan_path = str(data.get("plan_path") or "")
         g.plan_body = str(data.get("plan_body") or "")
+        g.plan_baseline = str(data.get("plan_baseline") or "")
         g.created_at = float(data.get("created_at") or 0)
-        # Reload plan body from disk if path set and body empty
+        # Prefer immutable baseline file over plan.md (plan.md is agent-writable)
+        if g.plan_path and not g.plan_baseline:
+            try:
+                from .goal_plan import plan_baseline_path
+            except ImportError:
+                from goal_plan import plan_baseline_path  # type: ignore
+            bp = plan_baseline_path(g.plan_path)
+            if bp and os.path.isfile(bp):
+                try:
+                    with open(bp, "r", encoding="utf-8") as f:
+                        g.plan_baseline = f.read()
+                except Exception:
+                    pass
+        if not g.plan_body and g.plan_baseline:
+            g.plan_body = g.plan_baseline
+        # Never rehydrate contract solely from plan.md (manipulated AC disaster).
+        # If only plan.md exists without baseline, load it but also freeze it.
         if g.plan_path and not g.plan_body and os.path.isfile(g.plan_path):
             try:
                 with open(g.plan_path, "r", encoding="utf-8") as f:
                     g.plan_body = f.read()
+                if not g.plan_baseline:
+                    g.plan_baseline = g.plan_body
             except Exception:
                 pass
         hist = []

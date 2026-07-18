@@ -95,8 +95,13 @@ Your job this turn:
    On reject you get each issue + this schema again — fix the file, do not
    invent a different structure.
 
-Ban: generic templates; single vague criterion; verification without a command
-or path check; restating the objective as the only content.
+Host FREEZES the accepted plan as an immutable contract (plan.baseline.md).
+Rewriting Acceptance criteria / Verification after accept is IGNORED and
+cannot unlock complete. Only checklist ``[x]`` marks may change on disk.
+
+Ban: generic templates; single vague criterion; verification that is only
+``test -f`` on a marker you just wrote; restating the objective as the only
+content; meta "prove the harness works" plans when the objective is real work.
 </goal-planning>
 """
 
@@ -137,10 +142,11 @@ def implementer_kickoff(tracker: "GoalTracker") -> str:
         "Execute it.\n"
         + "As you finish work, flip checklist boxes in the plan file on disk "
         f"(`{getattr(tracker, 'plan_path', '') or 'plan.md'}`): change "
-        "`- [ ]` to `- [x]`. Host re-reads that file on complete — open boxes "
-        "block update_goal(completed=true).\n"
-        + "Claim complete only with full-objective evidence. Host then runs a "
-        "host-spawned skeptic subagent that must call goal_verdict "
+        "`- [ ]` to `- [x]`. Host merges ONLY checkbox marks — rewriting "
+        "Acceptance criteria / Verification plan on disk is a no-op and a "
+        "manipulated plan cannot unlock complete.\n"
+        + "Claim complete only with full-objective evidence against the FROZEN "
+        "contract. Host then runs Task-mode verification requiring goal_verdict "
         "(prose alone cannot unlock).\n"
     )
 

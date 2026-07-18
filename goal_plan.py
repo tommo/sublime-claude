@@ -42,16 +42,16 @@ def plan_schema_for_prompt() -> str:
 Required ## headings (case-insensitive OK; body must use these names):
   ## Acceptance criteria   — ≥2 numbered/bulleted criteria
   ## Verification plan     — ≥2 numbered/bulleted checks
-Strongly recommended:
-  ## Task checklist        — `- [ ]` items the implementer flips to `[x]`
+  ## Task checklist        — ≥2 `- [ ]` items (item text frozen at accept)
 
-Each acceptance criterion MUST name at least one concrete artifact, e.g.:
-  - absolute or repo path (`/…/foo`, `src/…`, `.claude/goals/<id>/…`)
-  - command (`pytest …`, `rg …`, `test -f …`, `git status`)
-  - file/test/module/UI surface
+Each acceptance criterion MUST name a concrete artifact tied to the OBJECTIVE:
+  - path / module / command / test / UI — not only a goal-dir marker
 
-Each verification step MUST be an executable or inspectable check (command,
-path exists, file contents), not "make sure it works".
+Verification: ≥1 step must be substantive (pytest/rg/content/command exit),
+not only `test -f` on a file the implementer just created.
+
+HOST FREEZE: accept writes plan.baseline.md. Disk may only flip checklist [x].
+Rewriting AC/Verification after accept is IGNORED and cannot unlock complete.
 
 Minimal valid example (copy structure; replace with THIS objective):
 
@@ -59,22 +59,23 @@ Minimal valid example (copy structure; replace with THIS objective):
 # Plan: <objective>
 
 ## Acceptance criteria
-1. **Artifact**: path/to/output exists with expected content.
-2. **Check**: `command that proves done` exits 0 (or documented success).
+1. **Artifact**: path/to/shipped thing for <objective>
+2. **Proof**: `pytest path` (or real command) exits 0; log under evidence/
 
 ## Verification plan
-1. `gating`: run that command; require exit 0.
-2. `gating`: read/assert the artifact path/content.
+1. `gating`: run that test/command; require exit 0; save log
+2. `gating`: `rg`/read asserts the artifact still matches AC
 
 ## Task checklist
-- [ ] Create the artifact
-- [ ] Run verification and capture log
+- [ ] Implement the artifact for the objective
+- [ ] Run verification and capture evidence
 ```
 
 Reject reasons you will see if the gate fails:
-  - missing required ## sections
-  - fewer than 2 acceptance criteria or verification steps
-  - criteria/steps with no concrete path/command/artifact
+  - missing required ## sections or checklist
+  - fewer than 2 AC / verification / checklist items
+  - soft-only existence checks / no concrete path-command
+  - objective keywords missing (easy meta-plan)
   - generic host template / objective-only restatement
 """
 
@@ -156,13 +157,162 @@ def plan_quality_issues(plan_md: str, objective: str = "") -> List[str]:
             "verification steps need a concrete check in at least one line "
             "(`pytest`/`rg`/`test -f`/path to read, etc.)"
         )
+    # Easy-path theater: every check is only "file exists" under the goal dir
+    if vs and not _has_substantive_verification(vs):
+        issues.append(
+            "verification plan is too soft — at least one step must run a real "
+            "check (tests, grep content, command exit, not only test -f on a "
+            "marker the implementer just wrote)"
+        )
+    # Checklist required so complete cannot soft-pass with zero tracked work
+    cl = open_checklist_items(body)
+    checked = _checked_checklist_count(body)
+    if len(cl) + checked < 2:
+        issues.append(
+            "need ≥2 Task checklist items (`- [ ]` / `- [x]`) under "
+            "`## Task checklist` — host freezes the list at accept"
+        )
     obj = (objective or "").strip()
     if obj and body.count(obj) >= 5 and len(body) < len(obj) * 8:
         issues.append(
             "plan only restates the objective — expand into real steps "
             "with paths/commands"
         )
+    # North-star at accept: multi-token objectives must appear in AC/plan body
+    if obj:
+        dilute = _objective_dilution_issue(obj, body, ac)
+        if dilute:
+            issues.append(dilute)
     return issues
+
+
+def _checked_checklist_count(plan_md: str) -> int:
+    n = 0
+    for line in (plan_md or "").splitlines():
+        if re.match(r"^\s*[-*]\s*\[[xX]\]\s+\S", line):
+            n += 1
+    return n
+
+
+def _has_substantive_verification(steps: List[str]) -> bool:
+    """True if ≥1 step is more than a trivial existence check on a fresh marker."""
+    soft_only = re.compile(
+        r"^\s*(`?gating`?:)?\s*"
+        r"(`?test\s+-f\b|`?ls\b|`?stat\b|exists?|file\s+exists|"
+        r"path\s+exists|marker\s+exists|demo_ok)",
+        re.I,
+    )
+    strong = re.compile(
+        r"("
+        r"pytest|unittest|cargo\s+test|npm\s+test|go\s+test|"
+        r"\brg\b|\bgrep\b|diff\b|git\s+status|git\s+diff|"
+        r"exit\s*0|must\s+(pass|fail|match|contain)|"
+        r"content|stdout|assert|pil\s+load|compile"
+        r")",
+        re.I,
+    )
+    if not steps:
+        return False
+    if any(strong.search(s or "") for s in steps):
+        return True
+    # All soft existence checks → fail
+    if all(soft_only.search(s or "") or len((s or "").strip()) < 12 for s in steps):
+        return False
+    # Mixed non-strong but not all soft-only — allow
+    return True
+
+
+def _objective_tokens(objective: str) -> List[str]:
+    stop = {
+        "with", "that", "this", "from", "into", "using", "make", "have",
+        "will", "should", "would", "could", "just", "only", "more", "like",
+        "level", "close", "full", "real", "dont", "don't", "read", "file",
+        "code", "demo", "goal", "flow", "work", "test", "tests", "please",
+    }
+    tokens = []
+    seen = set()
+    for t in re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{3,}", objective or ""):
+        tl = t.lower()
+        if tl in stop or tl in seen:
+            continue
+        seen.add(tl)
+        tokens.append(tl)
+    return tokens[:12]
+
+
+def _objective_dilution_issue(
+    objective: str, plan_md: str, ac: List[str],
+) -> Optional[str]:
+    uniq = _objective_tokens(objective)
+    if len(uniq) < 2:
+        return None
+    blob = ("\n".join(ac) + "\n" + (plan_md or "")).lower()
+    hits = sum(1 for t in uniq if t in blob)
+    if hits < max(1, len(uniq) // 3):
+        return (
+            "plan barely mentions objective keywords — refuse easy meta-plans "
+            "that ignore the north-star (rewrite AC/verification for THIS objective)"
+        )
+    return None
+
+
+def plan_contract_integrity(
+    frozen_plan: str,
+    current_plan: str,
+) -> List[str]:
+    """Detect AC/verification thinning vs the frozen accepted contract.
+
+    Empty list = OK. Used at complete/verdict so a rewritten plan.md cannot
+    replace the host contract.
+    """
+    issues: List[str] = []
+    frozen = frozen_plan or ""
+    current = current_plan or frozen
+    fac = extract_acceptance_criteria(frozen)
+    cac = extract_acceptance_criteria(current)
+    fvs = extract_verification_steps(frozen)
+    cvs = extract_verification_steps(current)
+    if len(cac) < len(fac):
+        issues.append(
+            f"acceptance criteria thinned ({len(fac)} frozen → {len(cac)} now) — "
+            "host uses frozen contract; rewrite is ignored"
+        )
+    if len(cvs) < len(fvs):
+        issues.append(
+            f"verification steps thinned ({len(fvs)} frozen → {len(cvs)} now)"
+        )
+    # Frozen AC lines must still be present (normalized) in current body
+    cur_blob = current.lower()
+    missing = []
+    for line in fac:
+        key = re.sub(r"\s+", " ", (line or "").strip().lower())[:80]
+        if key and key not in cur_blob and key[:40] not in cur_blob:
+            missing.append(line[:60])
+    if missing:
+        issues.append(
+            "frozen acceptance criteria missing from plan body: "
+            + "; ".join(missing[:2])
+        )
+    return issues
+
+
+def plan_baseline_path(plan_path: str) -> str:
+    """Immutable sibling of plan.md written at accept."""
+    path = (plan_path or "").strip()
+    if not path:
+        return ""
+    root, base = os.path.split(path)
+    if base.lower() == "plan.md":
+        return os.path.join(root, "plan.baseline.md")
+    return path + ".baseline"
+
+
+def write_plan_baseline(plan_path: str, plan_md: str) -> str:
+    """Write immutable baseline next to plan.md; return path or ''."""
+    bpath = plan_baseline_path(plan_path)
+    if not bpath:
+        return ""
+    return write_plan_file(bpath, plan_md)
 
 
 def sample_concrete_plan(
@@ -456,17 +606,19 @@ def complete_claim_preflight(
     claim: str,
     plan_md: str,
     objective: str = "",
+    *,
+    plan_baseline: str = "",
 ) -> List[str]:
     """Host gates before scheduling verification. Empty list = may proceed.
 
     Blocks soft-complete theater: open checklist items, partial/deferral claim
-    language, and plans that drop the north-star objective without concrete
-    criteria still covering it.
+    language, diluted north-star, and thinned contracts vs frozen baseline.
     """
     issues: List[str] = []
     claim = (claim or "").strip()
     plan_md = plan_md or ""
     objective = (objective or "").strip()
+    baseline = (plan_baseline or "").strip() or plan_md
 
     partial = partial_claim_language(claim)
     if partial:
@@ -483,41 +635,20 @@ def complete_claim_preflight(
             f"{len(open_items)} open checklist item(s) remain: {preview}{more}"
         )
 
-    # North star: acceptance criteria must still engage the objective wording
-    # (or the plan body must still state the objective as the goal).
-    if objective:
-        ac = extract_acceptance_criteria(plan_md)
-        obj_l = objective.lower()
-        # Significant tokens from objective (len>=4) should appear in criteria/plan
-        tokens = [
-            t for t in re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{3,}", objective)
-            if t.lower() not in {
-                "with", "that", "this", "from", "into", "using", "make",
-                "have", "will", "should", "would", "could", "just", "only",
-                "more", "like", "level", "close", "full", "real",
-            }
-        ]
-        # Use unique lower tokens, cap
-        seen = set()
-        uniq = []
-        for t in tokens:
-            tl = t.lower()
-            if tl not in seen:
-                seen.add(tl)
-                uniq.append(tl)
-        uniq = uniq[:12]
-        if uniq:
-            blob = ("\n".join(ac) + "\n" + plan_md).lower()
-            hits = sum(1 for t in uniq if t in blob)
-            # If objective is multi-token ambition and almost none appear in plan, reject complete
-            if len(uniq) >= 3 and hits < max(2, len(uniq) // 3):
-                issues.append(
-                    "plan/criteria barely mention objective keywords — "
-                    "north-star objective was diluted; re-plan or finish full scope"
-                )
+    # Integrity vs frozen baseline (manipulated plan.md is a disaster)
+    if baseline.strip() and plan_md.strip():
+        issues.extend(plan_contract_integrity(baseline, plan_md))
 
-    # Quality re-check on frozen plan
-    issues.extend(plan_quality_issues(plan_md, objective))
+    if objective:
+        ac = extract_acceptance_criteria(baseline or plan_md)
+        dilute = _objective_dilution_issue(objective, baseline or plan_md, ac)
+        if dilute:
+            issues.append(
+                dilute.replace("rewrite AC", "north-star diluted at complete")
+            )
+
+    # Quality re-check on frozen baseline (not a thinned disk rewrite)
+    issues.extend(plan_quality_issues(baseline or plan_md, objective))
     return issues
 
 
