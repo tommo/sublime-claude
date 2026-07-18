@@ -1372,6 +1372,24 @@ class OutputView:
                         message=msg, completed=completed, blocked_reason=blocked)
                 except Exception as e:
                     print(f"[Claude] update_goal drain: {e}")
+        elif name == "goal_verdict" or (
+                isinstance(name, str) and name.endswith("goal_verdict")):
+            sess = None
+            try:
+                from . import claude_code
+                sess = claude_code.get_session_for_view(self.view) if self.view else None
+            except Exception:
+                sess = None
+            if sess is not None and hasattr(sess, "apply_goal_verdict"):
+                try:
+                    sess.apply_goal_verdict(
+                        achieved=tool_input.get("achieved") is True,
+                        evidence=tool_input.get("evidence"),
+                        gaps=tool_input.get("gaps"),
+                        message=(tool_input.get("message") or "").strip(),
+                    )
+                except Exception as e:
+                    print(f"[Claude] goal_verdict drain: {e}")
 
         self._render_current()
 
@@ -3228,14 +3246,12 @@ class OutputView:
             if _hint:
                 lines.append(f"  {_hint}\n")
 
-        # Adaptive Work strip: Goal (north star) + Tasks (steps) as one block.
-        # Distinct line prefixes → different colors via ClaudeOutput.sublime-syntax
-        # (claude.goal.* vs claude.task.*). No dual ───── banners.
+        # Adaptive Work strip: Goal (north star, ◆) + Tasks (▸/○) as one block.
+        # Distinct from composer ◎. Colors: ClaudeOutput.sublime-syntax.
         #
-        # Goal is sticky on the *live* conversation (working or idle after @done)
-        # so status stays visible between user turns. prompt() strips goal from
-        # the prior region before freezing history — otherwise every submit and
-        # host phase-switch left a permanent "◎ goal ·" corpse in the buffer.
+        # Goal is sticky on the *live* conversation (working or idle after @done).
+        # prompt() clears goal from the prior region before freeze — otherwise
+        # every submit / phase-switch left a permanent "◆ goal ·" corpse.
         # Tasks stay working-only so @done history has no task-list corpse.
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
@@ -3292,49 +3308,34 @@ class OutputView:
         if show_goal or show_tasks:
             lines.append("\n")
             if show_goal:
-                st = goal.status
-                if goal.verifying or goal.phase == "verifying":
-                    glabel = "verifying"
-                elif goal.planning or goal.phase == "planning":
-                    glabel = "planning"
-                elif st == "blocked":
-                    glabel = "blocked"
-                elif st == "budget_limited":
-                    glabel = "budget"
-                elif st in ("user_paused", "infra_paused"):
-                    glabel = "paused"
-                elif st == "active":
-                    glabel = "active"
-                else:
-                    glabel = st
-                body = (
-                    goal.pause_message
-                    or goal.blocked_reason
-                    or goal.message
-                    or goal.objective
-                    or ""
+                try:
+                    from .goal_tracker import format_goal_strip_line
+                except ImportError:
+                    from goal_tracker import format_goal_strip_line  # type: ignore
+                # Compact when todo steps already fill the work strip
+                gline = format_goal_strip_line(
+                    status=goal.status or "",
+                    phase=goal.phase or "",
+                    message=goal.message or "",
+                    objective=goal.objective or "",
+                    pause_message=goal.pause_message or "",
+                    blocked_reason=goal.blocked_reason or "",
+                    gaps=list(goal.gaps or []),
+                    token_budget=goal.token_budget,
+                    tokens_used=goal.tokens_used,
+                    verify_runs=int(goal.verify_runs or 0),
+                    verify_max=int(goal.verify_max or 0),
+                    compact=bool(show_tasks),
                 )
-                gline = "  ◎ goal · {}".format(glabel)
-                if goal.objective and body != goal.objective:
-                    gline += "  {}".format(
-                        goal.objective.replace("\n", " ").strip()[:80])
-                if body:
-                    gline += "  — {}".format(body.replace("\n", " ").strip()[:100])
-                extra = []
-                if goal.token_budget:
-                    extra.append("~{}/{}".format(
-                        goal.tokens_used or 0, goal.token_budget))
-                if goal.verify_runs:
-                    extra.append("verify {}/{}".format(
-                        goal.verify_runs, goal.verify_max or "?"))
-                if extra:
-                    gline += "  ({})".format(" · ".join(extra))
                 lines.append(gline + "\n")
             if show_tasks:
                 for todo in show:
                     # ▸ active (warm) vs ○ pending (dim) — not the goal glyph.
                     icon = "▸" if _todo_is_active(todo) else "○"
-                    lines.append("  {} {}\n".format(icon, todo.content))
+                    content = (todo.content or "").replace("\n", " ").strip()
+                    if len(content) > 72:
+                        content = content[:71] + "…"
+                    lines.append("  {} {}\n".format(icon, content))
                 if hidden > 0:
                     lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
                 elif expanded:

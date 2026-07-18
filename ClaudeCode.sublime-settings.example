@@ -8,6 +8,9 @@
     // If not set, defaults to SDK default (sonnet)
     "default_model": "opus",
 
+    // Service Manager base URL for "with XXX…" usage rows (Grok/Kimi)
+    // "quota_service_url": "http://127.0.0.1:3001",
+
     // Default provider (backend) for a bare "New Session". Defaults to "claude"
     // (official Anthropic). Set to a built-in (codex/copilot/pi/dsr/grok) or a custom
     // provider key from custom_providers. Set via "Claude: Set Default Provider".

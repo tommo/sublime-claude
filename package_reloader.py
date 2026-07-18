@@ -108,6 +108,24 @@ def reload_package(pkg_name: str = PKG, dummy: bool = True, verbose: bool = True
             dprint(f"dummy package: {e}")
 
     n_after = len(package_modules(pkg_name))
+    # 5) Ensure MCP socket is up — plugin_unloaded stopped it; if ST did not
+    # re-run plugin_loaded (or dropped the race), goal_verdict/update_goal eval
+    # dies with "name 'goal_verdict' is not defined" / no server.
+    mcp_started = False
+    try:
+        import importlib
+        mcp_mod = sys.modules.get(f"{pkg_name}.mcp_server") or importlib.import_module(
+            f"{pkg_name}.mcp_server")
+        if getattr(mcp_mod, "_server", None) is None:
+            mcp_mod.start()
+            mcp_started = True
+            if verbose:
+                dprint("mcp_server.start() after soft reload")
+        elif verbose:
+            dprint("mcp_server already running")
+    except Exception as e:
+        dprint(f"mcp_server restart failed: {e}")
+
     if verbose:
         dprint(f"end soft reload — {n_after} module(s)", "-" * 40)
 
@@ -117,6 +135,7 @@ def reload_package(pkg_name: str = PKG, dummy: bool = True, verbose: bool = True
         "unloaded": len(modules),
         "reloaded_plugins": loaded,
         "modules_after": n_after,
+        "mcp_started": mcp_started,
     }
 
 

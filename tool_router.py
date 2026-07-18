@@ -107,6 +107,14 @@ def create_sublime_router() -> ToolRouter:
         f"completed={bool(args.get('completed', False))!r}, "
         f"blocked_reason={args.get('blocked_reason', '')!r})")
 
+    # Structured skeptic verdict (verify phase) — preferred over prose parse
+    router.register("goal_verdict", lambda args:
+        f"return goal_verdict("
+        f"achieved={bool(args.get('achieved', False))!r}, "
+        f"evidence={args.get('evidence')!r}, "
+        f"gaps={args.get('gaps')!r}, "
+        f"message={args.get('message', '')!r})")
+
     # Plugin self-debug (agent ↔ live Sublime)
     router.register("debug_ping", simple_call_handler("debug_ping"))
     router.register("debug_sessions", simple_call_handler("debug_sessions"))

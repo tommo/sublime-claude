@@ -367,6 +367,7 @@ class MCPSocketServer:
             "read_profile_doc": self._read_profile_doc,
             "quick_done": self._quick_done,
             "update_goal": self._update_goal,
+            "goal_verdict": self._goal_verdict,
             # Terminal tools (our own PTY terminal)
             "terminal_list": self._terminal_list,
             "terminal_send": self._terminal_send,
@@ -993,6 +994,62 @@ class MCPSocketServer:
             message=message or "",
             completed=bool(completed),
             blocked_reason=blocked_reason or "",
+        )
+
+    def _goal_verdict(
+        self,
+        achieved: bool = False,
+        evidence=None,
+        gaps=None,
+        message: str = "",
+    ) -> dict:
+        """Structured verifier verdict (verify phase only).
+
+        Host-spawned skeptic subsessions call this tool; the verdict is always
+        applied on the parent implementer session's GoalTracker (never on the
+        child's empty tracker).
+        """
+        session = None
+        view_id = getattr(self, "_caller_view_id", None)
+        if view_id is not None and hasattr(sublime, "_claude_sessions"):
+            session = sublime._claude_sessions.get(view_id)
+        if session is None:
+            window = self._get_window()
+            if window:
+                vid = window.settings().get("claude_executing_view")
+                if vid is not None and hasattr(sublime, "_claude_sessions"):
+                    session = sublime._claude_sessions.get(vid)
+        # Route skeptic → parent goal owner
+        if session is not None and hasattr(sublime, "_claude_sessions"):
+            try:
+                from .goal_skeptic import resolve_verdict_session
+            except ImportError:
+                from goal_skeptic import resolve_verdict_session  # type: ignore
+            owner = resolve_verdict_session(session, sublime._claude_sessions)
+            if owner is None and session is not None:
+                try:
+                    from .goal_skeptic import is_goal_skeptic
+                except ImportError:
+                    from goal_skeptic import is_goal_skeptic  # type: ignore
+                if is_goal_skeptic(session):
+                    return {
+                        "ok": False,
+                        "error": "Skeptic parent session not found; cannot record verdict.",
+                        "rejected": True,
+                    }
+            if owner is not None:
+                session = owner
+        if session is None or not hasattr(session, "apply_goal_verdict"):
+            return {
+                "ok": False,
+                "error": "No session for goal_verdict.",
+                "rejected": True,
+            }
+        return session.apply_goal_verdict(
+            achieved=bool(achieved),
+            evidence=evidence,
+            gaps=gaps,
+            message=message or "",
         )
 
     # ─── Session Spawn ────────────────────────────────────────────────────

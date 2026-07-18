@@ -187,6 +187,48 @@ def _goal_is_open(goal: Optional["GoalState"]) -> bool:
     )
 
 
+def goal_strip_label(goal: Optional["GoalState"]) -> str:
+    """Human phase label for sticky ◎ goal strip + status chip."""
+    if not goal:
+        return ""
+    try:
+        from .goal_tracker import ui_phase_label
+    except ImportError:
+        from goal_tracker import ui_phase_label  # type: ignore
+    phase = goal.phase or ""
+    if goal.verifying:
+        phase = "verifying"
+    elif goal.planning and phase != "verifying":
+        phase = "planning"
+    return ui_phase_label(
+        status=goal.status or "",
+        phase=phase,
+        gaps=list(goal.gaps or []),
+    )
+
+
+def goal_strip_body(goal: Optional["GoalState"]) -> str:
+    """Secondary text for the strip: claim, pause, or first verify gaps."""
+    if not goal:
+        return ""
+    try:
+        from .goal_tracker import ui_phase_body
+    except ImportError:
+        from goal_tracker import ui_phase_body  # type: ignore
+    phase = goal.phase or ""
+    if goal.verifying:
+        phase = "verifying"
+    return ui_phase_body(
+        status=goal.status or "",
+        phase=phase,
+        message=goal.message or "",
+        objective=goal.objective or "",
+        pause_message=goal.pause_message or "",
+        blocked_reason=goal.blocked_reason or "",
+        gaps=list(goal.gaps or []),
+    )
+
+
 @dataclass
 class Conversation:
     """A single prompt + tools + response + meta."""

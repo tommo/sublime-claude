@@ -333,9 +333,10 @@ BACKENDS: Dict[str, BackendSpec] = {
         label="Kimi Code",
         abbrev="KM",
         bridge_script="kimi_main.py",
-        fallback_model="kimi-code/kimi-for-coding",
+        fallback_model="kimi-code/k3",
         default_models=[
-            ("kimi-code/kimi-for-coding", "K2.7 Coding (default)"),
+            ("kimi-code/k3", "K3"),
+            ("kimi-code/kimi-for-coding", "K2.7 Coding"),
             ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
         ],
         available=_kimi_available,
@@ -425,18 +426,56 @@ BACKENDS: Dict[str, BackendSpec] = {
 }
 
 
+# Collision notices are hot-path (all_backends is called often). Log once per key.
+_collision_notices: set = set()
+
+
 def all_backends() -> Dict[str, "BackendSpec"]:
     """All usable backends: built-ins (BACKENDS) + user custom_providers.
 
-    Custom providers override built-ins on name collision (rare; lets a user
-    replace a built-in's config). Fresh-merged on every call so UI and session
-    start always see the latest settings.
+    Built-ins always win on name collision (e.g. native ACP ``kimi`` must not be
+    replaced by settings.custom_providers.kimi Anthropic-compat → main.py).
+    Colliding customs are re-homed as ``{name}_api`` so the Moonshot-style entry
+    stays selectable. Fresh-merged on every call.
     """
+    from dataclasses import replace
+
     merged: Dict[str, "BackendSpec"] = dict(BACKENDS)
     try:
-        merged.update(_load_custom_providers())
+        custom = _load_custom_providers()
     except Exception as e:
         print(f"[Claude] failed to load custom providers: {e}")
+        custom = {}
+    for name, spec in custom.items():
+        if name in BACKENDS:
+            alt = f"{name}_api"
+            if alt in merged or alt in BACKENDS:
+                notice = f"skip:{name}:{alt}"
+                if notice not in _collision_notices:
+                    _collision_notices.add(notice)
+                    print(
+                        f"[Claude] custom_providers.{name} skipped: built-in '{name}' "
+                        f"exists and '{alt}' is taken — rename the custom key"
+                    )
+                continue
+            # Keep Anthropic-compat path under a distinct backend name
+            try:
+                merged[alt] = replace(
+                    spec,
+                    name=alt,
+                    label=(spec.label or name) + " (API)",
+                )
+            except Exception:
+                merged[alt] = spec
+            notice = f"remap:{name}:{alt}"
+            if notice not in _collision_notices:
+                _collision_notices.add(notice)
+                print(
+                    f"[Claude] custom_providers.{name} → backend '{alt}' "
+                    f"(built-in '{name}' is {BACKENDS[name].bridge_script})"
+                )
+            continue
+        merged[name] = spec
     return merged
 
 

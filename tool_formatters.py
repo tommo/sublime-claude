@@ -422,6 +422,18 @@ def _update_goal(view: "OutputView", tool: "ToolCall") -> str:
     return f": {msg}" if msg else ": progress"
 
 
+def _goal_verdict(view: "OutputView", tool: "ToolCall") -> str:
+    """Skeptic structured verdict."""
+    inp = tool.tool_input or {}
+    if inp.get("achieved") is True:
+        n = len(inp.get("evidence") or []) if isinstance(inp.get("evidence"), list) else 0
+        return f": achieved (evidence×{n})" if n else ": achieved"
+    gaps = inp.get("gaps") or []
+    if isinstance(gaps, list) and gaps:
+        return f": not_achieved — {gaps[0]}"
+    return ": not_achieved"
+
+
 def _webfetch(view: "OutputView", tool: "ToolCall") -> str:
     return f": {tool.tool_input.get('url', '')}"
 
@@ -523,6 +535,7 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "WebSearch": _websearch,
     "search_tool": _search_tool,
     "update_goal": _update_goal,
+    "goal_verdict": _goal_verdict,
     "WebFetch": _webfetch,
     "Task": _task,
     "NotebookEdit": _notebook_edit,

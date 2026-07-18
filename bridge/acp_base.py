@@ -549,13 +549,18 @@ class AcpBridge(BaseBridge):
             tool_name = self._normalize_tool_name(upd)
             tool_input = self._tool_input_from_update(upd, tool_name)
             tid = upd.get("toolCallId")
-            self._tool_ids_emitted.add(tid)
             if tid:
                 if tool_name and tool_name != "tool":
                     self._tool_names_by_id[tid] = tool_name
                 if tool_input:
                     prev = self._tool_inputs_by_id.get(tid) or {}
                     self._tool_inputs_by_id[tid] = {**prev, **tool_input}
+            # Kimi streams tool_call with empty input before title is useful;
+            # still emit when we have a real name so UI is not "☐ tool".
+            if tool_name == "tool" and not tool_input:
+                # Wait for tool_call_update with title/kind/rawInput
+                return
+            self._tool_ids_emitted.add(tid)
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
@@ -584,20 +589,27 @@ class AcpBridge(BaseBridge):
                 prev = self._tool_inputs_by_id.get(tid) or {}
                 self._tool_inputs_by_id[tid] = {**prev, **enriched}
             if tid not in self._tool_ids_emitted:
-                if enriched or upd.get("rawInput") or upd.get("locations"):
+                # Skip anonymous early stream chunks (Kimi JSON drip without title)
+                if tool_name == "tool" and status not in ("completed", "failed"):
+                    return
+                if (enriched or upd.get("rawInput") or upd.get("locations")
+                        or upd.get("title") or status in ("completed", "failed")):
                     self._tool_ids_emitted.add(tid)
                     send_notification("message", {
                         "type": "tool_use",
                         "id": tid,
                         "name": tool_name,
-                        "input": enriched,
+                        "input": enriched or self._tool_inputs_by_id.get(tid) or {},
                     })
-            elif enriched and status not in ("completed", "failed"):
-                # Enrich open row only (same id → output.tool upserts).
+            elif tool_name != "tool" or (enriched and status not in ("completed", "failed")):
+                # Enrich open row (same id → output.tool upserts). Prefer real name.
+                enrich_name = tool_name
+                if enrich_name == "tool" and tid:
+                    enrich_name = self._tool_names_by_id.get(tid) or "tool"
                 send_notification("message", {
                     "type": "tool_use",
                     "id": tid,
-                    "name": tool_name,
+                    "name": enrich_name,
                     "input": enriched,
                 })
             # Do not re-emit background=True on in_progress — Claude's UI
@@ -1025,19 +1037,40 @@ class AcpBridge(BaseBridge):
                 if mapped:
                     return mapped
 
-        # 3) title only when it looks like a tool id, not human description prose.
-        # Bare: "spawn_subagent", "list_dir". Decorated: "Read `/path`".
-        # Do NOT use first word of "Smoke-test subagent harness" / "Get task output".
+        # 3) title — tool id, decorated prose, or PascalCase agent names (Kimi).
+        # Bare: "spawn_subagent", "list_dir", "TodoList", "AskUserQuestion".
+        # Decorated: "Read `/path`", "Running: grep…", "Asking user questions".
+        # Do NOT use first word of free prose like "Smoke-test subagent harness".
         title = upd.get("title")
         if isinstance(title, str) and title.strip():
             t = title.strip()
             mapped = self._map_agent_tool_id(t)
             if mapped:
                 return mapped
+            # Human-prefixed activity titles (Kimi streams these often)
+            low = t.lower()
+            if low.startswith(("reading ", "read ")):
+                return "Read"
+            if low.startswith(("writing ", "write ", "wrote ")):
+                return "Write"
+            if low.startswith(("editing ", "edit ", "applying ")):
+                return "Edit"
+            if low.startswith(("running:", "running ", "execute ", "executing ")):
+                return "Bash"
+            if low.startswith("asking ") or "question" in low:
+                return "AskUserQuestion"
+            if low.startswith("todo") or "todolist" in low.replace(" ", ""):
+                return "TodoWrite"
             first = t.split()[0].strip("`'\"*")
             mapped = self._map_agent_tool_id(first)
             if mapped:
                 return mapped
+            # PascalCase / CamelCase bare tool id (TodoList, EnterPlanMode, …)
+            if first and first[0].isupper() and first.isascii() and first.isalnum():
+                mapped = self._map_agent_tool_id(first)
+                if mapped:
+                    return mapped
+                return first  # keep agent name; better than anonymous "tool"
             # snake_case / lowercase machine id without map entry
             if first and ("_" in first or first.islower()) and first.isascii():
                 return first

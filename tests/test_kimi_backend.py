@@ -38,17 +38,25 @@ class TestKimiBackendHelpers(unittest.TestCase):
                     self.assertTrue(kimi_backend.kimi_available())
 
     def test_normalize_model_aliases(self):
+        # Wire ids from real kimi config only (K3 + K2.7 family)
+        self.assertEqual(kimi_backend.normalize_model(None), "kimi-code/k3")
+        self.assertEqual(kimi_backend.normalize_model("k3"), "kimi-code/k3")
         self.assertEqual(
-            kimi_backend.normalize_model("coding"),
-            "kimi-code/kimi-for-coding",
-        )
-        self.assertEqual(
-            kimi_backend.normalize_model(None),
+            kimi_backend.normalize_model("k2.7"),
             "kimi-code/kimi-for-coding",
         )
         self.assertEqual(
             kimi_backend.normalize_model("highspeed"),
             "kimi-code/kimi-for-coding-highspeed",
+        )
+        ids = {m[0] for m in kimi_backend.KIMI_MODELS}
+        self.assertEqual(
+            ids,
+            {
+                "kimi-code/k3",
+                "kimi-code/kimi-for-coding",
+                "kimi-code/kimi-for-coding-highspeed",
+            },
         )
 
     def test_resolve_honors_kimi_bin_env(self):

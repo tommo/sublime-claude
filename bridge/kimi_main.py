@@ -43,7 +43,7 @@ except ImportError:
 
 class KimiBridge(AcpBridge):
     BACKEND_NAME = "kimi"
-    DEFAULT_MODEL = "kimi-code/kimi-for-coding"
+    DEFAULT_MODEL = "kimi-code/k3"  # matches kimi default_model / ACP currentValue
     LOG_PATH = os.path.join(
         os.environ.get("TMPDIR")
         or os.environ.get("TEMP")
@@ -68,21 +68,26 @@ class KimiBridge(AcpBridge):
         "agent": "acceptEdits",
         "ask": "default",
     }
+    # Only real wire ids from kimi config + short aliases
     MODEL_ALIASES = {
-        "default": "kimi-code/kimi-for-coding",
-        "kimi": "kimi-code/kimi-for-coding",
-        "coding": "kimi-code/kimi-for-coding",
+        "default": "kimi-code/k3",
+        "k3": "kimi-code/k3",
+        "kimi-code/k3": "kimi-code/k3",
+        "k2.7": "kimi-code/kimi-for-coding",
         "kimi-for-coding": "kimi-code/kimi-for-coding",
-        "highspeed": "kimi-code/kimi-for-coding-highspeed",
         "kimi-code/kimi-for-coding": "kimi-code/kimi-for-coding",
+        "highspeed": "kimi-code/kimi-for-coding-highspeed",
+        "kimi-for-coding-highspeed": "kimi-code/kimi-for-coding-highspeed",
         "kimi-code/kimi-for-coding-highspeed": "kimi-code/kimi-for-coding-highspeed",
     }
     # Prefer ToolKind from ACP; map common titles / ids to Claude formatters.
+    # Kimi often sends PascalCase titles (TodoList) or kind=other without meta.
     TOOL_TO_CANONICAL = {
         "read": "Read",
         "Read": "Read",
         "read_file": "Read",
         "ReadFile": "Read",
+        "ReadMediaFile": "Read",
         "edit": "Edit",
         "Edit": "Edit",
         "search_replace": "Edit",
@@ -99,11 +104,18 @@ class KimiBridge(AcpBridge):
         "glob": "Glob",
         "Glob": "Glob",
         "list_dir": "Glob",
+        "ListDir": "Glob",
         "fetch": "WebFetch",
         "WebFetch": "WebFetch",
         "think": "Think",
         "todo": "TodoWrite",
         "TodoWrite": "TodoWrite",
+        "TodoList": "TodoWrite",
+        "TodoRead": "TodoWrite",
+        "AskUserQuestion": "AskUserQuestion",
+        "ask_user_question": "AskUserQuestion",
+        "EnterPlanMode": "EnterPlanMode",
+        "ExitPlanMode": "ExitPlanMode",
         "update_goal": "update_goal",
         "goal_verdict": "goal_verdict",
     }

@@ -289,9 +289,12 @@ class Session:
         if initial_context:
             self.subsession_id = initial_context.get("subsession_id")
             self.parent_view_id = initial_context.get("parent_view_id")
+            # Host goal skeptic subsession (never owns the goal tracker)
+            self.goal_role = (initial_context.get("goal_role") or "") or None
         else:
             self.subsession_id = None
             self.parent_view_id = None
+            self.goal_role = None
 
         # Persona info (for release on close)
         if profile:
@@ -320,9 +323,14 @@ class Session:
         # Host-owned goal harness (native /goal — all backends)
         from .goal_tracker import GoalTracker
         self.goal_tracker = GoalTracker()
-        self._goal_verify_turn: bool = False  # current turn is skeptic
+        self._goal_verify_turn: bool = False  # legacy same-session flag (unused for host skeptic)
+        self._goal_planning_turn: bool = False  # planner writing plan.md
         self._goal_harness_continue: bool = False  # suppress user-queue steal? no
         self._goal_skip_continue_once: bool = False  # after user interrupt
+        # Verify mode: "task" (in-session Task POC) | "session" (legacy sheet)
+        self._goal_verify_mode: Optional[str] = None
+        self._goal_skeptic_view_id: Optional[int] = None  # legacy sheet only
+        self._goal_verify_awaiting: bool = False
 
         # Composer allowed only after live init/wake — never during restore/sleep.
         # Prevents enter_input_mode from flashing ◎ on package load / ST restart.
@@ -1628,7 +1636,10 @@ class Session:
             self._ensure_idle_input(reason="late interrupt ack")
             return
 
-        # 2. Handle UI for each completion type
+        # 2. Handle UI for each completion type.
+        # If Task-mode verify finish hands off to a new turn (continuation),
+        # we must return before the non-success gate forces working=False.
+        goal_handoff = False
         if completion == "error":
             error_msg = result['error'].get('message', str(result['error'])) if isinstance(result['error'], dict) else str(result['error'])
             # Print to the Sublime console (with backend context) so provider API
@@ -1641,16 +1652,42 @@ class Session:
                 self.output.current.working = False
                 self.output._render_current()
             try:
-                gt = getattr(self, "goal_tracker", None)
-                if gt and gt.is_active():
-                    gt.pause("infra", f"Turn error: {error_msg}"[:200])
-                    self._goal_verify_turn = False
-                    self.sync_goal_ui()
+                # Goal skeptic is a subagent — surface failure to parent, never
+                # pause the (empty) child goal tracker.
+                if self._goal_is_skeptic():
+                    self._goal_notify_parent_skeptic_done(
+                        error=f"Skeptic turn error: {error_msg}"[:200])
+                elif (getattr(self, "_goal_verify_awaiting", False)
+                      and (getattr(self, "_goal_verify_mode", None) or "task") == "task"):
+                    goal_handoff = self._goal_abort_task_verify(
+                        f"Host: verify turn error: {error_msg}"[:180],
+                        message="verify error",
+                    )
+                else:
+                    gt = getattr(self, "goal_tracker", None)
+                    if gt and gt.is_active():
+                        gt.pause("infra", f"Turn error: {error_msg}"[:200])
+                        self._goal_verify_turn = False
+                        self._goal_verify_awaiting = False
+                        self._goal_skeptic_view_id = None
+                        self.sync_goal_ui()
             except Exception:
                 pass
         elif completion == "interrupted":
             self._status("interrupted")
             self.output.interrupted()
+            try:
+                if self._goal_is_skeptic():
+                    self._goal_notify_parent_skeptic_done(
+                        error="Skeptic interrupted")
+                elif (getattr(self, "_goal_verify_awaiting", False)
+                      and (getattr(self, "_goal_verify_mode", None) or "task") == "task"):
+                    goal_handoff = self._goal_abort_task_verify(
+                        "Host: verify turn interrupted",
+                        message="interrupted",
+                    )
+            except Exception:
+                pass
         else:
             self._status("ready")
 
@@ -1684,6 +1721,10 @@ class Session:
             self._pending_retain = None
             self.output.text(f"\n◎ [retain] ▶\n\n")
             self.query(retain_content, display_prompt="[retain context]")
+            return
+
+        # 4b. Goal finish already started the next turn — do not clobber working
+        if goal_handoff:
             return
 
         # 5. GATE: deferred queue only on success — except interrupt keeps
@@ -1735,14 +1776,21 @@ class Session:
             except Exception as e:
                 print(f"[Claude] quick auto-close: {e}")
 
-        # 5. Process plugin-side queued prompts (sticky composer / queue_prompt).
+        # 5a. Task-mode goal verify must close before user queue steals the turn
+        # (otherwise phase stays verifying forever with pending tool verdict).
+        if (getattr(self, "_goal_verify_awaiting", False)
+                and (getattr(self, "_goal_verify_mode", None) or "task") == "task"):
+            if self._goal_on_turn_success():
+                return
+
+        # 5b. Process plugin-side queued prompts (sticky composer / queue_prompt).
         # Keep working=True so the next query() owns the busy state.
         # Does not clear ◎ draft — user may still be typing the next one.
-        # User queue wins over goal harness continuation.
+        # User queue wins over goal harness continuation (after verify closed).
         if self._fire_next_queued():
             return
 
-        # 5b. Host goal harness: verify deferred complete and/or continue.
+        # 5c. Host goal harness: verify deferred complete and/or continue.
         if self._goal_on_turn_success():
             return
 
@@ -4098,7 +4146,13 @@ class Session:
                 "summary": "already applied",
             }
         self._goal_last_update_sig = sig
-        # Verifier turns must not complete the goal via tool
+        # Skeptic subagent / verifier turns must not complete the goal
+        if self._goal_is_skeptic():
+            return {
+                "ok": False,
+                "error": "Goal skeptic cannot call update_goal; use goal_verdict.",
+                "rejected": True,
+            }
         if getattr(self, "_goal_verify_turn", False) and completed:
             return {
                 "ok": False,
@@ -4169,15 +4223,22 @@ class Session:
                 self._ensure_idle_input(reason="goal/resume-done")
                 return
             gt.resume()
-            # Still planning (no plan) → re-materialize host plan before execute
+            # Still planning (no plan) → resume planner, not a fake template plan
             if gt.phase == "planning" or not gt.has_plan():
+                self._goal_planning_turn = True
                 try:
-                    self._goal_materialize_host_plan()
-                except Exception as e:
-                    self.output.text(f"\n*Goal plan re-materialize failed: {e}*\n")
-                    self.sync_goal_ui()
-                    self._ensure_idle_input(reason="goal/resume-plan-fail")
-                    return
+                    from . import goal_plan
+                    if not (gt.plan_path or "").strip():
+                        gt.plan_path = goal_plan.default_plan_path(
+                            self._goal_project_root(), gt.goal_id)
+                except Exception:
+                    pass
+                self.sync_goal_ui()
+                self.query(
+                    goal_prompts.planner_kickoff(gt, plan_path=gt.plan_path or ""),
+                    display_prompt="/goal resume (plan)",
+                )
+                return
             self.sync_goal_ui()
             recap = goal_prompts.resume_recap(gt)
             self.query(recap, display_prompt="/goal resume")
@@ -4195,24 +4256,24 @@ class Session:
         gt.create(objective, token_budget=budget, tokens_baseline=baseline)
         self._goal_verify_turn = False
         self._goal_skip_continue_once = False
+        self._goal_planning_turn = True
+        # Reserve plan path; model must write a real plan (not host template).
+        try:
+            from . import goal_plan
+            root = self._goal_project_root()
+            gt.plan_path = goal_plan.default_plan_path(root, gt.goal_id)
+        except Exception:
+            pass
         self.sync_goal_ui()
         disp = f"/goal {objective}"
         if budget:
             disp += f" --budget {budget}"
-        # Host-owned plan expand (phase=planning until accept)
-        try:
-            plan_path = self._goal_materialize_host_plan()
-            self.output.text(
-                f"\n*Goal planning complete* — plan: `{plan_path or 'in-memory'}`\n"
-            )
-        except Exception as e:
-            print(f"[Claude] goal plan materialize: {e}")
-            self.output.text(f"\n*Goal planning failed: {e}*\n")
-            self.sync_goal_ui()
-            self._ensure_idle_input(reason="goal/plan-fail")
-            return
-        self.sync_goal_ui()
-        body = goal_prompts.implementer_kickoff(gt)
+        self.output.text(
+            f"\n*Goal planning* — write a concrete plan to "
+            f"`{gt.plan_path or '.claude/goals/…/plan.md'}` "
+            f"(host rejects templates).\n"
+        )
+        body = goal_prompts.planner_kickoff(gt, plan_path=gt.plan_path or "")
         self.query(body, display_prompt=disp)
 
     def _goal_refresh_tokens(self) -> None:
@@ -4236,72 +4297,144 @@ class Session:
         except Exception:
             return None
 
-    def _goal_materialize_host_plan(self) -> str:
-        """Host-owned plan expansion: write structured plan, accept → executing.
-
-        Path convention: ``{project}/.claude/goals/{goal_id}/plan.md``
-        (plugin-owned; differs from Grok Build session ``goal/plan.md``).
-        Returns plan_path (or empty string if in-memory only).
-        """
+    def _goal_try_accept_plan_from_disk(self) -> dict:
+        """Load plan.md written by planner; accept if quality gate passes."""
         from . import goal_plan
         gt = self.goal_tracker
         if not gt or not gt.goal_id:
-            raise RuntimeError("no goal")
-        plan_md = goal_plan.materialize_plan(
-            gt.objective, goal_kind="code-change", goal_id=gt.goal_id)
-        root = self._goal_project_root()
-        path = goal_plan.default_plan_path(root, gt.goal_id)
-        try:
-            path = goal_plan.write_plan_file(path, plan_md)
-        except Exception as e:
-            # Still accept in-memory so offline/no-cwd paths work
-            print(f"[Claude] goal plan write failed ({path}): {e}")
-            path = ""
-        ack = gt.accept_plan(plan_md, plan_path=path)
+            return {"ok": False, "error": "no goal"}
+        path = (gt.plan_path or "").strip() or goal_plan.default_plan_path(
+            self._goal_project_root(), gt.goal_id)
+        gt.plan_path = path
+        body = ""
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    body = f.read()
+            except Exception as e:
+                return {"ok": False, "error": f"read plan failed: {e}", "path": path}
+        if not body.strip():
+            return {
+                "ok": False,
+                "error": f"Plan file missing or empty: {path}",
+                "path": path,
+                "issues": ["write plan.md with required sections"],
+            }
+        issues = goal_plan.plan_quality_issues(body, gt.objective)
+        if issues:
+            return {"ok": False, "error": "quality", "issues": issues, "path": path}
+        ack = gt.accept_plan(body, plan_path=path)
         if not ack.get("ok"):
-            raise RuntimeError(ack.get("error") or "accept_plan failed")
-        return path
+            return {
+                "ok": False,
+                "error": ack.get("error") or "accept_plan failed",
+                "issues": ack.get("issues") or [],
+                "path": path,
+            }
+        return {"ok": True, "path": path}
+
+    def _goal_is_skeptic(self) -> bool:
+        try:
+            from .goal_skeptic import is_goal_skeptic
+        except ImportError:
+            from goal_skeptic import is_goal_skeptic  # type: ignore
+        return is_goal_skeptic(self)
+
+    def _goal_abort_task_verify(self, gap: str, message: str = "") -> bool:
+        """Fail-closed Task-mode verify on main (error/interrupt).
+
+        Records a not-achieved tool verdict if missing, then runs the finish
+        cycle. Returns True when finish started the next turn (continuation) —
+        caller must return early and must not force ``working=False``.
+        """
+        try:
+            from .goal_skeptic import (
+                prepare_task_verify_abort,
+                preserve_working_after_verify_finish,
+            )
+        except ImportError:
+            from goal_skeptic import (  # type: ignore
+                prepare_task_verify_abort,
+                preserve_working_after_verify_finish,
+            )
+        gt = getattr(self, "goal_tracker", None)
+        if not prepare_task_verify_abort(gt, gap, message=message):
+            return False
+        self._goal_verify_awaiting = False
+        started = bool(self._goal_finish_verify_cycle())
+        try:
+            self.sync_goal_ui()
+        except Exception:
+            pass
+        return preserve_working_after_verify_finish(started)
 
     def _goal_on_turn_success(self) -> bool:
         """After successful turn: verify and/or continue. True = started next turn."""
+        # Host skeptic subagent: report back to parent; never drive goal loop.
+        if self._goal_is_skeptic():
+            try:
+                self._goal_notify_parent_skeptic_done()
+            except Exception as e:
+                print(f"[Claude] goal skeptic notify failed: {e}")
+            return False
+
         gt = getattr(self, "goal_tracker", None)
         if not gt or getattr(self, "quick_mode", False):
             return False
 
-        # Just finished a verifier turn — apply verdict, then maybe continue
+        # Verify turn in progress
+        if getattr(self, "_goal_verify_awaiting", False):
+            mode = getattr(self, "_goal_verify_mode", None) or "task"
+            if mode == "task":
+                # Main-session executor turn ended (Task skeptic should have run)
+                self._goal_verify_awaiting = False
+                return self._goal_finish_verify_cycle()
+            # Legacy sheet: wait for child notify; keep parent busy
+            return True
+
+        # Recovery: phase stuck verifying without await flag (error/race)
+        if gt.phase == "verifying" and gt.is_active():
+            return self._goal_finish_verify_cycle()
+
+        # Planning turn: accept real plan from disk, else re-prompt planner
+        if gt.phase == "planning" or getattr(self, "_goal_planning_turn", False):
+            self._goal_planning_turn = False
+            result = self._goal_try_accept_plan_from_disk()
+            self.sync_goal_ui()
+            if result.get("ok"):
+                self.output.text(
+                    f"\n*Plan accepted* — `{result.get('path')}`\n"
+                    f"*Executing…*\n"
+                )
+                from . import goal_prompts
+                self.working = True
+                self.query(
+                    goal_prompts.implementer_kickoff(gt),
+                    display_prompt="↻ goal execute",
+                )
+                return True
+            issues = result.get("issues") or [result.get("error") or "plan invalid"]
+            # Surface full gate reasons in the sheet (schema, not one vague word)
+            detail = "; ".join(str(i) for i in issues[:6])
+            self.output.text(
+                f"\n*Plan rejected* (schema/quality gate) — {detail}\n"
+                f"  path: `{result.get('path') or gt.plan_path or ''}`\n"
+                "  Host re-sends full plan.md schema to the planner.\n"
+            )
+            from . import goal_prompts
+            self._goal_planning_turn = True
+            self.working = True
+            self.query(
+                goal_prompts.planner_revise(
+                    gt, issues, plan_path=gt.plan_path or ""),
+                display_prompt="↻ goal re-plan",
+            )
+            return True
+
+        # Legacy same-session verify turn (should not run once host skeptic is used)
         if getattr(self, "_goal_verify_turn", False):
             self._goal_verify_turn = False
-            self._goal_apply_verifier_result()
-            self.sync_goal_ui()
-            if gt.status == "complete":
-                try:
-                    if self.is_looping:
-                        self.cancel_scheduled_loop()
-                except Exception:
-                    pass
-                # Clear busy *before* host status text — otherwise text() can
-                # re-arm conversation.working while session.working is still True
-                # and leave a stuck ⠼ after verified complete.
-                self.working = False
-                if self.output and self.output.current:
-                    self.output.current.working = False
-                self.output.text("\n*Goal complete (verified).*\n")
-                if self.output and self.output.current:
-                    self.output.current.working = False
-                    try:
-                        self.output._render_pending = False
-                        self.output._do_render()
-                    except Exception:
-                        self.output._render_current()
-                self.sync_goal_ui()
-                try:
-                    self.output.set_name(self.display_name)
-                except Exception:
-                    pass
-                return False
-            if not gt.should_continue():
-                return False
-            return self._goal_fire_continuation()
+            return self._goal_finish_verify_cycle()
 
         if getattr(self, "_goal_skip_continue_once", False):
             self._goal_skip_continue_once = False
@@ -4320,7 +4453,7 @@ class Session:
             self.sync_goal_ui()
             return False
 
-        # Deferred complete → verifier turn
+        # Deferred complete → host-spawned skeptic subagent
         if gt.has_pending_complete():
             claim = gt.begin_verify()
             self.sync_goal_ui()
@@ -4335,32 +4468,379 @@ class Session:
             return self._goal_fire_continuation()
         return False
 
+    def _goal_spawn_skeptic_session(self):
+        """Create a background subsession for host verification (not implementer)."""
+        from .core import create_session
+        try:
+            from .goal_skeptic import make_skeptic_context, skeptic_display_name
+        except ImportError:
+            from goal_skeptic import make_skeptic_context, skeptic_display_name  # type: ignore
+
+        parent_vid = self.output.view.id() if self.output and self.output.view else None
+        if parent_vid is None:
+            raise RuntimeError("parent session has no view")
+        gt = self.goal_tracker
+        ctx = make_skeptic_context(parent_vid, verify_run=gt.verify_runs)
+        child = create_session(
+            self.window,
+            profile=None,
+            initial_context=ctx,
+            backend=self.backend,
+            focus=False,
+        )
+        name = skeptic_display_name(gt.verify_runs)
+        child.name = name
+        child.goal_role = "skeptic"
+        child.sleep_disabled = True
+        try:
+            child.output.set_name(name)
+        except Exception:
+            pass
+        return child
+
     def _goal_fire_verifier(self, claim: str) -> bool:
+        """Start host verification.
+
+        Default (``goal_skeptic_mode: task``): same main session stays the
+        goal *executor*; it must fan out a Task/Agent reviewer (no new sheet).
+
+        Legacy (``goal_skeptic_mode: session``): create_session skeptic sheet.
+        """
+        from . import goal_prompts
+        try:
+            from .goal_skeptic import resolve_skeptic_mode, MODE_SESSION, MODE_TASK
+        except ImportError:
+            from goal_skeptic import resolve_skeptic_mode, MODE_SESSION, MODE_TASK  # type: ignore
+
+        gt = self.goal_tracker
+        mode = resolve_skeptic_mode()
+        self._goal_verify_mode = mode
+        self._goal_verify_turn = False
+        self._goal_skeptic_view_id = None
+        self.working = True
+
+        if mode == MODE_SESSION:
+            return self._goal_fire_verifier_session_sheet(claim)
+
+        # In-session Task under main executor (single sheet)
+        prompt = goal_prompts.executor_verify_prompt(
+            gt.objective,
+            claim,
+            gaps_prior=gt.gaps or None,
+            plan_body=getattr(gt, "plan_body", "") or "",
+        )
+        self._goal_verify_awaiting = True
+        n = gt.verify_runs
+        cap = gt.verify_max
+        self.output.text(
+            f"\n*Goal · verifying* ({n}/{cap}) — stay the **executor** on this "
+            "sheet; spawn one Task/Agent **reviewer** (not a new session). "
+            "Complete unlocks only via `goal_verdict`.\n"
+        )
+        self.sync_goal_ui()
+        self.query(prompt, display_prompt="↻ goal verify")
+        return True
+
+    def _goal_fire_verifier_session_sheet(self, claim: str) -> bool:
+        """Legacy: separate ST session for skeptic (discouraged)."""
         from . import goal_prompts
         gt = self.goal_tracker
-        # Plan-grounded verify (criteria from host plan, not claim alone)
         prompt = goal_prompts.verifier_prompt(
             gt.objective,
             claim,
             gaps_prior=gt.gaps or None,
             plan_body=getattr(gt, "plan_body", "") or "",
         )
-        self._goal_verify_turn = True
-        self.working = True  # keep busy for next query
-        self.query(prompt, display_prompt="↻ goal verify")
+        try:
+            child = self._goal_spawn_skeptic_session()
+        except Exception as e:
+            print(f"[Claude] goal skeptic sheet spawn failed: {e}")
+            gt.record_tool_verdict(
+                achieved=False,
+                evidence=[],
+                gaps=[f"Host: skeptic session spawn failed: {e}"[:200]],
+                message="spawn failed",
+            )
+            return self._goal_finish_verify_cycle()
+
+        child_vid = (
+            child.output.view.id()
+            if child.output and child.output.view else None
+        )
+        self._goal_skeptic_view_id = child_vid
+        self._goal_verify_awaiting = True
+        self.output.text(
+            f"\n*Goal · verifying* (legacy sheet `{getattr(child, 'name', 'goal-skeptic')}` "
+            f"view {child_vid}) — prefer `goal_skeptic_mode=task` for in-sheet verify.\n"
+        )
+        self.sync_goal_ui()
+        self._goal_kick_skeptic_when_ready(child, prompt, attempt=0)
         return True
 
-    def _goal_apply_verifier_result(self) -> None:
-        from . import goal_prompts
+    def _goal_kick_skeptic_when_ready(self, child, prompt: str, attempt: int = 0) -> None:
+        """Poll child init, then fire verifier prompt (MCP spawn pattern)."""
+        try:
+            if child is None or not getattr(child, "output", None):
+                self._goal_skeptic_failed("skeptic session missing")
+                return
+            view = child.output.view
+            if view is None or not view.is_valid():
+                self._goal_skeptic_failed("skeptic view closed before init")
+                return
+            if getattr(child, "initialized", False) and not getattr(child, "working", False):
+                child.goal_role = "skeptic"
+                child.sleep_disabled = True
+                child.query(prompt, display_prompt="↻ goal skeptic")
+                return
+            if attempt >= 150:  # ~30s @ 200ms
+                self._goal_skeptic_failed("skeptic init timeout")
+                return
+            sublime.set_timeout(
+                lambda: self._goal_kick_skeptic_when_ready(child, prompt, attempt + 1),
+                200,
+            )
+        except Exception as e:
+            self._goal_skeptic_failed(f"skeptic kick error: {e}")
+
+    def _goal_skeptic_failed(self, reason: str) -> None:
+        """Fail-closed when host cannot run the skeptic subagent."""
+        gt = getattr(self, "goal_tracker", None)
+        self._goal_verify_awaiting = False
+        self._goal_skeptic_view_id = None
+        if gt is None:
+            self.working = False
+            return
+        if gt.phase == "verifying" and not gt.pending_tool_verdict:
+            gt.record_tool_verdict(
+                achieved=False,
+                evidence=[],
+                gaps=[f"Host: {reason}"],
+                message=reason[:200],
+            )
+        self._goal_finish_verify_cycle()
+
+    def _goal_notify_parent_skeptic_done(self, error: str = "") -> None:
+        """Skeptic child → parent: apply recorded verdict (or fail-closed)."""
+        try:
+            from .goal_skeptic import parent_view_id_for_skeptic
+        except ImportError:
+            from goal_skeptic import parent_view_id_for_skeptic  # type: ignore
+        pvid = parent_view_id_for_skeptic(self)
+        parent = None
+        if pvid is not None and hasattr(sublime, "_claude_sessions"):
+            parent = sublime._claude_sessions.get(pvid)
+        if parent is None:
+            print(f"[Claude] goal skeptic: parent {pvid} gone")
+            return
+        # If child never called goal_verdict (routed to parent), inject fail-closed
+        gt = getattr(parent, "goal_tracker", None)
+        if error and gt is not None and gt.phase == "verifying":
+            if not getattr(gt, "pending_tool_verdict", None):
+                gt.record_tool_verdict(
+                    achieved=False,
+                    evidence=[],
+                    gaps=[error],
+                    message=error[:200],
+                )
+        parent._goal_on_skeptic_finished(self)
+
+    def _goal_on_skeptic_finished(self, child_session=None) -> None:
+        """Parent: skeptic subagent finished — apply verdict and continue."""
+        if not getattr(self, "_goal_verify_awaiting", False) and \
+                getattr(self.goal_tracker, "phase", None) != "verifying":
+            return
+        self._goal_verify_awaiting = False
+        self._goal_skeptic_view_id = None
+        self._goal_verify_turn = False
+        # Keep parent busy while we apply + maybe continue
+        self.working = True
+        self._goal_finish_verify_cycle()
+
+    def _goal_finish_verify_cycle(self) -> bool:
+        """Apply skeptic verdict on parent and continue or stop. True = next turn started.
+
+        Emits exactly one host banner (complete XOR not-verified) — never both.
+        """
         gt = self.goal_tracker
-        text = ""
-        if self.output and self.output.current:
-            text = "".join(self.output.current.text_chunks)
-        achieved, gaps = goal_prompts.parse_verifier_verdict(text)
-        gt.apply_verdict(achieved, gaps=gaps, detail=gt.message)
-        if not achieved and gaps:
+        self._goal_verify_awaiting = False
+        self._goal_skeptic_view_id = None
+        self._goal_verify_turn = False
+        already_complete = gt.status == "complete"
+        self._goal_apply_verifier_result()
+        # Mode cleared after apply so logs still know path during apply
+        self._goal_verify_mode = None
+        self.sync_goal_ui()
+        if gt.status == "complete":
+            try:
+                if self.is_looping:
+                    self.cancel_scheduled_loop()
+            except Exception:
+                pass
+            # Clear busy *before* host status text — otherwise text() can
+            # re-arm conversation.working while session.working is still True
+            # and leave a stuck ⠼ after verified complete.
+            self.working = False
+            if self.output and self.output.current:
+                self.output.current.working = False
             self.output.text(
-                "\n*Verifier: not achieved — " + "; ".join(gaps[:4]) + "*\n")
+                "\n*Goal · complete* — verified via structured verdict.\n")
+            if self.output and self.output.current:
+                self.output.current.working = False
+                try:
+                    self.output._render_pending = False
+                    self.output._do_render()
+                except Exception:
+                    self.output._render_current()
+            self.sync_goal_ui()
+            try:
+                self.output.set_name(self.display_name)
+            except Exception:
+                pass
+            return False
+        # Not achieved only — never print this if status is complete
+        if gt.phase == "verifying":
+            gt.phase = "executing"
+        gaps = list(gt.gaps or [])
+        if gaps:
+            shown = "; ".join(gaps[:3])
+            more = f" (+{len(gaps) - 3} more)" if len(gaps) > 3 else ""
+            self.output.text(
+                f"\n*Goal · not verified* — back to **executing**. Gaps: {shown}{more}\n"
+            )
+        else:
+            self.output.text(
+                "\n*Goal · not verified* — back to **executing** "
+                "(no `goal_verdict` or empty evidence).\n"
+            )
+        self.sync_goal_ui()
+        if not gt.should_continue():
+            self.working = False
+            return False
+        return self._goal_fire_continuation()
+
+    def apply_goal_verdict(
+        self,
+        achieved: bool = False,
+        evidence=None,
+        gaps=None,
+        message: str = "",
+    ) -> dict:
+        """MCP goal_verdict drain — structured skeptic result (verify phase only).
+
+        When called from a skeptic subsession, MCP layer routes to the parent
+        first; this method always runs on the goal owner.
+        """
+        # Defense in depth: if a skeptic somehow lands here, bounce to parent
+        if self._goal_is_skeptic():
+            try:
+                from .goal_skeptic import parent_view_id_for_skeptic
+            except ImportError:
+                from goal_skeptic import parent_view_id_for_skeptic  # type: ignore
+            pvid = parent_view_id_for_skeptic(self)
+            parent = (
+                sublime._claude_sessions.get(pvid)
+                if pvid is not None and hasattr(sublime, "_claude_sessions")
+                else None
+            )
+            if parent is None:
+                return {
+                    "ok": False,
+                    "error": "Skeptic parent session not found for goal_verdict.",
+                    "rejected": True,
+                }
+            return parent.apply_goal_verdict(
+                achieved=achieved,
+                evidence=evidence,
+                gaps=gaps,
+                message=message,
+            )
+
+        gt = getattr(self, "goal_tracker", None)
+        if gt is None:
+            return {
+                "ok": False,
+                "error": "No goal tracker.",
+                "rejected": True,
+            }
+        if getattr(self, "quick_mode", False):
+            return {
+                "ok": False,
+                "error": "goal_verdict is not for Quick Agent.",
+                "rejected": True,
+            }
+        if not hasattr(gt, "record_tool_verdict"):
+            return {
+                "ok": False,
+                "error": (
+                    "GoalTracker.record_tool_verdict missing — soft-reload left a "
+                    "stale tracker class. Soft/hard reload ClaudeCode package and "
+                    "re-open the goal."
+                ),
+                "rejected": True,
+            }
+        # Coerce evidence/gaps from string or list
+        def _as_list(v):
+            if v is None:
+                return []
+            if isinstance(v, str):
+                lines = [ln.strip().lstrip("-* ") for ln in v.splitlines()]
+                return [x for x in lines if x]
+            if isinstance(v, (list, tuple)):
+                return [str(x).strip() for x in v if str(x).strip()]
+            return [str(v).strip()] if str(v).strip() else []
+
+        return gt.record_tool_verdict(
+            achieved=bool(achieved),
+            evidence=_as_list(evidence),
+            gaps=_as_list(gaps),
+            message=message or "",
+        )
+
+    def _goal_apply_verifier_result(self) -> None:
+        gt = self.goal_tracker
+        # Already complete (e.g. apply_verdict via sublime_eval mid-turn) —
+        # do not fail-closed and demote with a not-achieved apply.
+        if gt.status == "complete":
+            try:
+                gt._push("verify_applied", "already_complete")
+            except Exception:
+                pass
+            return
+
+        source = "none"
+        achieved = False
+        gaps = []
+        detail = gt.message
+
+        # Structured MCP goal_verdict only for *achieved*. Prose parse never
+        # unlocks complete (too easy to rubber-stamp); it may only supply gaps.
+        tool_v = None
+        if hasattr(gt, "take_tool_verdict"):
+            tool_v = gt.take_tool_verdict()
+        if tool_v:
+            source = "tool"
+            achieved = bool(tool_v.get("achieved"))
+            gaps = list(tool_v.get("gaps") or [])
+            detail = (tool_v.get("message") or detail or "").strip() or detail
+        else:
+            source = "no_tool"
+            achieved = False
+            gaps = list(gt.gaps or [])
+            if not gaps:
+                gaps = [
+                    "Host: no goal_verdict tool call — complete stays locked "
+                    "(use MCP goal_verdict, not bare apply_verdict)",
+                ]
+
+        gt.apply_verdict(achieved, gaps=gaps, detail=detail or gt.message)
+        # Transcript banners live in _goal_finish_verify_cycle (single place).
+        try:
+            gt._push(
+                "verify_applied",
+                ("achieved" if achieved else "not_achieved") + f" via {source}",
+            )
+        except Exception:
+            pass
 
     def _goal_fire_continuation(self) -> bool:
         from . import goal_prompts
@@ -4408,9 +4888,10 @@ class Session:
                 parts.append(f"ctx:{ctx_k}k")
         gt = getattr(self, "goal_tracker", None)
         if gt and gt.is_open():
-            chip = gt.status
-            if gt.phase == "verifying":
-                chip = "verifying"
+            try:
+                chip = gt.ui_phase_label() or gt.status
+            except Exception:
+                chip = "verifying" if gt.phase == "verifying" else gt.status
             parts.append(f"goal:{chip}")
         self.output.view.set_status("claude", f"{label}: {', '.join(parts)}")
 

@@ -14,13 +14,14 @@ sublime-claude owns the harness for **all backends** (Claude + Grok):
 | Plan path | `{project}/.claude/goals/{goal_id}/plan.md` (plugin-owned) |
 | `update_goal` MCP | Plugin drain → `GoalTracker` |
 | Continuation | Host `query` while `phase=executing` and plan ready |
-| Complete | Deferred → **plan-grounded verifier** → Achieved only |
+| Complete | Deferred → **host-spawned skeptic subagent** → Achieved only |
 
 ### Lifecycle
 
 1. **planning** — `/goal` creates the tracker; host materializes plan (Acceptance criteria + Verification plan, Grok-compatible sections). Continue loop is **off**.
 2. **executing** — plan accepted; implementer kickoff + host continues until claim/pause.
-3. **verifying** — `update_goal(completed=true)` → host verifier judges against the **plan**, not claim prose alone.
+3. **verifying** — `update_goal(completed=true)` → host starts a **verify turn on the main session**. Sticky strip / status chip show **verifying**. Main agent stays the **flow executor** and must spawn one **Task/Agent reviewer** (no new ST sheet). Reviewer (or executor using only skeptic evidence) **must** call MCP `goal_verdict`. Host applies tool only → **complete** or back to **executing** with gaps in the transcript and strip. Prose cannot unlock complete.  
+   - Settings: `goal_skeptic_mode` = `task` (default) | `session` (legacy separate sheet, discouraged).
 4. **complete / clear** — plan body cleared so a stale plan is not treated as active.
 
 Commands:

@@ -814,9 +814,20 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         # Add "Switch Backend" options (bridge transport only — terminal is claude CLI).
         # Built-ins in a stable order first, then any custom providers not yet listed.
         # Include current backend with "(current)" marker so users can see what's active.
+        # For Grok / Kimi, detail line shows live subscription usage from Service Manager
+        # (http://127.0.0.1:3001/api/quotas) when available — same meters as menubar.
         if not is_term:
+            try:
+                from .. import quota_client
+                quota_client.warm_cache()
+            except Exception:
+                quota_client = None  # type: ignore
             ordered = []
-            for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
+            # Stable built-in order (incl. ACP: grok, kimi) then remaining available.
+            for name in (
+                "claude", "codex", "copilot", "pi", "dsr",
+                "grok", "kimi", "grok_cc",
+            ):
                 if name in available_backends and name not in ordered:
                     ordered.append(name)
             for name in available_backends:
@@ -827,7 +838,14 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 label = spec.label
                 if other == backend:
                     label = f"{label} (current)"
-                items.append([f"with {label}…", f"Show {other} options"])
+                detail = f"Show {other} options"
+                if quota_client is not None:
+                    try:
+                        detail = quota_client.usage_detail_for_backend(
+                            other, fallback=detail)
+                    except Exception:
+                        pass
+                items.append([f"with {label}…", detail])
                 actions.append(("switch_backend", other))
 
         def on_select(idx):

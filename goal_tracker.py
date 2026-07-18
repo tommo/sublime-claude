@@ -28,6 +28,146 @@ HISTORY_MAX = 64
 GOAL_RESERVED = frozenset({"status", "pause", "resume", "clear", "edit"})
 
 
+def ui_phase_label(
+    *,
+    status: str = "",
+    phase: str = "",
+    gaps: Optional[List[str]] = None,
+) -> str:
+    """Human phase for sticky goal strip + status chip (pure; no Sublime)."""
+    st = (status or "").strip()
+    ph = (phase or "").strip()
+    if ph == "verifying":
+        return "verifying"
+    if ph == "planning":
+        return "planning"
+    if ph == "executing":
+        return "executing"
+    if st == "blocked":
+        return "blocked"
+    if st == "budget_limited":
+        return "budget"
+    if st in ("user_paused", "infra_paused"):
+        return "paused"
+    if st == "complete":
+        return "complete"
+    if st == "active":
+        return "active"
+    return st or "idle"
+
+
+def ui_phase_body(
+    *,
+    status: str = "",
+    phase: str = "",
+    message: str = "",
+    objective: str = "",
+    pause_message: str = "",
+    blocked_reason: str = "",
+    gaps: Optional[List[str]] = None,
+) -> str:
+    """Progress / gap line — not a second copy of the objective."""
+    ph = (phase or "").strip()
+    msg = (message or "").strip()
+    obj = (objective or "").strip()
+    if (pause_message or "").strip():
+        return pause_message.strip()
+    if (blocked_reason or "").strip():
+        return blocked_reason.strip()
+    gs = [g.strip() for g in (gaps or []) if (g or "").strip()]
+    if gs and ph != "verifying" and st_is_work(status):
+        if len(gs) == 1:
+            return gs[0]
+        return gs[0] + f" (+{len(gs) - 1} more)"
+    # Prefer progress message; skip if it only restates the objective
+    if msg and msg != obj and not _is_noise_progress(msg):
+        return msg
+    if ph == "verifying":
+        return msg or ""
+    return ""
+
+
+def st_is_work(status: str) -> bool:
+    return (status or "").strip() in (
+        "active", "user_paused", "blocked", "budget_limited", "infra_paused",
+    )
+
+
+def _is_noise_progress(msg: str) -> bool:
+    m = (msg or "").strip().lower()
+    return m in (
+        "plan accepted — executing",
+        "plan accepted",
+        "executing",
+    )
+
+
+def _clip(text: str, n: int) -> str:
+    t = (text or "").replace("\n", " ").strip()
+    if len(t) <= n:
+        return t
+    if n <= 1:
+        return "…"
+    # Constraints-first objectives ("don't X, just Y") — keep the tail intent
+    low = t.lower()
+    if low.startswith(("don't ", "do not ", "never ", "without ")):
+        return "…" + t[-(n - 1) :]
+    return t[: max(0, n - 1)] + "…"
+
+
+def format_goal_strip_line(
+    *,
+    status: str = "",
+    phase: str = "",
+    message: str = "",
+    objective: str = "",
+    pause_message: str = "",
+    blocked_reason: str = "",
+    gaps: Optional[List[str]] = None,
+    token_budget: Optional[int] = None,
+    tokens_used: Optional[int] = None,
+    verify_runs: int = 0,
+    verify_max: int = 0,
+    compact: bool = False,
+) -> str:
+    """One compact sticky work-strip line (no composer ◎ confusion).
+
+    Shape: ``  ◆ goal · {phase} · {short obj}  — {progress}  (extras)``
+    Uses ◆ (not ◎) so it never collides with the sticky composer marker.
+    """
+    label = ui_phase_label(status=status, phase=phase, gaps=gaps)
+    obj = _clip(objective, 36 if compact else 44)
+    body = ui_phase_body(
+        status=status,
+        phase=phase,
+        message=message,
+        objective=objective,
+        pause_message=pause_message,
+        blocked_reason=blocked_reason,
+        gaps=gaps,
+    )
+    body = _clip(body, 56 if compact else 72)
+    # Avoid "obj — obj"
+    if body and obj and body.lower() == obj.lower():
+        body = ""
+    line = f"  ◆ goal · {label}"
+    if obj:
+        line += f" · {obj}"
+    if body:
+        line += f"  — {body}"
+    extra = []
+    if token_budget:
+        extra.append(f"~{tokens_used or 0}/{token_budget}")
+    if verify_runs or (phase or "") == "verifying":
+        extra.append(f"verify {verify_runs or 0}/{verify_max or '?'}")
+    gap_n = len([g for g in (gaps or []) if (g or "").strip()])
+    if gap_n and (phase or "") != "verifying":
+        extra.append(f"{gap_n} gap" + ("s" if gap_n != 1 else ""))
+    if extra:
+        line += f"  ({' · '.join(extra)})"
+    return line
+
+
 @dataclass
 class GoalEvent:
     kind: str
@@ -57,6 +197,8 @@ class GoalTracker:
     verify_runs: int = 0
     verify_max: int = DEFAULT_VERIFY_MAX
     pending_completed_message: Optional[str] = None
+    # Structured skeptic result from MCP goal_verdict (preferred over prose parse)
+    pending_tool_verdict: Optional[Dict[str, Any]] = None
     continue_count: int = 0
     continue_max: int = DEFAULT_CONTINUE_MAX
     plan_path: str = ""
@@ -101,7 +243,62 @@ class GoalTracker:
         return True
 
     def has_pending_complete(self) -> bool:
+        # While verifying, claim is in-flight — not a new complete to re-fire
+        if self.phase == "verifying":
+            return False
         return self.pending_completed_message is not None
+
+    def ui_phase_label(self) -> str:
+        """Sticky strip / status chip phase word (verifying beats bare active)."""
+        return ui_phase_label(
+            status=self.status,
+            phase=self.phase,
+            gaps=self.gaps,
+        )
+
+    def ui_phase_body(self) -> str:
+        """Secondary strip text: claim while verifying, else gaps / message."""
+        return ui_phase_body(
+            status=self.status,
+            phase=self.phase,
+            message=self.message,
+            objective=self.objective,
+            pause_message=self.pause_message,
+            blocked_reason=self.blocked_reason,
+            gaps=self.gaps,
+        )
+
+    def sync_plan_body_from_disk(self) -> bool:
+        """Merge disk checklist ``[x]`` marks onto the frozen accepted plan.
+
+        Contract sections (Acceptance criteria, Verification plan, checklist
+        item *text*) stay as accepted. Disk may only flip checkbox state for
+        matching items. Deleting the checklist or thinning AC on disk is
+        ignored — open frozen items stay open so complete stays blocked.
+
+        Returns True if plan_body checklist marks changed.
+        """
+        path = (self.plan_path or "").strip()
+        if not path or not self.has_plan() or not (self.plan_body or "").strip():
+            return False
+        try:
+            import os
+            if not os.path.isfile(path):
+                return False
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                disk = f.read()
+        except Exception:
+            return False
+        try:
+            from .goal_plan import merge_checklist_marks
+        except ImportError:
+            from goal_plan import merge_checklist_marks  # type: ignore
+        merged, changed = merge_checklist_marks(self.plan_body, disk)
+        if not changed:
+            return False
+        self.plan_body = merged
+        self._push("plan_checklist_synced", path[:200])
+        return True
 
     # ── mutations ────────────────────────────────────────────────────────
 
@@ -136,6 +333,7 @@ class GoalTracker:
         self.verify_runs = 0
         self.verify_max = DEFAULT_VERIFY_MAX
         self.pending_completed_message = None
+        self.pending_tool_verdict = None
         self.continue_count = 0
         self.plan_path = plan_path or ""
         self.plan_body = ""
@@ -158,6 +356,17 @@ class GoalTracker:
                 "ok": False,
                 "error": "Plan missing required sections "
                 "(## Acceptance criteria, ## Verification plan).",
+            }
+        try:
+            from .goal_plan import plan_quality_issues
+        except ImportError:
+            from goal_plan import plan_quality_issues  # type: ignore
+        quality = plan_quality_issues(body, self.objective)
+        if quality:
+            return {
+                "ok": False,
+                "error": "Plan rejected: " + "; ".join(quality[:4]),
+                "issues": quality,
             }
         self.plan_body = body if body.endswith("\n") else body + "\n"
         if plan_path:
@@ -183,6 +392,7 @@ class GoalTracker:
         self.gaps = []
         self.verify_runs = 0
         self.pending_completed_message = None
+        self.pending_tool_verdict = None
         self.continue_count = 0
         self.plan_path = ""
         self.plan_body = ""
@@ -316,6 +526,24 @@ class GoalTracker:
                     "phase": self.phase,
                 }
             claim = msg or self.message or "claimed complete"
+            # Re-read plan.md so checklist [x] flips on disk count (not freeze-only)
+            self.sync_plan_body_from_disk()
+            # Host preflight: open checklist / partial language / diluted north-star
+            try:
+                from .goal_plan import complete_claim_preflight
+            except ImportError:
+                from goal_plan import complete_claim_preflight  # type: ignore
+            pre = complete_claim_preflight(claim, self.plan_body, self.objective)
+            if pre:
+                self._push("complete_rejected_preflight", pre[0][:200])
+                return {
+                    "ok": False,
+                    "error": "Complete rejected: " + "; ".join(pre[:4]),
+                    "rejected": True,
+                    "issues": pre,
+                    "status": self.status,
+                    "phase": self.phase,
+                }
             if mid_turn:
                 self.pending_completed_message = claim
                 self.message = claim
@@ -378,10 +606,87 @@ class GoalTracker:
             self._push("verify_cap")
             return None
         claim = self.pending_completed_message or ""
+        self.pending_completed_message = None  # claim consumed; avoid re-fire
+        # Fresh checklist state for verifier-side preflight too
+        self.sync_plan_body_from_disk()
         self.phase = "verifying"
         self.verify_runs += 1
+        self.pending_tool_verdict = None  # fresh skeptic turn
         self._push("verify_started", f"run {self.verify_runs}")
         return claim
+
+    def record_tool_verdict(
+        self,
+        *,
+        achieved: bool,
+        evidence: Optional[List[str]] = None,
+        gaps: Optional[List[str]] = None,
+        message: str = "",
+    ) -> Dict[str, Any]:
+        """MCP goal_verdict during verifying phase — structured, not prose parse."""
+        if self.phase != "verifying":
+            return {
+                "ok": False,
+                "error": "goal_verdict only valid during host verifying phase.",
+                "rejected": True,
+                "phase": self.phase,
+            }
+        if not self.is_active():
+            return {
+                "ok": False,
+                "error": f"Goal is {self.status}; cannot record verdict.",
+                "rejected": True,
+            }
+        ev = [str(x).strip() for x in (evidence or []) if str(x).strip()][:20]
+        gp = [str(x).strip() for x in (gaps or []) if str(x).strip()][:12]
+        # Structured fail-closed: achieved requires non-empty evidence, no gaps
+        if achieved:
+            if gp:
+                achieved = False
+                if "gaps present" not in " ".join(gp).lower():
+                    gp = gp + ["Host: gaps present — cannot mark achieved"]
+            if not ev:
+                achieved = False
+                gp = gp + ["Host: achieved requires non-empty evidence[]"]
+            # Re-read plan.md then preflight (checklist may have been flipped)
+            self.sync_plan_body_from_disk()
+            try:
+                from .goal_plan import complete_claim_preflight
+            except ImportError:
+                from goal_plan import complete_claim_preflight  # type: ignore
+            claim = (message or self.message or "").strip()
+            pre = complete_claim_preflight(claim, self.plan_body, self.objective)
+            if pre:
+                achieved = False
+                gp = gp + [f"Host: {p}" for p in pre[:4]]
+        else:
+            if not gp:
+                gp = ["not achieved (tool)"]
+        self.pending_tool_verdict = {
+            "achieved": bool(achieved),
+            "evidence": ev,
+            "gaps": gp,
+            "message": (message or "").strip()[:500],
+            "source": "tool",
+        }
+        self._push(
+            "tool_verdict",
+            ("achieved" if achieved else "not_achieved") + f" ev={len(ev)} gaps={len(gp)}",
+        )
+        return {
+            "ok": True,
+            "recorded": True,
+            "achieved": bool(achieved),
+            "evidence_count": len(ev),
+            "gaps": gp,
+            "message": "Verdict recorded; host applies at end of verify turn.",
+        }
+
+    def take_tool_verdict(self) -> Optional[Dict[str, Any]]:
+        """Consume structured verdict if the verifier called goal_verdict."""
+        v = self.pending_tool_verdict
+        self.pending_tool_verdict = None
+        return v
 
     def apply_verdict(
         self,
@@ -389,8 +694,11 @@ class GoalTracker:
         gaps: Optional[List[str]] = None,
         detail: str = "",
     ) -> None:
-        """After verifier turn."""
+        """After verifier turn. Terminal complete/cleared cannot be demoted."""
+        if self.status in ("complete", "cleared"):
+            return
         gaps = gaps or []
+        self.pending_tool_verdict = None
         if achieved:
             self.complete(detail or self.message or "verified")
             self.gaps = []

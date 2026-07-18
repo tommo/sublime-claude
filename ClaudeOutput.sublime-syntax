@@ -38,14 +38,20 @@ contexts:
       scope: claude.meta.done comment.line
       pop: true
 
-    # Sticky Work strip — Goal (purple family) vs Tasks (warm/dim).
-    # Indented "◎ goal · …" must not use unindented ^◎ prompt rule.
-    - match: '^\s*◎ goal · active\b.*$'
+    # Sticky Work strip — Goal (◆, not composer ◎) vs Tasks (warm/dim).
+    # Prefer ◆; keep ◎ goal · for history frozen before the glyph change.
+    - match: '^\s*[◆◎] goal · (executing|active)\b.*$'
       scope: claude.goal.active
-    - match: '^\s*◎ goal · blocked\b.*$'
+    - match: '^\s*[◆◎] goal · verifying\b.*$'
+      scope: claude.goal.verifying
+    - match: '^\s*[◆◎] goal · planning\b.*$'
+      scope: claude.goal.planning
+    - match: '^\s*[◆◎] goal · blocked\b.*$'
       scope: claude.goal.blocked
-    - match: '^\s*◎ goal · done\b.*$'
+    - match: '^\s*[◆◎] goal · (complete|done)\b.*$'
       scope: claude.goal.done
+    - match: '^\s*[◆◎] goal · (paused|budget)\b.*$'
+      scope: claude.goal.paused
 
     # Task steps under goal (or alone) — distinct glyphs from goal.
     - match: '^\s*▸ .+$'

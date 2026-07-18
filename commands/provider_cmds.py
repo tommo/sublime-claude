@@ -660,6 +660,11 @@ class ClaudeChangeProviderCommand(sublime_plugin.WindowCommand):
             sublime.error_message("No active session to change.")
             return
         items, names = [], []
+        try:
+            from .. import quota_client
+            quota_client.warm_cache()
+        except Exception:
+            quota_client = None  # type: ignore
         for name, spec in backends.all_backends().items():
             if spec.bridge_script != "main.py":
                 continue  # only Claude-bridge backends are eligible
@@ -668,6 +673,14 @@ class ClaudeChangeProviderCommand(sublime_plugin.WindowCommand):
             cur = "   (current)" if name == s.backend else ""
             avail_tag = "" if avail else "   (unavailable)"
             detail = "backend: {}".format(name) + ("" if avail else " — missing base_url/auth")
+            # Optional subscription usage (Service Manager) for mapped backends.
+            if quota_client is not None and avail:
+                try:
+                    u = quota_client.usage_detail_for_backend(name, fallback="")
+                    if u:
+                        detail = "{} · {}".format(detail, u)
+                except Exception:
+                    pass
             # "with X…" reads as "continue this conversation WITH X" — clearer
             # about the contextual (carry-over) nature of the change than a bare
             # provider name or "switch to X".

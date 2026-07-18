@@ -12,49 +12,55 @@ from typing import List, Optional, Tuple
 # Default install location when not on PATH (kimi-code layout).
 _DEFAULT_HOME_BIN = os.path.expanduser("~/.kimi-code/bin/kimi")
 
-# Models advertised in the picker; agent may remap via session/set_model.
-# Wire ids match `kimi acp` session/new configOptions (kimi-code/…).
+# Wire ids from `kimi acp` session/new configOptions / ~/.kimi-code/config.toml
+# (do not invent model ids — only what the CLI advertises).
 KIMI_MODELS: List[Tuple[str, str]] = [
-    ("kimi-code/kimi-for-coding", "K2.7 Coding (default)"),
+    ("kimi-code/k3", "K3"),
+    ("kimi-code/kimi-for-coding", "K2.7 Coding"),
     ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
-    ("kimi-for-coding", "Kimi for Coding (alias)"),
 ]
 
+# Short aliases → real wire ids only
 MODEL_ALIASES = {
-    "default": "kimi-code/kimi-for-coding",
-    "kimi": "kimi-code/kimi-for-coding",
-    "coding": "kimi-code/kimi-for-coding",
+    "default": "kimi-code/k3",
+    "k3": "kimi-code/k3",
+    "kimi-code/k3": "kimi-code/k3",
+    "k2.7": "kimi-code/kimi-for-coding",
     "kimi-for-coding": "kimi-code/kimi-for-coding",
+    "kimi-code/kimi-for-coding": "kimi-code/kimi-for-coding",
     "highspeed": "kimi-code/kimi-for-coding-highspeed",
-    "k2.5": "kimi-code/kimi-for-coding",
-    "k2": "kimi-code/kimi-for-coding",
+    "kimi-for-coding-highspeed": "kimi-code/kimi-for-coding-highspeed",
+    "kimi-code/kimi-for-coding-highspeed": "kimi-code/kimi-for-coding-highspeed",
 }
 
 
 def resolve_kimi_bin() -> str:
-    """Resolve kimi executable: KIMI_BIN → PATH → ~/.kimi-code/bin/kimi."""
+    """Resolve kimi executable: KIMI_BIN → ~/.kimi-code/bin → PATH.
+
+    Prefer the default install path before PATH: Sublime often has a sparse
+    PATH that omits ~/.kimi-code/bin even when the CLI is installed.
+    """
     env = (os.environ.get("KIMI_BIN") or "").strip()
     if env and os.path.isfile(env) and os.access(env, os.X_OK):
         return env
     if env:
-        # May be a name on PATH
         found = shutil.which(env)
         if found:
             return found
+    if os.path.isfile(_DEFAULT_HOME_BIN) and os.access(_DEFAULT_HOME_BIN, os.X_OK):
+        return _DEFAULT_HOME_BIN
     which = shutil.which("kimi")
     if which:
         return which
-    if os.path.isfile(_DEFAULT_HOME_BIN) and os.access(_DEFAULT_HOME_BIN, os.X_OK):
-        return _DEFAULT_HOME_BIN
     return env or "kimi"
 
 
 def kimi_available() -> bool:
     """True when a usable kimi binary is found (not merely the string 'kimi')."""
     path = resolve_kimi_bin()
-    if not path or path == "kimi":
-        return bool(shutil.which("kimi"))
-    return os.path.isfile(path) and os.access(path, os.X_OK)
+    if path and path != "kimi" and os.path.isfile(path) and os.access(path, os.X_OK):
+        return True
+    return bool(shutil.which("kimi"))
 
 
 def agent_argv(model: Optional[str] = None) -> List[str]:
@@ -65,7 +71,7 @@ def agent_argv(model: Optional[str] = None) -> List[str]:
     return [resolve_kimi_bin(), "acp"]
 
 
-def normalize_model(model: Optional[str], default: str = "kimi-code/kimi-for-coding") -> str:
+def normalize_model(model: Optional[str], default: str = "kimi-code/k3") -> str:
     if not model:
         return default
     key = model.strip()

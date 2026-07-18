@@ -85,7 +85,7 @@ All commands available via Command Palette (`Cmd+Shift+P`): type "Claude"
 
 | Command | Keybinding | Description |
 |---------|------------|-------------|
-| Switch Session | `Cmd+Alt+\` | Quick panel: active session, new, or switch |
+| Switch Session | `Cmd+Alt+\` | Quick panel: active session, new, or switch (`with Grok…` / `with Kimi Code…` show live subscription usage from Service Manager when available) |
 | Query Selection | `Cmd+Shift+Alt+C` | Query about selected code |
 | Query File | - | Query about current file |
 | Add Current File | - | Add file to context |
