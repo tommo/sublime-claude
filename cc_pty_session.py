@@ -221,10 +221,10 @@ class PtyEngineSession(session_mod.Session):
         stripped = prompt.strip()
         is_slash = stripped.startswith("/") and "\n" not in stripped
         if is_slash:
-            full_prompt, images, context_names = stripped, [], []
+            full_prompt, images, context_names, context_refs = stripped, [], [], []
         else:
             full_prompt, images = self._build_prompt_with_context(prompt)
-            _, context_names = self.context.take()
+            _, context_names, context_refs = self.context.take()
         # The interactive CLI can't accept image *data* via typed text, but its
         # paste handler auto-detects image *paths* in pasted text and inlines
         # the image as a message attachment (just like drag-drop) — no Read
@@ -240,7 +240,7 @@ class PtyEngineSession(session_mod.Session):
             self.output.show()
             if not self.name:
                 self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
-            self.output.prompt(ui_prompt, context_names)
+            self.output.prompt(ui_prompt, context_names, context_refs=context_refs)
         self.output._update_title()
         self._animate()
 
@@ -797,12 +797,20 @@ class PtyEngineSession(session_mod.Session):
         if not os.path.exists(server):
             return ""
         py = settings.get("python_path") or sys.executable
+        args = [server, "--view-id={}".format(self.output.view.id())]
+        # PTY Claude: read_image off unless settings force true.
+        raw = settings.get("mcp_enable_read_image", "auto")
+        if raw is True or (
+            isinstance(raw, str)
+            and raw.strip().lower() in ("1", "true", "yes", "on")
+        ):
+            args.append("--enable-read-image")
         return json.dumps({
             "mcpServers": {
                 "sublime": {
                     "type": "stdio",
                     "command": py,
-                    "args": [server, "--view-id={}".format(self.output.view.id())],
+                    "args": args,
                 }
             }
         })

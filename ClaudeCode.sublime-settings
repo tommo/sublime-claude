@@ -39,6 +39,11 @@
     //   "session" — legacy separate ST sheet via create_session (discouraged)
     // "goal_skeptic_mode": "task",
 
+    // sublime MCP read_image (vision over local PNG/JPEG for agents that cannot
+    // read binary via FS — mainly Grok ACP). Default "auto" enables it only for
+    // the Grok backend; set true to advertise on all backends, false to disable.
+    // "mcp_enable_read_image": "auto",
+
 
     // Auto-retry a turn that ends in error (e.g. provider 503/429 retries
     // exhausted). 0 = off (default). N = re-issue the turn up to N times,
@@ -188,16 +193,16 @@
     //     "deepseek": "deepseek-v4-pro"
     // },
 
-    // Quick Agent — full session sheet with a pinned fast model (same UX as
-    // New Session: inline ◎ input, streaming, tools). Open: "Claude: Quick Agent"
-    // or ⌘⇧\. Config: "Claude: Quick Agent Config". model "flash" → haiku alias
-    // (e.g. deepseek-v4-flash). Omit allowed_tools to inherit the global list.
+    // Quick Agent — one-shot sheet (⌘⇧\\). Fresh bridge per submit; keeps
+    // Claude Code preset + CLAUDE.md (append-only system prompt). Default tools
+    // are Read/Write/Edit/Bash/Glob/Grep + quick_done only — not full MCP.
+    // Override tools with "allowed_tools": [...]. model "flash" → haiku alias.
     "quick_agent": {
         "backend": "deepseek",
         "model": "flash",
         "effort": "low",
         "permission_mode": "bypassPermissions",
-        "system_prompt": "You are a Quick Agent: one user message → one short answer. After every reply call MCP quick_done: completed (host stops you; next user message starts a fresh agent), blocked (need user), or closed (leave/close/bye — host hides). Do not use update_goal."
+        "system_prompt": "You are a Quick Agent: one user message → one short answer."
     },
 
     // Environment variables passed to bridge process

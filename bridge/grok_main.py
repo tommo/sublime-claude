@@ -28,6 +28,8 @@ class GrokBridge(AcpBridge):
     BACKEND_NAME = "grok"
     DEFAULT_MODEL = "grok-4.5"
     LOG_PATH = "/tmp/grok_bridge.log"
+    # ACP text FS rejects binary; vision goes through sublime MCP read_image.
+    MCP_ENABLE_READ_IMAGE = True
 
     # Grok accepts many modeId strings; map Claude permission modes to the
     # closest Grok Build modes we care about.
@@ -183,18 +185,21 @@ class GrokBridge(AcpBridge):
         meta = super().build_session_meta(
             system_prompt=system_prompt, resume_failed=resume_failed)
         # Grok does not expose MCP tools as bare names — discover with
-        # search_tool, call with use_tool. Without this, agents invent
-        # read_image / fail to find the vision path for screenshots.
-        image_rule = (
-            "Images on disk: do NOT use read_file (fails with Cannot read "
-            "binary file over ACP). Use MCP via use_tool with "
-            "tool_name=\"sublime__read_image\" and tool_input="
-            "{\"path\":\"/absolute/path.png\"}. If the tool is unknown, "
-            "search_tool query=\"read_image\" first. Media tools "
-            "(image_edit/image_gen) accept file paths directly."
-        )
-        existing = meta.get("rules") or ""
-        meta["rules"] = (existing + "\n" + image_rule).strip() if existing else image_rule
+        # search_tool, call with use_tool. Only inject when read_image is on.
+        if self._mcp_enable_read_image:
+            image_rule = (
+                "Images on disk: do NOT use read_file (fails with Cannot read "
+                "binary file over ACP). Use MCP via use_tool with "
+                "tool_name=\"sublime__read_image\" and tool_input="
+                "{\"path\":\"/absolute/path.png\"}. If the tool is unknown, "
+                "search_tool query=\"read_image\" first. Media tools "
+                "(image_edit/image_gen) accept file paths directly."
+            )
+            existing = meta.get("rules") or ""
+            meta["rules"] = (
+                (existing + "\n" + image_rule).strip()
+                if existing else image_rule
+            )
         return meta
 
     def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:

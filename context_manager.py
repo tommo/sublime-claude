@@ -100,12 +100,27 @@ class ContextItem:
         """'open' in editor for code; 'reveal' in file manager otherwise."""
         if self.kind in ("folder", "image"):
             return "reveal"
-        p = self.path or self.name
+        p = self.path or ""
+        if not p:
+            return "reveal"
         if is_image_path(p):
             return "reveal"
-        if is_code_path(p) or self.kind == "selection":
+        if os.path.isdir(p):
+            return "reveal"
+        # Prefer editor focus for any file-ish attach (incl. path refs).
+        if self.kind in ("file", "selection", "path") or is_code_path(p):
             return "open"
         return "reveal"
+
+    def as_ref(self) -> dict:
+        """Serializable chip ref for click-to-focus in transcript UI."""
+        return {
+            "name": self.name or (os.path.basename(self.path) if self.path else "?"),
+            "path": self.path or "",
+            "line_range": self.line_range or "",
+            "action": self.open_action,
+            "kind": self.kind,
+        }
 
 
 class ContextManager:
@@ -195,11 +210,11 @@ class ContextManager:
         if is_image_path(path):
             body = (
                 f"Attached image path: {path}\n"
-                f"(On-disk image — for vision use use_tool with "
-                f"tool_name=\"sublime__read_image\" and "
-                f"tool_input={{\"path\": {path!r}}}; "
-                f"search_tool query=\"read_image\" if needed. "
-                f"Do not use read_file — it fails on binary images.)"
+                f"(On-disk image. If sublime MCP read_image is enabled for "
+                f"this session, vision via use_tool tool_name="
+                f"\"sublime__read_image\" tool_input={{\"path\": {path!r}}}. "
+                f"Otherwise pass the path to media tools; do not read_file "
+                f"binary images over ACP.)"
             )
             kind = "path"
         elif missing:
@@ -264,13 +279,18 @@ class ContextManager:
         self._refresh_display()
         return True
 
-    def take(self) -> Tuple[List[ContextItem], List[str]]:
-        """Consume the current items: returns (items_snapshot, names) and clears."""
-        items = self.items
+    def take(self) -> Tuple[List[ContextItem], List[str], List[dict]]:
+        """Consume pending items → (items, names, refs) then clear.
+
+        refs keep absolute paths so transcript 📎 chips stay clickable after
+        the turn starts (names alone cannot reopen the file).
+        """
+        items = list(self.items)
         names = [it.name for it in items]
+        refs = [it.as_ref() for it in items]
         self.items = []
         self._refresh_display()
-        return items, names
+        return items, names, refs
 
     # ── Prompt assembly ────────────────────────────────────────────────
 

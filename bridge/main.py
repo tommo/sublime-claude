@@ -246,6 +246,10 @@ class Bridge:
         view_id = params.get("view_id")
         self.cwd = cwd  # Store for later use (e.g., in can_use_tool)
         self._view_id = view_id  # Store for spawn_session to pass to subsessions
+        # Vision MCP tool — default off for Claude/SDK; host may opt in.
+        self._mcp_enable_read_image = bool(params.get("mcp_enable_read_image", False))
+        # Quick Agent: narrow MCP surface (only quick_done auto-allowed).
+        self._quick_mode = bool(params.get("quick_mode", False))
 
         # Generate a proper UUID for Claude CLI (--session-id requires valid UUID format)
         # view_id is Sublime's view ID (integer), not suitable for Claude's session_id
@@ -296,10 +300,13 @@ class Bridge:
         # Build the addon text (session info, project addon, subsession guide).
         # Profile-supplied system_prompt is treated as a full replacement
         # (user intent — they're overriding Claude Code's default prompt).
+        # append_system_prompt (Quick Agent) keeps the claude_code preset so
+        # CLAUDE.md / project instructions still load via setting_sources.
         # Otherwise we use the `claude_code` preset with `append`, which
         # preserves Claude Code's <env> block (cwd, additional working dirs,
         # platform, date, etc.) — losing that was why add_dirs looked broken.
         profile_system_prompt = params.get("system_prompt", "")
+        append_system_prompt = (params.get("append_system_prompt") or "").strip()
         addon = settings.get("system_prompt_addon")
 
         session_id_info = f"sublime.{session_id}"
@@ -332,6 +339,8 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         else:
             # Keep Claude Code's default prompt (env, cwd, add-dirs) and append ours.
             append_parts = []
+            if append_system_prompt:
+                append_parts.append(append_system_prompt)
             if addon:
                 append_parts.append(addon)
             append_parts.append(session_guide)
@@ -467,10 +476,14 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
 
         if os.path.exists(mcp_server_path):
             # Pass view_id so MCP server can inject it into spawn_session calls
-            view_id_arg = f"--view-id={self._view_id}" if self._view_id else ""
+            args = [mcp_server_path]
+            if self._view_id:
+                args.append(f"--view-id={self._view_id}")
+            if getattr(self, "_mcp_enable_read_image", False):
+                args.append("--enable-read-image")
             servers["sublime"] = {
                 "command": sys.executable,  # Use same python as bridge
-                "args": [mcp_server_path, view_id_arg] if view_id_arg else [mcp_server_path]
+                "args": args,
             }
 
         if servers:
@@ -755,8 +768,19 @@ You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id
         if tool_name == "ExitPlanMode":
             return await self._handle_exit_plan_mode(tool_input)
 
-        # Auto-allow built-in sublime MCP tools
+        # Auto-allow built-in sublime MCP tools — except Quick Agent, which only
+        # needs quick_done. Full MCP made agents thrash on get_window_summary.
         if tool_name.startswith("mcp__sublime__"):
+            if getattr(self, "_quick_mode", False):
+                short = tool_name.split("__")[-1] if "__" in tool_name else tool_name
+                if short != "quick_done" and tool_name != "mcp__sublime__quick_done":
+                    return PermissionResultDeny(
+                        message=(
+                            "Quick Agent: only mcp__sublime__quick_done is "
+                            "allowed. Use Read/Grep/Glob for files; attached "
+                            "context has the focused path — do not call "
+                            f"{tool_name}."
+                        ))
             return PermissionResultAllow(updated_input=tool_input)
 
         # Validate Bash commands for dangerous patterns

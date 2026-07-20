@@ -243,7 +243,9 @@ class Conversation:
     has_meta: bool = False  # True after meta() — show @done even if duration is 0
     usage: dict = None
     region: tuple = (0, 0)
-    context_names: List[str] = field(default_factory=list)  # Context files used
+    context_names: List[str] = field(default_factory=list)  # Context chip labels
+    # Path-rich refs for click-to-focus: [{name, path, line_range, action}, ...]
+    context_refs: List[dict] = field(default_factory=list)
 
     @property
     def tools(self) -> List[ToolCall]:

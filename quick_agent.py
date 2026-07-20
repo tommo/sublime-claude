@@ -61,12 +61,20 @@ def can_add_slot(n_slots: int, cap: int = MAX_QUICK_SLOTS) -> bool:
 def completion_contract() -> str:
     """Each user message is one short job; next message is a new session."""
     return (
-        "## After each reply (required)\n"
-        "This is a one-shot: handle *this* message, then call `quick_done`:\n"
-        "- **completed** — done; host stops you. User's next message starts a fresh agent\n"
-        "- **blocked** — need more from the user (say what in message)\n"
-        "- **closed** — user said leave/close/dismiss/bye — host hides the panel\n"
-        "Do NOT use update_goal. Do NOT narrate tool calls. Keep answers short."
+        "## Quick Agent contract (overrides long project rituals for this turn)\n"
+        "This is a **one-shot** panel reply — not a multi-hour coding session.\n"
+        "- Handle **this** user message only, then call MCP `quick_done`:\n"
+        "  - **completed** — done; host stops you; next user message = fresh agent\n"
+        "  - **blocked** — need more from the user (say what in message)\n"
+        "  - **closed** — user said leave/close/dismiss/bye — host hides the panel\n"
+        "- Prefer **attached context** (path chips / selection) for “this file / "
+        "this pmodule / this code”. Do **not** call `get_window_summary`, "
+        "`list_sessions`, `spawn_session`, or other session-fishing MCP tools.\n"
+        "- Skip EnterPlanMode / long task lists / multi-subagent workflows. "
+        "Project CLAUDE.md still applies for code style; not for full harness.\n"
+        "- Use Read/Grep/Glob (and Edit/Write only if the ask requires edits). "
+        "Only sublime MCP tool you need for lifecycle is `quick_done`.\n"
+        "- Do NOT use `update_goal`. Do NOT narrate tool calls. Keep answers short.\n"
     )
 
 
@@ -78,13 +86,24 @@ def default_system_prompt() -> str:
     )
 
 
+# Tools allowed by default for Quick (bypassPermissions still applies).
+# Full MCP surface was a design mistake — agents thrash on get_window_summary
+# instead of reading the attached file / project CLAUDE.md.
+DEFAULT_QUICK_ALLOWED_TOOLS = [
+    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    "mcp__sublime__quick_done",
+]
+
+
 def build_system_prompt(cfg: dict = None) -> str:
     """User config prompt + always-on completion contract."""
     cfg = cfg if isinstance(cfg, dict) else {}
     base = (cfg.get("system_prompt") or default_system_prompt()).strip()
     contract = completion_contract()
     # Avoid double-append if config already embeds the contract
-    if "quick_done" in base and "Task completion" in base:
+    if "quick_done" in base and "get_window_summary" in base:
+        return base
+    if "quick_done" in base and "Quick Agent contract" in base:
         return base
     if "quick_done" in base:
         return base.rstrip() + "\n\n" + contract
@@ -324,7 +343,13 @@ class QuickHost:
         model = resolve_model_id(cfg)
         effort = (cfg.get("effort") or "low").strip() or "low"
         system = build_system_prompt(cfg)
-        profile = {"model": model, "effort": effort, "system_prompt": system}
+        # append_system_prompt keeps Claude Code preset + CLAUDE.md /
+        # setting_sources. Full system_prompt replacement was wiping that.
+        profile = {
+            "model": model,
+            "effort": effort,
+            "append_system_prompt": system,
+        }
         s = Session(self.window, profile=profile, backend=backend)
         s.quick_mode = True
         s.sleep_disabled = True
@@ -504,6 +529,10 @@ class QuickHost:
             pass
 
         ns = self._spawn_session(slot.name, slot_id=slot.slot_id)
+        # Each new one-shot must re-pin the focused editor file/selection —
+        # otherwise "this pmodule" forces window-summary fishing.
+        _attach_focused_doc_context(
+            ns, _source_view_for_context(self.window))
         ns._quick_finished = False
         ns._quick_slot_id = slot.slot_id
         ns._quick_pending_prompt = text

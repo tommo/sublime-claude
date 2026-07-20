@@ -31,14 +31,24 @@ _IMAGE_EXTS = (
 _READ_IMAGE_MAX_BYTES = 4 * 1024 * 1024  # raw payload after optional shrink
 _READ_IMAGE_MAX_EDGE = 1600  # long edge for resize
 
-# Parse --view-id from command line args (passed by bridge)
+# Parse flags from command line args (passed by bridge).
+# --view-id=N: calling session
+# --enable-read-image: advertise + serve vision tool (default off; Grok ACP
+#   enables it — other backends rarely need multi-MB base64 image blocks).
 CALLER_VIEW_ID = None
+ENABLE_READ_IMAGE = False
 for arg in sys.argv[1:]:
     if arg.startswith("--view-id="):
         try:
             CALLER_VIEW_ID = int(arg.split("=", 1)[1])
         except ValueError:
             pass
+    elif arg in ("--enable-read-image", "--enable-read-image=1",
+                 "--enable-read-image=true"):
+        ENABLE_READ_IMAGE = True
+    elif arg in ("--enable-read-image=0", "--enable-read-image=false",
+                 "--disable-read-image"):
+        ENABLE_READ_IMAGE = False
 
 # Initialize tool router
 _router = create_sublime_router()
@@ -249,8 +259,7 @@ def handle_request(request: dict) -> dict:
         return None
 
     elif method == "tools/list":
-        return make_response(id, {
-            "tools": [
+        tools = [
                 # ─── Editor Tools ─────────────────────────────────────────
                 {
                     "name": "get_window_summary",
@@ -307,39 +316,6 @@ def handle_request(request: dict) -> dict:
                             "grep": {"type": "string", "description": "Filter lines matching regex pattern (case-sensitive)"},
                             "grep_i": {"type": "string", "description": "Filter lines matching regex pattern (case-insensitive)"}
                         }
-                    }
-                },
-                {
-                    "name": "read_image",
-                    "description": (
-                        "VISION: load a local image file (PNG/JPEG/WebP/GIF "
-                        "screenshots, UI renders, app captures) so the model can "
-                        "see pixels. Grok: call via use_tool tool_name="
-                        "\"sublime__read_image\" tool_input={\"path\":\"/abs/file.png\"}; "
-                        "if unknown, search_tool query=\"read_image\" first. "
-                        "Never use read_file on images (ACP text FS → "
-                        "'Cannot read binary file')."
-                    ),
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "path": {
-                                "type": "string",
-                                "description": "Absolute path to the image file"
-                            },
-                            "file_path": {
-                                "type": "string",
-                                "description": "Alias for path"
-                            },
-                            "max_edge": {
-                                "type": "number",
-                                "description": (
-                                    "Optional max long-edge pixels before shrink "
-                                    f"(default {_READ_IMAGE_MAX_EDGE})"
-                                )
-                            }
-                        },
-                        "required": ["path"]
                     }
                 },
                 # ─── Session Tools ────────────────────────────────────────
@@ -867,8 +843,49 @@ Examples:
                         "required": ["cmd"]
                     }
                 }
-            ]
-        })
+        ]
+        if ENABLE_READ_IMAGE:
+            read_image_tool = {
+                "name": "read_image",
+                "description": (
+                    "VISION: load a local image file (PNG/JPEG/WebP/GIF "
+                    "screenshots, UI renders, app captures) so the model can "
+                    "see pixels. Grok: call via use_tool tool_name="
+                    "\"sublime__read_image\" tool_input={\"path\":\"/abs/file.png\"}; "
+                    "if unknown, search_tool query=\"read_image\" first. "
+                    "Never use read_file on images (ACP text FS → "
+                    "'Cannot read binary file')."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Absolute path to the image file"
+                        },
+                        "file_path": {
+                            "type": "string",
+                            "description": "Alias for path"
+                        },
+                        "max_edge": {
+                            "type": "number",
+                            "description": (
+                                "Optional max long-edge pixels before shrink "
+                                f"(default {_READ_IMAGE_MAX_EDGE})"
+                            )
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+            # Prefer after read_view; fall back to end of list.
+            insert_at = next(
+                (i + 1 for i, t in enumerate(tools)
+                 if t.get("name") == "read_view"),
+                len(tools),
+            )
+            tools.insert(insert_at, read_image_tool)
+        return make_response(id, {"tools": tools})
 
     elif method == "tools/call":
         try:
@@ -880,6 +897,18 @@ Examples:
 
             # Local tools (no Sublime socket)
             if tool_name == "read_image":
+                if not ENABLE_READ_IMAGE:
+                    return make_response(id, {
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "Error: read_image is disabled for this session. "
+                                "Enable with settings mcp_enable_read_image=true "
+                                "(default auto: on for Grok ACP only)."
+                            ),
+                        }],
+                        "isError": True,
+                    })
                 return make_response(id, handle_read_image(args))
 
             # Route the tool call to get executable code

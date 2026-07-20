@@ -76,6 +76,8 @@ class OutputView:
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
         self._media_anchor: Dict[str, int] = {}  # abs path -> buffer pt for popup
         self._context_phantom_set = None  # clickable open/reveal chips on 📎 line
+        # Transcript turn 📎 chips (path-rich; rebuilt on each current-turn render)
+        self._turn_context_phantom_set = None
         self._pad_phantom_set = None  # invisible height under ◎ (not a gray box)
 
     def show(self, focus: bool = True, panel: Optional[str] = None) -> None:
@@ -1168,8 +1170,13 @@ class OutputView:
             lambda items=list(context_items): self._refresh_context_phantoms(items),
             10)
 
-    def prompt(self, text: str, context_names: List[str] = None) -> None:
-        """Start a new conversation with a prompt."""
+    def prompt(self, text: str, context_names: List[str] = None,
+               context_refs: List[dict] = None) -> None:
+        """Start a new conversation with a prompt.
+
+        context_names: display labels under 📎
+        context_refs: path-rich dicts for click-to-focus (from ContextItem.as_ref)
+        """
         # focus=False: stream/goal turns must not yank the user out of other files
         self.show(focus=False)
 
@@ -1217,6 +1224,12 @@ class OutputView:
         prev_todos = []
         prev_goal = None
         if self.current:
+            # Bake 📎 names into buffer so history stays readable after
+            # turn-context phantoms move to the next prompt.
+            try:
+                self._materialize_turn_context_line(self.current)
+            except Exception as e:
+                print(f"[Claude] materialize context line: {e}")
             # Always clear busy mark and re-render *this* turn before we swap
             # self.current. Debounced _render_current races with queued follow-up
             # queries and leaves a stale ⠋/⠧ under the previous @done.
@@ -1246,12 +1259,20 @@ class OutputView:
                 prev_todos = _open_todos(self.current.todos)
 
         # Start new
+        refs = list(context_refs or [])
+        # Back-compat: names-only → synthetic refs (no path → click is a no-op tip)
+        if not refs and context_names:
+            refs = [{"name": n, "path": "", "line_range": "", "action": "reveal"}
+                    for n in context_names]
+        names = list(context_names or [r.get("name") or "?" for r in refs])
         self.current = Conversation(
             prompt=text, todos=prev_todos, goal=prev_goal,
-            context_names=context_names or [])
+            context_names=names,
+            context_refs=refs)
         self._update_title()  # Show working indicator
 
-        # Render prompt with optional context indicator
+        # Render prompt with optional context indicator.
+        # Buffer keeps only 📎; names are clickable phantoms (same as pending chips).
         start = self.view.size()
         prefix = "\n" if start > 0 else ""
         # Indent continuation lines to align with first line after ◎
@@ -1260,13 +1281,10 @@ class OutputView:
             indented = lines[0] + "\n" + "\n".join("  " + l for l in lines[1:])
         else:
             indented = text
-        if context_names:
-            context_str = ", ".join(context_names)
-            line = f"{prefix}◎ {indented} ▶\n  {CONTEXT_PREFIX}{context_str}\n"
-            # print(f"[Claude] prompt: writing with context: {repr(line)}")
+        if names or refs:
+            line = f"{prefix}◎ {indented} ▶\n  {CONTEXT_PREFIX}\n"
         else:
             line = f"{prefix}◎ {indented} ▶\n"
-            # print(f"[Claude] prompt: writing without context: {repr(line)}")
         end = self._write(line)
         self.current.region = (start, end)
         # Track with Sublime region so it auto-adjusts when view content shifts
@@ -1276,6 +1294,12 @@ class OutputView:
             "", "", sublime.HIDDEN,
         )
         self._scroll_to_end()
+        if refs:
+            # Defer so layout has the 📎 line before we anchor INLINE phantoms.
+            sublime.set_timeout(
+                lambda r=list(refs), a=start, b=end: self._refresh_turn_context_phantoms(
+                    r, region=(a, b)),
+                15)
 
     def tool(self, name: str, tool_input: dict = None, tool_id: str = None, background: bool = False) -> None:
         """Add a pending tool.
@@ -3193,10 +3217,10 @@ class OutputView:
             else:
                 indented_prompt = self.current.prompt
             # Include context indicator if present
-            if self.current.context_names:
-                context_str = ", ".join(self.current.context_names)
+            if self.current.context_names or self.current.context_refs:
+                # Names live in clickable phantoms (see _refresh_turn_context_phantoms)
                 lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
-                lines.append(f"  {CONTEXT_PREFIX}{context_str}\n")
+                lines.append(f"  {CONTEXT_PREFIX}\n")
             else:
                 lines.append(f"{prefix}◎ {indented_prompt} ▶\n")
 
@@ -3478,6 +3502,17 @@ class OutputView:
 
         # Update title (tab only — no viewport effect)
         self._update_title()
+
+        # Re-anchor clickable 📎 chips for this turn (paths survive re-render)
+        try:
+            refs = list(getattr(self.current, "context_refs", None) or [])
+            if refs and self.current.region:
+                self._refresh_turn_context_phantoms(
+                    refs, region=self.current.region)
+            elif not refs:
+                self._clear_turn_context_phantoms()
+        except Exception as e:
+            print(f"[Claude] turn context phantoms: {e}")
 
         # Keep question UI glued to the conversation tail. When pinned, avoid
         # re-anchoring every spinner tick unless the block is missing/misplaced
@@ -4219,13 +4254,15 @@ class OutputView:
             sublime.status_message(f"Reveal failed: {e}")
 
     def _open_path(self, path: str, line: int = None) -> None:
-        """Open a code/text file in Sublime; optional 1-based line jump.
+        """Open/focus a file in Sublime; optional 1-based line jump.
 
         Also pins the path as the session edit target (preview → edit sync).
+        Prefer an already-open view (focus it) over reopening a second tab.
         """
         path = os.path.expanduser(path or "")
         if not path:
             return
+        path = os.path.abspath(path)
         window = self.view.window() if self.view else None
         if not window:
             return
@@ -4242,23 +4279,49 @@ class OutputView:
         self._sync_edit_target_from_preview(
             path,
             as_context=is_img,
-            announce=True,
+            announce=False,
             line=line,
         )
+        # Focus existing view when possible (true "click to focus")
+        target = None
+        try:
+            for v in window.views():
+                fn = v.file_name()
+                if not fn:
+                    continue
+                if os.path.abspath(fn) == path:
+                    target = v
+                    break
+        except Exception:
+            target = None
+        if target is not None:
+            window.focus_view(target)
+            if line and line > 0:
+                try:
+                    pt = target.text_point(max(0, line - 1), 0)
+                    target.sel().clear()
+                    target.sel().add(sublime.Region(pt, pt))
+                    target.show_at_center(pt)
+                except Exception:
+                    pass
+            base = os.path.basename(path)
+            loc = f"{base}:{line}" if line and line > 0 else base
+            sublime.status_message(f"Focused {loc}")
+            return
         if line and line > 0:
             window.open_file(
                 f"{path}:{line}", sublime.ENCODED_POSITION)
             sublime.status_message(
-                f"Opened {os.path.basename(path)}:{line} · edit target set")
+                f"Opened {os.path.basename(path)}:{line}")
         else:
             window.open_file(path)
             sublime.status_message(
-                f"Opened {os.path.basename(path)} · edit target set")
+                f"Opened {os.path.basename(path)}")
 
     def _refresh_context_phantoms(self, context_items: list) -> None:
-        """Clickable chips inline after the buffer 📎 (single line, no duplicate).
+        """Clickable chips inline after the pending 📎 (composer, not history).
 
-        Click name → open/reveal. Ctrl/Cmd+click name → remove that item.
+        Click name → open/focus file. Ctrl/Cmd+click name → remove that item.
         Trailing "clear" → drop all pending context.
         """
         import html as _html
@@ -4300,20 +4363,18 @@ class OutputView:
             path = getattr(item, "path", "") or ""
             name = _html.escape(item.name or os.path.basename(path) or "?")
             try:
-                action = item.open_action  # open | reveal (click still uses this)
+                action = item.open_action  # open | reveal
             except Exception:
                 action = "reveal"
             tip = (
-                f"{'open' if action == 'open' else 'reveal'}; "
+                f"click to {'open' if action == 'open' else 'reveal'}; "
                 f"ctrl/cmd+click to remove"
             )
-            # Name only — no "· open" suffix (many items would be noisy).
             chips.append(f'<a href="item:{i}" title="{_html.escape(tip)}">{name}</a>')
         clear_chip = (
             f'<a href="clear" title="clear all context" '
             f'style="color:color(var(--foreground) alpha(0.55))">clear</a>'
         )
-        # No leading 📎 — buffer already has CONTEXT_PREFIX on this line.
         body = (
             f'<body id="claude-context-chips" '
             f'style="margin:0;padding:0;font-size:11px;'
@@ -4323,16 +4384,7 @@ class OutputView:
             f'{clear_chip}</body>'
         )
         try:
-            # INLINE after 📎 / before trailing newline → one visual row.
-            # Region may include a leading \n (set_pending_context); locate 📎.
-            line_end = end - 1 if end > start and self.view.substr(end - 1) == "\n" else end
-            region_txt = self.view.substr(sublime.Region(start, end))
-            pref_at = region_txt.find(CONTEXT_PREFIX)
-            if pref_at >= 0:
-                anchor = start + pref_at + len(CONTEXT_PREFIX)
-            else:
-                anchor = start
-            anchor = max(start, min(anchor, line_end))
+            anchor = self._context_prefix_anchor(start, end)
             ph = sublime.Phantom(
                 sublime.Region(anchor, anchor),
                 body,
@@ -4342,6 +4394,145 @@ class OutputView:
             self._context_phantom_set.update([ph])
         except Exception as e:
             print(f"[Claude] context phantoms: {e}")
+
+    def _clear_turn_context_phantoms(self) -> None:
+        try:
+            ps = getattr(self, "_turn_context_phantom_set", None)
+            if ps is not None:
+                ps.update([])
+        except Exception:
+            pass
+
+    def _materialize_turn_context_line(self, conv) -> None:
+        """Write context names into the buffer for a finished turn.
+
+        Live turns show names only via clickable phantoms. When the turn is
+        frozen (next prompt starts), bake labels after 📎 so history stays
+        readable without the phantom set.
+        """
+        if not conv or not self.view or not self.view.is_valid():
+            return
+        names = list(getattr(conv, "context_names", None) or [])
+        if not names:
+            refs = getattr(conv, "context_refs", None) or []
+            names = [
+                (r.get("name") or os.path.basename(r.get("path") or "") or "?")
+                for r in refs if isinstance(r, dict)
+            ]
+        names = [n for n in names if n]
+        if not names:
+            return
+        start, end = self._find_context_prefix_in_region(
+            getattr(conv, "region", None) or (0, 0))
+        if end <= start:
+            return
+        # Region is the 📎 line incl. trailing newline; rewrite labels in place.
+        has_nl = end > start and self.view.substr(end - 1) == "\n"
+        label = ", ".join(names)
+        new_line = f"  {CONTEXT_PREFIX}{label}" + ("\n" if has_nl else "")
+        old = self.view.substr(sublime.Region(start, end))
+        # Already baked (re-render / double finalize)
+        if label in old and old.strip() != CONTEXT_PREFIX.strip():
+            return
+        self._replace(start, end, new_line)
+        # Region end shifts if label length differs from bare 📎 line
+        try:
+            delta = len(new_line) - (end - start)
+            if delta and conv.region:
+                a, b = conv.region
+                conv.region = (a, b + delta)
+        except Exception:
+            pass
+
+    def _context_prefix_anchor(self, start: int, end: int) -> int:
+        """Point just after CONTEXT_PREFIX within [start, end)."""
+        if not self.view or end <= start:
+            return max(0, start)
+        line_end = end - 1 if end > start and self.view.substr(end - 1) == "\n" else end
+        region_txt = self.view.substr(sublime.Region(start, end))
+        pref_at = region_txt.find(CONTEXT_PREFIX)
+        if pref_at >= 0:
+            anchor = start + pref_at + len(CONTEXT_PREFIX)
+        else:
+            anchor = start
+        return max(start, min(anchor, line_end))
+
+    def _find_context_prefix_in_region(self, region: tuple) -> tuple:
+        """Locate 📎 line inside a conversation region → (start, end) or (0,0)."""
+        if not self.view or not region:
+            return (0, 0)
+        a, b = int(region[0]), int(region[1])
+        if b <= a:
+            return (0, 0)
+        a = max(0, min(a, self.view.size()))
+        b = max(a, min(b, self.view.size()))
+        text = self.view.substr(sublime.Region(a, b))
+        idx = text.find(CONTEXT_PREFIX)
+        if idx < 0:
+            return (0, 0)
+        start = a + idx
+        nl = text.find("\n", idx)
+        end = a + nl + 1 if nl >= 0 else b
+        return (start, end)
+
+    def _refresh_turn_context_phantoms(
+            self, context_refs: list, region: tuple = None) -> None:
+        """Clickable 📎 chips on a turn's context line (click → focus file)."""
+        import html as _html
+        if not self.view or not self.view.is_valid():
+            return
+        refs = list(context_refs or [])
+        try:
+            if (self._turn_context_phantom_set is None
+                    or getattr(self, "_turn_context_view_id", None) != self.view.id()):
+                self._turn_context_phantom_set = sublime.PhantomSet(
+                    self.view, "claude_turn_context_chips")
+                self._turn_context_view_id = self.view.id()
+        except Exception:
+            return
+
+        if not refs:
+            self._clear_turn_context_phantoms()
+            return
+
+        reg = region or (getattr(self.current, "region", None) if self.current else None)
+        start, end = self._find_context_prefix_in_region(reg or (0, 0))
+        if end <= start:
+            self._clear_turn_context_phantoms()
+            return
+
+        chips = []
+        for i, ref in enumerate(refs):
+            if not isinstance(ref, dict):
+                continue
+            path = ref.get("path") or ""
+            name = _html.escape(ref.get("name") or os.path.basename(path) or "?")
+            action = ref.get("action") or ("open" if path else "reveal")
+            tip = f"click to {'open' if action == 'open' else 'reveal'} {path or name}"
+            chips.append(
+                f'<a href="tref:{i}" title="{_html.escape(tip)}">{name}</a>')
+        if not chips:
+            self._clear_turn_context_phantoms()
+            return
+        body = (
+            f'<body id="claude-turn-context" '
+            f'style="margin:0;padding:0;font-size:11px;'
+            f'color:color(var(--foreground) alpha(0.85))">'
+            f'{" · ".join(chips)}</body>'
+        )
+        try:
+            # Stash refs for href handler (index-based)
+            self._turn_context_refs = refs
+            anchor = self._context_prefix_anchor(start, end)
+            ph = sublime.Phantom(
+                sublime.Region(anchor, anchor),
+                body,
+                sublime.LAYOUT_INLINE,
+                on_navigate=self._handle_context_href,
+            )
+            self._turn_context_phantom_set.update([ph])
+        except Exception as e:
+            print(f"[Claude] turn context phantoms: {e}")
 
     @staticmethod
     def _modifier_held_for_remove() -> bool:
@@ -4371,11 +4562,46 @@ class OutputView:
             return
         from . import claude_code
         session = claude_code.get_session_for_view(self.view) if self.view else None
+        # Quick multi-slot: registry may lag; prefer active quick session
+        if session is None and self.view and self.view.window():
+            try:
+                from . import quick_agent as qa
+                host = qa.get_host(self.view.window())
+                if host and host.active_session:
+                    session = host.active_session
+            except Exception:
+                pass
 
         if href == "clear":
             if session:
                 session.clear_context()
                 sublime.status_message("Context cleared")
+            return
+
+        # Transcript turn chips (path-rich refs stored on click)
+        if href.startswith("tref:"):
+            try:
+                idx = int(href[5:])
+            except ValueError:
+                return
+            refs = getattr(self, "_turn_context_refs", None) or []
+            if self.current and getattr(self.current, "context_refs", None):
+                refs = self.current.context_refs or refs
+            if idx < 0 or idx >= len(refs):
+                return
+            ref = refs[idx] if isinstance(refs[idx], dict) else {}
+            path = (ref.get("path") or "").strip()
+            if not path:
+                sublime.status_message(
+                    f"No path for {ref.get('name') or 'context item'}")
+                return
+            action = ref.get("action") or "open"
+            if action == "open":
+                from .context_manager import first_line_of_range
+                line = first_line_of_range(ref.get("line_range") or "")
+                self._open_path(path, line=line)
+            else:
+                self._reveal_path(path)
             return
 
         if href.startswith("item:"):

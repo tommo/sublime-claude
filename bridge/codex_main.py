@@ -206,6 +206,8 @@ class CodexBridge(BaseBridge):
             args = [mcp_server_path]
             if view_id:
                 args.append(f"--view-id={view_id}")
+            if params.get("mcp_enable_read_image"):
+                args.append("--enable-read-image")
             # Pass as TOML config overrides
             config.append(f'mcp_servers.sublime.command="{sys.executable}"')
             args_toml = "[" + ", ".join(f'"{a}"' for a in args) + "]"

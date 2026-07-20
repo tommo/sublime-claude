@@ -106,6 +106,10 @@ class AcpBridge(BaseBridge):
     """Protocol-level ACP client; agent-specific details live in subclasses."""
 
     BACKEND_NAME: str = "acp"
+    # Opt-in vision MCP tool (mcp__sublime__read_image). Default off for most
+    # ACP agents; GrokBridge sets True. Overridable via initialize param
+    # mcp_enable_read_image / settings mcp_enable_read_image.
+    MCP_ENABLE_READ_IMAGE: bool = False
     DEFAULT_MODEL: str = ""
     CLIENT_NAME: str = "sublime-claude"
     CLIENT_VERSION: str = "0.2"
@@ -130,6 +134,8 @@ class AcpBridge(BaseBridge):
         self.cwd: str = os.getcwd()
         self.agent_mode: str = ""
         self._view_id: Optional[Any] = None
+        self._mcp_enable_read_image: bool = bool(
+            getattr(self, "MCP_ENABLE_READ_IMAGE", False))
         self.agent_capabilities: Dict[str, Any] = {}
         self.negotiated_protocol_version: int = 1
         self._terminals: Dict[str, Dict[str, Any]] = {}
@@ -1327,6 +1333,13 @@ class AcpBridge(BaseBridge):
             except OSError:
                 pass
         self._view_id = params.get("view_id")
+        # Optional vision MCP tool — default from class (Grok=on); host may
+        # override via mcp_enable_read_image (settings auto/true/false).
+        if "mcp_enable_read_image" in params:
+            self._mcp_enable_read_image = bool(params.get("mcp_enable_read_image"))
+        else:
+            self._mcp_enable_read_image = bool(
+                getattr(self, "MCP_ENABLE_READ_IMAGE", False))
         # Plugin permission rules — same payload Claude bridge receives.
         self.permission_mode = params.get("permission_mode") or "default"
         raw_allowed = params.get("allowed_tools") or []
@@ -1509,6 +1522,8 @@ class AcpBridge(BaseBridge):
         args = [mcp_server_path]
         if self._view_id is not None:
             args.append(f"--view-id={self._view_id}")
+        if self._mcp_enable_read_image:
+            args.append("--enable-read-image")
         return [{
             "name": "sublime",
             "type": "stdio",
@@ -3048,14 +3063,23 @@ class AcpBridge(BaseBridge):
         if head[:8] == b"\x89PNG\r\n\x1a\n" and len(head) >= 24:
             w, h = struct.unpack(">II", head[16:24])
         dim = f"{w}x{h}" if w and h else "unknown"
+        if self._mcp_enable_read_image:
+            vision = (
+                f"Do not use read_file for pixels. Call use_tool with "
+                f"tool_name=\"sublime__read_image\" and "
+                f"tool_input={{\"path\": {path!r}}} "
+                f"(search_tool query=\"read_image\" first if unknown). "
+                f"Or pass the path to image_edit / image_gen."
+            )
+        else:
+            vision = (
+                "read_image MCP is not enabled for this session "
+                "(path is usable by media tools that accept file paths)."
+            )
         note = (
             f"Image file ({mime}), {size} bytes, dimensions≈{dim}.\n"
             f"Path: {path}\n"
-            f"Do not use read_file for pixels. Call use_tool with "
-            f"tool_name=\"sublime__read_image\" and "
-            f"tool_input={{\"path\": {path!r}}} "
-            f"(search_tool query=\"read_image\" first if unknown). "
-            f"Or pass the path to image_edit / image_gen."
+            f"{vision}"
         )
         self.file_log(
             f"fs/read_text_file: image {path!r} → path note "

@@ -149,10 +149,21 @@ class TestShippedPureHelpers(unittest.TestCase):
         self.assertIn("quick_done", p)
         self.assertIn("closed", p.lower())
         self.assertIn("one-shot", p.lower())
-        self.assertIn("Do NOT use update_goal", p)
+        self.assertIn("update_goal", p)
+        self.assertIn("Do NOT use", p)
+        self.assertIn("get_window_summary", p)  # forbidden by contract
+        self.assertIn("attached context", p.lower())
         merged = self.qa.build_system_prompt({"system_prompt": "Be brief."})
         self.assertIn("Be brief", merged)
         self.assertIn("quick_done", merged)
+
+    def test_default_quick_tools_exclude_window_mcp(self):
+        tools = self.qa.DEFAULT_QUICK_ALLOWED_TOOLS
+        self.assertIn("Read", tools)
+        self.assertIn("mcp__sublime__quick_done", tools)
+        joined = " ".join(tools)
+        self.assertNotIn("get_window_summary", joined)
+        self.assertNotIn("spawn_session", joined)
 
     def test_stop_session_bridge(self):
         class FC:

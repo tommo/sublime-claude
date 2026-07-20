@@ -102,6 +102,8 @@ class CopilotBridge(BaseBridge):
             mcp_args = [mcp_server_path]
             if view_id:
                 mcp_args.append(f"--view-id={view_id}")
+            if params.get("mcp_enable_read_image"):
+                mcp_args.append("--enable-read-image")
             mcp_servers["sublime"] = {"type": "local", "command": sys.executable, "args": mcp_args, "tools": ["*"]}
         if mcp_servers:
             config["mcp_servers"] = mcp_servers

@@ -139,7 +139,7 @@ def load_env(window, settings, cwd=None):
     return env
 
 
-def build_sublime_mcp_config(settings, view_id):
+def build_sublime_mcp_config(settings, view_id, *, enable_read_image=False):
     """Inline `--mcp-config` JSON wiring the sublime MCP stdio server, scoped to
     `view_id` (the calling session's view). Returns "" to skip injection."""
     if not settings.get("pty_inject_sublime_mcp", True):
@@ -148,12 +148,20 @@ def build_sublime_mcp_config(settings, view_id):
     if not os.path.exists(server):
         return ""
     py = settings.get("python_path") or sys.executable
+    args = [server, "--view-id={}".format(view_id)]
+    # PTY is Claude Code — default off; opt in via settings or explicit kwarg.
+    if enable_read_image or settings.get("mcp_enable_read_image") is True:
+        args.append("--enable-read-image")
+    elif isinstance(settings.get("mcp_enable_read_image"), str):
+        if settings.get("mcp_enable_read_image").strip().lower() in (
+                "1", "true", "yes", "on"):
+            args.append("--enable-read-image")
     return json.dumps({
         "mcpServers": {
             "sublime": {
                 "type": "stdio",
                 "command": py,
-                "args": [server, "--view-id={}".format(view_id)],
+                "args": args,
             }
         }
     })

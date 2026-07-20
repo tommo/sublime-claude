@@ -235,6 +235,9 @@ class Session:
         # query; _auto_retry_pending lets query() cancel a scheduled retry.
         self._auto_retry_count: int = 0
         self._auto_retry_pending: bool = False
+        # Monotonic turn id: stale bridge _on_done (late interrupt after a
+        # queued follow-up already started) must not clobber the new turn.
+        self._query_gen: int = 0
         # Pending context for next query (delegated to ContextManager)
         self.context = ContextManager(self)
         # Profile docs available for reading (paths only, not content)
@@ -434,6 +437,16 @@ class Session:
         # In default mode, don't auto-allow any tools - prompt for all
         if isinstance(qa.get("allowed_tools"), list):
             allowed_tools = list(qa.get("allowed_tools") or [])
+        elif getattr(self, "quick_mode", False):
+            # Narrow default: full MCP made Quick thrash on get_window_summary.
+            try:
+                from .quick_agent import DEFAULT_QUICK_ALLOWED_TOOLS
+                allowed_tools = list(DEFAULT_QUICK_ALLOWED_TOOLS)
+            except Exception:
+                allowed_tools = [
+                    "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+                    "mcp__sublime__quick_done",
+                ]
         elif permission_mode == "default":
             allowed_tools = []
         else:
@@ -461,6 +474,8 @@ class Session:
             "allowed_tools": allowed_tools,
             "permission_mode": permission_mode,
             "view_id": str(self.output.view.id()) if self.output and self.output.view else None,
+            # Vision MCP tool (mcp__sublime__read_image): auto = Grok ACP only.
+            "mcp_enable_read_image": self._mcp_enable_read_image(settings),
         }
         if self.resume_id:
             init_params["resume"] = self.resume_id
@@ -514,11 +529,18 @@ class Session:
                 init_params["pre_compact_prompt"] = self.profile["pre_compact_prompt"]
             # Build system prompt with profile docs info
             system_prompt = self.profile.get("system_prompt", "")
+            append_system = (self.profile.get("append_system_prompt") or "").strip()
             if self.profile_docs:
                 docs_info = f"\n\nProfile Documentation: {len(self.profile_docs)} files available. Use list_profile_docs to see them and read_profile_doc(path) to read their contents."
                 system_prompt = system_prompt + docs_info if system_prompt else docs_info.strip()
             if system_prompt:
+                # Full replacement (profiles that intentionally override Claude).
                 init_params["system_prompt"] = system_prompt
+            elif append_system:
+                # Quick Agent: keep claude_code preset + CLAUDE.md, append contract.
+                init_params["append_system_prompt"] = append_system
+            if getattr(self, "quick_mode", False):
+                init_params["quick_mode"] = True
         else:
             # No profile - use default_model setting if available
             if default_model:
@@ -1459,6 +1481,8 @@ class Session:
 
         self.working = True
         self.query_count += 1
+        self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
+        query_gen = self._query_gen
         self._goal_last_update_sig = None  # allow same progress text next turn
         # Preserve sticky draft whenever the user is typing mid-stream — including
         # when a *queued* turn fires. Never wipe ◎ content just because the queue
@@ -1494,7 +1518,7 @@ class Session:
                     pass
         # Build prompt with context (may include images), then consume
         full_prompt, images = self._build_prompt_with_context(prompt)
-        _, context_names = self.context.take()
+        _, context_names, context_refs = self.context.take()
 
         # Store images for RPC call
         self._pending_images = images
@@ -1522,7 +1546,7 @@ class Session:
             # Auto-name session from first prompt if not already named
             if not self.name:
                 self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
-            self.output.prompt(ui_prompt, context_names)
+            self.output.prompt(ui_prompt, context_names, context_refs=context_refs)
         # Always show busy indicator: flip tab title now and start the spinner
         # loop. Silent queries (bg-task wakes, retain injects, …) still need a
         # visible cue that the session is processing, even though the user
@@ -1544,7 +1568,11 @@ class Session:
         if hasattr(self, '_pending_images') and self._pending_images:
             query_params["images"] = self._pending_images
             self._pending_images = []
-        if not self.client.send("query", query_params, self._on_done):
+
+        def _on_done_for_gen(result, _gen=query_gen):
+            self._on_done(result, _expected_gen=_gen)
+
+        if not self.client.send("query", query_params, _on_done_for_gen):
             self._status("error: bridge died")
             self.working = False
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
@@ -1599,7 +1627,19 @@ class Session:
             self._response_callback = None
             cb("Error: failed to send query")
 
-    def _on_done(self, result: dict) -> None:
+    def _on_done(self, result: dict, _expected_gen: Optional[int] = None) -> None:
+        # Stale completion: user Esc + queue already started a newer turn, but
+        # the cancelled turn's interrupt/error still arrives. Ignoring prevents
+        # *[interrupted]* spam and killing the live turn (working=False + re-fire).
+        if (_expected_gen is not None
+                and _expected_gen != getattr(self, "_query_gen", None)):
+            print(
+                f"[Claude] ignore stale turn done "
+                f"gen={_expected_gen} current={getattr(self, '_query_gen', None)} "
+                f"status={result.get('status') if isinstance(result, dict) else '?'}"
+            )
+            return
+
         self.current_tool = None
 
         # Clear executing session marker - MCP tools should no longer target this session
@@ -1619,9 +1659,14 @@ class Session:
         else:
             completion = "success"
 
-        # Interrupt already restored idle UI immediately. Late bridge ack:
-        # clear flag, flush any held queue, re-arm ◎ if drips wiped composer.
-        if completion == "interrupted" and not self.working:
+        # Interrupt already restored idle UI in interrupt(). Late bridge ack
+        # only settles flags + flushes queue — never paints *[interrupted]* again
+        # and never clobbers a newer live turn (generation check above).
+        if completion == "interrupted":
+            if self.working and not getattr(self, "_interrupting", False):
+                # Live turn is not the cancelled one — never clobber it.
+                print("[Claude] ignore interrupt done while another turn is live")
+                return
             self._interrupting = False
             if self._response_callback:
                 cb = self._response_callback
@@ -1630,10 +1675,15 @@ class Session:
                     cb("")
                 except Exception:
                     pass
-            # Do not clear_queue — interrupt kept user messages; fire next.
-            if self._fire_next_queued():
-                return
-            self._ensure_idle_input(reason="late interrupt ack")
+            # Host already set working=False + *[interrupted]*; just flush queue.
+            self.working = False
+            if self.output and self.output.current:
+                self.output.current.working = False
+            self._clear_deferred_state(clear_queue=False)
+            if not getattr(self, "_quick_finished", False):
+                if self._fire_next_queued():
+                    return
+                self._ensure_idle_input(reason="late interrupt ack")
             return
 
         # 2. Handle UI for each completion type.
@@ -2227,6 +2277,10 @@ class Session:
 
         self._interrupting = True
         # Keep user-queued messages — interrupt only cancels the active turn.
+        # Do NOT flush the queue here: bridge cancel is still in flight, and
+        # starting a new turn immediately races late interrupt _on_done (which
+        # used to mark the new turn *[interrupted]* and re-fire). Queue flushes
+        # from late interrupt ack / post-settle rearm once idle.
 
         # Goal harness: Esc pauses Active goal so we don't auto-continue.
         try:
@@ -2258,24 +2312,38 @@ class Session:
             self._update_queue_phantom()
         except Exception:
             pass
-        # Flush held queue and/or restore ◎. (Sticky mid-turn ◎ used to block
-        # the enter_input path that fired the queue.)
-        self._ensure_idle_input(reason="interrupt")
+        # Restore ◎ only — queue flush waits for settle (see rearm / late ack).
+        # Still allow flush via _ensure_idle_input once idle, but delay the
+        # first attempt so cancel lands before a new session/prompt.
         gen = getattr(self, "_interrupt_gen", 0) + 1
         self._interrupt_gen = gen
 
-        def _rearm_after_drip(_gen=gen):
+        def _rearm_after_drip(_gen=gen, fire_queue=True):
             if getattr(self, "_interrupt_gen", 0) != _gen:
                 return
             if self.working:
                 return
-            # Retry flush if first attempt raced the bridge still canceling
-            self._ensure_idle_input(reason="post-interrupt settle")
+            # After cancel settles: flush held queue once, else restore ◎.
+            if fire_queue:
+                self._ensure_idle_input(reason="post-interrupt settle")
+            else:
+                # Composer only (no queue) — used for very early re-paint
+                if not self.output:
+                    return
+                if self.output.is_input_mode():
+                    return
+                self._input_mode_entered = False
+                try:
+                    self._enter_input_with_draft()
+                except Exception:
+                    pass
 
-        # Bridge often emits 1–2 more lines after cancel; re-check composer/queue
-        sublime.set_timeout(_rearm_after_drip, 200)
-        sublime.set_timeout(_rearm_after_drip, 600)
-        sublime.set_timeout(_rearm_after_drip, 1200)
+        # Composer quickly; queue only after cancel has had time to settle
+        # (avoids Grok/Kimi agent_busy + late interrupt clobbering the new turn).
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=False), 50)
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 250)
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 700)
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 1400)
 
         if self.client:
             sent = self.client.send("interrupt", {})
@@ -4065,6 +4133,30 @@ class Session:
             or settings.get("effort", "high")
             or "high"
         ).strip()
+
+    def _mcp_enable_read_image(self, settings=None) -> bool:
+        """Whether sublime MCP should advertise read_image for this session.
+
+        settings.mcp_enable_read_image:
+          true / false — force on/off for all backends
+          "auto" (default) — on only for Grok ACP (needs vision over binary FS)
+        """
+        if settings is None:
+            settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        raw = settings.get("mcp_enable_read_image", "auto")
+        if isinstance(raw, str):
+            low = raw.strip().lower()
+            if low in ("1", "true", "yes", "on"):
+                return True
+            if low in ("0", "false", "no", "off"):
+                return False
+            # "auto" / empty / unknown → Grok ACP only
+            return self.backend == "grok"
+        if raw is True:
+            return True
+        if raw is False:
+            return False
+        return self.backend == "grok"
 
     # ── Host goal harness ────────────────────────────────────────────────
 
