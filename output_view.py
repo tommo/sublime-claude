@@ -166,7 +166,9 @@ class OutputView:
         # Strip any leading status glyphs so they never accumulate in the stored
         # base name (e.g. a ↻/◇ prefix leaking back in → "◇ ↻ name").
         import re
-        name = re.sub(r'^(?:[◉◇•❓⏸↻⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', name or "") or "Claude"
+        name = re.sub(
+            r'^(?:[◉◇•❓⏸↻⚠✘❌!❗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', name or ""
+        ) or "Claude"
         self._name = name  # Store for refresh_title
         self._update_title()
 
@@ -182,6 +184,7 @@ class OutputView:
         #   ◉ active + working   ◇ active + idle
         #   • inactive + working (no prefix) inactive + idle
         #   ❓ permission/question/plan   ⏸ sleeping   ↻ pending self-wake
+        #   ⚠ error-halted (turn/bridge failed; cleared on next query)
         from . import claude_code
         session = claude_code.get_session_for_view(self.view)
         is_sleeping = session and session.is_sleeping
@@ -196,6 +199,9 @@ class OutputView:
             (session and session.working)
             or (self.current and self.current.working)
         )
+        is_error_halt = bool(
+            session and getattr(session, "error_halted", False) and not is_working
+        )
         # ↻ = confirmed future wake only (clears when wake fires / expires).
         import time as _t
         _nxt = getattr(session, "next_wake_at", None) if session else None
@@ -204,6 +210,9 @@ class OutputView:
             prefix = "⏸ "
         elif is_questioning:
             prefix = "❓ "
+        elif is_error_halt:
+            # Visible alert on the tab until the user starts a new turn.
+            prefix = "⚠ "
         elif is_looping and not is_working:
             # Don't hide a live turn behind ↻ — busy wins.
             prefix = "↻ "
@@ -211,6 +220,7 @@ class OutputView:
             prefix = "◉ " if is_working else "◇ "
         else:
             # Inactive idle: no diamond (was wrongly ◇ and looked "idle-active").
+            # Error-halt already handled above (same ⚠ for active/inactive).
             prefix = "• " if is_working else ""
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")

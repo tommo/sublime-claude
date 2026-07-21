@@ -1042,15 +1042,27 @@ class MCPSocketServer:
         if session is None or not hasattr(session, "apply_goal_verdict"):
             return {
                 "ok": False,
-                "error": "No session for goal_verdict.",
+                "error": (
+                    "No session for goal_verdict (caller view not bound). "
+                    "Ensure the sublime MCP server was started with --view-id=… "
+                    "and the goal is open on that session."
+                ),
                 "rejected": True,
             }
-        return session.apply_goal_verdict(
-            achieved=bool(achieved),
-            evidence=evidence,
-            gaps=gaps,
-            message=message or "",
-        )
+        try:
+            return session.apply_goal_verdict(
+                achieved=bool(achieved),
+                evidence=evidence,
+                gaps=gaps,
+                message=message or "",
+            )
+        except Exception as e:
+            # Surface soft-reload / stale class errors clearly to the agent
+            return {
+                "ok": False,
+                "error": f"goal_verdict failed: {e}",
+                "rejected": True,
+            }
 
     # ─── Session Spawn ────────────────────────────────────────────────────
 

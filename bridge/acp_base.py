@@ -24,6 +24,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import uuid as uuidlib
@@ -208,6 +209,13 @@ class AcpBridge(BaseBridge):
         "read_image", "mcp__sublime__read_image",
         "x_keyword_search", "x_semantic_search", "x_user_search",
         "x_thread_fetch",
+        # Enter plan is free; ExitPlanMode is NEVER auto-allowed (see below).
+        "EnterPlanMode",
+    })
+    # Must show plan approval UI — never auto-allow under acceptEdits/bypass.
+    PLAN_EXIT_TOOLS = frozenset({
+        "ExitPlanMode", "exit_plan_mode", "exitPlanMode",
+        "submit_plan", "SubmitPlan", "exit-plan-mode",
     })
     # Read-only tools safe in plan mode without prompting.
     PLAN_READONLY_TOOLS = frozenset({
@@ -217,6 +225,7 @@ class AcpBridge(BaseBridge):
         "x_keyword_search", "x_semantic_search", "x_user_search",
         "x_thread_fetch",
         "scheduler_list", "CronList",
+        "EnterPlanMode",
     })
     # ACP / Grok tool kinds that are read-only research (from toolCall.kind or
     # _meta x.ai/tool.kind).
@@ -1506,31 +1515,132 @@ class AcpBridge(BaseBridge):
             self.model = models["currentModelId"]
 
     def _collect_mcp_servers(self) -> list:
-        """Built-in Sublime MCP server for the agent.
+        """MCP servers for ACP session/new (Grok, Kimi, …).
 
-        Grok's McpServer untagged enum requires stdio servers shaped as:
+        Always injects sublime (editor tools). Also injects **irr** (codebase
+        search) when the `irr` binary is available — same stdio shape Claude
+        uses from ~/.claude.json.
+
+        Grok/Kimi McpServer untagged enum requires:
           {name, type:"stdio", command, args?, env: [{name,value}, ...] | []}
-        A dict env {} is rejected with Invalid params. DSR/other agents accept
-        this shape too (extra `type` is ignored when unused).
+        A dict env {} is rejected with Invalid params.
         """
+        servers: List[dict] = []
         bridge_dir = os.path.dirname(os.path.abspath(__file__))
         plugin_dir = os.path.dirname(bridge_dir)
         mcp_server_path = os.path.join(plugin_dir, "mcp", "server.py")
-        if not os.path.exists(mcp_server_path):
+        if os.path.exists(mcp_server_path):
+            args = [mcp_server_path]
+            if self._view_id is not None:
+                args.append(f"--view-id={self._view_id}")
+            if self._mcp_enable_read_image:
+                args.append("--enable-read-image")
+            servers.append({
+                "name": "sublime",
+                "type": "stdio",
+                "command": sys.executable,
+                "args": args,
+                "env": [],
+            })
+        else:
             self.file_log(f"MCP server missing: {mcp_server_path}")
-            return []
-        args = [mcp_server_path]
-        if self._view_id is not None:
-            args.append(f"--view-id={self._view_id}")
-        if self._mcp_enable_read_image:
-            args.append("--enable-read-image")
-        return [{
-            "name": "sublime",
+
+        irr = self._collect_irr_mcp_server()
+        if irr:
+            servers.append(irr)
+            self.file_log(
+                f"MCP irr: {irr.get('command')} {' '.join(irr.get('args') or [])}")
+        return servers
+
+    def _collect_irr_mcp_server(self) -> Optional[dict]:
+        """stdio MCP for irr (semantic/code search). None if unavailable.
+
+        Binary: PATH `irr`, else ~/.nimble/bin/irr.
+        Index db (--db), first hit wins:
+          1) env SUBLIME_CLAUDE_IRR_DB / IRR_MCP_DB
+          2) Claude ~/.claude.json mcpServers.irr --db
+          3) cwd/.irr or parent project .irr
+          4) ~/.irr-pil/db/pil-core (common multi-project index)
+        Disable with env SUBLIME_CLAUDE_IRR_MCP=0.
+        """
+        if os.environ.get("SUBLIME_CLAUDE_IRR_MCP", "1").strip() in (
+                "0", "false", "off", "no"):
+            return None
+        irr_bin = (
+            shutil.which("irr")
+            or os.path.expanduser("~/.nimble/bin/irr")
+        )
+        if not irr_bin or not os.path.isfile(irr_bin):
+            if not shutil.which("irr"):
+                self.file_log("MCP irr: binary not found — skip")
+                return None
+            irr_bin = shutil.which("irr")
+
+        db = (
+            (os.environ.get("SUBLIME_CLAUDE_IRR_DB") or "").strip()
+            or (os.environ.get("IRR_MCP_DB") or "").strip()
+            or self._irr_db_from_claude_json()
+            or self._irr_db_near_cwd()
+            or self._irr_db_default()
+        )
+        if not db:
+            self.file_log("MCP irr: no index db found — skip")
+            return None
+        if not os.path.isdir(db):
+            self.file_log(f"MCP irr: db not a directory {db!r} — skip")
+            return None
+
+        return {
+            "name": "irr",
             "type": "stdio",
-            "command": sys.executable,
-            "args": args,
+            "command": irr_bin,
+            "args": ["mcp", "--db", db],
             "env": [],
-        }]
+        }
+
+    @staticmethod
+    def _irr_db_from_claude_json() -> str:
+        """Parse --db from Claude Code user mcpServers.irr if present."""
+        path = os.path.expanduser("~/.claude.json")
+        if not os.path.isfile(path):
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            entry = (data.get("mcpServers") or {}).get("irr") or {}
+            args = entry.get("args") or []
+            if not isinstance(args, list):
+                return ""
+            for i, a in enumerate(args):
+                if a == "--db" and i + 1 < len(args):
+                    return str(args[i + 1]).strip()
+                if isinstance(a, str) and a.startswith("--db="):
+                    return a.split("=", 1)[1].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _irr_db_near_cwd(self) -> str:
+        """Walk cwd→parents for a .irr index directory."""
+        start = (self.cwd or os.getcwd() or "").strip() or os.getcwd()
+        try:
+            cur = os.path.abspath(start)
+        except Exception:
+            return ""
+        for _ in range(8):
+            cand = os.path.join(cur, ".irr")
+            if os.path.isdir(cand):
+                return cand
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        return ""
+
+    @staticmethod
+    def _irr_db_default() -> str:
+        cand = os.path.expanduser("~/.irr-pil/db/pil-core")
+        return cand if os.path.isdir(cand) else ""
 
     def _is_agent_busy_error(self, e: BaseException) -> bool:
         msg = str(e).lower()
@@ -2413,6 +2523,32 @@ class AcpBridge(BaseBridge):
                 return True
         return False
 
+    def _is_plan_exit_tool(self, tool_name: str, tool_call: Optional[dict] = None) -> bool:
+        """True for ExitPlanMode / submit_plan (any agent naming)."""
+        if not tool_name:
+            tool_name = ""
+        if tool_name in self.PLAN_EXIT_TOOLS or tool_name == "ExitPlanMode":
+            return True
+        low = (tool_name or "").lower().replace("_", "").replace("-", "")
+        if low in ("exitplanmode", "submitplan"):
+            return True
+        if "exitplan" in low or low.endswith("planmode") and "exit" in low:
+            return True
+        # Title / rawInput hints (Kimi sometimes only sets title)
+        tc = tool_call or {}
+        title = (tc.get("title") or "")
+        if isinstance(title, str):
+            tlow = title.lower().replace(" ", "").replace("_", "")
+            if "exitplan" in tlow or tlow in ("submitplan", "exitplanmode"):
+                return True
+        raw = tc.get("rawInput") or {}
+        if isinstance(raw, dict):
+            for k in ("name", "tool", "variant", "toolName"):
+                v = raw.get(k)
+                if isinstance(v, str) and self._is_plan_exit_tool(v, {}):
+                    return True
+        return False
+
     def _permission_decision(self, tool_name: str,
                               tool_input: dict,
                               tool_call: Optional[dict] = None) -> Optional[bool]:
@@ -2423,6 +2559,11 @@ class AcpBridge(BaseBridge):
         mode = self.permission_mode or "default"
         tool_call = tool_call or {}
 
+        # Plan exit always needs the plan approval UI — never auto-allow,
+        # even under bypassPermissions (Claude bridge parity).
+        if self._is_plan_exit_tool(tool_name, tool_call):
+            return None
+
         # Full bypass — same as Claude bypassPermissions / --always-approve.
         if mode == "bypassPermissions":
             return True
@@ -2432,6 +2573,7 @@ class AcpBridge(BaseBridge):
             return True
 
         # Project / user auto-allow patterns (Always button + permissions.allow).
+        # Never pattern-auto-allow plan exit (handled above).
         for pattern in self._auto_allow_patterns:
             if self._match_permission_pattern(tool_name, tool_input, pattern):
                 self.file_log(
@@ -2507,6 +2649,35 @@ class AcpBridge(BaseBridge):
 
         tool_name = self._normalize_tool_name(tool_call)
         tool_input = self._tool_input_from_update(tool_call, tool_name)
+
+        # EnterPlanMode: notify host, allow (Claude bridge parity).
+        if tool_name in ("EnterPlanMode", "enter_plan_mode", "EnterPlan"):
+            send_notification("plan_mode_enter", {})
+            self._in_plan_mode = True
+            return {"outcome": {
+                "outcome": "selected", "optionId": allow_id,
+            }}
+
+        # ExitPlanMode / submit plan: full plan approval UI (never generic Y/N
+        # and never auto-allow). Kimi/Grok ACP both hit this path.
+        if self._is_plan_exit_tool(tool_name, tool_call):
+            self.file_log(
+                f"permission → plan approval UI for {tool_name!r} "
+                f"input_keys={list(tool_input.keys())}")
+            try:
+                plan_result = await self._handle_acp_exit_plan_permission(
+                    tool_input, tool_call)
+            except Exception as e:
+                self.file_log(f"exit plan permission UI failed: {e}")
+                plan_result = False
+            if plan_result is True:
+                return {"outcome": {
+                    "outcome": "selected", "optionId": allow_id,
+                }}
+            # Reject or cancel
+            return {"outcome": {
+                "outcome": "selected", "optionId": reject_id,
+            }}
 
         # Always re-read project auto-allows — UI "Always" persists them live.
         self._reload_auto_allow_patterns()
@@ -2851,6 +3022,82 @@ class AcpBridge(BaseBridge):
         except Exception as e:
             self.file_log(f"exit_plan_mode: fallback plan write failed: {e}")
             return ""
+
+    async def _handle_acp_exit_plan_permission(
+            self, tool_input: dict, tool_call: Optional[dict] = None) -> bool:
+        """session/request_permission for ExitPlanMode → plan approval UI.
+
+        Kimi (and any ACP agent without a dedicated exit_plan_mode method) hits
+        this instead of the generic Y/N permission. Returns True if approved.
+        """
+        tool_call = tool_call or {}
+        plan_content = (
+            (tool_input or {}).get("plan")
+            or (tool_input or {}).get("planContent")
+            or (tool_input or {}).get("content")
+            or (tool_input or {}).get("markdown")
+            or ""
+        )
+        if not isinstance(plan_content, str):
+            plan_content = str(plan_content or "")
+        # Prefer full plan from rawInput when present
+        raw = tool_call.get("rawInput") or {}
+        if isinstance(raw, dict) and not plan_content:
+            for k in ("plan", "planContent", "content", "markdown", "body"):
+                if raw.get(k):
+                    plan_content = str(raw.get(k) or "")
+                    break
+
+        plan_path = (
+            (tool_input or {}).get("planFilePath")
+            or (tool_input or {}).get("plan_file")
+            or (tool_input or {}).get("file_path")
+            or ""
+        )
+        if not plan_path:
+            plan_path = self._resolve_grok_plan_path(
+                self.session_id or "", self.cwd or "")
+        if plan_content:
+            plan_path = self._ensure_plan_on_disk(plan_content, plan_path)
+        elif plan_path and os.path.isfile(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8", errors="replace") as f:
+                    plan_content = f.read()
+            except Exception:
+                pass
+
+        approval_input = {
+            "plan": plan_content,
+            "planFilePath": plan_path or "",
+            "allowedPrompts": (tool_input or {}).get("allowedPrompts") or [],
+        }
+        self._in_plan_mode = True
+        send_notification("plan_mode_enter", {})  # ensure host knows we're in plan
+        result = await self.request_plan_approval(approval_input, timeout=3600)
+        approved = bool(isinstance(result, dict) and result.get("approved") is True)
+        if approved:
+            self._in_plan_mode = False
+            try:
+                self.agent_mode = (
+                    self.permission_mode_to_agent_mode("acceptEdits")
+                    or self.agent_mode or "auto"
+                )
+                await self.apply_mode()
+            except Exception as e:
+                self.file_log(f"plan approve mode switch failed: {e}")
+        else:
+            self._in_plan_mode = True
+            try:
+                self.agent_mode = (
+                    self.permission_mode_to_agent_mode("plan") or "plan"
+                )
+                await self.apply_mode()
+            except Exception as e:
+                self.file_log(f"plan reject mode switch failed: {e}")
+        self.file_log(
+            f"acp ExitPlanMode permission approved={approved!r} "
+            f"plan_chars={len(plan_content)} path={plan_path!r}")
+        return approved
 
     async def _acp_exit_plan_mode(self, params: dict) -> dict:
         """Grok `_x.ai/exit_plan_mode` → same plan UI as Claude ExitPlanMode."""

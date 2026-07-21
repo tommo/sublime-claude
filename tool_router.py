@@ -15,14 +15,16 @@ class ToolRouter:
 
     def route(self, tool_name: str, args: Dict[str, Any]) -> str:
         """Route a tool call to its handler, returning Python code to execute."""
-        handler = self.handlers.get(tool_name)
+        name = normalize_mcp_tool_name(tool_name)
+        handler = self.handlers.get(name) or self.handlers.get(tool_name)
         if not handler:
             raise ValueError(f"Unknown tool: {tool_name}")
         return handler(args)
 
     def has_tool(self, tool_name: str) -> bool:
         """Check if a tool is registered."""
-        return tool_name in self.handlers
+        name = normalize_mcp_tool_name(tool_name)
+        return name in self.handlers or tool_name in self.handlers
 
 
 # Pre-built handlers for common patterns
@@ -359,18 +361,44 @@ def create_sublime_router() -> ToolRouter:
     return router
 
 
+def normalize_mcp_tool_name(name: str) -> str:
+    """Strip Grok/Claude MCP prefixes so tools/call names resolve.
+
+    Grok use_tool often sends ``sublime__goal_verdict`` or
+    ``mcp__sublime__goal_verdict`` while tools/list registers bare
+    ``goal_verdict`` — unknown-name used to fail the call as MCP error.
+    """
+    n = (name or "").strip()
+    if not n:
+        return n
+    # mcp__server__tool
+    if n.startswith("mcp__"):
+        parts = n.split("__", 2)
+        if len(parts) == 3 and parts[2]:
+            return parts[2]
+    # server__tool (Grok UseTool tool_name)
+    if "__" in n:
+        left, right = n.split("__", 1)
+        if left and right and left.isidentifier() and not left.startswith("mcp"):
+            # sublime__goal_verdict → goal_verdict
+            return right
+    return n
+
+
 def parse_tool_call(method: str, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     """Parse an MCP tool call request.
 
     Returns:
-        Tuple of (tool_name, arguments)
+        Tuple of (tool_name, arguments) with name normalized.
     """
     if method != "tools/call":
         raise ValueError(f"Invalid method: {method}")
 
-    tool_name = params.get("name")
+    tool_name = params.get("name") or params.get("toolName") or params.get("tool")
     if not tool_name:
         raise ValueError("Missing tool name")
 
-    arguments = params.get("arguments", {})
-    return tool_name, arguments
+    arguments = params.get("arguments") or params.get("input") or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    return normalize_mcp_tool_name(str(tool_name)), arguments

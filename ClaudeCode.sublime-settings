@@ -21,6 +21,10 @@
     // Options: "default", "acceptEdits", "plan", "bypassPermissions"
     "permission_mode": "acceptEdits",
 
+    // Auto-sleep idle sessions after N minutes (0 = disabled). Timer starts
+    // when a turn *ends* (not when sticky ◎ opens mid-stream).
+    // "auto_sleep_minutes": 60,
+
     // Persona service URL for identity management
     "persona_url": "http://localhost:5002/personas",
 
@@ -43,6 +47,11 @@
     // read binary via FS — mainly Grok ACP). Default "auto" enables it only for
     // the Grok backend; set true to advertise on all backends, false to disable.
     // "mcp_enable_read_image": "auto",
+
+    // ACP (Grok/Kimi) also injects irr MCP (code search) when `irr` is on PATH
+    // or at ~/.nimble/bin/irr. Index db: env SUBLIME_CLAUDE_IRR_DB / IRR_MCP_DB,
+    // else --db from ~/.claude.json mcpServers.irr, else cwd/.irr, else
+    // ~/.irr-pil/db/pil-core. Disable: env SUBLIME_CLAUDE_IRR_MCP=0.
 
 
     // Auto-retry a turn that ends in error (e.g. provider 503/429 retries

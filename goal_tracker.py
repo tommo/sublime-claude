@@ -781,6 +781,64 @@ class GoalTracker:
         self.pending_tool_verdict = None
         return v
 
+    def evidence_dir(self) -> str:
+        """Directory for host/agent evidence files next to plan.md."""
+        path = (self.plan_path or "").strip()
+        if path:
+            return os.path.join(os.path.dirname(os.path.abspath(path)), "evidence")
+        return ""
+
+    def try_load_verdict_file(self) -> Optional[Dict[str, Any]]:
+        """Load evidence/VERDICT.json written by Task skeptic when MCP failed.
+
+        Same fail-closed rules as MCP goal_verdict (via record_tool_verdict).
+        Returns the record_tool_verdict result dict, or None if no file.
+        """
+        import json
+        edir = self.evidence_dir()
+        if not edir:
+            return None
+        for name in ("VERDICT.json", "verdict.json", "SKEPTIC_VERDICT.json"):
+            fpath = os.path.join(edir, name)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                self._push("verdict_file_error", f"{name}: {e}"[:200])
+                continue
+            if not isinstance(data, dict):
+                continue
+            # Normalize lists
+            def _as_list(v):
+                if v is None:
+                    return []
+                if isinstance(v, str):
+                    return [ln.strip().lstrip("-* ") for ln in v.splitlines() if ln.strip()]
+                if isinstance(v, (list, tuple)):
+                    return [str(x).strip() for x in v if str(x).strip()]
+                return [str(v).strip()] if str(v).strip() else []
+
+            achieved = bool(data.get("achieved"))
+            # Accept common aliases
+            if "achieved" not in data and "verdict" in data:
+                v = str(data.get("verdict") or "").lower()
+                achieved = v in ("achieved", "complete", "pass", "true", "ok")
+            rec = self.record_tool_verdict(
+                achieved=achieved,
+                evidence=_as_list(data.get("evidence")),
+                gaps=_as_list(data.get("gaps")),
+                message=str(data.get("message") or data.get("summary") or "")[:500],
+            )
+            if rec.get("ok"):
+                rec = dict(rec)
+                rec["source"] = "verdict_file"
+                rec["path"] = fpath
+                self._push("verdict_file", f"{name} achieved={rec.get('achieved')}")
+            return rec
+        return None
+
     def apply_verdict(
         self,
         achieved: bool,

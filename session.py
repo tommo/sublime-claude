@@ -313,6 +313,9 @@ class Session:
         self.last_activity: float = time.time()
         self.last_idle_at: float = 0  # set when session enters input mode (truly idle)
         self.sleep_disabled: bool = False  # per-session auto-sleep disable toggle
+        # Turn/bridge failed while idle — tab shows ⚠ until next query.
+        self.error_halted: bool = False
+        self.error_halt_message: str = ""
 
         # Terminal mode state
         self.terminal_mode: bool = False
@@ -571,6 +574,7 @@ class Session:
             self._clear_overlay_phantom()
             error_msg = result['error'].get('message', str(result['error']))
             print(f"[Claude] init error: {error_msg}")
+            self._mark_error_halt(error_msg)
             self._status("error")
 
             # Show user-friendly message in view
@@ -582,6 +586,10 @@ class Session:
                 self.output.text("\n*Session expired or not found.*\n\nUse `Claude: Restart Session` (Cmd+Shift+R) to start fresh.\n")
             else:
                 self.output.text(f"\n*Failed to connect: {error_msg}*\n\nTry `Claude: Restart Session` (Cmd+Shift+R).\n")
+            try:
+                self.output.set_name(self.name or "Claude")
+            except Exception:
+                pass
             # Still enter input mode so the user can interact with the error view
             self.working = False
             self._input_mode_entered = False
@@ -1483,6 +1491,8 @@ class Session:
         self.query_count += 1
         self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
         query_gen = self._query_gen
+        # New turn clears error-halt tab mark
+        self._clear_error_halt()
         self._goal_last_update_sig = None  # allow same progress text next turn
         # Preserve sticky draft whenever the user is typing mid-stream — including
         # when a *queued* turn fires. Never wipe ◎ content just because the queue
@@ -1531,9 +1541,15 @@ class Session:
 
         # Check if bridge is alive before sending
         if not self.client.is_alive():
+            self.working = False
+            self._mark_error_halt("bridge died")
             self._status("error: bridge died")
             if not silent:
                 self.output.text("\n\n*Bridge process died. Please restart the session.*\n")
+            try:
+                self.output.set_name(self.name or "Claude")
+            except Exception:
+                pass
             return
 
         # New query supersedes any prior interrupt debounce.
@@ -1573,9 +1589,14 @@ class Session:
             self._on_done(result, _expected_gen=_gen)
 
         if not self.client.send("query", query_params, _on_done_for_gen):
-            self._status("error: bridge died")
             self.working = False
+            self._mark_error_halt("bridge died")
+            self._status("error: bridge died")
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
+            try:
+                self.output.set_name(self.name or "Claude")
+            except Exception:
+                pass
             return
 
         # Sticky EOF composer: re-open ◎ so the next message can be typed
@@ -1696,6 +1717,7 @@ class Session:
             # errors are diagnosable at a glance — the chat view text alone is hard
             # to copy/inspect, and transient providers (e.g. Astron) hit these often.
             print(f"[Claude] query error [backend={self.backend}]: {error_msg}")
+            self._mark_error_halt(error_msg)
             self._status("error")
             self.output.text(f"\n\n*Error: {error_msg}*\n")
             if self.output.current:
@@ -1739,6 +1761,7 @@ class Session:
             except Exception:
                 pass
         else:
+            self._clear_error_halt()
             self._status("ready")
 
         self._interrupting = False
@@ -1783,6 +1806,10 @@ class Session:
             self.working = False
             if self.output and self.output.current:
                 self.output.current.working = False
+            # Reset idle clock when the turn ends (long ACP runs + sticky ◎).
+            now = time.time()
+            self.last_activity = now
+            self.last_idle_at = now
             if completion == "interrupted":
                 self._clear_deferred_state(clear_queue=False)
                 if not getattr(self, "_quick_finished", False):
@@ -1849,7 +1876,11 @@ class Session:
 
         # 7. Now set working=False and enter input mode
         self.working = False
-        self.last_activity = time.time()
+        now = time.time()
+        self.last_activity = now
+        # Idle clock starts when the turn ends — not when sticky ◎ opened
+        # mid-stream (that left last_idle_at stale after long ACP runs).
+        self.last_idle_at = now
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
     def _clear_deferred_state(self, clear_queue: bool = True) -> None:
@@ -1959,6 +1990,12 @@ class Session:
         # (never focus_view: that stole the editor from other files).
         if self.output.is_input_mode():
             self._input_mode_entered = True
+            # Critical: sticky ◎ is often already open mid-turn. Without this,
+            # last_idle_at stays at the *previous* idle stamp and auto-sleep
+            # fires immediately after a long ACP run ends.
+            if not self.working:
+                self.last_idle_at = time.time()
+                self.last_activity = time.time()
             try:
                 if self.output._view_is_focused():
                     self.output.focus_composer(force_show=True, steal_focus=False)
@@ -2349,10 +2386,12 @@ class Session:
             sent = self.client.send("interrupt", {})
             if not sent:
                 self._interrupting = False
+                self._mark_error_halt("bridge died")
                 self._status("error: bridge died")
                 try:
                     self.output.text(
                         "\n\n*Bridge process died. Please restart the session.*\n")
+                    self.output.set_name(self.name or "Claude")
                 except Exception:
                     pass
             else:
@@ -3416,7 +3455,12 @@ class Session:
             retries = self._auto_retry_count
             suffix = f" after {retries} auto-retr{'y' if retries == 1 else 'ies'}" if retries else ""
             self.output.text(f"\n\n*⚠ turn failed ({stop}){suffix}.*\n")
+            self._mark_error_halt(f"turn failed ({stop}){suffix}")
             self._status("error")
+            try:
+                self.output.set_name(self.name or "Claude")
+            except Exception:
+                pass
         else:
             self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
@@ -4932,13 +4976,36 @@ class Session:
         gaps = []
         detail = gt.message
 
-        # Structured MCP goal_verdict only for *achieved*. Prose parse never
-        # unlocks complete (too easy to rubber-stamp); it may only supply gaps.
+        # Structured unlock only: MCP goal_verdict, else evidence/VERDICT.json
+        # (Task children often lack MCP — they write the file; host ingests).
+        # Prose never unlocks complete.
         tool_v = None
+        source = "none"
         if hasattr(gt, "take_tool_verdict"):
             tool_v = gt.take_tool_verdict()
+            if tool_v:
+                source = "tool"
+        if not tool_v and hasattr(gt, "try_load_verdict_file"):
+            try:
+                file_rec = gt.try_load_verdict_file()
+                if file_rec and file_rec.get("ok"):
+                    # record_tool_verdict left pending; consume it
+                    tool_v = (
+                        gt.take_tool_verdict()
+                        if hasattr(gt, "take_tool_verdict") else None
+                    )
+                    if not tool_v and file_rec.get("recorded") is not False:
+                        tool_v = {
+                            "achieved": file_rec.get("achieved"),
+                            "evidence": [],
+                            "gaps": file_rec.get("gaps") or [],
+                            "message": file_rec.get("message") or "",
+                        }
+                    if tool_v:
+                        source = "verdict_file"
+            except Exception as e:
+                print(f"[Claude] goal VERDICT.json ingest: {e}")
         if tool_v:
-            source = "tool"
             achieved = bool(tool_v.get("achieved"))
             gaps = list(tool_v.get("gaps") or [])
             detail = (tool_v.get("message") or detail or "").strip() or detail
@@ -4948,8 +5015,8 @@ class Session:
             gaps = list(gt.gaps or [])
             if not gaps:
                 gaps = [
-                    "Host: no goal_verdict tool call — complete stays locked "
-                    "(use MCP goal_verdict, not bare apply_verdict)",
+                    "Host: no goal_verdict / VERDICT.json — complete stays locked "
+                    "(MCP goal_verdict or evidence/VERDICT.json next to plan.md)",
                 ]
 
         gt.apply_verdict(achieved, gaps=gaps, detail=detail or gt.message)
@@ -4986,6 +5053,25 @@ class Session:
         self.working = True
         self.query(prompt, display_prompt="↻ goal")
         return True
+
+    def _mark_error_halt(self, message: str = "") -> None:
+        """Flag session as error-halted so the tab shows ⚠ until next query."""
+        self.error_halted = True
+        self.error_halt_message = (message or "").strip()[:200]
+        try:
+            if self.output and self.output.view and self.output.view.is_valid():
+                self.output.view.settings().set("claude_error_halted", True)
+        except Exception:
+            pass
+
+    def _clear_error_halt(self) -> None:
+        self.error_halted = False
+        self.error_halt_message = ""
+        try:
+            if self.output and self.output.view and self.output.view.is_valid():
+                self.output.view.settings().erase("claude_error_halted")
+        except Exception:
+            pass
 
     def _status(self, text: str) -> None:
         """Update status on output view only."""

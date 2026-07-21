@@ -243,7 +243,10 @@ Rules:
 3. Partial / almost / LGTM → not achieved, list gaps.
 4. Adversarial: missing proof = gap, not benefit of the doubt.
 
-REQUIRED — MCP tool `goal_verdict` (sublime), not prose:
+REQUIRED — structured verdict (not prose):
+
+1) Prefer MCP ``goal_verdict`` on the sublime server (Grok: use_tool with
+   tool_name=\"sublime__goal_verdict\" or \"goal_verdict\"):
 
   goal_verdict(
     achieved=false,   # or true only if every criterion is proven
@@ -252,7 +255,11 @@ REQUIRED — MCP tool `goal_verdict` (sublime), not prose:
     message="one-line summary"
   )
 
-Host applies only the tool result. Omit the tool → not_achieved.
+2) If this agent cannot call MCP (common for Task children), write:
+   ``<plan-dir>/evidence/VERDICT.json`` with the same fields
+   (achieved, evidence, gaps, message). Host ingests that file at verify end.
+
+Host applies only structured tool or VERDICT.json. Omit both → not_achieved.
 </goal-verifier>
 """
 
@@ -281,9 +288,11 @@ A complete claim was deferred to host verification. This turn:
 4. Wait until that subagent finishes.
 5. Do not implement features. Do not call update_goal(completed=true).
 6. You are not the judge — the reviewer is. Do not rubber-stamp the claim.
-7. Prefer the reviewer calling MCP ``goal_verdict``. If the Task child cannot
-   use MCP, call ``goal_verdict`` yourself using only its evidence (weak
-   evidence → achieved=false with gaps).
+7. Prefer the reviewer calling MCP ``goal_verdict`` (or writing
+   ``evidence/VERDICT.json`` next to plan.md). If the Task child cannot use
+   MCP, either ensure VERDICT.json exists from the child, or call
+   ``goal_verdict`` yourself using **only** its evidence (weak/no proof →
+   achieved=false with gaps). Do not invent evidence the reviewer did not run.
 
 OBJECTIVE: {objective}
 CLAIM (untrusted): {claim}

@@ -244,8 +244,9 @@ def _check_auto_sleep():
     if not timeout_min or timeout_min <= 0:
         return
 
-    threshold = time.time() - (timeout_min * 60)
-    force_threshold = time.time() - (timeout_min * 60 * 2)
+    now = time.time()
+    threshold = now - (timeout_min * 60)
+    force_threshold = now - (timeout_min * 60 * 2)
 
     for view_id, session in list(sublime._claude_sessions.items()):
         if getattr(session, 'sleep_disabled', False):
@@ -260,14 +261,26 @@ def _check_auto_sleep():
                 continue
         except Exception:
             pass
-        if (session.initialized
+        if not (session.initialized
                 and not session.working
-                and not session.is_sleeping
-                and session.last_idle_at > 0
-                and session.last_idle_at < threshold):
-            force = session.last_idle_at < force_threshold
-            print(f"[Claude] auto-sleep: {session.name} idle for >{timeout_min}m (force={force})")
-            session.sleep(force=force)
+                and not session.is_sleeping):
+            continue
+        # Prefer last_idle_at (true idle). Fall back to last_activity so a
+        # session that never stamped idle (or stamped it mid-turn long ago)
+        # still needs a full timeout of *quiet* time after the last work.
+        idle_at = float(getattr(session, "last_idle_at", 0) or 0)
+        last_act = float(getattr(session, "last_activity", 0) or 0)
+        # Idle clock cannot predate last work — long ACP turns used to leave
+        # last_idle_at at pre-run sticky-◎ open time → instant sleep on done.
+        effective_idle = max(idle_at, last_act)
+        if effective_idle <= 0 or effective_idle >= threshold:
+            continue
+        force = effective_idle < force_threshold
+        idle_m = int((now - effective_idle) / 60)
+        print(
+            f"[Claude] auto-sleep: {session.name} idle ~{idle_m}m "
+            f"(timeout={timeout_min}m force={force})")
+        session.sleep(force=force)
 
     schedule_auto_sleep()
 
