@@ -564,6 +564,12 @@ class AcpBridge(BaseBridge):
             tool_name = self._normalize_tool_name(upd)
             tool_input = self._tool_input_from_update(upd, tool_name)
             tid = upd.get("toolCallId")
+            # Kimi lifecycle rows (title "Starting") — never paint ☐/✔ noise
+            if self._should_suppress_tool_row(upd, tool_name):
+                self.file_log(
+                    f"suppress tool_call noise: title={upd.get('title')!r} "
+                    f"name={tool_name!r} id={tid!r}")
+                return
             if tid:
                 if tool_name and tool_name != "tool":
                     self._tool_names_by_id[tid] = tool_name
@@ -596,6 +602,14 @@ class AcpBridge(BaseBridge):
                 tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
             elif tid and tool_name and tool_name != "tool":
                 self._tool_names_by_id[tid] = tool_name
+            # Lifecycle rows that never opened a real tool — drop entirely
+            if (self._should_suppress_tool_row(upd, tool_name)
+                    and (not tid or tid not in self._tool_ids_emitted)):
+                self.file_log(
+                    f"suppress tool_call_update noise: "
+                    f"title={upd.get('title')!r} name={tool_name!r} "
+                    f"status={status!r}")
+                return
             # Grok: bare tool_call then richer update. Emit tool_use at most
             # once per id (plugin upserts); re-emitting created a second ☐
             # that never received tool_result → last row stuck pending.
@@ -607,8 +621,17 @@ class AcpBridge(BaseBridge):
                 # Skip anonymous early stream chunks (Kimi JSON drip without title)
                 if tool_name == "tool" and status not in ("completed", "failed"):
                     return
+                # Don't open a brand-new row only to close lifecycle noise
+                if (tool_name == "tool"
+                        and status in ("completed", "failed")
+                        and not enriched
+                        and not self._tool_update_has_substance(upd)):
+                    return
                 if (enriched or upd.get("rawInput") or upd.get("locations")
                         or upd.get("title") or status in ("completed", "failed")):
+                    # Skip opening rows for lifecycle titles at completed
+                    if self._should_suppress_tool_row(upd, tool_name):
+                        return
                     self._tool_ids_emitted.add(tid)
                     send_notification("message", {
                         "type": "tool_use",
@@ -621,15 +644,21 @@ class AcpBridge(BaseBridge):
                 enrich_name = tool_name
                 if enrich_name == "tool" and tid:
                     enrich_name = self._tool_names_by_id.get(tid) or "tool"
-                send_notification("message", {
-                    "type": "tool_use",
-                    "id": tid,
-                    "name": enrich_name,
-                    "input": enriched,
-                })
+                if not self._should_suppress_tool_row(upd, enrich_name):
+                    send_notification("message", {
+                        "type": "tool_use",
+                        "id": tid,
+                        "name": enrich_name,
+                        "input": enriched,
+                    })
             # Do not re-emit background=True on in_progress — Claude's UI
             # waits for task_notification which most ACP agents never send.
             if status in ("completed", "failed"):
+                # No open row for this id → nothing to close (noise already dropped)
+                if tid not in self._tool_ids_emitted and not self._tool_update_has_substance(upd):
+                    # may have been suppressed at open
+                    if self._should_suppress_tool_row(upd, tool_name) or tool_name == "tool":
+                        return
                 diff_input = (
                     self._extract_diff_input(upd)
                     if tool_name in ("Edit", "Write") else None
@@ -1006,6 +1035,17 @@ class AcpBridge(BaseBridge):
         "Skill", "EnterPlanMode", "ExitPlanMode", "ask_user",
         "Thinking",
     })
+    # Kimi (and others) emit lifecycle *titles* as tool_call rows — e.g.
+    # title="Starting" → was kept as PascalCase tool id → "✔ Starting".
+    _LIFECYCLE_TOOL_NOISE = frozenset({
+        "starting", "started", "start", "loading", "loaded", "load",
+        "thinking", "thought", "working", "processing", "waiting",
+        "initializing", "initialize", "init", "preparing", "prepare",
+        "running", "done", "finished", "complete", "completed",
+        "idle", "ready", "pending", "progress", "status", "update",
+        "beginning", "ending", "end", "stop", "stopped", "cancel",
+        "cancelled", "canceled", "continue", "continuing",
+    })
 
     def _map_agent_tool_id(self, name: str) -> Optional[str]:
         """Map an agent tool id / variant → Claude formatter name, or None."""
@@ -1034,6 +1074,77 @@ class AcpBridge(BaseBridge):
             return n
         return None
 
+    def _is_lifecycle_tool_noise(self, text: str) -> bool:
+        """True for status titles like 'Starting' / 'Working…' (not real tools)."""
+        if not text or not isinstance(text, str):
+            return False
+        t = text.strip().lower().rstrip(".…! ")
+        if not t:
+            return False
+        if t in self._LIFECYCLE_TOOL_NOISE:
+            return True
+        first = t.split()[0].strip("`'\"*") if t else ""
+        return first in self._LIFECYCLE_TOOL_NOISE
+
+    def _title_looks_like_tool_id(self, first: str) -> bool:
+        """Accept multi-hump CamelCase (EnterPlanMode) / snake_case; reject Starting."""
+        if not first or not first.isascii():
+            return False
+        if first in self._CANONICAL_NAMES or self._map_agent_tool_id(first):
+            return True
+        if "_" in first and first.replace("_", "").isalnum():
+            return True  # snake_case machine id
+        if first[0].isupper() and first.isalnum():
+            # Multi-hump: ReadFile, TodoWrite, ExitPlanMode (≥2 capitals)
+            if sum(1 for c in first if c.isupper()) >= 2:
+                return True
+        return False
+
+    def _tool_update_has_substance(self, upd: dict) -> bool:
+        """True if rawInput/locations look like a real tool invocation."""
+        raw = upd.get("rawInput") or {}
+        if isinstance(raw, dict) and raw:
+            for k in (
+                "command", "path", "file_path", "target_file", "query",
+                "pattern", "content", "old_string", "new_string", "tool",
+                "name", "toolName", "variant", "tool_name", "tool_input",
+                "arguments", "prompt", "description", "todos",
+            ):
+                v = raw.get(k)
+                if v is not None and v != "" and v != {} and v != []:
+                    return True
+        locs = upd.get("locations") or []
+        if isinstance(locs, list) and any(
+                isinstance(x, dict) and x.get("path") for x in locs):
+            return True
+        return False
+
+    def _should_suppress_tool_row(self, upd: dict, tool_name: str) -> bool:
+        """Drop Kimi lifecycle tool_call noise (✔ Starting)."""
+        title = (upd.get("title") or "").strip()
+        name = (tool_name or "").strip()
+        # Real mapped / mcp tools always keep
+        if name and name not in ("tool",):
+            if (name in self._CANONICAL_NAMES
+                    or self._map_agent_tool_id(name)
+                    or name.startswith("mcp__")
+                    or name.startswith("sublime__")
+                    or "__" in name):
+                if not self._is_lifecycle_tool_noise(name):
+                    return False
+        # Lifecycle title with no real args → suppress
+        if self._is_lifecycle_tool_noise(title) or self._is_lifecycle_tool_noise(name):
+            if not self._tool_update_has_substance(upd):
+                return True
+        # Bare single-hump PascalCase name that isn't a known tool
+        if (name and name[0].isupper() and name.isalpha()
+                and name not in self._CANONICAL_NAMES
+                and not self._map_agent_tool_id(name)
+                and sum(1 for c in name if c.isupper()) < 2
+                and not self._tool_update_has_substance(upd)):
+            return True
+        return False
+
     def _normalize_tool_name(self, upd: dict) -> str:
         # 1) Grok advertises the real tool id on _meta.x.ai/tool.name — prefer it.
         meta = upd.get("_meta") or {}
@@ -1055,10 +1166,14 @@ class AcpBridge(BaseBridge):
         # 3) title — tool id, decorated prose, or PascalCase agent names (Kimi).
         # Bare: "spawn_subagent", "list_dir", "TodoList", "AskUserQuestion".
         # Decorated: "Read `/path`", "Running: grep…", "Asking user questions".
-        # Do NOT use first word of free prose like "Smoke-test subagent harness".
+        # Do NOT use first word of free prose / lifecycle ("Starting", "Working").
         title = upd.get("title")
         if isinstance(title, str) and title.strip():
             t = title.strip()
+            # Lifecycle titles are never tool ids (Kimi "Starting" spam)
+            if self._is_lifecycle_tool_noise(t) and not self._tool_update_has_substance(upd):
+                mapped_kind = KIND_TO_NAME.get((upd.get("kind") or "").lower())
+                return mapped_kind or "tool"
             mapped = self._map_agent_tool_id(t)
             if mapped:
                 return mapped
@@ -1071,7 +1186,9 @@ class AcpBridge(BaseBridge):
             if low.startswith(("editing ", "edit ", "applying ")):
                 return "Edit"
             if low.startswith(("running:", "running ", "execute ", "executing ")):
-                return "Bash"
+                # "Running" alone is lifecycle noise; "Running: cmd" is Bash
+                if low.startswith("running:") or len(t.split()) > 1:
+                    return "Bash"
             if low.startswith("asking ") or "question" in low:
                 return "AskUserQuestion"
             if low.startswith("todo") or "todolist" in low.replace(" ", ""):
@@ -1080,14 +1197,19 @@ class AcpBridge(BaseBridge):
             mapped = self._map_agent_tool_id(first)
             if mapped:
                 return mapped
-            # PascalCase / CamelCase bare tool id (TodoList, EnterPlanMode, …)
-            if first and first[0].isupper() and first.isascii() and first.isalnum():
+            # PascalCase / CamelCase / snake_case only when it looks like a tool id
+            if first and self._title_looks_like_tool_id(first):
                 mapped = self._map_agent_tool_id(first)
                 if mapped:
                     return mapped
-                return first  # keep agent name; better than anonymous "tool"
+                if first in self._CANONICAL_NAMES:
+                    return first
+                if "_" in first or sum(1 for c in first if c.isupper()) >= 2:
+                    return first
             # snake_case / lowercase machine id without map entry
-            if first and ("_" in first or first.islower()) and first.isascii():
+            if (first and first.isascii() and first.replace("_", "").isalnum()
+                    and ("_" in first or first.islower())
+                    and not self._is_lifecycle_tool_noise(first)):
                 return first
 
         mapped = KIND_TO_NAME.get((upd.get("kind") or "").lower())
