@@ -229,9 +229,21 @@ def _bash(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _read(view: "OutputView", tool: "ToolCall") -> str:
-    out = f": {tool.tool_input.get('file_path', '')}"
+    import os
+    inp = tool.tool_input or {}
+    path = (
+        inp.get("file_path")
+        or inp.get("path")
+        or inp.get("target_file")
+        or ""
+    )
+    out = f": {path}" if path else ""
     if tool.result and tool.status == "done":
-        out += view._format_read_result(tool.result)
+        # Kimi (and some agents) Read a directory → listing, not file lines
+        if path and os.path.isdir(path):
+            out += view._format_glob_result(tool.result)
+        else:
+            out += view._format_read_result(tool.result)
     return out
 
 
@@ -439,12 +451,34 @@ def _webfetch(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _task(view: "OutputView", tool: "ToolCall") -> str:
-    sub = tool.tool_input.get("subagent_type", "") or ""
-    desc = tool.tool_input.get("description", "") or ""
+    """Task / Agent / AgentSwarm — show type + short description."""
+    inp = tool.tool_input or {}
+    sub = (
+        inp.get("subagent_type")
+        or inp.get("subagentType")
+        or inp.get("type")
+        or inp.get("agent_type")
+        or ""
+    )
+    desc = (
+        inp.get("description")
+        or inp.get("prompt")
+        or ""
+    )
+    if not isinstance(desc, str):
+        desc = str(desc) if desc else ""
+    # Huge Agent prompts: first line only
+    if desc:
+        desc = desc.strip().split("\n", 1)[0].strip()
+        if len(desc) > 80:
+            desc = desc[:77] + "…"
     if sub and desc:
-        return f": {sub} - {desc}"
+        return f": {sub} — {desc}"
     if sub or desc:
         return f": {sub or desc}"
+    # Status-only while args still streaming
+    if tool.status in ("pending", "running", "in_progress"):
+        return ": subagent…"
     return ""
 
 
@@ -482,8 +516,27 @@ def _task_list(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _task_get(view: "OutputView", tool: "ToolCall") -> str:
-    tid = tool.tool_input.get("taskId", "")
-    return f": #{tid}" if tid else ""
+    inp = tool.tool_input or {}
+    tid = (
+        inp.get("taskId")
+        or inp.get("task_id")
+        or ""
+    )
+    if not tid:
+        ids = inp.get("task_ids") or inp.get("taskIds") or []
+        if isinstance(ids, list) and ids:
+            tid = ids[0]
+    block = inp.get("block")
+    bits = []
+    if tid:
+        bits.append(f"#{tid}")
+    if block:
+        bits.append("wait")
+    if bits:
+        return f": {' '.join(str(b) for b in bits)}"
+    if tool.status in ("pending", "running", "in_progress"):
+        return ": waiting…"
+    return ""
 
 
 def _ask_user(view: "OutputView", tool: "ToolCall") -> str:
@@ -538,12 +591,15 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "goal_verdict": _goal_verdict,
     "WebFetch": _webfetch,
     "Task": _task,
+    "Agent": _task,
+    "AgentSwarm": _task,
     "NotebookEdit": _notebook_edit,
     "TodoWrite": _todo_write,
     "TaskCreate": _task_create,
     "TaskUpdate": _task_update,
     "TaskList": _task_list,
     "TaskGet": _task_get,
+    "TaskOutput": _task_get,
     "ask_user": _ask_user,
     "Skill": _skill,
     "EnterPlanMode": _enter_plan_mode,

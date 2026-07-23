@@ -1998,7 +1998,9 @@ class Session:
                 self.last_activity = time.time()
             try:
                 if self.output._view_is_focused():
-                    self.output.focus_composer(force_show=True, steal_focus=False)
+                    # Re-pin scroll only — never yank mid-draft caret to EOF
+                    self.output.focus_composer(
+                        force_show=True, steal_focus=False, preserve_caret=True)
             except Exception:
                 pass
             return
@@ -2010,7 +2012,8 @@ class Session:
         if self._input_mode_entered and not self.working:
             try:
                 if self.output.is_input_mode() and self.output._view_is_focused():
-                    self.output.focus_composer(force_show=True, steal_focus=False)
+                    self.output.focus_composer(
+                        force_show=True, steal_focus=False, preserve_caret=True)
             except Exception:
                 pass
             return
@@ -5205,12 +5208,14 @@ class Session:
         plan_id = params.get("id")
         tool_input = params.get("tool_input", {}) or {}
 
-        # Prefer path from bridge (Grok session plan.md); else scan.
+        # Prefer path from bridge; else scan disk (Kimi/Claude/Grok plans).
         plan_file = (
             tool_input.get("planFilePath")
             or tool_input.get("plan_file")
             or self._find_plan_file()
         )
+        if plan_file and not os.path.isfile(plan_file):
+            plan_file = self._find_plan_file() or plan_file
         self.plan_file = plan_file
         allowed_prompts = tool_input.get("allowedPrompts", [])
 
@@ -5255,14 +5260,25 @@ class Session:
             enable_wrap()
 
     def _find_plan_file(self) -> Optional[str]:
-        """Find the most recent plan file in ~/.claude/plans/ (or Grok session)."""
+        """Find the newest on-disk plan (Kimi / Claude / Grok)."""
         import glob
+        # Kimi: ~/.kimi-code/sessions/<wd>/<session_id>/agents/*/plans/*.md
+        root = os.path.expanduser("~/.kimi-code/sessions")
+        sid = str(self.session_id or "")
+        if os.path.isdir(root):
+            if sid:
+                cands = glob.glob(os.path.join(
+                    root, "*", sid, "agents", "*", "plans", "*.md"))
+            else:
+                cands = []
+            cands = [p for p in cands if os.path.isfile(p)]
+            if cands:
+                return max(cands, key=os.path.getmtime)
         plans_dir = os.path.expanduser("~/.claude/plans")
         if os.path.exists(plans_dir):
             plan_files = glob.glob(os.path.join(plans_dir, "*.md"))
             if plan_files:
                 return max(plan_files, key=os.path.getmtime)
-        # Grok Build: ~/.grok/sessions/<enc_cwd>/<session>/plan.md
         if self.plan_file and os.path.isfile(self.plan_file):
             return self.plan_file
         return None

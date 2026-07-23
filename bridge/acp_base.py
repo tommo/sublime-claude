@@ -311,17 +311,67 @@ class AcpBridge(BaseBridge):
         except Exception as e:
             self.log(f"session/set_model({self.model}) failed: {e}")
 
+    def _advertised_mode_ids(self) -> List[str]:
+        """modeIds from session/new|load modes.availableModes (if any)."""
+        ids: List[str] = []
+        for m in self._available_modes or []:
+            if isinstance(m, dict) and m.get("id"):
+                ids.append(str(m["id"]))
+            elif isinstance(m, str):
+                ids.append(m)
+        return ids
+
+    def _resolve_set_mode_id(self) -> str:
+        """Map self.agent_mode to a modeId the agent actually advertises.
+
+        Open-source kimi-cli only advertises ``default`` (set_session_mode
+        asserts mode_id == "default"). Kimi Code may advertise
+        default|plan|auto|yolo. Never send Claude-only ids like acceptEdits.
+        """
+        want = (self.agent_mode or "default").strip()
+        advertised = self._advertised_mode_ids()
+        if not advertised:
+            # No list yet — only send safe universal id
+            if want in ("default", "plan", "auto", "yolo"):
+                return want
+            return "default"
+        if want in advertised:
+            return want
+        # Fallbacks when host wants acceptEdits/bypass but agent has other names
+        for cand in (
+            want,
+            "yolo" if want in ("acceptEdits", "auto") else "",
+            "auto" if want in ("bypassPermissions", "dontAsk") else "",
+            "plan" if want == "plan" else "",
+            "default",
+        ):
+            if cand and cand in advertised:
+                return cand
+        return advertised[0]
+
     async def apply_mode(self) -> None:
-        """Push self.agent_mode to the live session via session/set_mode."""
-        if not self.session_id or not self.agent_mode:
+        """Push mode via session/set_mode (only if agent advertises modes)."""
+        if not self.session_id:
+            return
+        mode_id = self._resolve_set_mode_id()
+        # kimi-cli OSS: only "default" is valid; skip no-op churn
+        advertised = self._advertised_mode_ids()
+        if advertised == ["default"] and mode_id == "default":
+            self.agent_mode = "default"
+            return
+        if advertised and mode_id not in advertised:
+            self.file_log(
+                f"session/set_mode skip unknown modeId={mode_id!r} "
+                f"advertised={advertised}")
             return
         try:
             await self._send_acp("session/set_mode", {
                 "sessionId": self.session_id,
-                "modeId": self.agent_mode,
+                "modeId": mode_id,
             })
+            self.agent_mode = mode_id
         except Exception as e:
-            self.log(f"session/set_mode({self.agent_mode}) failed: {e}")
+            self.log(f"session/set_mode({mode_id}) failed: {e}")
 
     def usage_from_tool_update(self, upd: dict) -> Optional[dict]:
         """Optional usage payload embedded in tool_call_update (e.g. dsr.usage)."""
@@ -563,6 +613,8 @@ class AcpBridge(BaseBridge):
         elif kind == "tool_call":
             tool_name = self._normalize_tool_name(upd)
             tool_input = self._tool_input_from_update(upd, tool_name)
+            tool_name, tool_input = self._reclassify_read_dir(
+                tool_name, tool_input)
             tid = upd.get("toolCallId")
             # Kimi lifecycle rows (title "Starting") — never paint ☐/✔ noise
             if self._should_suppress_tool_row(upd, tool_name):
@@ -614,6 +666,9 @@ class AcpBridge(BaseBridge):
             # once per id (plugin upserts); re-emitting created a second ☐
             # that never received tool_result → last row stuck pending.
             enriched = self._tool_input_from_update(upd, tool_name)
+            tool_name, enriched = self._reclassify_read_dir(tool_name, enriched)
+            if tid and tool_name and tool_name != "tool":
+                self._tool_names_by_id[tid] = tool_name
             if tid and enriched:
                 prev = self._tool_inputs_by_id.get(tid) or {}
                 self._tool_inputs_by_id[tid] = {**prev, **enriched}
@@ -641,16 +696,20 @@ class AcpBridge(BaseBridge):
                     })
             elif tool_name != "tool" or (enriched and status not in ("completed", "failed")):
                 # Enrich open row (same id → output.tool upserts). Prefer real name.
+                # kimi-cli streams arg JSON one token at a time as tool_call_update;
+                # only re-paint when title/args became usable (not every drip).
                 enrich_name = tool_name
                 if enrich_name == "tool" and tid:
                     enrich_name = self._tool_names_by_id.get(tid) or "tool"
                 if not self._should_suppress_tool_row(upd, enrich_name):
-                    send_notification("message", {
-                        "type": "tool_use",
-                        "id": tid,
-                        "name": enrich_name,
-                        "input": enriched,
-                    })
+                    if status in ("completed", "failed") or self._should_repaint_tool(
+                            tid, upd, enriched):
+                        send_notification("message", {
+                            "type": "tool_use",
+                            "id": tid,
+                            "name": enrich_name,
+                            "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                        })
             # Do not re-emit background=True on in_progress — Claude's UI
             # waits for task_notification which most ACP agents never send.
             if status in ("completed", "failed"):
@@ -1101,7 +1160,7 @@ class AcpBridge(BaseBridge):
         return False
 
     def _tool_update_has_substance(self, upd: dict) -> bool:
-        """True if rawInput/locations look like a real tool invocation."""
+        """True if rawInput/locations/content-JSON look like a real tool call."""
         raw = upd.get("rawInput") or {}
         if isinstance(raw, dict) and raw:
             for k in (
@@ -1113,6 +1172,8 @@ class AcpBridge(BaseBridge):
                 v = raw.get(k)
                 if v is not None and v != "" and v != {} and v != []:
                     return True
+        if self._parse_content_args_json(upd):
+            return True
         locs = upd.get("locations") or []
         if isinstance(locs, list) and any(
                 isinstance(x, dict) and x.get("path") for x in locs):
@@ -1165,6 +1226,7 @@ class AcpBridge(BaseBridge):
 
         # 3) title — tool id, decorated prose, or PascalCase agent names (Kimi).
         # Bare: "spawn_subagent", "list_dir", "TodoList", "AskUserQuestion".
+        # Official kimi-cli: "ToolName: key_arg" (session.py get_title).
         # Decorated: "Read `/path`", "Running: grep…", "Asking user questions".
         # Do NOT use first word of free prose / lifecycle ("Starting", "Working").
         title = upd.get("title")
@@ -1177,6 +1239,14 @@ class AcpBridge(BaseBridge):
             mapped = self._map_agent_tool_id(t)
             if mapped:
                 return mapped
+            # "Read: /path" / "Bash: ls" / "Agent: Implement …" (kimi-cli title)
+            if ":" in t:
+                head = t.split(":", 1)[0].strip()
+                mapped = self._map_agent_tool_id(head)
+                if mapped:
+                    return mapped
+                if head in self._CANONICAL_NAMES:
+                    return head
             # Human-prefixed activity titles (Kimi streams these often)
             low = t.lower()
             if low.startswith(("reading ", "read ")):
@@ -1189,6 +1259,8 @@ class AcpBridge(BaseBridge):
                 # "Running" alone is lifecycle noise; "Running: cmd" is Bash
                 if low.startswith("running:") or len(t.split()) > 1:
                     return "Bash"
+            if low.startswith("launching ") and "agent" in low:
+                return "Task"
             if low.startswith("asking ") or "question" in low:
                 return "AskUserQuestion"
             if low.startswith("todo") or "todolist" in low.replace(" ", ""):
@@ -1278,9 +1350,106 @@ class AcpBridge(BaseBridge):
                     break
         return out
 
+    def _reclassify_read_dir(
+            self, tool_name: str, tool_input: Optional[dict]) -> tuple:
+        """Kimi Read on a directory is a listing — show as Glob, not Read lines."""
+        if tool_name != "Read":
+            return tool_name, tool_input or {}
+        inp = tool_input or {}
+        path = inp.get("file_path") or inp.get("path") or ""
+        if not path or not os.path.isdir(path):
+            return tool_name, inp
+        return "Glob", {"pattern": path, "path": path}
+
+    def _should_repaint_tool(
+            self, tid: Optional[str], upd: dict, enriched: dict) -> bool:
+        """True when a tool_call_update is worth re-sending to the plugin UI.
+
+        kimi-cli ToolCallProgress re-sends full args every delta (session.py
+        _send_tool_call_part). Re-painting each char floods the transcript.
+        """
+        if not tid:
+            return True
+        title = (upd.get("title") or "").strip()
+        prev_title = getattr(self, "_tool_titles_by_id", {}).get(tid) or ""
+        if not hasattr(self, "_tool_titles_by_id"):
+            self._tool_titles_by_id = {}
+        if title and title != prev_title:
+            self._tool_titles_by_id[tid] = title
+            # Prefer titles that gained a subtitle ("Bash: cmd") or Agent label
+            if ":" in title or len(title) > len(prev_title) + 2:
+                return True
+        # Full rawInput or complete content JSON → paint once usable
+        if isinstance(upd.get("rawInput"), dict) and upd.get("rawInput"):
+            prev = self._tool_inputs_by_id.get(tid) or {}
+            if not prev or any(
+                    enriched.get(k) and enriched.get(k) != prev.get(k)
+                    for k in ("file_path", "path", "command", "pattern",
+                              "description", "query", "content", "old_string")):
+                return True
+        if self._parse_content_args_json(upd):
+            prev = self._tool_inputs_by_id.get(tid) or {}
+            if not prev:
+                return True
+            # Only if a display-critical field newly appeared or grew a lot
+            for k in ("file_path", "path", "command", "pattern", "description"):
+                a, b = str(prev.get(k) or ""), str(enriched.get(k) or "")
+                if b and (not a or len(b) > len(a) + 8):
+                    return True
+        return False
+
+    def _parse_content_args_json(self, upd: dict) -> dict:
+        """Parse tool args JSON from ACP content blocks (kimi-cli official).
+
+        ToolCallStart / ToolCallProgress put accumulated args as::
+          content: [{type: "content", content: {type: "text", text: "{...}"}}]
+        Partial streams fail json.loads — return {}.
+        """
+        for block in (upd.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            text = None
+            if block.get("type") == "content":
+                inner = block.get("content")
+                if isinstance(inner, dict):
+                    text = inner.get("text")
+                elif isinstance(inner, str):
+                    text = inner
+            elif block.get("type") == "text":
+                text = block.get("text")
+            if not isinstance(text, str):
+                continue
+            s = text.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                data = json.loads(s)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+            if isinstance(data, dict) and data:
+                return data
+        return {}
+
     def _tool_input_from_update(self, upd: dict, tool_name: str = "") -> dict:
-        """Claude-formatter-ready input from rawInput + locations + title."""
+        """Claude-formatter-ready input from rawInput + content JSON + title.
+
+        kimi-cli (github.com/MoonshotAI/kimi-cli acp/session.py) streams args
+        as content text JSON, not only rawInput.
+        """
         out = self._normalize_tool_input(upd.get("rawInput") or {}, tool_name)
+        # Official ACP: full args JSON in content blocks
+        if not out:
+            content_args = self._parse_content_args_json(upd)
+            if content_args:
+                out = self._normalize_tool_input(content_args, tool_name)
+        else:
+            # Merge content keys as fill-ins when rawInput sparse
+            content_args = self._parse_content_args_json(upd)
+            if content_args:
+                extra = self._normalize_tool_input(content_args, tool_name)
+                for k, v in extra.items():
+                    if v and not out.get(k):
+                        out[k] = v
         for loc in (upd.get("locations") or []):
             if not isinstance(loc, dict) or not loc.get("path"):
                 continue
@@ -1306,18 +1475,69 @@ class AcpBridge(BaseBridge):
                             out.setdefault("file_path", path)
                 except IndexError:
                     pass
-        # Task: Grok puts the human description in title ("Smoke-test subagent harness")
-        if tool_name == "Task" and isinstance(title, str):
-            t = title.strip()
-            if t and t not in self.TOOL_TO_CANONICAL and "_" not in t.split()[0]:
-                # Skip bare tool ids / snake_case titles
-                if not out.get("description") and t.lower() not in (
-                        "task", "spawn_subagent", "spawn subagent"):
-                    out["description"] = t
+        # kimi-cli get_title: "ToolName: key_arg" when args partial
+        if isinstance(title, str) and ":" in title:
+            _, _, sub = title.partition(":")
+            sub = sub.strip()
+            if sub:
+                if tool_name == "Bash" and not out.get("command"):
+                    out["command"] = sub
+                elif tool_name in ("Read", "Write", "Edit") and not out.get(
+                        "file_path"):
+                    out["file_path"] = sub.split()[0] if sub else sub
+                elif tool_name in ("Grep", "Glob") and not out.get("pattern"):
+                    out["pattern"] = sub
+                elif tool_name == "Task" and not out.get("description"):
+                    out["description"] = sub[:200]
+        # Task / Kimi Agent: description in rawInput or title
+        # ("Launching coder agent: Implement render.playground…")
+        if tool_name == "Task":
+            if not out.get("description"):
+                for k in ("description", "prompt", "task"):
+                    v = out.get(k)
+                    if isinstance(v, str) and v.strip():
+                        # Prefer short description; prompt is often huge
+                        if k == "prompt" and len(v) > 120:
+                            out["description"] = v.strip().split("\n", 1)[0][:100]
+                        else:
+                            out["description"] = v.strip()[:200]
+                        break
+            if isinstance(title, str):
+                t = title.strip()
+                if t and not out.get("description"):
+                    low = t.lower()
+                    # Strip "Launching coder agent: " prefix (Kimi)
+                    for prefix in (
+                        "launching coder agent:",
+                        "launching agent:",
+                        "launching explore agent:",
+                        "running agent:",
+                    ):
+                        if low.startswith(prefix):
+                            t = t[len(prefix):].strip()
+                            low = t.lower()
+                            break
+                    if t and low not in (
+                            "task", "agent", "agentswarm", "spawn_subagent",
+                            "spawn subagent"):
+                        out["description"] = t[:200]
+                # "Launching coder agent: …" → subagent_type=coder
+                if not out.get("subagent_type") and isinstance(title, str):
+                    m = re.search(
+                        r"\b(coder|explore|general|reviewer|plan)\b",
+                        title, flags=re.I)
+                    if m:
+                        out["subagent_type"] = m.group(1).lower()
             if not out.get("subagent_type"):
-                st = out.get("subagentType") or out.get("type") or ""
+                st = (
+                    out.get("subagentType")
+                    or out.get("subagent_type")
+                    or out.get("type")
+                    or out.get("agent_type")
+                    or ""
+                )
                 if st:
-                    out["subagent_type"] = st
+                    out["subagent_type"] = str(st)
         # TaskGet / get_command_or_subagent_output: task_ids → taskId
         if tool_name == "TaskGet" and not out.get("taskId"):
             ids = out.get("task_ids") or out.get("taskIds") or []
@@ -1628,8 +1848,16 @@ class AcpBridge(BaseBridge):
         modes = result.get("modes") or {}
         if modes.get("availableModes"):
             self._available_modes = modes["availableModes"]
+            self.file_log(
+                f"session modes advertised: "
+                f"{self._advertised_mode_ids()}")
         if modes.get("currentModeId"):
-            self.agent_mode = modes["currentModeId"]
+            # Prefer agent-reported mode, then re-resolve host permission intent
+            cur = str(modes["currentModeId"])
+            want = self.permission_mode_to_agent_mode(self.permission_mode)
+            self.agent_mode = want or cur
+            # Clamp to advertised list
+            self.agent_mode = self._resolve_set_mode_id()
         models = result.get("models") or {}
         if models.get("availableModels"):
             self._available_models = models["availableModels"]
@@ -2686,6 +2914,12 @@ class AcpBridge(BaseBridge):
         if self._is_plan_exit_tool(tool_name, tool_call):
             return None
 
+        # AskUserQuestion is a choice UI, not a Y/N allow. Auto-allowing it
+        # always selects the first option (Option A / q0_opt_0).
+        if tool_name in (
+                "AskUserQuestion", "ask_user", "ask_user_question", "AskUser"):
+            return None
+
         # Full bypass — same as Claude bypassPermissions / --always-approve.
         if mode == "bypassPermissions":
             return True
@@ -2733,15 +2967,21 @@ class AcpBridge(BaseBridge):
     async def _acp_request_permission(self, params: dict) -> dict:
         tool_call = params.get("toolCall") or {}
         options = params.get("options") or []
+        # kimi-cli OSS optionIds: approve | approve_for_session | reject
+        # (session.py _handle_approval_request). Also kind-based allow_*.
         allow_once = next((o.get("optionId") for o in options
                            if isinstance(o, dict)
-                           and o.get("kind") == "allow_once"), None)
+                           and (o.get("kind") == "allow_once"
+                                or o.get("optionId") in ("approve", "approve_once"))), None)
         allow_always = next((o.get("optionId") for o in options
                              if isinstance(o, dict)
-                             and o.get("kind") == "allow_always"), None)
+                             and (o.get("kind") == "allow_always"
+                                  or o.get("optionId") in (
+                                      "approve_for_session", "approve_always"))), None)
         reject_once = next((o.get("optionId") for o in options
                             if isinstance(o, dict)
-                            and o.get("kind") == "reject_once"), None)
+                            and (o.get("kind") == "reject_once"
+                                 or o.get("optionId") in ("reject", "reject_once"))), None)
         reject_always = next((o.get("optionId") for o in options
                               if isinstance(o, dict)
                               and o.get("kind") == "reject_always"), None)
@@ -2771,6 +3011,13 @@ class AcpBridge(BaseBridge):
 
         tool_name = self._normalize_tool_name(tool_call)
         tool_input = self._tool_input_from_update(tool_call, tool_name)
+        # Recover rawInput.questions from earlier tool_call_update (permission
+        # payload often only has title + truncated content).
+        tid = tool_call.get("toolCallId")
+        if tid and isinstance(self._tool_inputs_by_id.get(tid), dict):
+            prev = self._tool_inputs_by_id[tid]
+            for k, v in prev.items():
+                tool_input.setdefault(k, v)
 
         # EnterPlanMode: notify host, allow (Claude bridge parity).
         if tool_name in ("EnterPlanMode", "enter_plan_mode", "EnterPlan"):
@@ -2800,6 +3047,19 @@ class AcpBridge(BaseBridge):
             return {"outcome": {
                 "outcome": "selected", "optionId": reject_id,
             }}
+
+        # Kimi AskUserQuestion: choices are permission options (q0_opt_0…).
+        # Never auto-allow — that always picks Option A (first allow_once).
+        if self._is_ask_user_permission(tool_name, options, tool_call):
+            self.file_log(
+                f"permission → question UI for {tool_name!r} "
+                f"n_options={len(options)}")
+            try:
+                return await self._handle_acp_ask_user_permission(
+                    tool_call, options, tool_input)
+            except Exception as e:
+                self.file_log(f"ask_user permission UI failed: {e}")
+                return {"outcome": {"outcome": "cancelled"}}
 
         # Always re-read project auto-allows — UI "Always" persists them live.
         self._reload_auto_allow_patterns()
@@ -2839,6 +3099,167 @@ class AcpBridge(BaseBridge):
             return {"outcome": {"outcome": "selected", "optionId": oid}}
         oid = (reject_always if always and reject_always else reject_id) or reject_id
         return {"outcome": {"outcome": "selected", "optionId": oid}}
+
+    def _is_ask_user_permission(
+            self, tool_name: str, options: list,
+            tool_call: Optional[dict] = None) -> bool:
+        """Kimi encodes AskUserQuestion choices as permission optionIds."""
+        if tool_name in (
+                "AskUserQuestion", "ask_user", "ask_user_question",
+                "AskUser"):
+            return True
+        title = ((tool_call or {}).get("title") or "")
+        if isinstance(title, str) and "question" in title.lower():
+            return True
+        for o in options or []:
+            if not isinstance(o, dict):
+                continue
+            oid = str(o.get("optionId") or "")
+            # q0_opt_0 / q1_opt_2 / q0_skip
+            if re.match(r"^q\d+_opt_\d+$", oid) or re.match(
+                    r"^q\d+_skip$", oid):
+                return True
+        return False
+
+    async def _handle_acp_ask_user_permission(
+            self, tool_call: dict, options: list,
+            tool_input: dict) -> dict:
+        """Show question UI; return selected optionId (Kimi q0_opt_N / skip)."""
+        raw = tool_call.get("rawInput") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        questions = (
+            raw.get("questions")
+            or (tool_input or {}).get("questions")
+            or []
+        )
+        questions = self._normalize_questions(questions)
+
+        # Fallback: synthesize one question from permission options
+        if not questions:
+            choices = [
+                o for o in (options or [])
+                if isinstance(o, dict)
+                and str(o.get("kind") or "").startswith("allow")
+                and not str(o.get("optionId") or "").startswith("approve")
+            ]
+            q_text = ""
+            for c in (tool_call.get("content") or []):
+                if not isinstance(c, dict):
+                    continue
+                body = c.get("content")
+                if isinstance(body, dict) and body.get("text"):
+                    q_text = str(body["text"])
+                    break
+                if c.get("type") == "text" and c.get("text"):
+                    q_text = str(c["text"])
+                    break
+            questions = [{
+                "question": q_text or "Choose an option:",
+                "header": "",
+                "options": [
+                    {"label": o.get("name") or o.get("optionId") or "?",
+                     "description": ""}
+                    for o in choices
+                ],
+                "multiSelect": False,
+            }]
+
+        self.question_id += 1
+        qid = self.question_id
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self.pending_questions[qid] = fut
+        send_notification("question_request", {
+            "id": qid,
+            "questions": questions,
+        })
+        try:
+            answers = await fut
+        except Exception as e:
+            self.file_log(f"ask_user permission cancelled: {e}")
+            answers = None
+        finally:
+            self.pending_questions.pop(qid, None)
+
+        skip_id = next(
+            (o.get("optionId") for o in (options or [])
+             if isinstance(o, dict) and (
+                 "skip" in str(o.get("optionId") or "").lower()
+                 or str(o.get("kind") or "").startswith("reject"))),
+            None,
+        )
+        if answers is None:
+            if skip_id:
+                return {"outcome": {
+                    "outcome": "selected", "optionId": skip_id,
+                }}
+            return {"outcome": {"outcome": "cancelled"}}
+
+        # Map first answer label → optionId (single-q; multi-q is often
+        # sequential q0 / q1 permission requests from Kimi).
+        label = self._first_answer_label(answers, questions)
+        if not label:
+            if skip_id:
+                return {"outcome": {
+                    "outcome": "selected", "optionId": skip_id,
+                }}
+            return {"outcome": {"outcome": "cancelled"}}
+
+        oid = self._match_option_id_for_label(options, label)
+        self.file_log(
+            f"ask_user permission selected label={label!r} optionId={oid!r}")
+        if oid:
+            return {"outcome": {"outcome": "selected", "optionId": oid}}
+        # Free-text "Other" — no exact option; reject/skip rather than Option A
+        if skip_id:
+            return {"outcome": {
+                "outcome": "selected", "optionId": skip_id,
+            }}
+        return {"outcome": {"outcome": "cancelled"}}
+
+    @staticmethod
+    def _first_answer_label(answers: dict, questions: list) -> str:
+        if not isinstance(answers, dict) or not answers:
+            return ""
+        # Prefer key matching first question text
+        if questions:
+            q0 = questions[0].get("question") or ""
+            if q0 and q0 in answers:
+                v = answers[q0]
+                if isinstance(v, (list, tuple)) and v:
+                    return str(v[0])
+                return str(v) if v is not None else ""
+        for v in answers.values():
+            if isinstance(v, (list, tuple)) and v:
+                return str(v[0])
+            if v is not None and str(v) != "":
+                return str(v)
+        return ""
+
+    @staticmethod
+    def _match_option_id_for_label(options: list, label: str) -> str:
+        label = (label or "").strip()
+        if not label:
+            return ""
+        # Exact name match
+        for o in options or []:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or "").strip()
+            if name == label:
+                return str(o.get("optionId") or "")
+        # Case-insensitive / prefix (Recommended suffix noise)
+        low = label.lower()
+        for o in options or []:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or "").strip()
+            if name.lower() == low or name.lower().startswith(low):
+                return str(o.get("optionId") or "")
+            if low in name.lower():
+                return str(o.get("optionId") or "")
+        return ""
 
     def _normalize_questions(self, questions: list) -> list:
         """Normalize Grok/Claude question payloads for the plugin UI.
@@ -3020,6 +3441,22 @@ class AcpBridge(BaseBridge):
             enc_cwd, session_id, "plan.md",
         )
 
+    def _find_kimi_plan_file(self, session_id: str = "") -> str:
+        """Newest plan under ~/.kimi-code/sessions/.../plans/*.md."""
+        import glob
+        root = os.path.expanduser("~/.kimi-code/sessions")
+        if not os.path.isdir(root):
+            return ""
+        sid = (session_id or self.session_id or "").strip()
+        if sid:
+            cands = glob.glob(os.path.join(
+                root, "*", sid, "agents", "*", "plans", "*.md"))
+        else:
+            cands = glob.glob(os.path.join(
+                root, "*", "session_*", "agents", "*", "plans", "*.md"))
+        cands = [p for p in cands if os.path.isfile(p)]
+        return max(cands, key=os.path.getmtime) if cands else ""
+
     @staticmethod
     def _plan_unified_diff(before: str, after: str, *, max_chars: int = 12000) -> str:
         """Unified diff of plan before approval UI vs after user edits."""
@@ -3176,9 +3613,24 @@ class AcpBridge(BaseBridge):
             or (tool_input or {}).get("file_path")
             or ""
         )
+        # Kimi: path is often only on display / locations, not rawInput
         if not plan_path:
-            plan_path = self._resolve_grok_plan_path(
-                self.session_id or "", self.cwd or "")
+            display = tool_call.get("display") or {}
+            if isinstance(display, dict):
+                plan_path = display.get("path") or ""
+        if not plan_path:
+            for loc in (tool_call.get("locations") or []):
+                if isinstance(loc, dict) and loc.get("path"):
+                    plan_path = str(loc["path"])
+                    break
+        # Prefer real on-disk plan: Kimi fancy names, then Grok plan.md
+        if not plan_path or not os.path.isfile(plan_path):
+            kimi = self._find_kimi_plan_file(self.session_id or "")
+            if kimi:
+                plan_path = kimi
+            elif not plan_path:
+                plan_path = self._resolve_grok_plan_path(
+                    self.session_id or "", self.cwd or "")
         if plan_content:
             plan_path = self._ensure_plan_on_disk(plan_content, plan_path)
         elif plan_path and os.path.isfile(plan_path):

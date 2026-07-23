@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Dict, List, Optional
 
 _BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +16,7 @@ sys.path.insert(0, _BRIDGE_DIR)
 sys.path.insert(0, _PLUGIN_DIR)
 
 from acp_base import AcpBridge, run_bridge  # noqa: E402
+from rpc_helpers import send_notification  # noqa: E402
 
 try:
     from kimi_backend import (  # noqa: E402
@@ -52,19 +54,23 @@ class KimiBridge(AcpBridge):
         "kimi_bridge.log",
     )
 
+    # Modes: open-source kimi-cli only advertises ``default``
+    # (server.py set_session_mode asserts mode_id == "default").
+    # Kimi Code may also advertise plan|auto|yolo — apply_mode resolves
+    # against session availableModes and never sends acceptEdits.
     PERM_TO_MODE = {
         "default": "default",
-        "acceptEdits": "acceptEdits",
-        "auto": "default",
-        "bypassPermissions": "bypassPermissions",
+        "acceptEdits": "yolo",   # Code: yolo; OSS falls back to default
+        "auto": "auto",
+        "bypassPermissions": "auto",
         "plan": "plan",
-        "dontAsk": "default",
+        "dontAsk": "auto",
     }
     MODE_TO_PERM = {
         "default": "default",
         "plan": "plan",
-        "bypassPermissions": "bypassPermissions",
-        "acceptEdits": "acceptEdits",
+        "auto": "bypassPermissions",
+        "yolo": "acceptEdits",
         "agent": "acceptEdits",
         "ask": "default",
     }
@@ -112,6 +118,14 @@ class KimiBridge(AcpBridge):
         "TodoWrite": "TodoWrite",
         "TodoList": "TodoWrite",
         "TodoRead": "TodoWrite",
+        # Subagents — format like Claude Task (description + type)
+        "Agent": "Task",
+        "AgentSwarm": "Task",
+        "agent": "Task",
+        "spawn_subagent": "Task",
+        "Task": "Task",
+        "TaskOutput": "TaskGet",
+        "TaskGet": "TaskGet",
         "AskUserQuestion": "AskUserQuestion",
         "ask_user_question": "AskUserQuestion",
         "EnterPlanMode": "EnterPlanMode",
@@ -171,6 +185,98 @@ class KimiBridge(AcpBridge):
             self.log(f"authenticated via {preferred}")
         except Exception as e:
             self.log(f"authenticate({preferred}) failed: {e}")
+
+    async def handle_interrupt(self, req_id: Optional[int],
+                                params: dict) -> None:
+        """Cancel turn; second Esc hard-kills hung Agent subagents.
+
+        Kimi Code Agent tools can ignore session/cancel for 30–60+ min while
+        the parent session/prompt never returns — UI stays busy forever.
+        First interrupt: cancel + force local prompt settle.
+        Second interrupt within 15s: SIGKILL the kimi-code process (session
+        must be reopened — better than a stuck hour-long spinner).
+        """
+        now = time.time()
+        last = float(getattr(self, "_kimi_last_interrupt_at", 0) or 0)
+        count = int(getattr(self, "_kimi_interrupt_streak", 0) or 0)
+        if now - last < 15.0:
+            count += 1
+        else:
+            count = 1
+        self._kimi_last_interrupt_at = now
+        self._kimi_interrupt_streak = count
+
+        # Longer wait than default — subagents need cancel to propagate
+        fut = self._prompt_fut
+        active = fut is not None and not fut.done()
+        has_query = self._query_req_id is not None
+        if not active and not has_query and count < 2:
+            self.file_log("interrupt: idle (no in-flight prompt)")
+            send_result(req_id, {"status": "interrupted"})
+            return
+
+        for tid in list(self._terminals):
+            try:
+                await self._terminal_close(tid)
+            except Exception:
+                pass
+
+        await self._cancel_agent_turn(
+            reason="interrupt", wait_s=3.0, settle_s=0.4, force_local=True)
+
+        for pid, pfut in list(self.pending_permissions.items()):
+            if pfut and not pfut.done():
+                pfut.set_result({"kind": "denied-interactively-by-user"})
+            self.pending_permissions.pop(pid, None)
+        for qid, qfut in list(self.pending_questions.items()):
+            if qfut and not qfut.done():
+                qfut.set_result(None)
+            self.pending_questions.pop(qid, None)
+        for pid, pfut in list(self.pending_plan_approvals.items()):
+            if pfut and not pfut.done():
+                pfut.set_result(None)
+            self.pending_plan_approvals.pop(pid, None)
+
+        # Hard kill if still hung after cancel (Agent subagent ignores cancel)
+        still_busy = (
+            (self._prompt_fut is not None and not self._prompt_fut.done())
+            or count >= 2
+        )
+        if still_busy and count >= 2:
+            await self._kimi_hard_kill_agent(reason="double_interrupt")
+            self._kimi_interrupt_streak = 0
+
+        send_result(req_id, {"status": "interrupted"})
+
+    async def _kimi_hard_kill_agent(self, *, reason: str = "") -> None:
+        """SIGKILL kimi-code ACP process so a stuck Agent cannot hold the UI."""
+        proc = getattr(self, "proc", None)
+        if proc is None:
+            self.file_log(f"kimi hard kill ({reason}): no proc")
+            return
+        pid = getattr(proc, "pid", None)
+        self.file_log(f"kimi hard kill ({reason}): pid={pid}")
+        try:
+            if proc.returncode is None:
+                proc.kill()
+        except Exception as e:
+            self.file_log(f"kimi hard kill failed: {e}")
+        # Settle local waiters
+        fut = self._prompt_fut
+        if fut is not None and not fut.done():
+            fut.set_result({"stopReason": "cancelled"})
+        self._prompt_cancelled = True
+        self._cancel_in_flight = True
+        send_notification("message", {
+            "type": "system",
+            "subtype": "init",
+            "data": {
+                "message": (
+                    "Kimi agent process killed (stuck turn). "
+                    "Restart this session to continue."
+                ),
+            },
+        })
 
 
 def main() -> None:

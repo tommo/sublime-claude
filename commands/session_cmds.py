@@ -405,23 +405,22 @@ class ClaudeCodeQueuePromptCommand(sublime_plugin.WindowCommand):
 class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
     def run(self) -> None:
         s = get_active_session(self.window)
-        if not s:
+        if not s or not s.output:
             return
-        # If working, always interrupt — don't just clear input
-        if s.working:
-            s.interrupt()
-            return
-        # If idle in input mode with text, clear the input
+        # Non-empty composer always clears first — never interrupt while typing.
         if s.output.is_input_mode() and s.output.get_input_text().strip():
             view = s.output.view
+            if not view or not view.is_valid():
+                return
             start = s.output._input_start
             view.run_command("claude_replace", {
                 "start": start,
                 "end": view.size(),
-                "text": ""
+                "text": "",
             })
             view.sel().clear()
             view.sel().add(sublime.Region(start, start))
+            s.draft_prompt = ""
             return
         s.interrupt()
 

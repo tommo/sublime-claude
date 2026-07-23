@@ -370,7 +370,12 @@ class OutputView:
         }
 
     def _restore_view_state(self, pin: dict) -> None:
-        """Restore viewport to the pinned text anchor; keep caret out of the tail."""
+        """Restore viewport to the pinned text anchor; keep caret out of the tail.
+
+        Sticky-composer carets use pin['composer_caret'] / preserve_sel so
+        deferred restores do not yank the caret to viewport-top or draft EOF
+        while the user is editing mid-draft during a stream.
+        """
         if not pin or not self.view or not self.view.is_valid():
             return
         view = self.view
@@ -398,8 +403,19 @@ class OutputView:
                 except Exception:
                     pass
 
-        # Prefer carets that were in the visible slice; otherwise park at the
-        # viewport anchor so ST does not auto-scroll to an EOF caret every tick.
+        # Sticky ◎ draft caret — always win over viewport-anchor parking
+        cc = pin.get("composer_caret")
+        if cc is not None:
+            try:
+                pos = max(0, min(int(cc), size))
+                view.sel().clear()
+                view.sel().add(sublime.Region(pos, pos))
+            except Exception:
+                pass
+            _apply_vp()
+            return
+
+        # Prefer carets that were in the visible slice.
         keep = []
         for a, b in (pin.get("sels") or []):
             lo, hi = (a, b) if a <= b else (b, a)
@@ -408,12 +424,18 @@ class OutputView:
                     max(0, min(int(a), size)),
                     max(0, min(int(b), size)),
                 ))
-        view.sel().clear()
         if keep:
+            view.sel().clear()
             for a, b in keep:
                 view.sel().add(sublime.Region(a, b))
-        else:
+        elif pin.get("preserve_sel"):
+            # Explicit: leave selection alone (composer caret already correct)
+            pass
+        elif pin.get("sels"):
+            # Had sels but none in viewport — park at anchor (history reading)
+            view.sel().clear()
             view.sel().add(sublime.Region(anchor, anchor))
+        # else: empty sels list without preserve — leave selection alone
         _apply_vp()
 
     def _schedule_viewport_restore(self, pin: dict) -> None:
@@ -977,13 +999,18 @@ class OutputView:
         except Exception:
             return False
 
-    def focus_composer(self, force_show: bool = True, *, steal_focus: bool = False) -> None:
+    def focus_composer(
+            self, force_show: bool = True, *, steal_focus: bool = False,
+            preserve_caret: bool = False) -> None:
         """Park caret in ◎ and optionally scroll to the true view bottom.
 
         Does NOT steal window focus unless steal_focus=True (user action: click
         below, Enter outside draft). Stream/goal/idle re-pins must never call
         focus_view — that made the agent sheet unusable while working in other
         files.
+
+        preserve_caret=True: do not yank caret to draft EOF if it already sits
+        inside the ◎ strip (stream re-pins must use this).
 
         AskUserQuestion free-text reuses _input_mode — park caret only (no pad).
         """
@@ -999,8 +1026,9 @@ class OutputView:
                 # Free-text "Other..." — keep caret at type-in end, no sticky chrome
                 self._update_composer_pad_phantom()  # clears pad
                 caret = self.view.size()
-                self.view.sel().clear()
-                self.view.sel().add(sublime.Region(caret, caret))
+                if not preserve_caret:
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(caret, caret))
                 if force_show and self._view_is_focused():
                     try:
                         self.view.show(caret)
@@ -1009,6 +1037,19 @@ class OutputView:
                 return
             # Wipe legacy blank rows under ◎ before parking caret
             self.collapse_empty_composer_tail()
+            # Stream/idle re-pin: keep mid-draft caret (do not force EOF)
+            if preserve_caret:
+                try:
+                    sel = self.view.sel()
+                    if sel:
+                        b = sel[0].begin()
+                        if self._input_start <= b <= self.view.size():
+                            self._update_composer_pad_phantom()
+                            if force_show and self._view_is_focused():
+                                self._scroll_layout_to_bottom(force=False)
+                            return
+                except Exception:
+                    pass
             caret = self.view.size()
             self.view.sel().clear()
             self.view.sel().add(sublime.Region(caret, caret))
@@ -3095,12 +3136,19 @@ class OutputView:
                 self._update_title()
             return
         self._render_current(auto_scroll=False)
-        # Periodically clear undo history to prevent memory bloat
+        # Periodically clear undo history to prevent memory bloat.
+        # Must not call from a TextCommand context (ST warns / no-ops).
         if self._spinner_frame % 50 == 0:
-            try:
-                self.view.clear_undo_stack()
-            except AttributeError:
-                pass  # Not available in older Sublime builds
+            view = self.view
+
+            def _clear_undo(v=view):
+                try:
+                    if v and v.is_valid():
+                        v.clear_undo_stack()
+                except Exception:
+                    pass
+
+            sublime.set_timeout(_clear_undo, 0)
 
     def refresh_preserving_input(self) -> None:
         """Re-render conversation without losing the sticky composer draft.
@@ -3564,11 +3612,16 @@ class OutputView:
 
         if pin is not None:
             # Immediate + deferred restore (beats ST auto-scroll-to-caret).
-            # If we already restored a composer caret, strip sels from pin so
-            # restore doesn't yank the caret back to pre-delta coords.
+            # Sticky composer: pin composer_caret so deferred restores keep the
+            # mid-draft caret (never park at viewport top / draft EOF).
             if was_input and caret_in_composer:
                 pin = dict(pin)
                 pin["sels"] = []
+                pin["preserve_sel"] = True
+                if self._input_marker_intact():
+                    max_off = max(0, self.view.size() - self._input_start)
+                    pin["composer_caret"] = self._input_start + max(
+                        0, min(caret_off, max_off, len(draft or "")))
             self._restore_view_state(pin)
             self._schedule_viewport_restore(pin)
             if was_input and caret_in_composer and self._input_marker_intact():
@@ -3582,6 +3635,7 @@ class OutputView:
             # Sticky composer: keep ◎ + bottom split on the viewport floor when
             # the transcript grows — only if this sheet is focused (never yank
             # the user out of another file on stream ticks).
+            # Do NOT move the caret — only scroll.
             if self._view_is_focused():
                 self._scroll_layout_to_bottom(force=(delta != 0))
                 if delta != 0:
@@ -4716,11 +4770,41 @@ class OutputView:
         return f" → {len(lines)} matches"
 
     def _format_read_result(self, result: str) -> str:
-        """Format Read result as line count."""
+        """Format Read result as line count (or dir listing when applicable)."""
         if not result or not result.strip():
             return " → 0 lines"
-        lines = result.strip().split("\n")
-        return f" → {len(lines)} lines"
+        text = result.strip()
+        lines = [l for l in text.split("\n") if l.strip()]
+        if lines and self._looks_like_dir_listing(lines):
+            return f" → {len(lines)} entries"
+        return f" → {len(text.splitlines())} lines"
+
+    @staticmethod
+    def _looks_like_dir_listing(lines: list) -> bool:
+        """Heuristic: short name-per-line listing, not numbered file content."""
+        import re
+        if not lines or len(lines) > 500:
+            return False
+        # Claude/Kimi file reads often prefix with "   12|" or "12\t"
+        numbered = 0
+        for ln in lines[:20]:
+            if re.match(r"^\s*\d+[\|:\t]", ln):
+                numbered += 1
+        if numbered >= max(2, min(5, len(lines) // 2)):
+            return False
+        # Dir listings: short lines, mostly basenames (no spaces or single token)
+        short = 0
+        for ln in lines[:30]:
+            s = ln.strip()
+            if len(s) > 80:
+                return False
+            # ls-style or plain name / name/
+            if re.match(r"^[\w.\-@+]+/?$", s) or re.match(
+                    r"^[d\-][rwx\-]{9}\s", s):
+                short += 1
+            elif " " not in s and len(s) < 64:
+                short += 1
+        return short >= max(2, int(len(lines[:30]) * 0.6))
 
     def _format_mcp_result(self, result: str) -> str:
         """Format generic MCP tool result."""
