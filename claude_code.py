@@ -44,6 +44,7 @@ from .commands import (
     ClaudeCodeAddMcpCommand,
     ClaudeCodeTogglePermissionModeCommand,
     ClaudeSubmitInputCommand,
+    ClaudeSendNowCommand,
     ClaudeInsertNewlineCommand,
     ClaudePermissionAllowCommand,
     ClaudePermissionDenyCommand,

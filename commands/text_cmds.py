@@ -50,8 +50,12 @@ def _caret_outside_composer(view, output) -> bool:
 
 
 class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
-    """Handle Enter key in input mode - submit the prompt."""
-    def run(self, edit):
+    """Handle Enter / send-now in input mode.
+
+    Default Enter while busy → queue. With send_now=True (Ctrl/Cmd+Enter) →
+    cancel the live turn and run the message next (Grok-style send now).
+    """
+    def run(self, edit, send_now=False):
         s = get_session_for_view(self.view)
         if not s:
             return
@@ -91,8 +95,10 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
         text = s.output.get_input_text().strip()
 
-        # Ignore empty input (already in ◎ — stay put)
+        # Empty composer + send now: force-send top of queue (cancel current).
         if not text:
+            if send_now and s.working and s._queued_prompts:
+                s.send_now("")
             return
 
         # Manual submit = user takeover; drop the loop indicator. If the agent
@@ -108,10 +114,12 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             self._handle_command(s, cmd)
             return
 
-        # If working: queue only — leave ◎ open and clear just the submitted
-        # text so the user can keep typing the next message without a full exit.
+        # Busy: queue (Enter) or cancel-and-send (Ctrl/Cmd+Enter).
         if s.working:
-            s.queue_prompt(text)
+            if send_now:
+                s.send_now(text)
+            else:
+                s.queue_prompt(text)
             # Clear only the submitted line; do not exit sticky (preserves peel
             # + draft path). Next keystrokes are a new message.
             try:
@@ -227,6 +235,16 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             lines.append("")
             session.output.text("\n".join(lines))
         session.output.enter_input_mode()  # scrolls true bottom via focus_composer
+
+
+class ClaudeSendNowCommand(sublime_plugin.TextCommand):
+    """Cancel-and-send: interrupt the live turn and run composer/top queue next."""
+    def run(self, edit):
+        s = get_session_for_view(self.view)
+        if not s or not s.output:
+            return
+        # Reuse submit path so composer clear + slash handling stay consistent.
+        self.view.run_command("claude_submit_input", {"send_now": True})
 
 
 class ClaudeGoalStatusCommand(sublime_plugin.WindowCommand):

@@ -770,11 +770,15 @@ class AcpBridge(BaseBridge):
             # already renders ◎ <prompt> — do not double-print as text_delta.
             pass
         elif kind == "plan":
-            # Grok/ACP "plan" session updates (todo-style entries). Do not dump
-            # a **Plan:** text block into the transcript — the plugin already
-            # has a Tasks UI (TodoWrite / Task*), and external trackers
-            # (kanban etc.) own real planning. Echoing here is noise.
-            pass
+            # Kimi TodoWrite lands as ACP plan entries (title/status), not only
+            # tool_use.rawInput. Drive the plugin Tasks strip; never dump a
+            # **Plan:** text block into the transcript.
+            entries = upd.get("entries") or upd.get("plan") or []
+            if isinstance(entries, list) and entries:
+                send_notification("message", {
+                    "type": "plan_todos",
+                    "entries": entries,
+                })
         elif kind == "current_mode_update":
             self._handle_mode_update(upd)
         elif kind == "available_commands_update":
@@ -2503,12 +2507,13 @@ class AcpBridge(BaseBridge):
 
     async def handle_rewind_execute(self, req_id: Optional[int],
                                      params: dict) -> None:
-        """Rewind to a user-prompt index (conversation + optional files).
+        """Conversation-only rewind to a prompt_index.
 
-        Grok ACP `_x.ai/rewind/execute` is best-effort (often success:false
-        without error). We always apply a client-side truncate of session
-        files so the next session/load sees the shortened history, then
-        call the ACP method for any server-side effects.
+        Never restores project file snapshots. Truncates Grok *session*
+        transcript files (chat_history / rewind_points / updates) so the next
+        session/load forgets later turns. ACP ``_x.ai/rewind/execute`` is
+        best-effort (often success:false with no error) — session truncate is
+        the reliable path.
         """
         if not self.session_id:
             send_error(req_id, -32000, "session not initialized")
@@ -2521,13 +2526,10 @@ class AcpBridge(BaseBridge):
         except (TypeError, ValueError):
             send_error(req_id, -32602, "prompt_index required (int)")
             return
-        mode = (params.get("mode") or "conversation_only").strip()
-        if mode not in ("all", "conversation_only", "code_only", "files_only"):
-            mode = "conversation_only"
-        restore_files = bool(params.get("restore_files", mode in ("all", "files_only")))
+        # Product scope: conversation only — ignore mode/restore_files from host.
+        mode = "conversation_only"
 
-        disk = await asyncio.to_thread(
-            self._client_rewind_disk, target, restore_files)
+        disk = await asyncio.to_thread(self._client_rewind_conversation, target)
         acp_result: dict = {}
         try:
             acp_params = {
@@ -2540,7 +2542,7 @@ class AcpBridge(BaseBridge):
             if leaf:
                 acp_params["expected_leaf_response_id"] = leaf
             # Grok ACP execute often hangs or returns success:false; never
-            # block the bridge forever — disk truncate is the real work.
+            # block the bridge forever — session truncate is the real work.
             acp_result = await asyncio.wait_for(
                 self._send_acp("_x.ai/rewind/execute", acp_params),
                 timeout=12.0,
@@ -2550,10 +2552,10 @@ class AcpBridge(BaseBridge):
                 f"acp={str(acp_result)[:300]}")
         except asyncio.TimeoutError:
             self.file_log(
-                f"rewind/execute ACP TIMEOUT (disk still applied) target={target}")
+                f"rewind/execute ACP TIMEOUT (session still cut) target={target}")
             acp_result = {"success": False, "error": "acp timeout"}
         except Exception as e:
-            self.file_log(f"rewind/execute ACP error (disk still applied): {e}")
+            self.file_log(f"rewind/execute ACP error (session still cut): {e}")
             acp_result = {"success": False, "error": str(e)}
 
         draft = (disk or {}).get("draft_prompt") or ""
@@ -2563,18 +2565,41 @@ class AcpBridge(BaseBridge):
             "ok": True,
             "prompt_index": target,
             "draft_prompt": draft,
+            "mode": mode,
             "disk": disk or {},
             "acp": acp_result,
             "session_id": self.session_id,
         })
 
-    def _client_rewind_disk(self, target_prompt_index: int,
-                             restore_files: bool) -> dict:
-        """Truncate Grok session files to before user-prompt target_prompt_index.
+    @staticmethod
+    def _chat_row_text(o: dict) -> str:
+        content = o.get("content") or ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    parts.append(b.get("text") or "")
+            return "".join(parts)
+        return ""
 
-        Keeps system preamble; drops the Nth real user_query and everything
-        after. Optionally restores file_snapshots from that rewind point.
-        Returns {draft_prompt, truncated_user_turns, files_restored, session_dir}.
+    @staticmethod
+    def _user_query_body(text: str) -> str:
+        if "<user_query>" not in text:
+            return ""
+        try:
+            body = text.split("<user_query>", 1)[1]
+            return body.split("</user_query>", 1)[0].strip()
+        except IndexError:
+            return text.strip()
+
+    def _client_rewind_conversation(self, target_prompt_index: int) -> dict:
+        """Truncate Grok *session* history to before target_prompt_index.
+
+        Conversation only — never writes project files / file_snapshots.
+        Cut key is real ``prompt_index`` (not Nth user_query). Updates are
+        stream-cut at the first line with ``_meta.promptIndex >= target``.
         """
         sdir = self._grok_session_dir()
         if not sdir:
@@ -2582,46 +2607,48 @@ class AcpBridge(BaseBridge):
 
         chat_path = os.path.join(sdir, "chat_history.jsonl")
         rp_path = os.path.join(sdir, "rewind_points.jsonl")
+        up_path = os.path.join(sdir, "updates.jsonl")
         draft = ""
-        files_restored: list = []
+        cut_at = None
+        kept_rp = 0
+        dropped_rp = 0
+        kept_up = 0
+        dropped_up = 0
 
-        # Resolve draft + file snapshots from rewind_points.jsonl
-        snapshots: dict = {}
+        # rewind_points: keep prompt_index < target; draft from matching row
         if os.path.isfile(rp_path):
-            kept_rp = []
+            kept_lines = []
             with open(rp_path, "r", encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
+                    raw = line.strip()
+                    if not raw:
                         continue
                     try:
-                        o = json.loads(line)
+                        o = json.loads(raw)
                     except json.JSONDecodeError:
+                        kept_lines.append(raw)
                         continue
-                    idx = o.get("prompt_index")
                     try:
-                        idx = int(idx)
+                        idx = int(o.get("prompt_index"))
                     except (TypeError, ValueError):
+                        kept_lines.append(raw)
                         continue
                     if idx < target_prompt_index:
-                        kept_rp.append(line)
-                    elif idx == target_prompt_index:
-                        # Draft = this prompt; snapshots = pre-prompt files.
-                        # Prefer ACP preview if disk line has none.
-                        draft = (
-                            o.get("prompt_preview")
-                            or o.get("prompt_text")
-                            or draft
-                        )
-                        snapshots = o.get("file_snapshots") or {}
-                        # Do not keep this point or later ones.
+                        kept_lines.append(raw)
+                        kept_rp += 1
+                    else:
+                        dropped_rp += 1
+                        if idx == target_prompt_index:
+                            draft = (
+                                o.get("prompt_preview")
+                                or o.get("prompt_text")
+                                or draft
+                            )
             with open(rp_path, "w", encoding="utf-8") as f:
-                for line in kept_rp:
+                for line in kept_lines:
                     f.write(line + "\n")
 
-        # Truncate chat_history at the Nth real <user_query> user turn
-        user_turns = 0
-        cut_at = None
+        # chat_history: cut at first row whose prompt_index >= target
         if os.path.isfile(chat_path):
             lines = open(chat_path, "r", encoding="utf-8").read().splitlines()
             for i, line in enumerate(lines):
@@ -2629,73 +2656,103 @@ class AcpBridge(BaseBridge):
                     o = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if o.get("type") != "user":
+                try:
+                    pi = o.get("prompt_index")
+                    if pi is None:
+                        pi = o.get("promptIndex")
+                    pi = int(pi) if pi is not None else None
+                except (TypeError, ValueError):
+                    pi = None
+                if pi is None or pi < target_prompt_index:
                     continue
-                if o.get("synthetic_reason"):
-                    continue
-                content = o.get("content") or ""
-                text = content if isinstance(content, str) else ""
-                if isinstance(content, list):
-                    parts = []
-                    for b in content:
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            parts.append(b.get("text") or "")
-                    text = "".join(parts)
-                # Real user prompts are wrapped in <user_query> by Grok.
-                if "<user_query>" not in text and user_turns == 0 and not text.strip():
-                    continue
-                # Skip pure system-ish user rows without user_query once we
-                # have seen at least one — but count rows with user_query.
-                if "<user_query>" not in text:
-                    continue
-                if user_turns == target_prompt_index:
-                    cut_at = i
-                    # Extract draft from user_query if rewind_points lacked it
-                    if not draft and "<user_query>" in text:
-                        try:
-                            draft = text.split("<user_query>", 1)[1]
-                            draft = draft.split("</user_query>", 1)[0].strip()
-                        except IndexError:
-                            draft = text.strip()
-                    break
-                user_turns += 1
+                cut_at = i
+                text = self._chat_row_text(o)
+                if not draft:
+                    draft = self._user_query_body(text) or draft
+                break
+            # Fallback: no prompt_index fields (rare / heavily compacted) —
+            # treat target as Nth real <user_query> only if it fits.
+            if cut_at is None:
+                user_turns = 0
+                for i, line in enumerate(lines):
+                    try:
+                        o = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if o.get("type") != "user" or o.get("synthetic_reason"):
+                        continue
+                    text = self._chat_row_text(o)
+                    if "<user_query>" not in text:
+                        continue
+                    if user_turns == target_prompt_index:
+                        cut_at = i
+                        if not draft:
+                            draft = self._user_query_body(text)
+                        break
+                    user_turns += 1
             if cut_at is not None:
                 with open(chat_path, "w", encoding="utf-8") as f:
                     for line in lines[:cut_at]:
                         f.write(line + "\n")
 
-        # Restore pre-prompt file contents
-        if restore_files and isinstance(snapshots, dict):
-            for _name, snap in snapshots.items():
-                if not isinstance(snap, dict):
-                    continue
-                path = snap.get("path") or _name
-                if not path:
-                    continue
-                if not os.path.isabs(path):
-                    path = os.path.join(self.cwd or ".", path)
-                content = snap.get("content")
-                if content is None:
-                    continue
-                try:
-                    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(content if isinstance(content, str) else str(content))
-                    files_restored.append(path)
-                except OSError as e:
-                    self.file_log(f"rewind restore {path!r}: {e}")
+        # updates.jsonl: stream-cut at first _meta.promptIndex >= target
+        # (later tool_call rows lack promptIndex and must still drop).
+        if os.path.isfile(up_path):
+            kept_u: list = []
+            cutting = False
+            with open(up_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    raw = line.rstrip("\n")
+                    if cutting:
+                        dropped_up += 1
+                        continue
+                    pi = self._updates_line_prompt_index(raw)
+                    if pi is not None and pi >= target_prompt_index:
+                        cutting = True
+                        dropped_up += 1
+                        continue
+                    kept_u.append(raw)
+                    kept_up += 1
+            with open(up_path, "w", encoding="utf-8") as f:
+                for line in kept_u:
+                    f.write(line + "\n")
 
         self.file_log(
-            f"client rewind disk target={target_prompt_index} "
+            f"client rewind conversation target={target_prompt_index} "
             f"cut_at={cut_at} draft_len={len(draft or '')} "
-            f"files={len(files_restored)} dir={sdir}")
+            f"rp_keep={kept_rp} rp_drop={dropped_rp} "
+            f"up_keep={kept_up} up_drop={dropped_up} dir={sdir}")
         return {
             "session_dir": sdir,
             "draft_prompt": draft or "",
             "cut_at": cut_at,
-            "files_restored": files_restored,
-            "truncated_user_turns_before": user_turns if cut_at is not None else None,
+            "files_restored": [],  # conversation only — never project files
+            "kept_rp": kept_rp,
+            "dropped_rp": dropped_rp,
+            "kept_updates": kept_up,
+            "dropped_updates": dropped_up,
         }
+
+    @staticmethod
+    def _updates_line_prompt_index(line: str):
+        """Return _meta.promptIndex from an updates.jsonl line, or None."""
+        if "promptIndex" not in line and "prompt_index" not in line:
+            return None
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        u = (o.get("params") or {}).get("update") or {}
+        meta = u.get("_meta") or {}
+        pi = meta.get("promptIndex")
+        if pi is None:
+            pi = meta.get("prompt_index")
+        if pi is None:
+            pi = u.get("promptIndex")
+        try:
+            return int(pi) if pi is not None else None
+        except (TypeError, ValueError):
+            return None
 
     async def handle_shutdown(self, req_id: Optional[int],
                                params: dict) -> None:

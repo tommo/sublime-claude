@@ -136,7 +136,16 @@ _TODO_CLOSED = frozenset({
 
 
 def _todo_status_norm(status: str) -> str:
-    return (status or "pending").strip().lower().replace("-", "_")
+    """Normalize Claude / Grok / Kimi todo status strings to a common set."""
+    s = (status or "pending").strip().lower().replace("-", "_").replace(" ", "_")
+    # Kimi TodoDisplayBlock / tool uses "done"; ACP plan uses "completed".
+    if s in ("done", "complete", "finished"):
+        return "completed"
+    if s in ("inprogress",):
+        return "in_progress"
+    if s in ("todo", "open", "not_started"):
+        return "pending"
+    return s or "pending"
 
 
 def _todo_is_open(todo: "TodoItem") -> bool:

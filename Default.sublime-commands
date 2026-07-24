@@ -270,6 +270,10 @@
         "command": "claude_code_queue_prompt"
     },
     {
+        "caption": "Claude: Send Now (cancel turn)",
+        "command": "claude_send_now"
+    },
+    {
         "caption": "Claude: View Session History...",
         "command": "claude_code_view_history"
     },

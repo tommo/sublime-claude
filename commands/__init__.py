@@ -78,6 +78,7 @@ from ..quick_agent import (  # noqa: F401
 )
 from .text_cmds import (  # noqa: F401
     ClaudeToggleSubmitModeCommand,
+    ClaudeSendNowCommand,
     ClaudeSubmitInputCommand,
     ClaudeInsertCommand,
     ClaudeToggleTasksFoldCommand,

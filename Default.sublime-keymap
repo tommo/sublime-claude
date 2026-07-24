@@ -134,6 +134,7 @@
         ]
     },
     // Submit on Enter (default mode: submit_with_modifier=false)
+    // While busy, plain Enter queues; Ctrl/Cmd+Enter is send-now (cancel+send).
     {
         "keys": ["enter"],
         "command": "claude_submit_input",
@@ -152,49 +153,62 @@
             { "key": "claude_submit_with_modifier", "operator": "equal", "operand": false }
         ]
     },
-    // Modifier+Enter mode: Enter inserts newline, Cmd/Ctrl+Enter submits
+    // Send now (cancel-and-send while busy; normal submit when idle).
+    // Bound in both submit modes so Ctrl/Cmd+Enter always means "send now"
+    // mid-turn, matching Grok/Kimi TUI.
+    {
+        "keys": ["super+enter"],
+        "command": "claude_submit_input",
+        "args": { "send_now": true },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+enter"],
+        "command": "claude_submit_input",
+        "args": { "send_now": true },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+enter"],
+        "command": "claude_submit_input",
+        "args": { "send_now": true },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+enter"],
+        "command": "claude_submit_input",
+        "args": { "send_now": true },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true }
+        ]
+    },
+    // Explicit queue while busy (works in both submit modes; idle = normal submit)
+    {
+        "keys": ["alt+enter"],
+        "command": "claude_submit_input",
+        "args": { "send_now": false },
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true }
+        ]
+    },
+    // Modifier+Enter mode: Enter inserts newline (submit/send-now is Ctrl/Cmd+Enter)
     {
         "keys": ["enter"],
         "command": "claude_insert_newline",
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
             { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
-            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
-        ]
-    },
-    {
-        "keys": ["super+enter"],
-        "command": "claude_submit_input",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
-            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
-        ]
-    },
-    {
-        "keys": ["ctrl+enter"],
-        "command": "claude_submit_input",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
-            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
-        ]
-    },
-    {
-        "keys": ["super+enter"],
-        "command": "claude_submit_input",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true },
-            { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
-        ]
-    },
-    {
-        "keys": ["ctrl+enter"],
-        "command": "claude_submit_input",
-        "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_sleeping", "operator": "equal", "operand": true },
             { "key": "claude_submit_with_modifier", "operator": "equal", "operand": true }
         ]
     },

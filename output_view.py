@@ -1384,22 +1384,47 @@ class OutputView:
                 name=name, tool_input=tool_input, status=status, id=tool_id)
             self.current.events.append(tool_call)
 
-        # Capture TodoWrite state (Anthropic stock tool — full snapshot per call)
-        if name == "TodoWrite" and "todos" in tool_input:
-            raw = tool_input.get("todos") or []
-            # Keep closed items out of the live list so they don't reappear
-            # next round as fake "pending" (cancelled used to count as pending).
-            self.current.todos = [
-                TodoItem(
-                    content=t.get("content", "") or t.get("activeForm", "") or "",
-                    status=_todo_status_norm(t.get("status", "pending")),
-                    id=str(t.get("id") or ""),
-                )
-                for t in raw
-                if isinstance(t, dict)
-            ]
-            self.current.todos = _open_todos(self.current.todos)
-            self.current.todos_all_done = not self.current.todos
+        # Capture TodoWrite state (Claude/Grok full snapshot; Kimi uses title/done).
+        if name == "TodoWrite" or (
+                isinstance(name, str)
+                and name.lower() in ("todowrite", "todolist", "todo")):
+            raw = (
+                tool_input.get("todos")
+                or tool_input.get("items")
+                or tool_input.get("tasks")
+                or []
+            )
+            if isinstance(raw, list) and raw:
+                parsed = self._todos_from_raw_list(raw)
+                merge = tool_input.get("merge") is True
+                if merge and self.current.todos:
+                    by_id = {t.id: t for t in self.current.todos if t.id}
+                    for t in parsed:
+                        if t.id and t.id in by_id:
+                            by_id[t.id].content = t.content or by_id[t.id].content
+                            by_id[t.id].status = t.status
+                        elif t.id:
+                            by_id[t.id] = t
+                        else:
+                            self.current.todos.append(t)
+                    # Rebuild list preserving open order: updated by_id + no-id
+                    kept = []
+                    seen = set()
+                    for t in self.current.todos:
+                        if t.id and t.id in by_id:
+                            if t.id not in seen:
+                                kept.append(by_id[t.id])
+                                seen.add(t.id)
+                        elif not t.id:
+                            kept.append(t)
+                    for tid, t in by_id.items():
+                        if tid not in seen:
+                            kept.append(t)
+                    self.current.todos = kept
+                else:
+                    self.current.todos = parsed
+                self.current.todos = _open_todos(self.current.todos)
+                self.current.todos_all_done = not self.current.todos
         # Task* variants (this harness's split API — incremental ops)
         elif name == "TaskCreate":
             subject = tool_input.get("subject", "") or tool_input.get("description", "")
@@ -1655,6 +1680,58 @@ class OutputView:
         if any(self._is_in_current(t) for t in targets):
             self._render_current()
 
+    @staticmethod
+    def _todos_from_raw_list(raw: list) -> list:
+        """Normalize Claude/Grok/Kimi todo dicts → TodoItem list.
+
+        Kimi uses ``title`` + status ``done``; Claude uses ``content`` +
+        ``completed``; Grok often matches Claude.
+        """
+        from .output_models import TodoItem, _todo_status_norm
+        out = []
+        for t in raw:
+            if not isinstance(t, dict):
+                continue
+            content = (
+                t.get("content")
+                or t.get("title")
+                or t.get("text")
+                or t.get("activeForm")
+                or t.get("active_form")
+                or t.get("subject")
+                or ""
+            )
+            content = str(content).strip()
+            if not content:
+                continue
+            out.append(TodoItem(
+                content=content,
+                status=_todo_status_norm(t.get("status", "pending")),
+                id=str(t.get("id") or t.get("taskId") or t.get("task_id") or ""),
+            ))
+        return out
+
+    def apply_plan_todos(self, entries: list) -> None:
+        """ACP sessionUpdate plan entries → Tasks strip (Kimi TodoDisplayBlock)."""
+        if not self.current or not isinstance(entries, list):
+            return
+        # Plan entries: {content|title, status, priority}
+        raw = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            raw.append({
+                "content": e.get("content") or e.get("title") or e.get("text") or "",
+                "status": e.get("status") or "pending",
+                "id": str(e.get("id") or ""),
+            })
+        parsed = self._todos_from_raw_list(raw)
+        if not parsed and not entries:
+            return
+        self.current.todos = _open_todos(parsed)
+        self.current.todos_all_done = not self.current.todos
+        self._render_current()
+
     def _sync_todos_from_task_result(self, name: str, tool: "ToolCall", result: str) -> None:
         """Parse Task* result text and merge into current.todos.
 
@@ -1814,8 +1891,12 @@ class OutputView:
         self._render_pending = False
         self._do_render()
 
-    def interrupted(self) -> None:
-        """Show interrupted indicator."""
+    def interrupted(self, show_banner: bool = True) -> None:
+        """End the live turn UI (optional *[interrupted]* banner).
+
+        show_banner=False is used for cancel-and-send so the next turn does not
+        sit under a misleading interrupted marker.
+        """
         if not self.current:
             return
         self.current.working = False
@@ -1838,8 +1919,8 @@ class OutputView:
             self.pending_question = None
             if callback:
                 callback(None)
-        # Append interrupted text
-        self.current.events.append("\n\n*[interrupted]*\n")
+        if show_banner:
+            self.current.events.append("\n\n*[interrupted]*\n")
         self._render_current()
 
     def clear(self) -> None:
@@ -3312,29 +3393,13 @@ class OutputView:
                         lines.append(f"  {symbol} {event.name}{detail}\n")
                 i += 1
 
-        # Working indicator at bottom (animated)
-        if self.current.working:
-            spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
-            lines.append(f"  {spinner}\n")
-            # While the provider is retrying a 429/5xx, surface the hint as its
-            # own line — scoped claude.retry (muted) via the syntax, and dropped
-            # by _clear_api_retry_hint as soon as content resumes.
-            try:
-                from . import claude_code
-                _sess = claude_code.get_session_for_view(self.view)
-                _hint = getattr(_sess, "_api_retry_hint", None)
-            except Exception:
-                _hint = None
-            if _hint:
-                lines.append(f"  {_hint}\n")
-
-        # Adaptive Work strip: Goal (north star, ◆) + Tasks (▸/○) as one block.
-        # Distinct from composer ◎. Colors: ClaudeOutput.sublime-syntax.
+        # Adaptive Work strip: Goal (◆) + Tasks (▸/○), then spinner.
+        # Order matters: never leave a floating ⠹ above the goal strip
+        # (looks broken on /goal resume). prompt() still strips goal from the
+        # frozen prior region so history has no ◆ corpses.
         #
-        # Goal is sticky on the *live* conversation (working or idle after @done).
-        # prompt() clears goal from the prior region before freeze — otherwise
-        # every submit / phase-switch left a permanent "◆ goal ·" corpse.
-        # Tasks stay working-only so @done history has no task-list corpse.
+        # After @done (has_meta), hide goal/tasks on that turn — otherwise
+        # "@done + ◆ goal · executing" stacks. Next turn re-attaches GoalState.
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
             self.current.todos_all_done = True
@@ -3369,12 +3434,15 @@ class OutputView:
                 self.current.goal = None
         except Exception:
             pass
-        show_goal = bool(goal and _goal_is_open(goal))
+        turn_done = bool(self.current.has_meta)
+        # Open goal chrome: live turns + idle/paused. Never under a finished
+        # @done sheet (next prompt() re-attaches GoalState to the new turn).
+        show_goal = bool(goal and _goal_is_open(goal) and not turn_done)
         show_tasks = False
         show = []
         hidden = 0
         expanded = False
-        if self.current.working and open_todos:
+        if self.current.working and open_todos and not turn_done:
             active = [t for t in open_todos if _todo_is_active(t)]
             pending = [t for t in open_todos if not _todo_is_active(t)]
             expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
@@ -3422,6 +3490,19 @@ class OutputView:
                     lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
                 elif expanded:
                     lines.append("  (super+click to collapse)\n")
+
+        # Spinner under the work strip (never above ◆ goal / todos).
+        if self.current.working and not turn_done:
+            spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
+            lines.append(f"  {spinner}\n")
+            try:
+                from . import claude_code
+                _sess = claude_code.get_session_for_view(self.view)
+                _hint = getattr(_sess, "_api_retry_hint", None)
+            except Exception:
+                _hint = None
+            if _hint:
+                lines.append(f"  {_hint}\n")
 
         # Meta — show after meta() even when duration_ms was 0 (ACP/Grok).
         if self.current.has_meta or self.current.duration > 0:

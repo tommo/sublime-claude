@@ -35,10 +35,21 @@ OBJECTIVE:
 {contract}
 Rules:
 1. Deliver the objective fully — no leaving manual steps for the user.
-2. Track work with todos when the task has multiple steps.
+2. Task list is mandatory (not optional):
+   - At the START of implementer work, create a task list (TodoWrite / Task tool)
+     that covers the plan's checklist or acceptance steps — one item per
+     concrete unit of work.
+   - AFTER finishing each unit (and BEFORE starting the next), update that
+     task list: mark the finished item completed; add items if the work
+     splits further.
+   - Also flip plan.md checkboxes (`- [ ]` → `- [x]`) when a host checklist
+     item is done. Do not leave a long streak of work with a stale task list.
+   - Never call update_goal(completed=true) while the task list still has
+     open/pending items for this objective (or the host plan checklist does).
 3. Verify as you go with real commands/files — no test theater.
 4. Report progress with the MCP tool `update_goal`:
-   - update_goal(message="…") for progress notes
+   - update_goal(message="…") for progress notes (pair with a task-list
+     update in the same stretch of work)
    - update_goal(completed=true, message="…") ONLY when the FULL objective is done
      (host rejects open checklist items, partial/deferral claim language, and
      diluted plans; then a goal_verdict turn must still pass)
@@ -136,17 +147,24 @@ code yet. Do not call update_goal(completed=true). End after writing plan.md.
 def implementer_kickoff(tracker: "GoalTracker") -> str:
     """First implementer turn after host accepts the plan."""
     excerpt = _plan_contract_excerpt(tracker)
+    plan_path = getattr(tracker, "plan_path", "") or "plan.md"
     return (
         goal_rules(tracker.objective, plan_body=excerpt)
         + "\nThe host has ACCEPTED the plan (real contract, not a template). "
         "Execute it.\n"
-        + "As you finish work, flip checklist boxes in the plan file on disk "
-        f"(`{getattr(tracker, 'plan_path', '') or 'plan.md'}`): change "
-        "`- [ ]` to `- [x]`. Host merges ONLY checkbox marks — rewriting "
-        "Acceptance criteria / Verification plan on disk is a no-op and a "
-        "manipulated plan cannot unlock complete.\n"
+        + "FIRST actions this turn (before deep implementation):\n"
+        + "1. Create/refresh the session task list (TodoWrite) from the plan "
+        "checklist / AC — every open item visible as a todo.\n"
+        + "2. As you complete each step: (a) mark that todo completed, "
+        "(b) flip the matching checkbox in the plan file on disk "
+        f"(`{plan_path}`): `- [ ]` → `- [x]`, "
+        "(c) optionally update_goal(message=…) for host progress.\n"
+        + "Host merges ONLY checkbox marks — rewriting Acceptance criteria / "
+        "Verification plan on disk is a no-op and a manipulated plan cannot "
+        "unlock complete.\n"
         + "Claim complete only with full-objective evidence against the FROZEN "
-        "contract. Host then runs Task-mode verification requiring goal_verdict "
+        "contract AND an empty open task list / fully checked plan. Host then "
+        "runs Task-mode verification requiring goal_verdict "
         "(prose alone cannot unlock).\n"
     )
 
@@ -178,8 +196,17 @@ OBJECTIVE: {tracker.objective}
 {criteria}
 {excerpt}
 Continue implementing and verifying against the HOST PLAN CONTRACT.
-Call update_goal(message=…) for progress.
-When fully done: update_goal(completed=true, message=summary of evidence).
+
+Task list discipline (required every turn):
+- If no task list exists yet, create one NOW from the plan checklist/AC.
+- Before other work: sync todos + plan.md checkboxes to reality (mark done
+  what you already finished; keep only remaining open items).
+- After each finished unit: update the task list immediately — do not batch
+  many steps with a silent/stale task list.
+- Pair meaningful progress with update_goal(message=…).
+
+When fully done (all todos/checkboxes closed + evidence): update_goal(
+  completed=true, message=summary of evidence).
 If stuck after real attempts: update_goal(blocked_reason=…).
 
 If remaining work is parallelizable, use Task/Agent subagents or

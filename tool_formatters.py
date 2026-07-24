@@ -487,7 +487,12 @@ def _notebook_edit(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _todo_write(view: "OutputView", tool: "ToolCall") -> str:
-    todos = tool.tool_input.get("todos", [])
+    todos = (
+        tool.tool_input.get("todos")
+        or tool.tool_input.get("items")
+        or tool.tool_input.get("tasks")
+        or []
+    )
     count = len(todos) if isinstance(todos, list) else "?"
     return f": {count} task{'s' if count != 1 else ''}"
 

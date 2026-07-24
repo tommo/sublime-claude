@@ -1162,8 +1162,8 @@ class Session:
                 "rewind_execute",
                 {
                     "prompt_index": idx,
+                    # Conversation only — never project file_snapshots.
                     "mode": "conversation_only",
-                    "restore_files": False,
                 },
                 on_exec,
             )
@@ -1682,11 +1682,16 @@ class Session:
 
         # Interrupt already restored idle UI in interrupt(). Late bridge ack
         # only settles flags + flushes queue — never paints *[interrupted]* again
-        # and never clobbers a newer live turn (generation check above).
+        # and never clobbers a newer live turn (queue/send_now may already run).
         if completion == "interrupted":
-            if self.working and not getattr(self, "_interrupting", False):
-                # Live turn is not the cancelled one — never clobber it.
-                print("[Claude] ignore interrupt done while another turn is live")
+            # Critical: if settle timers / send_now already started the next
+            # turn, working=True while _interrupting may still be True. The
+            # old check required "working and not interrupting" so it missed
+            # that case, forced working=False, and re-fired the queue —
+            # superseding the turn we just started (Grok looks "weird").
+            if self.working:
+                print("[Claude] ignore interrupt done — newer turn already live")
+                self._interrupting = False
                 return
             self._interrupting = False
             if self._response_callback:
@@ -2130,6 +2135,43 @@ class Session:
         self._queued_prompts.append(prompt)
         self._update_queue_phantom()
 
+    def send_now(self, prompt: str = "") -> bool:
+        """Cancel-and-send: stop the live turn, run this prompt next.
+
+        Grok/Kimi TUI "send now" semantics — not mid-stream steer. Existing
+        queued follow-ups stay (this message is prepended and fires first after
+        interrupt settles). Empty prompt with a non-empty queue flushes the top
+        of the queue after cancel. Idle + prompt runs immediately.
+
+        Returns True if a send/interrupt was started.
+        """
+        prompt = (prompt or "").strip()
+
+        if not self.working:
+            if prompt:
+                self._fire_queued_now(prompt)
+                return True
+            if self._queued_prompts:
+                return self._fire_next_queued()
+            return False
+
+        if prompt:
+            # Prefer this message first; drop exact dupes already queued.
+            self._queued_prompts = [p for p in self._queued_prompts if p != prompt]
+            self._queued_prompts.insert(0, prompt)
+            self._update_queue_phantom()
+        elif not self._queued_prompts:
+            sublime.status_message("Nothing to send now")
+            return False
+
+        print(f"[Claude] send now: interrupt → {self._queued_prompts[0][:60]!r}")
+        self._status(f"send now: {self._queued_prompts[0][:40]}…")
+        sublime.status_message("Send now — interrupting current turn…")
+        # Quiet interrupt: no *[interrupted]* banner (next turn replaces it).
+        self._send_now_pending = True
+        self.interrupt()
+        return True
+
     def _fire_next_queued(self) -> bool:
         """Pop and run the next queued prompt. Preserves ◎ draft. True if fired."""
         if not self._queued_prompts:
@@ -2226,7 +2268,12 @@ class Session:
         if q:
             rows.append(
                 '<div style="margin:0 0 2px 0;font-size:10px;'
-                'color:color(var(--foreground) alpha(0.4));">queue</div>'
+                'color:color(var(--foreground) alpha(0.4));">'
+                'queue · '
+                '<a href="send_now" style="color:var(--orangish);'
+                'text-decoration:none;" title="Cancel turn and send top now">'
+                'send now</a>'
+                '</div>'
             )
             for i, msg in enumerate(q):
                 short = msg.replace("\n", " ").strip()
@@ -2238,6 +2285,8 @@ class Session:
                     f'background-color:color(var(--foreground) alpha(0.06));'
                     f'color:var(--bluish);font-size:11px;">'
                     f'⏳ {safe}'
+                    f'&nbsp;<a href="send:{i}" style="color:var(--orangish);'
+                    f'text-decoration:none;" title="send now">↵</a>'
                     f'&nbsp;<a href="drop:{i}" style="color:var(--redish);'
                     f'text-decoration:none;" title="remove">×</a>'
                     f'</div>'
@@ -2266,6 +2315,19 @@ class Session:
                 pass
 
     def _on_queue_phantom_navigate(self, href: str) -> None:
+        if href == "send_now":
+            # Top of queue → cancel-and-send (empty composer path).
+            self.send_now("")
+            return
+        if href.startswith("send:"):
+            try:
+                idx = int(href.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return
+            if 0 <= idx < len(self._queued_prompts):
+                msg = self._queued_prompts.pop(idx)
+                self.send_now(msg)
+            return
         if not href.startswith("drop:"):
             return
         try:
@@ -2336,18 +2398,24 @@ class Session:
         except Exception as e:
             print(f"[Claude] goal interrupt pause: {e}")
 
-        # Immediate UI: idle + *[interrupted]* + input. Do NOT leave
-        # session.working=True with conversation.working=False (no busy mark
-        # and no input — the "dead UI" state after a hung cancel).
+        # Immediate UI: idle. Do NOT leave session.working=True with
+        # conversation.working=False (dead UI after a hung cancel).
+        send_now = bool(getattr(self, "_send_now_pending", False))
+        self._send_now_pending = False
         self.working = False
         self.current_tool = None
         self._clear_deferred_state(clear_queue=False)
         try:
             if self.output:
-                self.output.interrupted()
+                if send_now:
+                    # Cancel-and-send: no *[interrupted]* banner (next turn
+                    # starts immediately — banner looks broken on Grok).
+                    self.output.interrupted(show_banner=False)
+                else:
+                    self.output.interrupted()
         except Exception:
             pass
-        self._status("interrupted")
+        self._status("send now…" if send_now else "interrupted")
         try:
             self._update_queue_phantom()
         except Exception:
@@ -2361,6 +2429,8 @@ class Session:
         def _rearm_after_drip(_gen=gen, fire_queue=True):
             if getattr(self, "_interrupt_gen", 0) != _gen:
                 return
+            # Newer turn already live (from an earlier settle or late ack) —
+            # do not re-fire the rest of the queue on this interrupt gen.
             if self.working:
                 return
             # After cancel settles: flush held queue once, else restore ◎.
@@ -2381,9 +2451,11 @@ class Session:
         # Composer quickly; queue only after cancel has had time to settle
         # (avoids Grok/Kimi agent_busy + late interrupt clobbering the new turn).
         sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=False), 50)
-        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 250)
-        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 700)
-        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 1400)
+        # Prefer waiting for bridge cancel ACK (late _on_done) for queue fire;
+        # these are backups if the ACK is slow/missing.
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 450)
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 900)
+        sublime.set_timeout(lambda: _rearm_after_drip(fire_queue=True), 1600)
 
         if self.client:
             sent = self.client.send("interrupt", {})
@@ -3232,6 +3304,8 @@ class Session:
             "turn_usage": self._on_msg_turn_usage,
             "result": self._on_msg_result,
             "system": self._on_msg_system,
+            # Kimi TodoWrite → ACP plan entries (title/status)
+            "plan_todos": self._on_msg_plan_todos,
         }
 
     # ── method-level handlers ────────────────────────────────────────────
@@ -3309,6 +3383,18 @@ class Session:
             print(f"[Claude] wake query error: {e}")
 
     # ── message-level handlers ───────────────────────────────────────────
+
+    def _on_msg_plan_todos(self, params: dict) -> None:
+        """ACP plan sessionUpdate (Kimi TodoWrite display blocks) → Tasks UI."""
+        if not self.output or not self.working:
+            return
+        entries = params.get("entries") or []
+        if not isinstance(entries, list) or not entries:
+            return
+        try:
+            self.output.apply_plan_todos(entries)
+        except Exception as e:
+            print(f"[Claude] plan_todos: {e}")
 
     def _on_msg_tool_use(self, params: dict) -> None:
         name = params.get("name", "")
