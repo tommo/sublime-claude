@@ -4930,48 +4930,130 @@ class OutputView:
         return short >= max(2, int(len(lines[:30]) * 0.6))
 
     def _format_mcp_result(self, result: str) -> str:
-        """Format generic MCP tool result."""
+        """Format generic MCP tool result (Claude / Grok / Codex / Kimi).
+
+        Handles:
+        - Claude-style ``{'type':'text','text':'…'}`` / list of content blocks
+        - Codex wall-time wrapper + JSON content array
+        - Result::Ok / CallToolResult envelopes
+        - Plain multi-line text (irr search hits, etc.)
+        """
         try:
             import re
-            import ast
             import json
 
-            # Extract the 'text' field from MCP format: {'type': 'text', 'text': '...'}
-            match = re.search(r"'text':\s*'((?:[^'\\]|\\.)*)'", result)
-            if not match:
-                # Try double quotes
-                match = re.search(r'"text":\s*"((?:[^"\\]|\\.)*)"', result)
+            if result is None:
+                return ""
+            if not isinstance(result, str):
+                result = str(result)
+            raw = result.strip()
+            if not raw:
+                return ""
 
-            if match:
-                text = match.group(1)
-                # Decode escapes
-                text = text.replace('\\n', '\n').replace("\\'", "'").replace('\\"', '"')
-                # Try to parse as JSON for pretty display
+            text = ""
+
+            # Codex: Wall time …\nOutput:\n[{type:text,text:…}]
+            if "Output:" in raw and (
+                    raw.startswith("Wall time") or "\nOutput:\n" in raw):
+                rest = raw.split("Output:", 1)[1].strip()
+                try:
+                    data = json.loads(rest)
+                    if isinstance(data, list):
+                        parts = []
+                        for b in data:
+                            if isinstance(b, dict) and b.get("text") is not None:
+                                parts.append(str(b.get("text") or ""))
+                        text = "\n".join(parts)
+                    elif isinstance(data, dict):
+                        if data.get("text") is not None:
+                            text = str(data.get("text") or "")
+                        elif "content" in data:
+                            text = self._format_mcp_result(
+                                json.dumps(data["content"]))
+                            return text  # already formatted
+                except Exception:
+                    text = rest
+
+            # Envelope JSON: {"Ok":{"content":[…]}} / {"content":[…]}
+            if not text and raw[:1] in "{[":
+                try:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        if "Ok" in data:
+                            data = data["Ok"]
+                        if isinstance(data, dict) and "content" in data:
+                            data = data["content"]
+                        if isinstance(data, list):
+                            parts = []
+                            for b in data:
+                                if isinstance(b, dict) and b.get("text") is not None:
+                                    parts.append(str(b.get("text") or ""))
+                            text = "\n".join(parts)
+                        elif isinstance(data, dict) and data.get("type") == "text":
+                            text = str(data.get("text") or "")
+                        elif isinstance(data, dict):
+                            compact = json.dumps(data, ensure_ascii=False)
+                            if len(compact) < 60:
+                                return f" → {compact}"
+                            lines = []
+                            for k, v in list(data.items())[:5]:
+                                lines.append(f"    │ {k}: {str(v)[:50]}")
+                            if len(data) > 5:
+                                lines.append(f"    │ ... ({len(data) - 5} more)")
+                            return "\n" + "\n".join(lines)
+                        elif isinstance(data, list):
+                            return f" → [{len(data)} items]"
+                except Exception:
+                    pass
+
+            # Legacy Python-repr / JSON text field scrape
+            if not text:
+                match = re.search(r"'text':\s*'((?:[^'\\]|\\.)*)'", raw)
+                if not match:
+                    match = re.search(r'"text":\s*"((?:[^"\\]|\\.)*)"', raw, re.DOTALL)
+                if match:
+                    text = match.group(1)
+                    text = text.replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
+
+            if not text:
+                # Plain multi-line tool output (already unwrapped by bridge)
+                text = raw
+
+            text = text.strip()
+            if not text:
+                return ""
+
+            # Nested JSON object as the text body
+            if text[:1] in "{[":
                 try:
                     data = json.loads(text)
                     if isinstance(data, dict):
-                        # Compact single-line for small results
                         compact = json.dumps(data, ensure_ascii=False)
                         if len(compact) < 60:
                             return f" → {compact}"
-                        # Multi-line for larger results
                         lines = []
                         for k, v in list(data.items())[:5]:
-                            v_str = str(v)[:50]
-                            lines.append(f"    │ {k}: {v_str}")
+                            lines.append(f"    │ {k}: {str(v)[:50]}")
                         if len(data) > 5:
                             lines.append(f"    │ ... ({len(data) - 5} more)")
                         return "\n" + "\n".join(lines)
-                    elif isinstance(data, list):
+                    if isinstance(data, list):
                         return f" → [{len(data)} items]"
-                except:
-                    # Plain text, show truncated
-                    if len(text) > 60:
-                        return f" → {text[:60]}..."
-                    return f" → {text}" if text else ""
+                except Exception:
+                    pass
 
-            return ""
-        except:
+            lines = [ln for ln in text.splitlines() if ln.strip()]
+            if not lines:
+                return ""
+            if len(lines) == 1 and len(lines[0]) <= 72:
+                return f" → {lines[0]}"
+            # Multi-line: show first few lines (irr search / list_projects)
+            shown = lines[:6]
+            out = "\n" + "\n".join(f"    │ {ln[:100]}" for ln in shown)
+            if len(lines) > 6:
+                out += f"\n    │ … (+{len(lines) - 6} lines)"
+            return out
+        except Exception:
             return ""
 
     def _format_ask_user_result(self, result: str, question: str) -> str:

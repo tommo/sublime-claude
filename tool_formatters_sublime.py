@@ -30,13 +30,18 @@ def _basename(path: str) -> str:
 
 
 def _mcp_short_name(name: str) -> str:
-    """mcp__sublime__find_file / sublime__find_file → find_file."""
+    """mcp__sublime__find_file / sublime__find_file → find_file.
+
+    For non-sublime MCP (``mcp__irr__search``) return the full name so
+    format_tool_detail can apply the generic mcp__ formatter path.
+    """
     n = (name or "").strip()
     if n.startswith("mcp__sublime__"):
         return n[len("mcp__sublime__"):]
     if n.startswith("sublime__"):
         return n[len("sublime__"):]
-    if n.startswith("mcp__") and "__" in n[4:]:
+    # mcp__server__tool — keep full for dispatch; also expose bare tool leaf
+    if n.startswith("mcp__") and n.count("__") >= 2:
         return n
     return n
 

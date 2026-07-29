@@ -698,9 +698,19 @@ def format_tool_detail(view: "OutputView", tool: "ToolCall") -> str:
         or t.name.startswith("sublime__")
         or short in SUBLIME_MCP_FORMATTERS
     )
+    is_any_mcp = (
+        is_sublime_mcp
+        or t.name.startswith("mcp__")
+        or (isinstance(t.name, str) and t.name.startswith("mcp_"))
+    )
     if not detail and is_sublime_mcp:
         detail = _mcp_call_args_fallback(t)
         if t.result and t.status == "done":
+            detail += view._format_mcp_result(t.result)
+    elif not detail and is_any_mcp:
+        # Codex/Kimi/Grok non-sublime MCP: show args + unified result summary
+        detail = _mcp_call_args_fallback(t)
+        if t.result and t.status in ("done", "error"):
             detail += view._format_mcp_result(t.result)
     elif (
         not fmt

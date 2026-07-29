@@ -11,7 +11,7 @@ import sys
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 
 # ── Logging: stderr → plugin console; also append to shared bridge log file ──
@@ -42,6 +42,167 @@ from base import BaseBridge
 # ── Command → Tool Conversions ──────────────────────────────────────────
 
 import re
+
+def _parse_json_maybe(val: Any) -> Any:
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return val
+        try:
+            return json.loads(s)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return val
+    return val
+
+
+def _mcp_content_blocks_to_text(payload: Any) -> str:
+    """Flatten MCP content blocks / CallToolResult-ish dicts to plain text."""
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, list):
+        parts = []
+        for b in payload:
+            if isinstance(b, dict):
+                if b.get("type") == "text" and b.get("text") is not None:
+                    parts.append(str(b.get("text") or ""))
+                elif "text" in b:
+                    parts.append(str(b.get("text") or ""))
+                else:
+                    parts.append(json.dumps(b, ensure_ascii=False)[:500])
+            else:
+                parts.append(str(b))
+        return "\n".join(p for p in parts if p)
+    if isinstance(payload, dict):
+        # CallToolResult: {content:[{type,text}], isError?}
+        if "content" in payload:
+            return _mcp_content_blocks_to_text(payload.get("content"))
+        # Result envelope: {Ok: {...}} / {Err: ...}
+        if "Ok" in payload:
+            return _mcp_content_blocks_to_text(payload.get("Ok"))
+        if "Err" in payload:
+            err = payload.get("Err")
+            return err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)
+        if "error" in payload and len(payload) <= 3:
+            err = payload.get("error")
+            return err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)
+        if "text" in payload and payload.get("type") == "text":
+            return str(payload.get("text") or "")
+        return json.dumps(payload, ensure_ascii=False)
+    return str(payload)
+
+
+def _unwrap_codex_mcp_result(result: Any) -> tuple:
+    """Normalize Codex MCP result → (text, is_error).
+
+    Codex 0.14x emits several shapes:
+    - wall-time wrapper: ``Wall time: …\\nOutput:\\n[{type:text,text:…}]``
+    - Result::Ok / Err envelopes
+    - raw CallToolResult {content:[…]}
+    - plain string
+    """
+    if result is None:
+        return "", False
+    is_error = False
+    if isinstance(result, dict):
+        if result.get("isError") or result.get("is_error"):
+            is_error = True
+        if "Err" in result or (
+                "error" in result and "content" not in result and "Ok" not in result):
+            is_error = True
+        text = _mcp_content_blocks_to_text(result)
+        return (text or "").strip(), is_error
+
+    if not isinstance(result, str):
+        return str(result).strip(), False
+
+    s = result.strip()
+    # Codex function_call_output wrapper
+    if "Output:" in s and (s.startswith("Wall time") or "\nOutput:\n" in s):
+        rest = s.split("Output:", 1)[1].strip()
+        # Drop truncation banners / chunk headers above the JSON if any
+        for marker in ("\n[{", "\n{", "[{", "{"):
+            idx = rest.find(marker.lstrip("\n"))
+            if idx >= 0:
+                # keep from first JSON-looking start
+                cand = rest[idx:].lstrip()
+                parsed = _parse_json_maybe(cand)
+                if parsed is not cand:
+                    return _mcp_content_blocks_to_text(parsed).strip(), False
+        parsed = _parse_json_maybe(rest)
+        if parsed is not rest:
+            return _mcp_content_blocks_to_text(parsed).strip(), False
+        return rest, False
+
+    parsed = _parse_json_maybe(s)
+    if parsed is not s:
+        return _mcp_content_blocks_to_text(parsed).strip(), False
+    return s, False
+
+
+def _extract_mcp_fields(item: dict) -> tuple:
+    """Return (server, tool_name, arguments, display_name) from a Codex MCP item.
+
+    Supports legacy item.type=mcpToolCall and newer namespaced function_call
+    style fields (server / tool / toolName / namespace).
+    """
+    if not isinstance(item, dict):
+        return "", "", {}, "mcp"
+
+    tool_name = (
+        item.get("tool")
+        or item.get("toolName")
+        or item.get("tool_name")
+        or item.get("name")
+        or ""
+    )
+    server = (
+        item.get("server")
+        or item.get("serverLabel")
+        or item.get("server_label")
+        or item.get("serverName")
+        or item.get("server_name")
+        or ""
+    )
+    # namespace: "mcp__irr" (Codex 0.14x function_call)
+    ns = item.get("namespace") or item.get("ns") or ""
+    if isinstance(ns, str) and ns.startswith("mcp__") and not server:
+        server = ns[len("mcp__"):] or ns
+    if isinstance(ns, str) and ns.startswith("mcp__") and tool_name == ns:
+        tool_name = ""
+
+    args = (
+        item.get("arguments")
+        or item.get("input")
+        or item.get("args")
+        or item.get("toolInput")
+        or {}
+    )
+    args = _parse_json_maybe(args)
+    if not isinstance(args, dict):
+        args = {"value": args} if args not in (None, "") else {}
+
+    tool_name = str(tool_name or "").strip()
+    server = str(server or "").strip()
+    # Strip accidental mcp__ prefix on tool name
+    if tool_name.startswith("mcp__") and "__" in tool_name[5:]:
+        # mcp__irr__search → server=irr, tool=search
+        parts = tool_name.split("__")
+        if len(parts) >= 3:
+            server = server or parts[1]
+            tool_name = "__".join(parts[2:])
+
+    if server and tool_name:
+        display = f"mcp__{server}__{tool_name}"
+    elif tool_name:
+        display = tool_name
+    elif server:
+        display = f"mcp__{server}"
+    else:
+        display = "mcp"
+    return server, tool_name, args, display
+
 
 def _detect_read_command(cmd: str) -> Optional[dict]:
     """Detect file-read commands and return simplified tool params."""
@@ -112,6 +273,8 @@ class CodexBridge(BaseBridge):
 
         # Accumulate command output from outputDelta events
         self._command_output: dict[str, list[str]] = {}
+        # call_id / item_id map for MCP tool_use ↔ tool_result pairing
+        self._mcp_call_ids: dict[str, str] = {}
 
     def log(self, msg):  # type: ignore[override]
         log(msg)  # delegate to module-level log() which also writes to file
@@ -409,6 +572,15 @@ class CodexBridge(BaseBridge):
         elif method == "item/completed":
             self._handle_item_completed(params)
 
+        elif method == "rawResponseItem/completed":
+            # Codex 0.14x also emits response items (function_call + namespace)
+            # for MCP; bridge them when item/started path missed them.
+            self._handle_raw_response_item(params)
+
+        elif method == "item/mcpToolCall/progress":
+            # Optional progress — ignore (item/completed carries final result)
+            pass
+
         elif method == "item/commandExecution/outputDelta":
             delta = params.get("delta", "")
             item_id = params.get("itemId", "")
@@ -429,7 +601,11 @@ class CodexBridge(BaseBridge):
             log(f"Codex error: {params}")
 
         elif method.startswith("codex/event/"):
-            pass  # Ignore other codex-specific events
+            # Surface MCP lifecycle events that don't go through item/*
+            payload = params.get("msg") if isinstance(params.get("msg"), dict) else params
+            if isinstance(payload, dict) and payload.get("type") == "mcp_tool_call_end":
+                self._handle_mcp_tool_call_end_event(payload)
+            # other codex-specific events ignored
 
         # else: ignore unknown notifications
 
@@ -437,7 +613,7 @@ class CodexBridge(BaseBridge):
         """Translate item/started to tool_use notification."""
         item = params.get("item", {})
         item_type = item.get("type", "")
-        item_id = item.get("id", "")
+        item_id = item.get("id", "") or item.get("call_id", "") or item.get("callId", "")
 
         if item_type == "commandExecution":
             # Prefer clean command from commandActions, fall back to full command
@@ -492,28 +668,110 @@ class CodexBridge(BaseBridge):
                 "name": tool_name,
                 "input": input_data,
             })
-        elif item_type == "mcpToolCall":
-            tool_name = item.get("toolName", "")
-            server = item.get("serverLabel", "")
-            # Match Claude's MCP tool naming: mcp__server__tool
-            if server and tool_name:
-                name = f"mcp__{server}__{tool_name}"
-            elif tool_name:
-                name = tool_name
-            else:
-                name = server or "mcp"
-            send_notification("message", {
-                "type": "tool_use",
-                "id": item_id,
-                "name": name,
-                "input": item.get("arguments", {}),
-            })
+        elif self._is_mcp_tool_item(item_type, item):
+            self._emit_mcp_tool_use(item, item_id)
+
+        elif item_type in ("function_call", "custom_tool_call"):
+            # Namespaced MCP function_call (Codex 0.14x) without mcpToolCall type
+            if item.get("namespace") or str(item.get("name") or "").startswith("mcp__"):
+                self._emit_mcp_tool_use(item, item_id)
+
+    def _is_mcp_tool_item(self, item_type: str, item: dict) -> bool:
+        t = (item_type or "").strip()
+        if t in ("mcpToolCall", "McpToolCall", "mcp_tool_call"):
+            return True
+        if t.lower() == "mcptoolcall":
+            return True
+        # Heuristic: server + tool fields
+        if isinstance(item, dict) and (
+                item.get("server") or item.get("serverLabel")
+                or item.get("namespace")):
+            if item.get("tool") or item.get("toolName") or item.get("name"):
+                return True
+        return False
+
+    def _emit_mcp_tool_use(self, item: dict, item_id: str) -> None:
+        """Emit unified tool_use for Codex MCP (Claude-style mcp__server__tool)."""
+        _server, _tool, args, display = _extract_mcp_fields(item)
+        tid = item_id or item.get("call_id") or item.get("callId") or display
+        # Track call_id → item id for function_call_output matching
+        call_id = item.get("call_id") or item.get("callId") or tid
+        self._mcp_call_ids[str(call_id)] = str(tid)
+        self._mcp_call_ids[str(tid)] = str(tid)
+        log(f"mcp tool_use {display} id={tid} args_keys={list(args.keys())}")
+        send_notification("message", {
+            "type": "tool_use",
+            "id": str(tid),
+            "name": display,
+            "input": args,
+        })
+
+    def _emit_mcp_tool_result(
+            self, item_id: str, result: Any, is_error: bool = False) -> None:
+        text, err = _unwrap_codex_mcp_result(result)
+        if err:
+            is_error = True
+        # Cap payload size for the plugin; formatters summarize further.
+        content = text if text else ("(error)" if is_error else "(no result)")
+        if len(content) > 12000:
+            content = content[:12000] + "\n… (truncated)"
+        send_notification("message", {
+            "type": "tool_result",
+            "tool_use_id": str(item_id),
+            "content": content,
+            "is_error": bool(is_error),
+        })
+
+    def _handle_mcp_tool_call_end_event(self, payload: dict) -> None:
+        """codex/event mcp_tool_call_end → tool_result (fallback path)."""
+        call_id = payload.get("call_id") or payload.get("callId") or ""
+        inv = payload.get("invocation") or {}
+        result = payload.get("result")
+        # Ensure a tool_use row exists (in case item/started was skipped)
+        item_id = self._mcp_call_ids.get(str(call_id))
+        if not item_id:
+            item_id = str(call_id or "mcp")
+            synthetic = {
+                "server": inv.get("server"),
+                "tool": inv.get("tool"),
+                "arguments": inv.get("arguments") or {},
+                "call_id": call_id,
+            }
+            self._emit_mcp_tool_use(synthetic, item_id)
+        is_error = isinstance(result, dict) and (
+            "Err" in result or "error" in result)
+        self._emit_mcp_tool_result(item_id, result, is_error=is_error)
+
+    def _handle_raw_response_item(self, params: dict) -> None:
+        """Handle rawResponseItem/completed for namespaced MCP function calls."""
+        item = params.get("item") or params.get("responseItem") or params
+        if not isinstance(item, dict):
+            return
+        itype = item.get("type") or ""
+        if itype == "function_call" and (
+                item.get("namespace")
+                or str(item.get("name") or "").startswith("mcp__")):
+            item_id = (
+                item.get("id")
+                or item.get("call_id")
+                or item.get("callId")
+                or ""
+            )
+            self._emit_mcp_tool_use(item, item_id)
+        elif itype == "function_call_output":
+            call_id = item.get("call_id") or item.get("callId") or ""
+            item_id = self._mcp_call_ids.get(str(call_id))
+            if not item_id:
+                # Only handle if we know this was MCP (prefix lookup failed)
+                return
+            out = item.get("output") or item.get("result") or ""
+            self._emit_mcp_tool_result(item_id, out, is_error=False)
 
     def _handle_item_completed(self, params: dict) -> None:
         """Translate item/completed to tool_result notification."""
         item = params.get("item", {})
         item_type = item.get("type", "")
-        item_id = item.get("id", "")
+        item_id = item.get("id", "") or item.get("call_id", "") or item.get("callId", "")
 
         if item_type == "commandExecution":
             exit_code = item.get("exitCode", 0)
@@ -535,14 +793,34 @@ class CodexBridge(BaseBridge):
                 "content": "File updated",
                 "is_error": False,
             })
-        elif item_type == "mcpToolCall":
-            result = item.get("result", "")
-            send_notification("message", {
-                "type": "tool_result",
-                "tool_use_id": item_id,
-                "content": str(result)[:2000] if result else "(no result)",
-                "is_error": bool(item.get("error")),
-            })
+        elif self._is_mcp_tool_item(item_type, item):
+            result = (
+                item.get("result")
+                or item.get("output")
+                or item.get("content")
+                or ""
+            )
+            is_error = bool(
+                item.get("error")
+                or item.get("isError")
+                or item.get("is_error")
+                or (isinstance(result, dict) and (
+                    "Err" in result or result.get("isError")))
+            )
+            # Map call_id if present
+            call_id = item.get("call_id") or item.get("callId")
+            if call_id:
+                self._mcp_call_ids[str(call_id)] = str(item_id)
+            self._emit_mcp_tool_result(item_id, result, is_error=is_error)
+        elif item_type in ("function_call_output",):
+            call_id = item.get("call_id") or item.get("callId") or item_id
+            item_id_mapped = self._mcp_call_ids.get(str(call_id))
+            if item_id_mapped:
+                self._emit_mcp_tool_result(
+                    item_id_mapped,
+                    item.get("output") or item.get("result") or "",
+                    is_error=False,
+                )
 
     def _complete_turn(self, is_error: bool = False) -> None:
         """Send turn result notification and deferred query response."""
