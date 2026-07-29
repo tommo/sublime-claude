@@ -2010,18 +2010,20 @@ class Session:
                 pass
             return
 
-        # Skip if we've already entered input mode after the last query
-        # This prevents duplicate entries from multiple callers (on_activated, _on_done, etc.)
-        # Still allow re-entry while working after submit cleared the strip.
-        # Exception: if ◎ is gone but flag is set, allow re-entry (post-interrupt drip).
+        # Skip if already entered and sticky ◎ is still present. If the flag is
+        # set but ◎ was wiped by a re-render/interrupt drip, fall through and
+        # re-open (this was "failed to enter input mode a few times").
         if self._input_mode_entered and not self.working:
-            try:
-                if self.output.is_input_mode() and self.output._view_is_focused():
-                    self.output.focus_composer(
-                        force_show=True, steal_focus=False, preserve_caret=True)
-            except Exception:
-                pass
-            return
+            if self.output.is_input_mode():
+                try:
+                    if self.output._view_is_focused():
+                        self.output.focus_composer(
+                            force_show=True, steal_focus=False, preserve_caret=True)
+                except Exception:
+                    pass
+                return
+            # Stale flag — ◎ missing
+            self._input_mode_entered = False
 
         # Queued prompts (e.g. notalone inject while sleeping) take priority
         # only when idle — fire without wiping a draft the user is typing.
@@ -2032,26 +2034,51 @@ class Session:
         if self.output.current and self.output.current.working and not self.working:
             self.output.current.working = False
 
+        # Stuck free-text question mode without a live question blocks sticky ◎
+        try:
+            if (getattr(self.output, "_question_input_mode", False)
+                    and not (self.output.pending_question
+                             and self.output.pending_question.callback)):
+                self.output._question_input_mode = False
+                if self.output.view:
+                    self.output.view.settings().set(
+                        "claude_question_input_mode", False)
+        except Exception:
+            pass
+
         self.output.enter_input_mode()  # ends with focus_composer → scroll bottom
 
         # Check if enter_input_mode actually succeeded (might have deferred)
         if not self.output.is_input_mode():
-            # Retry once after pending render / race settles.
-            def _retry():
+            # Retry a few times after pending render / modal teardown races.
+            def _retry(tries=0):
                 if not self.output:
                     return
+                if self.working and tries > 0:
+                    # Mid-stream sticky is still allowed, but don't thrash.
+                    pass
                 if self.output.is_input_mode():
+                    self._input_mode_entered = True
                     if self.output._view_is_focused():
-                        self.output.focus_composer(force_show=True, steal_focus=False)
+                        self.output.focus_composer(
+                            force_show=True, steal_focus=False, preserve_caret=True)
+                    return
+                if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
+                    if tries < 8:
+                        sublime.set_timeout(lambda: _retry(tries + 1), 100 + tries * 50)
                     return
                 if self.output.current and self.output.current.working and not self.working:
                     self.output.current.working = False
+                self._input_mode_entered = False
                 self.output.enter_input_mode()
                 if self.output.is_input_mode():
                     self._input_mode_entered = True
                     if not self.working:
                         self.last_idle_at = time.time()
-            sublime.set_timeout(_retry, 50)
+                    return
+                if tries < 8:
+                    sublime.set_timeout(lambda: _retry(tries + 1), 80 + tries * 40)
+            sublime.set_timeout(lambda: _retry(0), 50)
             return
 
         self._input_mode_entered = True

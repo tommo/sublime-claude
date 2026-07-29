@@ -3268,12 +3268,38 @@ class AcpBridge(BaseBridge):
             f"ask_user permission selected label={label!r} optionId={oid!r}")
         if oid:
             return {"outcome": {"outcome": "selected", "optionId": oid}}
-        # Free-text "Other" — no exact option; reject/skip rather than Option A
-        if skip_id:
-            return {"outcome": {
-                "outcome": "selected", "optionId": skip_id,
-            }}
-        return {"outcome": {"outcome": "cancelled"}}
+
+        # Free-text Other: never skip/cancel — that silently drops user input.
+        # Prefer system "Other" option if present; else pass free text as the
+        # selected option name via optionId (Kimi may surface it as the answer).
+        other_id = self._find_other_option_id(options)
+        if other_id:
+            self.file_log(
+                f"ask_user free-text → Other optionId={other_id!r} "
+                f"text={label!r}")
+            # Include free text in a way agents/logs can see; optionId is Other.
+            return {
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": other_id,
+                    # Nonstandard extras some agents ignore — still log them.
+                    "userInput": label,
+                    "freeText": label,
+                },
+            }
+
+        # No Other option: use free text as optionId (better than skip/cancel).
+        self.file_log(
+            f"ask_user free-text with no Other option — "
+            f"using freeform optionId text={label!r}")
+        return {
+            "outcome": {
+                "outcome": "selected",
+                "optionId": label,
+                "userInput": label,
+                "freeText": label,
+            },
+        }
 
     @staticmethod
     def _first_answer_label(answers: dict, questions: list) -> str:
@@ -3299,23 +3325,46 @@ class AcpBridge(BaseBridge):
         label = (label or "").strip()
         if not label:
             return ""
-        # Exact name match
+        # Exact name match first
         for o in options or []:
             if not isinstance(o, dict):
                 continue
-            name = str(o.get("name") or "").strip()
+            name = str(o.get("name") or o.get("label") or "").strip()
             if name == label:
                 return str(o.get("optionId") or "")
-        # Case-insensitive / prefix (Recommended suffix noise)
+        # Case-insensitive exact / Recommended suffix
         low = label.lower()
         for o in options or []:
             if not isinstance(o, dict):
                 continue
-            name = str(o.get("name") or "").strip()
-            if name.lower() == low or name.lower().startswith(low):
+            name = str(o.get("name") or o.get("label") or "").strip()
+            nlow = name.lower()
+            if nlow == low:
                 return str(o.get("optionId") or "")
-            if low in name.lower():
+            # Strip "(Recommended)" noise on either side
+            n_clean = re.sub(r"\s*\(recommended\)\s*$", "", nlow).strip()
+            l_clean = re.sub(r"\s*\(recommended\)\s*$", "", low).strip()
+            if n_clean and n_clean == l_clean:
                 return str(o.get("optionId") or "")
+        return ""
+
+    @staticmethod
+    def _find_other_option_id(options: list) -> str:
+        """Locate system-added Other / freeform option (Kimi adds one)."""
+        for o in options or []:
+            if not isinstance(o, dict):
+                continue
+            name = str(o.get("name") or o.get("label") or "").strip().lower()
+            oid = str(o.get("optionId") or "")
+            if name in (
+                "other", "other...", "other…", "custom",
+                "type your own", "something else",
+            ):
+                return oid
+            if name.startswith("other"):
+                return oid
+            if re.search(r"(^|_)(other|freeform|custom)(_|$)", oid.lower()):
+                return oid
         return ""
 
     def _normalize_questions(self, questions: list) -> list:

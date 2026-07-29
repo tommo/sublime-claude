@@ -2848,6 +2848,9 @@ class OutputView:
             "claude_question_block",
             "claude_permission_block",
             "claude_plan_block",
+            # Free-text "Other" lives after the question block — protect it
+            # so spinner re-renders don't wipe what the user is typing.
+            "claude_question_input_marker",
         ):
             regs = self.view.get_regions(key)
             if regs and regs[0].size() > 0:
@@ -2858,6 +2861,11 @@ class OutputView:
             a, b = q.region
             if b > a:
                 starts.append(a)
+        # Free-text mode without marker region: use stored start
+        if getattr(self, "_question_input_mode", False):
+            qs = getattr(self, "_question_input_start", None)
+            if qs is not None:
+                starts.append(max(0, int(qs) - len("\n    ▸ ")))
         return min(starts) if starts else None
 
     def _render_question(self) -> None:
@@ -2988,6 +2996,40 @@ class OutputView:
             # Appended to events → rendered inline (scoped claude.question.answered)
             # and preserved across renders, instead of living as eatable trailing UI.
             self.current.events.append(f"  ☑ {summary}\n")
+        # Drop free-text Other line + flags (modal already parked sticky ◎).
+        try:
+            regs = self.view.get_regions("claude_question_input_marker")
+            if regs:
+                self.view.set_read_only(False)
+                self._replace(regs[0].begin(), self.view.size(), "")
+            elif getattr(self, "_question_input_mode", False):
+                q_start = getattr(self, "_question_input_start", None)
+                if q_start is not None and q_start <= self.view.size():
+                    erase_from = max(0, q_start - len("\n    ▸ "))
+                    self.view.set_read_only(False)
+                    self._replace(erase_from, self.view.size(), "")
+        except Exception:
+            pass
+        # Free-text Other reuses _input_mode without sticky ◎ chrome — clear both
+        # so has_turn_modal_ui / enter_input_mode don't stay stuck.
+        was_free_text = bool(getattr(self, "_question_input_mode", False))
+        self._question_input_mode = False
+        try:
+            self.view.settings().set("claude_question_input_mode", False)
+            self.view.erase_regions("claude_question_input_marker")
+        except Exception:
+            pass
+        if was_free_text or self._input_mode:
+            try:
+                tail = self.view.substr(
+                    sublime.Region(max(0, self.view.size() - 120), self.view.size()))
+                # Only clear sticky flags when ◎ isn't actually present (free-text path)
+                if "◎ " not in tail:
+                    self._input_mode = False
+                    self.view.settings().set("claude_input_mode", False)
+            except Exception:
+                if was_free_text:
+                    self._input_mode = False
         clear_pending_block(
             self.view,
             block_region_key="claude_question_block",
@@ -2995,7 +3037,7 @@ class OutputView:
             button_keys={},  # questions don't have per-button hit-box regions
             fallback_region_end=(self.current.region[1] if self.current else None),
             replacement="",
-            extra_region_keys=("claude_question_keys",),
+            extra_region_keys=("claude_question_keys", "claude_question_input_marker"),
         )
         if summary:
             self._render_current()
