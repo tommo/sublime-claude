@@ -127,7 +127,8 @@ The output view features an inline input area (marked with `◎`) where you type
 - **Enter** - Submit prompt
 - **Shift+Enter** - Insert newline (multiline prompts)
 - **@** - Open context menu (add files, selection, folder, or clear context)
-- **Cmd+K** - Clear output
+- **Cmd+K** - Clear output (full wipe)
+- **Cmd+Shift+K** - Clear older rounds, keep last turn
 - **Alt+Escape** - Interrupt current query
 
 ### Loop (Idle Re-prompt)
@@ -369,7 +370,7 @@ The output view shows:
 
 View title shows session status:
 - `◉` Active + working
-- `◇` Active + idle
+- `◇` Idle (focused or not — always shown)
 - `•` Inactive + working
 - `⏸` Sleeping (bridge stopped)
 - `❓` Waiting for permission/question response
@@ -425,7 +426,7 @@ Add a docstring at the top - it's shown when calling `list_tools()`.
 
 ### Session Spawning
 
-- `spawn_session(prompt, name?, profile?, persona_id?, backend?, fork_current?)` - Spawn a subsession
+- `spawn_session(prompt, name?, profile?, persona_id?, backend?, fork_current?, fork_from_view_id?)` - Spawn a subsession; `fork_from_view_id` branches workers off an explorer base (same backend family)
 - `list_sessions()` - List active sessions in current window
 - `list_backends()` - List backends usable as `spawn_session`'s `backend` arg (built-ins + custom providers), with live availability, bridge family, and models
 - `list_personas()` - List available personas from persona server

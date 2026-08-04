@@ -48,13 +48,24 @@ class GrokBridge(AcpBridge):
         "code": "acceptEdits",
         "ask": "default",
     }
-    MODEL_ALIASES = {
-        "grok-4.5": "grok-4.5",
-        "grok-4-fast": "grok-composer-2.5-fast",
-        "grok-composer-2.5-fast": "grok-composer-2.5-fast",
-        "composer": "grok-composer-2.5-fast",
-        "composer-2.5": "grok-composer-2.5-fast",
-    }
+    # Prefer grok_backend catalog (includes DeepSeek BYOK ids + short aliases).
+    try:
+        from grok_backend import GROK_MODEL_ALIASES as _GB_ALIASES
+        MODEL_ALIASES = dict(_GB_ALIASES)
+    except Exception:
+        MODEL_ALIASES = {
+            "grok-4.5": "grok-4.5",
+            "grok-4-fast": "grok-4-fast",
+            "grok-composer-2.5-fast": "grok-composer-2.5-fast",
+            "composer": "grok-composer-2.5-fast",
+            "composer-2.5": "grok-composer-2.5-fast",
+            "deepseek-v4-pro": "deepseek-v4-pro",
+            "deepseek-v4-flash": "deepseek-v4-flash",
+            "deepseek-pro": "deepseek-v4-pro",
+            "deepseek-flash": "deepseek-v4-flash",
+            "ds-pro": "deepseek-v4-pro",
+            "ds-flash": "deepseek-v4-flash",
+        }
     # Grok Build tool ids + rawInput.variant values → Claude formatters.
     # Prefer _meta.x.ai/tool.name when present; variants are a common fallback.
     TOOL_TO_CANONICAL = {
@@ -135,15 +146,29 @@ class GrokBridge(AcpBridge):
         super().__init__()
         self._always_approve: bool = False
 
+    def _effort_for_model(self) -> str:
+        """Effort only for models that support it (not DeepSeek BYOK)."""
+        if not self.effort:
+            return ""
+        try:
+            from grok_backend import model_supports_reasoning_effort
+            if not model_supports_reasoning_effort(self.model or ""):
+                return ""
+        except Exception:
+            m = (self.model or "").lower()
+            if m.startswith("deepseek") or "deepseek" in m:
+                return ""
+        return self.effort
+
     def agent_argv(self) -> List[str]:
         args = [GROK_BIN, "agent"]
         if self.model:
             args += ["--model", self.model]
         # Reasoning effort at spawn — Grok's reliable path (session/set_model
-        # does not always rebind effort mid-process).
-        if self.effort:
-            # max → xhigh via normalize_effort; pass canonical wire level.
-            args += ["--reasoning-effort", self.effort]
+        # does not always rebind effort mid-process). Skip for BYOK chat models.
+        effort = self._effort_for_model()
+        if effort:
+            args += ["--reasoning-effort", effort]
         # Full bypass: agent skips permission RPCs entirely. Other modes
         # (acceptEdits / default / plan) go through session/request_permission
         # so AcpBridge can apply plugin allowed_tools + auto-allow patterns.
@@ -155,13 +180,20 @@ class GrokBridge(AcpBridge):
     def set_model_params(self) -> dict:
         """Include reasoningEffort so set_model can rebind when supported."""
         params = super().set_model_params()
-        if self.effort:
+        effort = self._effort_for_model()
+        if effort:
             # Try both top-level and _meta — Grok versions vary.
-            params["reasoningEffort"] = self.effort
+            params["reasoningEffort"] = effort
             params["_meta"] = {
                 **(params.get("_meta") or {}),
-                "reasoningEffort": self.effort,
+                "reasoningEffort": effort,
             }
+        else:
+            # Drop effort if parent added any — DeepSeek rejects it.
+            params.pop("reasoningEffort", None)
+            meta = params.get("_meta")
+            if isinstance(meta, dict):
+                meta.pop("reasoningEffort", None)
         return params
 
     def spawn_env(self) -> Optional[Dict[str, str]]:
@@ -185,7 +217,9 @@ class GrokBridge(AcpBridge):
         meta = super().build_session_meta(
             system_prompt=system_prompt, resume_failed=resume_failed)
         # Grok does not expose MCP tools as bare names — discover with
-        # search_tool, call with use_tool. Only inject when read_image is on.
+        # search_tool, call with use_tool. Vision only when read_image is on
+        # (DeepSeek BYOK has no vision — leave tool off and warn).
+        existing = meta.get("rules") or ""
         if self._mcp_enable_read_image:
             image_rule = (
                 "Images on disk: do NOT use read_file (fails with Cannot read "
@@ -195,11 +229,17 @@ class GrokBridge(AcpBridge):
                 "search_tool query=\"read_image\" first. Media tools "
                 "(image_edit/image_gen) accept file paths directly."
             )
-            existing = meta.get("rules") or ""
-            meta["rules"] = (
-                (existing + "\n" + image_rule).strip()
-                if existing else image_rule
+        else:
+            image_rule = (
+                "This model has no vision/image input. Never call "
+                "read_image / sublime__read_image / image_gen / image_edit "
+                "for understanding screenshots. Use file paths and text only; "
+                "do not read binary images via read_file."
             )
+        meta["rules"] = (
+            (existing + "\n" + image_rule).strip()
+            if existing else image_rule
+        )
         return meta
 
     def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:

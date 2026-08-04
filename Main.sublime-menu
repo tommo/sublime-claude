@@ -39,6 +39,10 @@
                         "command": "claude_code_clear"
                     },
                     {
+                        "caption": "Clear Output (Keep Last Round)  ⌘⇧K",
+                        "command": "claude_code_clear_keep_last"
+                    },
+                    {
                         "caption": "Interrupt",
                         "command": "claude_code_interrupt"
                     },

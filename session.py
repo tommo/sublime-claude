@@ -226,6 +226,9 @@ class Session:
         self.profile: Optional[Dict] = profile  # Profile config (model, betas, system_prompt, preload_docs)
         self.initial_context: Optional[Dict] = initial_context  # Initial context (subsession_id, parent_view_id, etc.)
         self.effort: Optional[str] = None  # Resolved reasoning effort for this session
+        # Live ACP model catalog (Grok availableModels incl. DeepSeek BYOK)
+        self.available_models: list = []
+        self.model: Optional[str] = None  # last known model id for this session
         self.name: Optional[str] = None
         self.total_cost: float = 0.0
         self.query_count: int = 0
@@ -477,8 +480,10 @@ class Session:
             "allowed_tools": allowed_tools,
             "permission_mode": permission_mode,
             "view_id": str(self.output.view.id()) if self.output and self.output.view else None,
-            # Vision MCP tool (mcp__sublime__read_image): auto = Grok ACP only.
-            "mcp_enable_read_image": self._mcp_enable_read_image(settings),
+            # Vision MCP: auto = Grok ACP only, and not for models without vision
+            # (DeepSeek BYOK breaks the session if read_image is advertised).
+            "mcp_enable_read_image": self._mcp_enable_read_image(
+                settings, model=model_for_env),
         }
         if self.resume_id:
             init_params["resume"] = self.resume_id
@@ -503,9 +508,12 @@ class Session:
                     break
             if resume_session_at:
                 init_params["resume_session_at"] = resume_session_at
-        # Pass subsession_id if this is a subsession
-        if hasattr(self, 'subsession_id') and self.subsession_id:
+        # Pass subsession identity if this is a subsession (host holds parent;
+        # bridge/MCP expose it so agents need not search).
+        if getattr(self, "subsession_id", None):
             init_params["subsession_id"] = self.subsession_id
+        if getattr(self, "parent_view_id", None) is not None:
+            init_params["parent_view_id"] = self.parent_view_id
         # Effort resolution. Order: profile → provider override → env → global.
         # Claude: on resume omit unless profile/provider pins (keep CLI session).
         # Grok: always pass — agent spawn uses --reasoning-effort (not configurable
@@ -549,6 +557,21 @@ class Session:
             if default_model:
                 real_model, _ = _resolve_model_id(default_model)
                 init_params["model"] = real_model
+        # Track model; drop reasoning effort for Grok BYOK chat models (DeepSeek).
+        if init_params.get("model"):
+            self.model = init_params["model"]
+            if self.output and self.output.view:
+                self.output.view.settings().set("claude_model", self.model)
+        if self.backend == "grok" and init_params.get("model"):
+            try:
+                from . import grok_backend
+                if not grok_backend.model_supports_reasoning_effort(init_params["model"]):
+                    init_params.pop("effort", None)
+                    self.effort = None
+                    if self.output and self.output.view:
+                        self.output.view.settings().erase("claude_effort")
+            except Exception:
+                pass
         sent = self.client.send("initialize", init_params, self._on_init)
         if not sent:
             # Bridge died before we could send — simulate an error so _on_init cleans up
@@ -644,8 +667,35 @@ class Session:
             self.effort = str(bridge_effort)
             if self.output and self.output.view:
                 self.output.view.settings().set("claude_effort", self.effort)
+        # ACP availableModels (Grok includes BYOK DeepSeek from config.toml)
+        raw_models = result.get("models")
+        if isinstance(raw_models, list) and raw_models:
+            self.available_models = raw_models
+        elif isinstance(raw_models, dict):
+            am = raw_models.get("availableModels") or raw_models.get("available_models")
+            if isinstance(am, list):
+                self.available_models = am
+        mid = result.get("model") or result.get("modelId")
+        if mid:
+            self.model = str(mid)
+            if self.output and self.output.view:
+                self.output.view.settings().set("claude_model", self.model)
         if self.effort and self.backend in ("claude", "grok"):
-            parts.append(f"effort:{self.effort}")
+            show_effort = True
+            if self.backend == "grok":
+                try:
+                    from . import grok_backend
+                    m = (
+                        self.model
+                        or (self.output.view.settings().get("claude_model")
+                            if self.output and self.output.view else "")
+                        or ""
+                    )
+                    show_effort = grok_backend.model_supports_reasoning_effort(m)
+                except Exception:
+                    show_effort = True
+            if show_effort:
+                parts.append(f"effort:{self.effort}")
         if parts:
             self._status(f"ready ({'; '.join(parts)})")
         else:
@@ -4294,25 +4344,61 @@ class Session:
             or "high"
         ).strip()
 
-    def _mcp_enable_read_image(self, settings=None) -> bool:
+    def _mcp_enable_read_image(self, settings=None, model=None) -> bool:
         """Whether sublime MCP should advertise read_image for this session.
 
         settings.mcp_enable_read_image:
           true / false — force on/off for all backends
-          "auto" (default) — on only for Grok ACP (needs vision over binary FS)
+          "auto" (default) — on only for Grok ACP with vision-capable models
+        DeepSeek (and other no-vision BYOK models) never get read_image even if
+        force-true would apply — calling it can hard-fail the agent turn.
         """
         if settings is None:
             settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        mid = model
+        if mid is None:
+            mid = getattr(self, "model", None)
+        if mid is None and self.output and self.output.view:
+            mid = self.output.view.settings().get("claude_model")
+        # Hard block no-vision models (DeepSeek via Grok)
+        if self.backend == "grok" and mid:
+            try:
+                from . import grok_backend
+                if not grok_backend.model_supports_vision(mid):
+                    return False
+            except Exception:
+                pass
         raw = settings.get("mcp_enable_read_image", "auto")
         if isinstance(raw, str):
             low = raw.strip().lower()
             if low in ("1", "true", "yes", "on"):
+                # Still refuse no-vision models
+                if self.backend == "grok" and mid:
+                    try:
+                        from . import grok_backend
+                        return grok_backend.model_supports_vision(mid)
+                    except Exception:
+                        return True
                 return True
             if low in ("0", "false", "no", "off"):
                 return False
-            # "auto" / empty / unknown → Grok ACP only
-            return self.backend == "grok"
+            # "auto" → Grok ACP + vision model only
+            if self.backend != "grok":
+                return False
+            if mid:
+                try:
+                    from . import grok_backend
+                    return grok_backend.model_supports_vision(mid)
+                except Exception:
+                    return True
+            return True
         if raw is True:
+            if self.backend == "grok" and mid:
+                try:
+                    from . import grok_backend
+                    return grok_backend.model_supports_vision(mid)
+                except Exception:
+                    return True
             return True
         if raw is False:
             return False
@@ -5226,24 +5312,136 @@ class Session:
 
     def _context_tokens_k(self) -> Optional[int]:
         """Get context token count in thousands from latest usage data."""
-        if not self.context_usage:
-            return None
-        u = self.context_usage
-        # Usage fields may be explicitly null (Grok turn_usage mid-stream).
-        def _n(key: str) -> int:
-            v = u.get(key, 0)
+        snap = self.context_budget_snapshot()
+        return snap.get("context_k")
+
+    def context_budget_snapshot(self) -> dict:
+        """Structured context budget for parent agents / MCP tools.
+
+        Helps orchestrators decide whether to continue on a worker, fork a
+        fresh branch, or stop pushing into a near-full context — not just
+        dump more work into one agent.
+        """
+        def _n(src, key: str) -> int:
+            if not isinstance(src, dict):
+                return 0
+            v = src.get(key, 0)
             try:
                 return int(v or 0)
             except (TypeError, ValueError):
                 return 0
-        input_t = (
-            _n("input_tokens")
-            + _n("cache_read_input_tokens")
-            + _n("cache_creation_input_tokens")
-        )
-        if not input_t:
-            return None
-        return max(1, input_t // 1000)
+
+        u = self.context_usage if isinstance(self.context_usage, dict) else {}
+        input_tokens = _n(u, "input_tokens")
+        cache_read = _n(u, "cache_read_input_tokens")
+        cache_create = _n(u, "cache_creation_input_tokens")
+        output_tokens = _n(u, "output_tokens")
+        reasoning_tokens = _n(u, "reasoning_tokens")
+        # Context = prompt-side tokens (incl. cache) — matches status bar / @done
+        context_tokens = input_tokens + cache_read + cache_create
+        if not context_tokens:
+            total = _n(u, "total_tokens")
+            if total:
+                context_tokens = total
+
+        context_k = max(1, context_tokens // 1000) if context_tokens else None
+
+        # Window size: usage fields, virtual model @200k/@400k, else unknown
+        max_ctx = None
+        for key in (
+            "context_window",
+            "max_context_tokens",
+            "model_context_window",
+            "context_limit",
+        ):
+            v = _n(u, key)
+            if v > 0:
+                max_ctx = v
+                break
+        if max_ctx is None:
+            model_raw = (
+                getattr(self, "model", None)
+                or (self.output.view.settings().get("claude_model")
+                    if self.output and self.output.view else None)
+                or ""
+            )
+            try:
+                _, lim = _resolve_model_id(str(model_raw))
+                if lim:
+                    max_ctx = int(lim)
+            except Exception:
+                pass
+
+        pct = None
+        if max_ctx and context_tokens:
+            pct = round(100.0 * context_tokens / max_ctx, 1)
+
+        # Headroom bands for strategy hints (only when window known)
+        headroom = None
+        if pct is not None:
+            if pct >= 85:
+                headroom = "critical"
+            elif pct >= 70:
+                headroom = "tight"
+            elif pct >= 50:
+                headroom = "moderate"
+            else:
+                headroom = "comfortable"
+
+        model = getattr(self, "model", None)
+        if not model and self.output and self.output.view:
+            try:
+                model = self.output.view.settings().get("claude_model")
+            except Exception:
+                model = None
+        backend = getattr(self, "backend", None) or "claude"
+        queries = int(getattr(self, "query_count", 0) or 0)
+        try:
+            cost = float(getattr(self, "total_cost", 0) or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+
+        # Human one-liner for prompts / list_sessions
+        parts = []
+        if context_k is not None:
+            if max_ctx:
+                parts.append(
+                    f"ctx:{context_k}k/{max(1, max_ctx // 1000)}k"
+                    + (f" ({pct}%)" if pct is not None else "")
+                )
+            else:
+                parts.append(f"ctx:{context_k}k")
+        elif not u:
+            parts.append("ctx:unknown")
+        if headroom:
+            parts.append(f"headroom:{headroom}")
+        if queries:
+            parts.append(f"{queries}q")
+        if cost > 0:
+            parts.append(f"${cost:.4f}")
+        if backend:
+            mbit = f"{backend}/{model}" if model else backend
+            parts.append(mbit)
+        summary = " · ".join(parts) if parts else "ctx:unknown"
+
+        return {
+            "context_tokens": context_tokens or None,
+            "context_k": context_k,
+            "input_tokens": input_tokens or None,
+            "output_tokens": output_tokens or None,
+            "cache_read_tokens": cache_read or None,
+            "cache_creation_tokens": cache_create or None,
+            "reasoning_tokens": reasoning_tokens or None,
+            "max_context_tokens": max_ctx,
+            "context_pct": pct,
+            "headroom": headroom,
+            "query_count": queries,
+            "total_cost": cost,
+            "backend": backend,
+            "model": model,
+            "summary": summary,
+            "has_usage": bool(u),
+        }
 
     def _clear_status(self) -> None:
         if self.output.view and self.output.view.is_valid():

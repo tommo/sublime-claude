@@ -201,7 +201,10 @@ def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
     if profile:
         bits.append(f"profile={profile}")
     if inp.get("fork_current"):
-        bits.append("fork")
+        bits.append("fork:self")
+    ff = inp.get("fork_from_view_id")
+    if ff is not None:
+        bits.append(f"fork:{ff}")
     if prompt:
         bits.append(_clip(str(prompt), 45))
     out = _join_bits(*bits)
@@ -239,6 +242,12 @@ def _read_session_output(view: "OutputView", tool: "ToolCall") -> str:
         bits.append(f"{lines} lines")
     out = _join_bits(*bits)
     if tool.status == "done" and tool.result:
+        r = tool.result
+        if isinstance(r, dict):
+            cs = r.get("context_summary") or (r.get("context_budget") or {}).get("summary")
+            if cs:
+                bits.append(str(cs))
+                out = _join_bits(*bits)
         out += view._format_mcp_result(tool.result)
     return out
 
@@ -300,6 +309,12 @@ def _set_timer(view: "OutputView", tool: "ToolCall") -> str:
     return _join_bits(*bits)
 
 
+def _session_info(view: "OutputView", tool: "ToolCall") -> str:
+    if tool.status == "done" and tool.result:
+        return view._format_mcp_result(tool.result) or ""
+    return ""
+
+
 def _signal_complete(view: "OutputView", tool: "ToolCall") -> str:
     inp = _tool_input(tool)
     sid = inp.get("session_id")
@@ -307,8 +322,16 @@ def _signal_complete(view: "OutputView", tool: "ToolCall") -> str:
     bits = []
     if sid is not None:
         bits.append(f"session {sid}")
+    else:
+        bits.append("self")
     if summary:
         bits.append(_clip(str(summary), 45))
+    if tool.status == "done" and isinstance(tool.result, dict):
+        cs = tool.result.get("context_summary") or (
+            (tool.result.get("context_budget") or {}).get("summary")
+        )
+        if cs:
+            bits.append(str(cs))
     return _join_bits(*bits)
 
 
@@ -440,6 +463,7 @@ SUBLIME_MCP_FORMATTERS: Dict[str, Callable] = {
     "spawn_session": _spawn_session,
     "send_to_session": _send_to_session,
     "list_sessions": _list_sessions,
+    "session_info": _session_info,
     "read_session_output": _read_session_output,
     "list_profile_docs": _list_profile_docs,
     "read_profile_doc": _read_profile_doc,

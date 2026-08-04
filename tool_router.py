@@ -96,6 +96,7 @@ def create_sublime_router() -> ToolRouter:
     router.register("list_profiles", simple_call_handler("list_profiles"))
     router.register("list_personas", simple_call_handler("list_personas"))
     router.register("list_sessions", simple_call_handler("list_sessions"))
+    router.register("session_info", simple_call_handler("session_info"))
     router.register("list_profile_docs", simple_call_handler("list_profile_docs"))
 
     # Quick Agent self-stop (transient slots only)
@@ -143,6 +144,8 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('fork_current', False)}, "
         f"{args.get('wait_for_completion', False)}"
         + (f", backend={args['backend']!r}" if args.get('backend') else "")
+        + (f", fork_from_view_id={int(args['fork_from_view_id'])}"
+           if args.get('fork_from_view_id') is not None else "")
         + f", _caller_view_id={args.get('_caller_view_id')})")
 
     router.register("send_to_session", lambda args:
@@ -216,7 +219,9 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('wake_prompt')!r})")
 
     router.register("signal_complete", lambda args:
-        f"return signal_subsession_complete(session_id={args.get('session_id')}, result_summary={args.get('result_summary')!r})")
+        f"return signal_subsession_complete("
+        f"session_id={args.get('session_id')!r}, "
+        f"result_summary={args.get('result_summary')!r})")
 
     # Custom tools
     router.register("sublime_eval", lambda args: args.get("code", ""))

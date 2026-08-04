@@ -311,6 +311,7 @@ class Bridge:
 
         session_id_info = f"sublime.{session_id}"
         view_id_info = view_id or session_id
+        parent_view_id = params.get("parent_view_id")
         session_guide = f"""
 
 ## Session Info
@@ -318,14 +319,17 @@ class Bridge:
 Session ID: {session_id_info}
 View ID: {view_id_info}
 """
+        if parent_view_id is not None:
+            session_guide += f"Parent View ID: {parent_view_id}\n"
 
         subsession_id = params.get("subsession_id")
         self._subsession_id = subsession_id  # Store for signal_complete tool
         subsession_guide = ""
         if subsession_id:
-            subsession_guide = f"""
-You are subsession **{subsession_id}**. Call signal_complete(session_id={view_id_info}, result_summary="...") when done.
-"""
+            subsession_guide = (
+                f"\nYou are subsession {subsession_id} (view_id={view_id_info}). "
+                f"When done, call MCP signal_complete(result_summary=…) — not prose alone.\n"
+            )
 
         if profile_system_prompt:
             # Profile wants full replacement; concatenate our pieces onto it.

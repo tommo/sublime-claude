@@ -33,6 +33,7 @@ from .commands import (
     ClaudeCodeClearContextCommand,
     ClaudeCodeInterruptCommand,
     ClaudeCodeClearCommand,
+    ClaudeCodeClearKeepLastCommand,
     ClaudeCodeResetInputCommand,
     ClaudeCodeRenameCommand,
     ClaudeCodeToggleCommand,

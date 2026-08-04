@@ -200,43 +200,50 @@ class MCPSocketServer:
             timeout = 30
             done.wait(timeout=timeout)
 
-            # Handle spawn_session wait - poll for initialization
+            # Handle spawn_session / send_to_session wake — poll for initialization
             eval_result = result.get("result")
             if isinstance(eval_result, dict) and eval_result.get("_wait_for_init"):
                 session = eval_result.pop("_session")
                 prompt = eval_result.pop("_prompt")
                 wait_for_completion = eval_result.pop("_wait_for_completion", False)
                 eval_result.pop("_wait_for_init")
+                tag = "wake" if eval_result.get("waking") else "spawn"
 
                 # Wait for initialization (in this background thread, not main thread)
                 max_wait = 30
                 start = time.time()
                 vid = session.output.view.id() if session.output and session.output.view else "?"
-                print(f"[MCP spawn:{vid}] waiting for init (backend={session.backend})...")
+                print(f"[MCP {tag}:{vid}] waiting for init (backend={session.backend})...")
                 while not session.initialized and time.time() - start < max_wait:
                     time.sleep(0.1)
 
                 if not session.initialized:
                     elapsed = time.time() - start
-                    print(f"[MCP spawn:{vid}] INIT TIMEOUT after {elapsed:.1f}s — prompt will be DROPPED. "
+                    print(f"[MCP {tag}:{vid}] INIT TIMEOUT after {elapsed:.1f}s — prompt will be DROPPED. "
                           f"client_alive={session.client.is_alive() if session.client else False} "
                           f"session_id={session.session_id!r}")
                     eval_result["error"] = "Session failed to initialize within 30 seconds"
+                    eval_result.pop("sent", None)
                 else:
                     elapsed = time.time() - start
-                    print(f"[MCP spawn:{vid}] init OK in {elapsed:.1f}s — scheduling initial prompt "
+                    print(f"[MCP {tag}:{vid}] init OK in {elapsed:.1f}s — scheduling prompt "
                           f"(working={session.working}, client_alive={session.client.is_alive() if session.client else False})")
                     # Send the prompt from main thread
-                    def send_prompt(_vid=vid, _prompt=prompt, _session=session):
+                    def send_prompt(_vid=vid, _prompt=prompt, _session=session, _tag=tag):
                         try:
-                            print(f"[MCP spawn:{_vid}] firing initial prompt "
-                                  f"(working={_session.working}, initialized={_session.initialized}, "
-                                  f"client_alive={_session.client.is_alive() if _session.client else False}): "
-                                  f"{_prompt[:80]!r}")
-                            _session.query(_prompt)
-                            print(f"[MCP spawn:{_vid}] query() returned (working now={_session.working})")
+                            # If still busy after wake (rare), queue instead of drop
+                            if _session.working:
+                                print(f"[MCP {_tag}:{_vid}] busy after init — queue_prompt")
+                                _session.queue_prompt(_prompt)
+                            else:
+                                print(f"[MCP {_tag}:{_vid}] firing prompt "
+                                      f"(working={_session.working}, initialized={_session.initialized}, "
+                                      f"client_alive={_session.client.is_alive() if _session.client else False}): "
+                                      f"{_prompt[:80]!r}")
+                                _session.query(_prompt)
+                            print(f"[MCP {_tag}:{_vid}] deliver done (working now={_session.working})")
                         except Exception as e:
-                            print(f"[MCP spawn:{_vid}] query() RAISED: {type(e).__name__}: {e}")
+                            print(f"[MCP {_tag}:{_vid}] deliver RAISED: {type(e).__name__}: {e}")
                     sublime.set_timeout(send_prompt, 0)
 
                     # Optionally wait for completion
@@ -362,6 +369,7 @@ class MCPSocketServer:
             "spawn_session": self._spawn_session,
             "send_to_session": self._send_to_session,
             "list_sessions": self._list_sessions,
+            "session_info": self._session_info,
             "read_session_output": self._read_session_output,
             "list_profile_docs": self._list_profile_docs,
             "read_profile_doc": self._read_profile_doc,
@@ -1092,8 +1100,12 @@ class MCPSocketServer:
             summary.append(f"  {mark} {name} → {spec.label or name}{pin}  [{kind}, bridge={spec.bridge_script}]")
         summary.append("")
         summary.append(f"default backend: {default}")
-        summary.append("Spawn via spawn_session(backend=<name>). fork_current=true only "
-                       "works within the same bridge family (same bridge_script).")
+        summary.append(
+            "Spawn via spawn_session(backend=<name>). "
+            "fork_current / fork_from_view_id only work within the same bridge "
+            "family (same bridge_script). Prefer fork_from_view_id to branch "
+            "workers off a base explorer session."
+        )
         return {"summary": "\n".join(summary), "default": default, "backends": rows}
 
     def _list_profiles(self) -> dict:
@@ -1154,12 +1166,47 @@ class MCPSocketServer:
             "personas": [{"id": p.get("id"), "alias": p.get("alias"), "is_locked": p.get("is_locked", False)} for p in personas]
         }
 
-    def _spawn_session(self, prompt: str, name: str = None, profile: str = None, checkpoint: str = None, persona_id: int = None, fork_current: bool = False, wait_for_completion: bool = False, backend: str = "claude", _caller_view_id: int = None) -> dict:
-        """Spawn a new Claude session with the given prompt. Returns with _wait_for_init flag.
+    @staticmethod
+    def _bridge_script_for(backend_name: str):
+        try:
+            return backends.get(backend_name).bridge_script
+        except Exception:
+            return None
+
+    @classmethod
+    def _same_backend_family(cls, a: str, b: str) -> bool:
+        """True if session IDs are portable between backends a and b."""
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        ba, bb = cls._bridge_script_for(a), cls._bridge_script_for(b)
+        return ba is not None and ba == bb
+
+    def _spawn_session(
+        self,
+        prompt: str,
+        name: str = None,
+        profile: str = None,
+        checkpoint: str = None,
+        persona_id: int = None,
+        fork_current: bool = False,
+        wait_for_completion: bool = False,
+        backend: str = None,
+        fork_from_view_id: int = None,
+        _caller_view_id: int = None,
+    ) -> dict:
+        """Spawn a new session with the given prompt. Returns with _wait_for_init flag.
+
+        Fork sources (pick one; checkpoint wins if set):
+          - fork_current: fork the caller's transcript
+          - fork_from_view_id: fork any open session's transcript (explorer → workers)
+        Fork requires same backend family as the source (session IDs are not portable
+        across bridges). parent_view_id is always the caller (orchestrator), even when
+        forking a sibling/child explorer.
 
         Args:
-            _caller_view_id: The view_id of the calling session. If provided, used as parent_view_id.
-                             This ensures subsession signals go to the correct parent.
+            _caller_view_id: view_id of the calling session → parent for signal_complete.
         """
         from .core import create_session, get_active_session
         import uuid
@@ -1168,11 +1215,19 @@ class MCPSocketServer:
         if not window:
             return {"error": "No window"}
 
+        if fork_current and fork_from_view_id is not None:
+            return {
+                "error": "Pass only one of fork_current or fork_from_view_id "
+                         "(not both)"
+            }
+
         project_path = _get_project_profiles_path()
         profiles, checkpoints = load_profiles_and_checkpoints(project_path)
         profile_config = None
         resume_id = None
         fork = False
+        fork_source_view_id = None
+        fork_source_backend = None
 
         # Load profile config if specified
         if profile:
@@ -1197,40 +1252,80 @@ class MCPSocketServer:
             if not name:
                 name = persona.get("alias", f"persona-{persona_id}")
 
+        def _resolve_fork_source(source_session, label: str):
+            nonlocal resume_id, fork, fork_source_view_id, fork_source_backend, backend
+            if not source_session:
+                return {"error": f"Cannot fork: {label} not found"}
+            sid = getattr(source_session, "session_id", None)
+            if not sid:
+                return {
+                    "error": f"Cannot fork: {label} has no session_id yet "
+                             f"(still starting?)"
+                }
+            src_backend = getattr(source_session, "backend", None) or "claude"
+            # Inherit source backend when agent omits backend (avoid default→claude
+            # clobbering a grok/codex explorer base).
+            if not backend:
+                backend = src_backend
+            if not self._same_backend_family(src_backend, backend):
+                return {
+                    "error": (
+                        f"Cannot fork {src_backend!r} session into {backend!r}; "
+                        f"session IDs are not portable across bridge families. "
+                        f"Use backend={src_backend!r} (or same bridge family), "
+                        f"or spawn fresh without fork."
+                    ),
+                    "source_backend": src_backend,
+                    "requested_backend": backend,
+                }
+            resume_id = sid
+            fork = True
+            try:
+                fork_source_view_id = (
+                    source_session.output.view.id()
+                    if source_session.output and source_session.output.view
+                    else None
+                )
+            except Exception:
+                fork_source_view_id = None
+            fork_source_backend = src_backend
+            return None
+
+        # Fork from an arbitrary open session (context explorer → workers)
+        if fork_from_view_id is not None:
+            try:
+                fork_from_view_id = int(fork_from_view_id)
+            except (TypeError, ValueError):
+                return {"error": f"Invalid fork_from_view_id: {fork_from_view_id!r}"}
+            source = sublime._claude_sessions.get(fork_from_view_id)
+            err = _resolve_fork_source(source, f"view_id {fork_from_view_id}")
+            if err:
+                return err
+
         # Fork from caller session if requested
-        if fork_current:
-            caller_session = sublime._claude_sessions.get(_caller_view_id) if _caller_view_id else None
+        elif fork_current:
+            caller_session = (
+                sublime._claude_sessions.get(_caller_view_id)
+                if _caller_view_id else None
+            )
             if not caller_session:
                 caller_session = get_active_session(window)
-            current_session = caller_session
-            if current_session and current_session.session_id:
-                # Session IDs aren't portable across backends — codex thread IDs
-                # can't be resumed by the Claude bridge, etc. Only allow fork
-                # within the same backend family: backends that share the same
-                # bridge_script share session storage (the Claude bridge +
-                # any Anthropic-compatible custom provider use main.py).
-                def _bridge_script(name):
-                    try:
-                        return backends.get(name).bridge_script
-                    except Exception:
-                        return None
-                same_family = current_session.backend == backend or (
-                    _bridge_script(current_session.backend) is not None
-                    and _bridge_script(current_session.backend) == _bridge_script(backend)
-                )
-                if not same_family:
-                    return {"error": f"Cannot fork {current_session.backend!r} session into {backend!r} backend; session IDs are not portable. Spawn fresh (fork_current=False)."}
-                resume_id = current_session.session_id
-                fork = True
-            else:
-                return {"error": "Cannot fork: current session has no session_id"}
+            err = _resolve_fork_source(caller_session, "current session")
+            if err:
+                return err
 
-        # Load checkpoint if specified (overrides fork_current)
+        # Load checkpoint if specified (overrides fork_current / fork_from_view_id)
         if checkpoint:
             if checkpoint not in checkpoints:
                 return {"error": f"Checkpoint '{checkpoint}' not found"}
             resume_id = checkpoints[checkpoint].get("session_id")
             fork = True
+            # Checkpoint does not record backend — keep agent-chosen or default below
+
+        # Fresh spawn / incomplete backend: settings default, then claude
+        if not backend:
+            settings = sublime.load_settings("ClaudeCode.sublime-settings")
+            backend = settings.get("default_backend", "claude") or "claude"
 
         # Generate unique subsession ID for notalone2 completion tracking
         subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
@@ -1251,6 +1346,7 @@ class MCPSocketServer:
 
         # Create new session with initial context
         print(f"[MCP spawn] backend={backend} fork_current={fork_current} "
+              f"fork_from_view_id={fork_from_view_id!r} "
               f"resume_id={resume_id!r} fork={fork} "
               f"profile={profile!r} checkpoint={checkpoint!r} persona_id={persona_id} "
               f"caller_view={_caller_view_id} subsession_id={subsession_id}")
@@ -1267,8 +1363,11 @@ class MCPSocketServer:
 
         view_id = session.output.view.id() if session.output.view else None
 
+        # One-liner: parent often says "report back" without naming the tool.
+        prompt = self._with_subsession_report_contract(prompt or "")
+
         # Return with flags for background thread to handle waiting
-        return {
+        out = {
             "_wait_for_init": True,  # Signal to wait for initialization
             "_session": session,  # Session object for polling
             "_prompt": prompt,  # Prompt to send after init
@@ -1277,13 +1376,36 @@ class MCPSocketServer:
             "name": name or "(unnamed)",
             "view_id": view_id,
             "subsession_id": subsession_id,  # Return subsession_id for parent to track
+            "parent_view_id": parent_view_id,
+            "backend": backend,
+            "fork": fork,
             "profile": profile,
             "checkpoint": checkpoint,
         }
+        if fork_source_view_id is not None:
+            out["forked_from_view_id"] = fork_source_view_id
+            out["forked_from_backend"] = fork_source_backend
+        return out
+
+    @staticmethod
+    def _with_subsession_report_contract(prompt: str) -> str:
+        """Append a one-line signal_complete reminder if missing."""
+        body = (prompt or "").rstrip()
+        if "signal_complete" in body:
+            return body
+        return (
+            body
+            + "\n\nWhen done, call MCP signal_complete(result_summary=…) "
+            "(not prose alone; parent routes automatically and receives "
+            "your context_budget for strategy)."
+        )
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
-        """Send a message to an existing session."""
+        """Send a message to an existing session.
 
+        Sleeping workers (⏸ / is_sleeping) are auto-woken; the MCP socket
+        handler waits for init then fires the prompt (same path as spawn).
+        """
         session = sublime._claude_sessions.get(view_id)
         if not session:
             return {"error": f"Session not found for view_id {view_id}"}
@@ -1291,15 +1413,65 @@ class MCPSocketServer:
         if session.working:
             return {"error": "Session is busy", "view_id": view_id}
 
+        name = session.name or "(unnamed)"
+        sleeping = False
+        try:
+            sleeping = bool(session.is_sleeping)
+        except Exception:
+            pass
+
+        # ⏸ worker: resume bridge, then wait+query via _wait_for_init
+        if sleeping:
+            if not getattr(session, "session_id", None):
+                return {
+                    "error": "Session sleeping but has no session_id — cannot wake",
+                    "view_id": view_id,
+                }
+            print(f"[MCP send:{view_id}] sleeping → wake for prompt")
+            session.wake()
+            return {
+                "_wait_for_init": True,
+                "_session": session,
+                "_prompt": prompt,
+                "_wait_for_completion": False,
+                "sent": True,
+                "waking": True,
+                "view_id": view_id,
+                "name": name,
+            }
+
+        # Bridge still coming up (wake already in flight, or first start)
         if not session.initialized:
+            if session.client or getattr(session, "session_id", None):
+                print(f"[MCP send:{view_id}] not ready → wait for init")
+                return {
+                    "_wait_for_init": True,
+                    "_session": session,
+                    "_prompt": prompt,
+                    "_wait_for_completion": False,
+                    "sent": True,
+                    "waking": True,
+                    "view_id": view_id,
+                    "name": name,
+                }
             return {"error": "Session not initialized", "view_id": view_id}
 
         session.query(prompt)
         return {
             "sent": True,
             "view_id": view_id,
-            "name": session.name or "(unnamed)",
+            "name": name,
         }
+
+    @staticmethod
+    def _session_context_budget(session) -> dict:
+        """Context budget snapshot from a Session (safe if method missing)."""
+        try:
+            if hasattr(session, "context_budget_snapshot"):
+                return session.context_budget_snapshot() or {}
+        except Exception as e:
+            print(f"[MCP] context_budget_snapshot failed: {e}")
+        return {"summary": "ctx:unknown", "has_usage": False}
 
     def _list_sessions(self) -> dict:
         """List subsessions only (spawned via spawn_session)."""
@@ -1313,11 +1485,41 @@ class MCPSocketServer:
             # Only show subsessions (spawned sessions have a parent_view_id)
             if not getattr(session, 'parent_view_id', None):
                 continue
-            status = "⏳" if session.working else "✓"
-            cost = f"${session.total_cost:.4f}" if session.total_cost else ""
+            sleeping = False
+            try:
+                sleeping = bool(session.is_sleeping)
+            except Exception:
+                pass
+            if sleeping:
+                status = "⏸"
+            elif session.working:
+                status = "⏳"
+            else:
+                status = "✓"
+            budget = self._session_context_budget(session)
             name = session.name or "(unnamed)"
-            lines.append(f"{status} [{view_id}] {name} ({session.query_count} queries) {cost}")
-            sessions.append({"view_id": view_id, "name": name, "working": session.working})
+            sid = getattr(session, "subsession_id", None) or ""
+            budget_s = budget.get("summary") or ""
+            lines.append(
+                f"{status} [{view_id}] {name}"
+                + (f" · {budget_s}" if budget_s else "")
+                + (f" sub={sid}" if sid else "")
+            )
+            sessions.append({
+                "view_id": view_id,
+                "name": name,
+                "working": bool(session.working),
+                "sleeping": sleeping,
+                "subsession_id": getattr(session, "subsession_id", None),
+                "parent_view_id": getattr(session, "parent_view_id", None),
+                "backend": getattr(session, "backend", None),
+                # True when fork_from_view_id can use this sheet as a base
+                "forkable": bool(getattr(session, "session_id", None)),
+                "context_budget": budget,
+                "context_summary": budget.get("summary"),
+                "context_pct": budget.get("context_pct"),
+                "headroom": budget.get("headroom"),
+            })
 
         if not lines:
             return {"summary": "No subsessions", "sessions": []}
@@ -1416,13 +1618,21 @@ class MCPSocketServer:
             if skipped_messages > 0:
                 content = f"[... {skipped_messages} earlier messages truncated ...]\n\n{content}"
 
+        budget = self._session_context_budget(session)
         return {
             "view_id": view_id,
             "name": session.name or "(unnamed)",
-            "working": session.working,
+            "working": bool(session.working),
+            "sleeping": bool(getattr(session, "is_sleeping", False)),
+            "backend": getattr(session, "backend", None),
             "output": content,
             "line_count": content.count('\n') + 1 if content else 0,
             "truncated": truncated,
+            # Context budget — use to decide continue vs fork vs new worker
+            "context_budget": budget,
+            "context_summary": budget.get("summary"),
+            "context_pct": budget.get("context_pct"),
+            "headroom": budget.get("headroom"),
         }
 
     def _list_profile_docs(self) -> dict:
@@ -2224,28 +2434,88 @@ class MCPSocketServer:
         except Exception as e:
             return {"error": str(e)}
 
+    def _session_info(self) -> dict:
+        """Identity for the MCP caller session (view_id from --view-id).
+
+        Parent linkage lives on the host Session — agents must not search for it.
+        """
+        view_id = getattr(self, "_caller_view_id", None)
+        if view_id is None:
+            return {"error": "No caller view_id (MCP not bound to a session)"}
+        try:
+            view_id = int(view_id)
+        except (TypeError, ValueError):
+            return {"error": f"Invalid caller view_id: {view_id!r}"}
+
+        session = sublime._claude_sessions.get(view_id)
+        if not session:
+            return {
+                "error": f"Session {view_id} not found",
+                "view_id": view_id,
+                "available": list(sublime._claude_sessions.keys()),
+            }
+
+        parent_view_id = getattr(session, "parent_view_id", None)
+        subsession_id = getattr(session, "subsession_id", None)
+        sleeping = bool(getattr(session, "is_sleeping", False))
+        if callable(getattr(type(session), "is_sleeping", None)):
+            try:
+                sleeping = bool(session.is_sleeping)
+            except Exception:
+                pass
+
+        name = session.name or "(unnamed)"
+        budget = self._session_context_budget(session)
+        return {
+            "view_id": view_id,
+            "parent_view_id": parent_view_id,
+            "subsession_id": subsession_id,
+            "is_subsession": bool(parent_view_id or subsession_id),
+            "name": name,
+            "backend": getattr(session, "backend", None) or "claude",
+            "initialized": bool(getattr(session, "initialized", False)),
+            "working": bool(getattr(session, "working", False)),
+            "sleeping": sleeping,
+            "session_id": getattr(session, "session_id", None),
+            "context_budget": budget,
+            "context_summary": budget.get("summary"),
+            "context_pct": budget.get("context_pct"),
+            "headroom": budget.get("headroom"),
+        }
+
     def _signal_subsession_complete(self, session_id: int = None, result_summary: str = None) -> dict:
         """Signal that this subsession has completed.
 
-        Directly injects result_summary into parent session's prompt queue.
+        Directly injects result_summary into parent session's prompt queue,
+        plus host-attached context budget so the parent can choose
+        continue / fork / new-worker strategy.
 
         Args:
-            session_id: The subsession's view_id (required to identify caller)
+            session_id: Subsession view_id. Defaults to MCP caller (_caller_view_id).
             result_summary: Optional summary of what was accomplished
 
         Returns:
-            {status: "signaled", subsession_id: str}
+            {status: "signaled", subsession_id: str, parent_view_id: …, context_budget: …}
         """
-        # Look up the calling session by session_id
+        # MCP process is bound to the child sheet — prefer that over agent-passed ids.
         if session_id is None:
-            return {"error": "session_id is required - pass your view_id from spawn result"}
+            session_id = getattr(self, "_caller_view_id", None)
+        if session_id is None:
+            return {
+                "error": "session_id missing and no MCP caller view_id — "
+                         "cannot route signal_complete"
+            }
+        try:
+            session_id = int(session_id)
+        except (TypeError, ValueError):
+            return {"error": f"Invalid session_id: {session_id!r}"}
 
         session = sublime._claude_sessions.get(session_id)
         if not session:
             available = list(sublime._claude_sessions.keys())
             return {"error": f"Session {session_id} not found", "available": available}
 
-        # Get parent_view_id from this subsession
+        # Get parent_view_id from this subsession (host state — not agent-discovered)
         parent_view_id = getattr(session, 'parent_view_id', None)
         subsession_id = getattr(session, 'subsession_id', None)
 
@@ -2264,12 +2534,31 @@ class MCPSocketServer:
         if not parent_session.initialized:
             return {"error": f"Parent session {parent_view_id} not initialized"}
 
-        # Build wake prompt
-        wake_prompt = f"✅ Subsession {subsession_id} completed"
-        if result_summary:
-            wake_prompt += f":\n{result_summary}"
+        budget = self._session_context_budget(session)
+        budget_line = budget.get("summary") or "ctx:unknown"
+        view_id = None
+        try:
+            view_id = session.output.view.id() if session.output and session.output.view else session_id
+        except Exception:
+            view_id = session_id
 
-        print(f"[Claude] signal_complete: queuing for parent {parent_view_id}: {wake_prompt[:50]}...")
+        # Build wake prompt — always include context budget for parent strategy
+        wake_prompt = (
+            f"✅ Subsession {subsession_id or view_id} completed "
+            f"(view_id={view_id})\n"
+            f"context_budget: {budget_line}"
+        )
+        if budget.get("headroom"):
+            wake_prompt += (
+                f"\nstrategy_hint: headroom={budget['headroom']}"
+                " — tight/critical → prefer fork_from_view_id of a lighter base "
+                "or a fresh worker over piling more into this session; "
+                "comfortable → safe to send_to_session for follow-ups"
+            )
+        if result_summary:
+            wake_prompt += f"\n\n{result_summary}"
+
+        print(f"[Claude] signal_complete: queuing for parent {parent_view_id}: {wake_prompt[:80]}...")
 
         # Queue injection with retry if parent is busy
         def try_inject():
@@ -2283,7 +2572,17 @@ class MCPSocketServer:
 
         sublime.set_timeout(try_inject, 0)
 
-        return {"status": "signaled", "subsession_id": subsession_id, "parent_view_id": parent_view_id, "result_summary": result_summary}
+        return {
+            "status": "signaled",
+            "subsession_id": subsession_id,
+            "parent_view_id": parent_view_id,
+            "view_id": view_id,
+            "result_summary": result_summary,
+            "context_budget": budget,
+            "context_summary": budget_line,
+            "context_pct": budget.get("context_pct"),
+            "headroom": budget.get("headroom"),
+        }
 
     def _list_notifications(self) -> dict:
         """List active notifications for this session (direct sync socket)."""

@@ -40,7 +40,7 @@ FONT_SIZE = 12
 STATUS_ACTIVE_WORKING = "◉"    # Active session, working
 STATUS_ACTIVE_IDLE = "◇"       # Active session, idle
 STATUS_INACTIVE_WORKING = "•"  # Inactive session, working
-STATUS_INACTIVE_IDLE = ""      # Inactive session, idle
+STATUS_INACTIVE_IDLE = "◇"     # Inactive session, idle (same hollow diamond; never hide)
 STATUS_ERROR_HALT = "⚠"        # Turn/bridge error — session idle but failed
 
 # Spinner frames for loading

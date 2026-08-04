@@ -319,6 +319,55 @@ class ClaudeReplaceContentCommand(sublime_plugin.TextCommand):
         self.view.replace(edit, sublime.Region(0, self.view.size()), content)
 
 
+class NoopCommand(sublime_plugin.TextCommand):
+    """No-op for blocked history mutations (preserve caret/selection)."""
+
+    def run(self, edit):
+        pass
+
+
+class ClaudeSelectDraftCommand(sublime_plugin.TextCommand):
+    """Select only the ◎ composer draft (Cmd/Ctrl+A while caret in draft)."""
+
+    def run(self, edit):
+        from ..composer_geometry import draft_select_range
+        s = get_session_for_view(self.view)
+        if not s or not s.output or not s.output.is_input_mode():
+            self.view.run_command("select_all")
+            return
+        start = s.output._input_start
+        end = self.view.size()
+        if start is None:
+            start = end
+        a, b = draft_select_range(start, end)
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(a, b))
+        try:
+            self.view.show(sublime.Region(a, b))
+        except Exception:
+            pass
+
+
+class ClaudeSelectHistoryCommand(sublime_plugin.TextCommand):
+    """Select transcript only, excluding ◎ draft (Cmd/Ctrl+A while browsing)."""
+
+    def run(self, edit):
+        from ..composer_geometry import history_select_range
+        s = get_session_for_view(self.view)
+        if not s or not s.output or not s.output.is_input_mode():
+            self.view.run_command("select_all")
+            return
+        start = s.output._input_start
+        if start is None:
+            start = self.view.size()
+        a, b = history_select_range(start, self.view.size())
+        self.view.sel().clear()
+        if b > a:
+            self.view.sel().add(sublime.Region(a, b))
+        else:
+            self.view.sel().add(sublime.Region(0, 0))
+
+
 class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
     """Insert newline in input mode (Shift+Enter / modifier-submit Enter)."""
     def run(self, edit):

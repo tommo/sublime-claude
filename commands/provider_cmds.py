@@ -776,8 +776,42 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
                     sublime.save_settings("ClaudeCode.sublime-settings")
                     s.restart()
                 return
+            # Grok: vision MCP is bound at session start. Switching to/from
+            # DeepSeek (no vision) must restart so read_image is not advertised.
+            if s.backend == "grok":
+                try:
+                    from .. import grok_backend
+                    old = getattr(s, "model", None) or (
+                        s.output.view.settings().get("claude_model")
+                        if s.output and s.output.view else "")
+                    old_v = grok_backend.model_supports_vision(old or "")
+                    new_v = grok_backend.model_supports_vision(real_model)
+                    if old_v != new_v:
+                        if sublime.ok_cancel_dialog(
+                            f"Model '{mid}' changes vision support "
+                            f"({'on' if new_v else 'off'}).\n"
+                            f"Restart session so MCP read_image matches "
+                            f"(avoids broken image tool calls)?",
+                            "Restart",
+                        ):
+                            settings = sublime.load_settings(
+                                "ClaudeCode.sublime-settings")
+                            default_models = settings.get("default_models", {})
+                            default_models[s.backend] = mid
+                            settings.set("default_models", default_models)
+                            sublime.save_settings("ClaudeCode.sublime-settings")
+                            s.restart()
+                        return
+                except Exception as e:
+                    print(f"[Claude] vision check on set_model: {e}")
             if s.client:
                 s.client.send("set_model", {"model": real_model})
+            s.model = real_model
+            try:
+                if s.output and s.output.view:
+                    s.output.view.settings().set("claude_model", real_model)
+            except Exception:
+                pass
             sublime.status_message(f"Model: {mid}")
 
         self.window.show_quick_panel(items, on_select)
@@ -805,7 +839,19 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
                 all_models[backend] = [list(m) for m in backends.get(backend).default_models]
             except Exception:
                 all_models[backend] = DEFAULT_MODELS.get(backend, [])
-        return all_models.get(backend, [])
+        models = list(all_models.get(backend, []) or [])
+        # Grok ACP: merge session availableModels + ~/.grok config BYOK catalog
+        if backend == "grok":
+            try:
+                from .. import grok_backend
+                extra = []
+                s = get_active_session(self.window)
+                if s is not None and getattr(s, "available_models", None):
+                    extra.extend(s.available_models)
+                models = [list(m) for m in grok_backend.grok_picker_models(extra=extra)]
+            except Exception as e:
+                print(f"[Claude] grok model merge: {e}")
+        return models
 
 
 class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):

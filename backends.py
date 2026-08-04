@@ -313,16 +313,14 @@ BACKENDS: Dict[str, BackendSpec] = {
         available=_pi_available,
     ),
     # Native Grok Build via ACP (`grok agent stdio`).
+    # default_models refreshed in all_backends() via grok_picker_models().
     "grok": BackendSpec(
         name="grok",
         label="Grok",
         abbrev="GR",
         bridge_script="grok_main.py",
         fallback_model="grok-4.5",
-        default_models=[
-            ("grok-4.5", "Grok 4.5"),
-            ("grok-composer-2.5-fast", "Composer 2.5"),
-        ],
+        default_models=list(grok_backend.GROK_MODELS),
         available=_grok_available,
         pinned=True,
     ),
@@ -441,6 +439,16 @@ def all_backends() -> Dict[str, "BackendSpec"]:
     from dataclasses import replace
 
     merged: Dict[str, "BackendSpec"] = dict(BACKENDS)
+    # Refresh Grok catalog (built-ins + ~/.grok/config.toml BYOK models).
+    try:
+        from dataclasses import replace as _replace
+        if "grok" in merged:
+            merged["grok"] = _replace(
+                merged["grok"],
+                default_models=list(grok_backend.grok_picker_models()),
+            )
+    except Exception as e:
+        print(f"[Claude] grok model catalog refresh failed: {e}")
     try:
         custom = _load_custom_providers()
     except Exception as e:

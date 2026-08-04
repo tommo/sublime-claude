@@ -16,13 +16,25 @@ from typing import Callable, Dict, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .output import OutputView, ToolCall
 
-# Grok Imagine / video tools — result is a saved file path.
+# Tools whose on-disk path should get clickable media preview phantoms.
+# Includes Grok Imagine/video *and* sublime MCP read_image (path is input).
 MEDIA_TOOLS = frozenset({
     "image_gen", "image_edit", "image_to_video", "reference_to_video", "video_gen",
+    "read_image", "ReadImage",
+    "mcp__sublime__read_image", "sublime__read_image",
 })
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 VIDEO_EXTS = (".mp4", ".webm", ".mov", ".mkv")
 MEDIA_EXTS = IMAGE_EXTS + VIDEO_EXTS
+
+
+def is_media_tool_name(name: str) -> bool:
+    """True for media path tools (incl. mcp__*/use_tool *read_image suffixes)."""
+    n = (name or "").strip()
+    if n in MEDIA_TOOLS:
+        return True
+    low = n.lower().replace("-", "_")
+    return low.endswith("read_image") or low.endswith("readimage")
 
 # X / Twitter search tools.
 X_SEARCH_TOOLS = frozenset({
@@ -30,31 +42,61 @@ X_SEARCH_TOOLS = frozenset({
 })
 
 
-def extract_media_path(result: Optional[str], tool_input: Optional[dict] = None) -> Optional[str]:
-    """Best-effort absolute path from media tool result / input."""
+def extract_media_path(
+        result: Optional[str],
+        tool_input: Optional[dict] = None,
+        cwd: Optional[str] = None,
+) -> Optional[str]:
+    """Best-effort absolute path from media tool result / input.
+
+    Also unwraps Grok use_tool nested ``tool_input`` / ``arguments`` and
+    resolves relative paths against *cwd* when provided.
+    """
     candidates = []
-    if isinstance(tool_input, dict):
-        for k in ("path", "file_path", "output_path", "image", "filename"):
-            v = tool_input.get(k)
+
+    def _collect_from_dict(d: dict) -> None:
+        if not isinstance(d, dict):
+            return
+        for k in ("path", "file_path", "output_path", "image", "filename",
+                  "target_file"):
+            v = d.get(k)
             if isinstance(v, str) and v.strip():
                 candidates.append(v.strip())
-        # image_edit may pass image as list of refs
-        imgs = tool_input.get("images")
+        imgs = d.get("images")
         if isinstance(imgs, list):
             for v in imgs:
                 if isinstance(v, str) and v.strip():
                     candidates.append(v.strip())
+        # Nested UseTool / MCP args
+        for nk in ("tool_input", "arguments", "input", "args"):
+            nested = d.get(nk)
+            if isinstance(nested, dict):
+                _collect_from_dict(nested)
+            elif isinstance(nested, str) and nested.strip().startswith("{"):
+                try:
+                    obj = json.loads(nested)
+                    if isinstance(obj, dict):
+                        _collect_from_dict(obj)
+                except Exception:
+                    pass
+
+    if isinstance(tool_input, dict):
+        _collect_from_dict(tool_input)
+        # Stashed after tool_done
+        mp = tool_input.get("_media_path")
+        if isinstance(mp, str) and mp.strip():
+            candidates.insert(0, mp.strip())
 
     text = (result or "").strip()
     if text:
+        # MCP read_image: "Image loaded (path=/abs/file.png, …)" or similar
+        for m in re.finditer(r"path=([^\s,)]+)", text):
+            candidates.append(m.group(1))
         # Whole-result JSON: {"path":"…","filename":"1.jpg",…}
         try:
             obj = json.loads(text)
             if isinstance(obj, dict):
-                for k in ("path", "file_path", "output_path", "filename"):
-                    v = obj.get(k)
-                    if isinstance(v, str) and v.strip():
-                        candidates.append(v.strip())
+                _collect_from_dict(obj)
             elif isinstance(obj, str):
                 candidates.append(obj)
         except Exception:
@@ -64,10 +106,7 @@ def extract_media_path(result: Optional[str], tool_input: Optional[dict] = None)
             try:
                 obj = json.loads(m.group(0))
                 if isinstance(obj, dict):
-                    for k in ("path", "file_path", "filename"):
-                        v = obj.get(k)
-                        if isinstance(v, str) and v.strip():
-                            candidates.append(v.strip())
+                    _collect_from_dict(obj)
             except Exception:
                 pass
         # Bare absolute/relative media paths in text
@@ -76,19 +115,24 @@ def extract_media_path(result: Optional[str], tool_input: Optional[dict] = None)
                 text, re.I):
             candidates.append(m.group(0))
         for m in re.finditer(
-                r'(?:images|videos)/\S+?\.(?:png|jpe?g|webp|gif|bmp|mp4|webm|mov|mkv)\b',
+                r'(?:images|videos|captures)/\S+?\.(?:png|jpe?g|webp|gif|bmp|mp4|webm|mov|mkv)\b',
                 text, re.I):
             candidates.append(m.group(0))
 
-    for c in candidates:
+    def _resolve(c: str) -> Optional[str]:
         p = os.path.expanduser(c)
         if os.path.isfile(p):
-            return p
-        # session-relative images/1.jpg — leave to caller with session root
-        if c.startswith(("images/", "videos/")) or not os.path.isabs(p):
-            # Prefer absolute paths that exist; keep first absolute even if missing
-            # (file may still be writing).
-            pass
+            return os.path.abspath(p)
+        if cwd and not os.path.isabs(p):
+            joined = os.path.join(cwd, p)
+            if os.path.isfile(joined):
+                return os.path.abspath(joined)
+        return None
+
+    for c in candidates:
+        hit = _resolve(c)
+        if hit:
+            return hit
     # Prefer first absolute-looking candidate even if not yet on disk
     for c in candidates:
         p = os.path.expanduser(c)
@@ -96,7 +140,10 @@ def extract_media_path(result: Optional[str], tool_input: Optional[dict] = None)
             return p
     for c in candidates:
         if c.lower().endswith(MEDIA_EXTS):
-            return os.path.expanduser(c)
+            p = os.path.expanduser(c)
+            if cwd and not os.path.isabs(p):
+                return os.path.abspath(os.path.join(cwd, p))
+            return p
     return None
 
 
@@ -277,18 +324,25 @@ def _read_image_path(tool: "ToolCall") -> str:
 
 
 def _read_image(view: "OutputView", tool: "ToolCall") -> str:
-    path = _read_image_path(tool)
-    label = media_display_path(path) if path else ""
-    # Prefer a useful short path; fall back to full if basename is useless
-    # (e.g. tmpXXXX.png) — still never emit a fake "✓ vision" mark.
-    if path and (not label or label == os.path.basename(path)):
-        # Keep last 2 path segments when not images/N.jpg style
-        parts = path.replace("\\", "/").rstrip("/").split("/")
-        if len(parts) >= 2:
-            label = "/".join(parts[-2:])
-        else:
-            label = parts[-1] if parts else path
-    out = f": {label}" if label else ""
+    """Show path like other media tools so phantoms/click-preview can match."""
+    path = None
+    if isinstance(tool.tool_input, dict):
+        path = tool.tool_input.get("_media_path")
+    if not path:
+        path = _read_image_path(tool) or extract_media_path(
+            getattr(tool, "result", None), tool.tool_input)
+    if path and isinstance(tool.tool_input, dict) and not tool.tool_input.get("_media_path"):
+        tool.tool_input["_media_path"] = path
+        tool.tool_input.setdefault("path", path)
+    # Path label in the tool line; full abs path on _media_path for phantoms.
+    out = ""
+    if path:
+        label = media_display_path(path)
+        if not label or label == os.path.basename(path):
+            parts = path.replace("\\", "/").rstrip("/").split("/")
+            label = "/".join(parts[-2:]) if len(parts) >= 2 else (
+                parts[-1] if parts else path)
+        out = f": {label}"
     if tool.status == "error" and tool.result:
         out += f" ✗ {_clip(str(tool.result), 60)}"
     return out

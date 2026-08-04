@@ -181,8 +181,8 @@ class OutputView:
         window = self.view.window()
         is_active = window and window.settings().get("claude_active_view") == self.view.id()
         # Tab icons (active = this view is claude_active_view):
-        #   ◉ active + working   ◇ active + idle
-        #   • inactive + working (no prefix) inactive + idle
+        #   ◉ active + working   • inactive + working
+        #   ◇ idle (active or not — always visible)
         #   ❓ permission/question/plan   ⏸ sleeping   ↻ pending self-wake
         #   ⚠ error-halted (turn/bridge failed; cleared on next query)
         from . import claude_code
@@ -216,12 +216,11 @@ class OutputView:
         elif is_looping and not is_working:
             # Don't hide a live turn behind ↻ — busy wins.
             prefix = "↻ "
-        elif is_active:
-            prefix = "◉ " if is_working else "◇ "
+        elif is_working:
+            prefix = "◉ " if is_active else "• "
         else:
-            # Inactive idle: no diamond (was wrongly ◇ and looked "idle-active").
-            # Error-halt already handled above (same ⚠ for active/inactive).
-            prefix = "• " if is_working else ""
+            # Idle diamond always shown (focused or not) — do not autohide.
+            prefix = "◇ "
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
@@ -1285,13 +1284,17 @@ class OutputView:
             # self.current. Debounced _render_current races with queued follow-up
             # queries and leaves a stale ⠋/⠧ under the previous @done.
             self.current.working = False
-            # Goal strip is *live* chrome (like the spinner), not history.
-            # Leaving it in the frozen region stacked "◎ goal · …" once per
-            # user submit *and* per host phase-switch prompt (plan/verify).
-            # Carry GoalState onto the next Conversation; re-render without it.
+            # Goal + Tasks strips are *live* chrome (like the spinner), not
+            # history. Leaving them in the frozen region stacked "◎ goal" /
+            # "○ task" once per user submit. Snapshot, strip, re-render, then
+            # carry onto the next Conversation.
             if _goal_is_open(self.current.goal):
                 prev_goal = self.current.goal
             self.current.goal = None
+            if not self.current.todos_all_done:
+                prev_todos = _open_todos(self.current.todos)
+            self.current.todos = []
+            self.current.todos_all_done = True
             self._render_pending = False
             try:
                 self._do_render()
@@ -1305,9 +1308,6 @@ class OutputView:
                 dropped = len(self.conversations) - HISTORY_CAP
                 print(f"[Claude] conversation history capped: dropped {dropped} oldest turn(s)")
                 self.conversations = self.conversations[-HISTORY_CAP:]
-            # Carry only still-open todos (drop completed/cancelled leftovers).
-            if not self.current.todos_all_done:
-                prev_todos = _open_todos(self.current.todos)
 
         # Start new
         refs = list(context_refs or [])
@@ -1664,9 +1664,27 @@ class OutputView:
             old_status = target.status
             target.status = DONE
             target.result = result
-            # Media tools: stash absolute path for formatters + inline phantoms.
-            if target.name in MEDIA_TOOLS and result:
-                path = extract_media_path(result, target.tool_input)
+            # Media tools (incl. read_image): stash abs path for click preview.
+            from .tool_formatters import is_media_tool_name
+            if is_media_tool_name(target.name):
+                cwd = None
+                try:
+                    from . import claude_code
+                    sess = claude_code.get_session_for_view(self.view) if self.view else None
+                    if sess is not None and hasattr(sess, "_cwd"):
+                        cwd = sess._cwd()
+                except Exception:
+                    pass
+                path = extract_media_path(
+                    result, target.tool_input, cwd=cwd)
+                if not path and isinstance(target.tool_input, dict):
+                    # Input-only paths (read_image before/without path= in result)
+                    from .tool_formatters import _read_image_path
+                    path = _read_image_path(target) or None
+                    if path and cwd and not os.path.isabs(path):
+                        joined = os.path.join(cwd, path)
+                        if os.path.isfile(joined):
+                            path = joined
                 if path:
                     if not isinstance(target.tool_input, dict):
                         target.tool_input = {}
@@ -1933,8 +1951,13 @@ class OutputView:
         """
         # Remember if we were in input mode
         was_input_mode = self._input_mode
-        # Check if agent is currently working (before we clear state)
-        was_working = self.current and self.current.working
+        # Agent busy: conversation flag and/or session.working (silent wakes)
+        from . import claude_code as _cc
+        _sess = _cc.get_session_for_view(self.view) if self.view else None
+        was_working = bool(
+            (self.current and self.current.working)
+            or (_sess and getattr(_sess, "working", False))
+        )
 
         # Snapshot supportive state BEFORE wiping conversations/current.
         # Background tools we want to keep visible (their bash subprocesses are
@@ -1986,15 +2009,25 @@ class OutputView:
         # If agent was working, create a stub conversation to receive further output
         # This prevents output from being silently discarded after clear.
         # Attach the carried bg tools + todos so they remain visible while the
-        # turn keeps going.
+        # turn keeps going. Sticky ◎ is still valid mid-stream — restore it
+        # (old path returned early and left the input area gone).
         if was_working:
             self.current = Conversation(prompt="(continued)", working=True)
             self.current.region = (0, 0)  # Will be set on first render
             self.current.events.extend(carry_bg_tools)
             self.current.todos = carry_todos
             self.current.goal = carry_goal
+            if carry_bg_tools or carry_todos or carry_goal:
+                self._render_current()
             self._update_title()  # Show working indicator
-            return  # Don't enter input mode while working
+            # Sticky composer while busy: re-open ◎ so user can queue / type
+            if was_input_mode or (
+                _sess is not None
+                and getattr(_sess, "working", False)
+                and getattr(_sess, "_composer_allowed", True)
+            ):
+                self.enter_input_mode()
+            return
 
         # Idle case: build a zero-prompt carry-forward conversation so the
         # supportive UI (bg-tool entries, todos, goal) stays visible. _do_render
@@ -2013,6 +2046,90 @@ class OutputView:
         # lines and the pending-context line via session lookup)
         if was_input_mode:
             self.enter_input_mode()
+
+    def clear_keep_last(self) -> None:
+        """Clear older log rounds; keep only the last conversation turn.
+
+        Unlike clear() (full wipe), the latest prompt+response stays visible.
+        Buffer text can be restored with Cmd+Z; dropped rounds are not.
+        """
+        # Last round = live current turn, else last finished conversation
+        if self.current is not None:
+            keep = self.current
+            dropped = len(self.conversations)
+        elif self.conversations:
+            keep = self.conversations[-1]
+            dropped = len(self.conversations) - 1
+        else:
+            sublime.status_message("Claude: nothing to clear")
+            return
+
+        if dropped <= 0:
+            sublime.status_message("Claude: already only last round")
+            return
+
+        was_input_mode = self._input_mode
+        draft = ""
+        if was_input_mode:
+            draft = self.get_input_text()
+            try:
+                from . import claude_code
+                _s = claude_code.get_session_for_view(self.view)
+                if _s is not None:
+                    _s.draft_prompt = draft
+            except Exception:
+                pass
+            self.exit_input_mode(keep_text=False)
+
+        if self.view and self.view.is_valid():
+            self._cleared_content = self.view.substr(sublime.Region(0, self.view.size()))
+            self.view.set_read_only(False)
+            self.view.run_command("claude_clear_all")
+            self.view.set_read_only(True)
+            self.view.settings().set("claude_input_mode", False)
+            try:
+                self.view.erase_regions("claude_conversation")
+                self.view.erase_regions("claude_permission_block")
+            except Exception:
+                pass
+
+        # Drop older rounds; keep last as current
+        self.conversations = []
+        self.current = keep
+        self.current.region = (0, 0)
+        self.pending_permission = None
+        self._permission_queue.clear()
+        self.pending_plan = None
+        self.pending_question = None
+        self._pending_context_region = (0, 0)
+        self._input_mode = False
+        self._input_start = 0
+        self._input_area_start = 0
+        self._render_pending = False
+
+        # Paint kept round at top of empty buffer
+        self._auto_scroll = True
+        try:
+            self._do_render()
+        except Exception as e:
+            print(f"[Claude] clear_keep_last render: {e}")
+
+        self._update_title()
+        if was_input_mode:
+            self.enter_input_mode()
+            if draft and self._input_mode:
+                try:
+                    self.view.set_read_only(False)
+                    self.view.run_command("append", {"characters": draft})
+                    self._update_composer_pad_phantom()
+                    self.focus_composer(force_show=True)
+                except Exception:
+                    pass
+
+        sublime.status_message(
+            f"Claude: cleared {dropped} older round"
+            f"{'s' if dropped != 1 else ''}, kept last"
+        )
 
     def undo_clear(self) -> None:
         """Restore content from last clear.
@@ -3437,11 +3554,13 @@ class OutputView:
 
         # Adaptive Work strip: Goal (◆) + Tasks (▸/○), then spinner.
         # Order matters: never leave a floating ⠹ above the goal strip
-        # (looks broken on /goal resume). prompt() still strips goal from the
-        # frozen prior region so history has no ◆ corpses.
+        # (looks broken on /goal resume). prompt() still strips goal/todos
+        # from the frozen prior region so history has no ◆/○ corpses.
         #
-        # After @done (has_meta), hide goal/tasks on that turn — otherwise
-        # "@done + ◆ goal · executing" stacks. Next turn re-attaches GoalState.
+        # Goal: live turns only (hide under finished @done sheet).
+        # Tasks: live *and* idle — backlog must stay visible after the turn
+        # settles (Grok "say which ID…"). When idle, paint tasks *after*
+        # @done so they sit just above sticky ◎ (not buried mid-transcript).
         open_todos = _open_todos(self.current.todos)
         if not open_todos:
             self.current.todos_all_done = True
@@ -3477,6 +3596,7 @@ class OutputView:
         except Exception:
             pass
         turn_done = bool(self.current.has_meta)
+        is_working = bool(self.current.working and not turn_done)
         # Open goal chrome: live turns + idle/paused. Never under a finished
         # @done sheet (next prompt() re-attaches GoalState to the new turn).
         show_goal = bool(goal and _goal_is_open(goal) and not turn_done)
@@ -3484,7 +3604,7 @@ class OutputView:
         show = []
         hidden = 0
         expanded = False
-        if self.current.working and open_todos and not turn_done:
+        if open_todos:
             active = [t for t in open_todos if _todo_is_active(t)]
             pending = [t for t in open_todos if not _todo_is_active(t)]
             expanded = bool(self.view.settings().get("claude_tasks_expanded", False)) \
@@ -3497,14 +3617,30 @@ class OutputView:
             show_tasks = bool(show)
             hidden = len(open_todos) - len(show) if show else 0
 
-        if show_goal or show_tasks:
+        def _append_task_lines() -> None:
+            if not show_tasks:
+                return
+            for todo in show:
+                # ▸ active (warm) vs ○ pending (dim) — not the goal glyph.
+                icon = "▸" if _todo_is_active(todo) else "○"
+                content = (todo.content or "").replace("\n", " ").strip()
+                if len(content) > 72:
+                    content = content[:71] + "…"
+                lines.append("  {} {}\n".format(icon, content))
+            if hidden > 0:
+                lines.append(
+                    "  … +{} more  (super+click to expand)\n".format(hidden))
+            elif expanded:
+                lines.append("  (super+click to collapse)\n")
+
+        # Live turn: goal + tasks above spinner.
+        if is_working and (show_goal or show_tasks):
             lines.append("\n")
             if show_goal:
                 try:
                     from .goal_tracker import format_goal_strip_line
                 except ImportError:
                     from goal_tracker import format_goal_strip_line  # type: ignore
-                # Compact when todo steps already fill the work strip
                 gline = format_goal_strip_line(
                     status=goal.status or "",
                     phase=goal.phase or "",
@@ -3520,21 +3656,10 @@ class OutputView:
                     compact=bool(show_tasks),
                 )
                 lines.append(gline + "\n")
-            if show_tasks:
-                for todo in show:
-                    # ▸ active (warm) vs ○ pending (dim) — not the goal glyph.
-                    icon = "▸" if _todo_is_active(todo) else "○"
-                    content = (todo.content or "").replace("\n", " ").strip()
-                    if len(content) > 72:
-                        content = content[:71] + "…"
-                    lines.append("  {} {}\n".format(icon, content))
-                if hidden > 0:
-                    lines.append("  … +{} more  (super+click to expand)\n".format(hidden))
-                elif expanded:
-                    lines.append("  (super+click to collapse)\n")
+            _append_task_lines()
 
-        # Spinner under the work strip (never above ◆ goal / todos).
-        if self.current.working and not turn_done:
+        # Spinner under the live work strip (never above ◆ goal / todos).
+        if is_working:
             spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
             lines.append(f"  {spinner}\n")
             try:
@@ -3589,6 +3714,34 @@ class OutputView:
             if not meta_parts:
                 meta_parts.append("ok")
             lines.append(f"\n  @done({', '.join(meta_parts)})\n")
+
+        # Idle: open backlog sits after @done (or after events if no meta),
+        # immediately above sticky ◎ — so "todo list visible in idle" is true.
+        if not is_working and show_tasks:
+            lines.append("\n")
+            _append_task_lines()
+        elif not is_working and show_goal:
+            # Rare: open goal without todos and without @done (paused idle).
+            lines.append("\n")
+            try:
+                from .goal_tracker import format_goal_strip_line
+            except ImportError:
+                from goal_tracker import format_goal_strip_line  # type: ignore
+            gline = format_goal_strip_line(
+                status=goal.status or "",
+                phase=goal.phase or "",
+                message=goal.message or "",
+                objective=goal.objective or "",
+                pause_message=goal.pause_message or "",
+                blocked_reason=goal.blocked_reason or "",
+                gaps=list(goal.gaps or []),
+                token_budget=goal.token_budget,
+                tokens_used=goal.tokens_used,
+                verify_runs=int(goal.verify_runs or 0),
+                verify_max=int(goal.verify_max or 0),
+                compact=False,
+            )
+            lines.append(gline + "\n")
 
         text = "".join(lines)
 
@@ -4156,12 +4309,13 @@ class OutputView:
                 print(f"[Claude] media PhantomSet: {e}")
                 return
 
+        from .tool_formatters import is_media_tool_name
         media_tools = []
         for conv in list(self.conversations) + (
                 [self.current] if self.current is not None else []):
             for event in conv.events:
                 if (isinstance(event, ToolCall)
-                        and event.name in MEDIA_TOOLS
+                        and is_media_tool_name(event.name)
                         and event.status == DONE):
                     media_tools.append(event)
 
@@ -4187,14 +4341,20 @@ class OutputView:
                 continue
             disp = media_display_path(path)
             # Locate tool line (last match for this name+path wins).
+            # Names may be mcp__sublime__read_image or short read_image.
             candidates = []
-            pat = (r"(?m)^  " + _re.escape(sym) + r" "
-                   + _re.escape(tool.name) + r".*")
+            name_pat = _re.escape(tool.name)
+            # Also match lines that only show the short tool tail (read_image)
+            short = tool.name.split("__")[-1] if "__" in tool.name else tool.name
+            if short != tool.name:
+                name_pat = f"(?:{_re.escape(tool.name)}|{_re.escape(short)})"
+            pat = (r"(?m)^  " + _re.escape(sym) + r" " + name_pat + r".*")
+            base = os.path.basename(path)
             for m in _re.finditer(pat, content):
                 line = m.group(0)
                 if disp and disp in line:
                     candidates.append(m.start())
-                elif path in line:
+                elif path in line or (base and base in line):
                     candidates.append(m.start())
                 elif not candidates:
                     candidates.append(m.start())

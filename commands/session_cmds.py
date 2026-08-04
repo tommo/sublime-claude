@@ -782,6 +782,17 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 backend_models = backends.get(backend).default_models
             except Exception:
                 backend_models = []
+        # Grok: always merge config.toml BYOK + live session models
+        if backend == "grok":
+            try:
+                from .. import grok_backend
+                extra = []
+                if active_session is not None and getattr(
+                        active_session, "available_models", None):
+                    extra.extend(active_session.available_models)
+                backend_models = list(grok_backend.grok_picker_models(extra=extra))
+            except Exception as e:
+                print(f"[Claude] grok session model list: {e}")
         for m in backend_models:
             if isinstance(m, str):
                 model_id, model_name = m, m

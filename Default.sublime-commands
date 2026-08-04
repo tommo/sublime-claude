@@ -181,6 +181,10 @@
         "command": "claude_code_clear"
     },
     {
+        "caption": "Claude: Clear Output (Keep Last Round)",
+        "command": "claude_code_clear_keep_last"
+    },
+    {
         "caption": "Claude: Undo Message",
         "command": "claude_undo_message"
     },

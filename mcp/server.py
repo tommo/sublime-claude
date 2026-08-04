@@ -336,17 +336,32 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "spawn_session",
-                    "description": "Spawn a new Claude subsession. Returns view_id. Use fork_current=true to share your full conversation context with the subsession — it sees everything you've learned so far (files read, decisions made, codebase understanding) without re-discovering it. This is the preferred way to parallelize work. Use profile for specialized configurations (e.g. 1M context model with preloaded docs).",
+                    "description": """Spawn a subsession. Returns view_id + subsession_id.
+
+Workflow for base context then workers:
+  1) spawn_session(prompt=…, name="explorer", backend=X)  # fresh base builder
+  2) after it finishes, spawn workers with fork_from_view_id=<explorer view_id>
+     so each worker inherits the explorer transcript (same backend family).
+
+Fork rules:
+  - fork_current: fork THIS (caller) session
+  - fork_from_view_id: fork any open session (e.g. explorer base) — preferred for derived workers
+  - Do not pass both. checkpoint overrides either.
+  - Cross-backend fork is impossible (session IDs are not portable). backend defaults to the fork source when forking; otherwise settings default.
+  - Prefer list_sessions + send_to_session to reuse idle/sleeping workers over re-spawning.
+
+Host appends a one-line signal_complete reminder. Child parent_view_id is always the caller (orchestrator), even when forking a sibling explorer.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "prompt": {"type": "string", "description": "Initial prompt for the new session"},
+                            "prompt": {"type": "string", "description": "Task for the child (host adds signal_complete reminder)."},
                             "name": {"type": "string", "description": "Optional: name for the session"},
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
-                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
+                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from (overrides fork_current / fork_from_view_id)"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
-                            "backend": {"type": "string", "description": "Optional: backend to use — a built-in (claude, codex, copilot, pi, dsr, grok, grok_cc) or a custom Anthropic-compatible provider from settings.custom_providers (default: claude)"},
-                            "fork_current": {"type": "boolean", "description": "Optional: fork from the current session (preserves conversation history). Default: false"},
+                            "backend": {"type": "string", "description": "Optional: backend (claude, codex, grok, … or custom). When forking, defaults to the source session's backend; otherwise settings default_backend."},
+                            "fork_current": {"type": "boolean", "description": "Fork caller's history into the child (default false). Only same backend family."},
+                            "fork_from_view_id": {"type": "integer", "description": "Fork that open session's history (view_id from list_sessions / prior spawn). Use for explorer→worker. Same backend family only; backend defaults to source."},
                             "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
                         },
                         "required": ["prompt"]
@@ -354,7 +369,7 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "send_to_session",
-                    "description": "Send a message to an existing session by view_id. Use this to continue a spawned session.",
+                    "description": "Send a message to an existing session by view_id. Prefer this over spawn_session when list_sessions shows an idle (✓) or sleeping (⏸) worker with the right context. Sleeping workers are auto-woken — do not treat ⏸ as failure and spawn a new worker.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -366,12 +381,12 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List spawned subsessions with their view_ids and status.",
+                    "description": "List your subsessions (view_id, backend, sleeping ⏸ / working ⏳ / idle ✓, forkable, context_budget/headroom). Prefer send_to_session to a ✓ or ⏸ worker with comfortable headroom over spawn_session. ⏸ auto-wakes on send. tight/critical headroom → fork a lighter base or spawn fresh instead of stuffing one agent. fork_from_view_id when forkable=true.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
                     "name": "read_session_output",
-                    "description": "Read the conversation output from a Claude session. Use to check results from spawned subsessions.",
+                    "description": "Read conversation output from a subsession. Also returns context_budget (tokens used, pct, headroom: comfortable|moderate|tight|critical) so you can decide continue vs fork vs new worker — do not keep pushing into a tight/critical session.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -625,27 +640,42 @@ Returns notification_id for cancellation via unregister_notification().""",
                     }
                 },
                 {
+                    "name": "session_info",
+                    "description": """Identity for THIS Claude/Sublime session (MCP is bound to your sheet).
+
+Returns view_id, parent_view_id (if subsession), subsession_id, sleeping, backend, name,
+and context_budget (tokens / pct / headroom). Do NOT search files or list_sessions to
+find parent — call this. Parent routing for signal_complete is automatic.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
+                },
+                {
                     "name": "signal_complete",
                     "description": """Signal that this subsession has completed.
 
-ONLY for subsessions (spawned via spawn_session). Notifies parent session.
-The session_id is your view_id (shown in spawn result).
+ONLY for sessions spawned via spawn_session. Host looks up parent_view_id from
+this sheet — do NOT search for parent ids. session_id defaults to this MCP
+session (omit it). Host attaches context_budget (tokens used, headroom) to the
+parent notification so the parent can choose continue / fork / new-worker
+strategy — you only need result_summary for the work product.
 
 Example:
-  signal_complete(session_id=12345, result_summary="Task done. See output above.")""",
+  signal_complete(result_summary="Task done. Files: … Findings: …")""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "session_id": {
                                 "type": "integer",
-                                "description": "Your session's view_id (from spawn result)"
+                                "description": "Optional. Defaults to this session's view_id (MCP --view-id). Omit unless overriding."
                             },
                             "result_summary": {
                                 "type": "string",
                                 "description": "Brief summary of what was accomplished"
                             }
                         },
-                        "required": ["session_id"]
+                        "required": []
                     }
                 },
                 {
@@ -891,9 +921,13 @@ Examples:
         try:
             tool_name, args = parse_tool_call(method, params)
 
-            # Inject caller view_id for spawn_session (so subsession knows parent)
+            # Per-session MCP process: CALLER_VIEW_ID is this sheet. Inject so
+            # the agent never has to discover parent/self ids by searching.
             if tool_name == "spawn_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
                 args["_caller_view_id"] = CALLER_VIEW_ID
+            if tool_name in ("signal_complete", "signal_subsession_complete"):
+                if CALLER_VIEW_ID is not None and args.get("session_id") is None:
+                    args["session_id"] = CALLER_VIEW_ID
 
             # Local tools (no Sublime socket)
             if tool_name == "read_image":

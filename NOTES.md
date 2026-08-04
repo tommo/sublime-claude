@@ -198,14 +198,13 @@ Multiple permission requests are queued - only one shown at a time.
 
 **View title status indicators:**
 - `◉` Active + working
-- `◇` Active + idle
+- `◇` Idle (active or inactive — always shown)
 - `•` Inactive + working
-- (no prefix) Inactive + idle
 
 ### UX Details
 - New Session command creates fresh view + immediately opens input prompt
 - Enter key in output view opens input prompt
-- Cmd+K clears output, Cmd+Z undoes clear (custom undo via `_cleared_content`)
+- Cmd+K clears output fully; Cmd+Shift+K keeps last round; Cmd+Z undoes buffer text (custom undo via `_cleared_content`)
 - Cmd+Escape interrupts current query
 - Context commands require active session
 

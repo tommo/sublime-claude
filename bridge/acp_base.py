@@ -169,6 +169,9 @@ class AcpBridge(BaseBridge):
         # Client-side backup timers when host does not inject scheduled prompts.
         # task_id (or toolCallId) → asyncio.Task
         self._client_schedule_tasks: Dict[str, Any] = {}
+        # Grok multiplexes subagent session/update on the parent ACP pipe with
+        # a different sessionId. Count drops so we can log without spam.
+        self._foreign_session_drops: int = 0
         # Serialize writes to agent stdin — concurrent create_task handlers
         # (permission + terminal + fs) would otherwise interleave JSON lines.
         self._acp_write_lock: Optional[asyncio.Lock] = None
@@ -506,6 +509,12 @@ class AcpBridge(BaseBridge):
                 continue
             if method == "session/update":
                 kind = (params.get("update") or {}).get("sessionUpdate")
+                # Drop child/subagent streams before logging noise (Grok fans
+                # subagent tool_call + agent_message onto this same stdio).
+                if self._is_foreign_session(params):
+                    self._note_foreign_session_drop(
+                        kind or "session/update", params)
+                    continue
                 if kind in (
                     "tool_call", "tool_call_update", "current_mode_update",
                     "scheduled_task_created", "scheduled_task_fired",
@@ -515,12 +524,19 @@ class AcpBridge(BaseBridge):
                 self._forward_update(params)
             elif method and "mcp" in method.lower():
                 # Surface MCP lifecycle (servers_updated, init_progress, …)
+                # Still skip foreign-session MCP chatter if tagged.
+                if self._is_foreign_session(params):
+                    self._note_foreign_session_drop(method, params)
+                    continue
                 self.file_log(
                     f"← acp {method}: {json.dumps(params)[:600]}")
             elif method in (
                 "x.ai/session/update", "_x.ai/session/update",
             ):
                 # Grok may nest schedule lifecycle under x.ai/session/update.
+                if self._is_foreign_session(params):
+                    self._note_foreign_session_drop(method, params)
+                    continue
                 self.file_log(
                     f"← acp {method}: {json.dumps(params)[:600]}")
                 upd = params.get("update") or params
@@ -576,7 +592,43 @@ class AcpBridge(BaseBridge):
 
     # ── session/update → Sublime message notifications ─────────────────
 
+    def _is_foreign_session(self, params: Optional[dict]) -> bool:
+        """True when update/request is for a subagent (or other) sessionId.
+
+        Grok Build streams subagent turns on the *parent* ACP pipe, each tagged
+        with the child sessionId. Painting those agent_message_chunk /
+        tool_call rows into the parent view floods the transcript. fs/terminal
+        *requests* still use child sessionIds and must keep being answered —
+        only UI-bound notifications are filtered via this helper.
+        """
+        if not params or not isinstance(params, dict):
+            return False
+        if not self.session_id:
+            return False
+        sid = params.get("sessionId") or params.get("session_id")
+        if not sid:
+            return False
+        return str(sid) != str(self.session_id)
+
+    def _note_foreign_session_drop(self, kind: str, params: dict) -> None:
+        self._foreign_session_drops += 1
+        n = self._foreign_session_drops
+        # Log first few + then every 50th so parallel subagents are visible
+        # without drowning the bridge log.
+        if n <= 5 or n % 50 == 0:
+            sid = params.get("sessionId") or params.get("session_id") or "?"
+            self.file_log(
+                f"drop foreign session update #{n} kind={kind!r} "
+                f"sid={sid} (parent={self.session_id})")
+
     def _forward_update(self, params: dict) -> None:
+        # Defense in depth: reader already drops foreign sessions; keep
+        # filter here if anything calls this path directly.
+        if self._is_foreign_session(params):
+            kind = (params.get("update") or {}).get("sessionUpdate")
+            self._note_foreign_session_drop(kind or "forward", params)
+            return
+
         if self._loading_session:
             upd = params.get("update", {})
             kind = upd.get("sessionUpdate")

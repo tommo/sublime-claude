@@ -562,12 +562,12 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
     def _reconnect_orphaned_view(self, window, quiet: bool = False):
         self._restore_session(window, paint=not quiet)
 
-    # Buffer-mutating commands that must stay inside the ◎ input region.
-    # Everything else (Cmd+D find_under_expand, multi-cursor, find, nav) is
-    # allowed over history — the view is read-mostly; we only block edits.
+    # Buffer-mutating commands that must stay wholly inside the ◎ draft.
+    # Nav/select/find are never blocked. History mutations are no-ops.
     _INPUT_EDIT_COMMANDS = frozenset({
         "insert", "insert_snippet", "insert_best_completion",
         "left_delete", "right_delete", "delete_word", "delete_to_mark",
+        "delete_to_bol", "delete_to_eol", "delete_line", "delete_by_type",
         "cut", "paste", "paste_and_indent", "paste_from_history",
         "swap_line_up", "swap_line_down", "join_lines", "duplicate_line",
         "permute_lines", "permute_selection", "sort_lines", "wrap_lines",
@@ -575,100 +575,111 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         "commit_completion", "auto_complete", "replace_completion_with_next_completion",
         "yank", "run_macro_file", "run_macro",
         "upper_case", "lower_case", "title_case", "swap_case",
+        "transpose",
     })
+    _INPUT_UNDO_COMMANDS = frozenset({"undo", "soft_undo", "redo", "soft_redo"})
 
-    def _park_caret_in_draft(self, session) -> int:
-        """Move caret to end of ◎ draft. No scroll. Returns draft-end point."""
-        view = self.view
-        view.set_read_only(False)
-        end = view.size()
-        view.sel().clear()
-        view.sel().add(sublime.Region(end, end))
-        return end
+    def _sel_regions(self):
+        return [(r.begin(), r.end()) for r in self.view.sel()]
 
-    def _focus_draft_bottom(self, session) -> None:
-        """Park caret in draft and scroll so ◎ + bottom hline are in view.
+    def _geometry(self, session) -> str:
+        """draft | history | crossing | none — from live selection + boundary."""
+        from .composer_geometry import classify_regions
+        if not session.output.is_input_mode():
+            return "none"
+        start = session.output._input_start
+        if start is None:
+            return "none"
+        return classify_regions(self._sel_regions(), start, self.view.size())
 
-        Used when typing/pasting was redirected from history — ST's default
-        show(caret) only frames the caret row and leaves the hline off-screen.
-        Question free-text reuses _input_mode: park only, no sticky pad.
-        """
-        try:
-            session.output.focus_composer(force_show=True)
-        except Exception:
-            self._park_caret_in_draft(session)
-
-    def _sel_outside_draft(self, session) -> bool:
-        """True if any selection touches conversation history (before ◎)."""
+    def _wholly_in_draft(self, session) -> bool:
+        from .composer_geometry import wholly_in_draft
         if not session.output.is_input_mode():
             return False
-        input_start = session.output._input_start
-        for region in self.view.sel():
-            if region.begin() < input_start or region.end() < input_start:
-                return True
-        return False
+        start = session.output._input_start
+        if start is None:
+            return False
+        return wholly_in_draft(self._sel_regions(), start, self.view.size())
 
     def on_text_command(self, command_name, args):
-        """Intercept text commands to restrict edits in input mode."""
+        """Gate mutations by caret geometry, not input_mode alone.
+
+        input_mode = composer chrome exists. Composing = selection wholly in draft.
+        History: allow copy/nav; no-op mutations without yanking caret.
+        """
         s = get_session_for_view(self.view)
         if not s:
             return None
 
-        # Paste always routes through claude_paste_image — even when not yet
-        # in input mode (otherwise ST paste hits a read-only history region
-        # and image clipboards are dropped).
-        if command_name in ("paste", "paste_and_indent"):
-            if s.output.is_input_mode() and self._sel_outside_draft(s):
-                # Redirect paste into draft and reveal ◎ + bottom pad
-                self._focus_draft_bottom(s)
-            return ("claude_paste_image", {})
-
         if not s.output.is_input_mode():
+            # Composer not up — paste may still need image path handler when
+            # user is about to open composer; only when wholly ready later.
+            if command_name in ("paste", "paste_and_indent"):
+                return ("claude_paste_image", {})
             return None
 
-        # Click on/below ◎ (pad hairline or near EOF) → focus composer.
+        geom = self._geometry(s)
+        in_draft = geom == "draft"
+
+        # Clicks: only special-case pad below EOF / ◎ marker — never yank
+        # history clicks or mid-draft clicks to EOF.
         if command_name == "drag_select":
             args = args or {}
             sublime.set_timeout(
-                lambda a=dict(args), sess=s: self._focus_composer_if_click_below(sess, a),
+                lambda a=dict(args), sess=s: self._handle_composer_click(sess, a),
                 0,
             )
             return None
 
-        # Plugin / navigation / selection / find — never block (Cmd+D etc.)
+        # Cmd/Ctrl+A — region depends on geometry
+        if command_name == "select_all":
+            if in_draft:
+                return ("claude_select_draft", {})
+            # history or crossing → history only (exclude draft)
+            return ("claude_select_history", {})
+
+        # Undo: draft → soft; history → no-op (never rewind transcript)
+        if command_name in self._INPUT_UNDO_COMMANDS:
+            if not in_draft:
+                return ("noop", {})
+            if command_name in ("redo", "soft_redo"):
+                return ("soft_redo", {})
+            return ("soft_undo", {})
+
         if command_name.startswith("claude_"):
             return None
+
+        # Paste: only into draft; history is no-op (no caret move)
+        if command_name in ("paste", "paste_and_indent"):
+            if in_draft:
+                return ("claude_paste_image", {})
+            return ("noop", {})
+
         if command_name not in self._INPUT_EDIT_COMMANDS:
             return None
 
-        # Edit outside ◎ draft → rewrite into draft (never leave text in history)
-        if not self._sel_outside_draft(s):
-            return None
-
-        _delete_cmds = (
-            "left_delete", "right_delete", "delete_word", "delete_to_mark",
-            "cut",
-        )
-        # Moving sel alone is not enough — ST still applies insert at the old
-        # region. Re-dispatch after parking caret; scroll to true bottom so the
-        # hline pad is visible (show(caret) alone only frames the caret row).
-        if command_name == "insert":
-            self._focus_draft_bottom(s)
-            chars = (args or {}).get("characters", "")
-            return ("insert", {"characters": chars})
-        if command_name == "insert_snippet":
-            self._focus_draft_bottom(s)
-            return ("insert_snippet", args or {})
-        if command_name in _delete_cmds:
-            # Block delete in history; park caret only — no viewport thrash
-            self._park_caret_in_draft(s)
+        # Mutations only when wholly in draft; else no-op, keep selection
+        if not in_draft:
             return ("noop", {})
 
-        self._park_caret_in_draft(s)
-        return ("noop", {})
+        # Clamp: backspace/delete-left at draft start must not eat history/◎
+        if command_name in ("left_delete", "delete_word", "delete_to_bol"):
+            start = s.output._input_start
+            if start is not None:
+                for r in self.view.sel():
+                    if r.empty() and r.begin() <= start:
+                        return ("noop", {})
+                    if not r.empty() and r.begin() < start:
+                        return ("noop", {})
 
-    def _focus_composer_if_click_below(self, session, args: dict) -> None:
-        """If mouse click is on/below the ◎ line, put caret in the draft."""
+        return None
+
+    def _handle_composer_click(self, session, args: dict) -> None:
+        """Explicit ◎-marker / pad-below-EOF only; history clicks stay put.
+
+        Never call focus_composer (which yanks to EOF) for ordinary draft
+        clicks — ST already placed the caret.
+        """
         try:
             if not session or not session.output or not session.output.is_input_mode():
                 return
@@ -676,132 +687,129 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             if not view or not view.is_valid():
                 return
             input_start = session.output._input_start
+            if input_start is None:
+                return
             event = (args or {}).get("event") or {}
-            click_y = None
-            if "y" in event:
-                try:
-                    layout = view.window_to_layout((event.get("x", 0), event["y"]))
-                    click_y = float(layout[1])
-                except Exception:
-                    click_y = None
-            if click_y is not None:
-                try:
-                    _lx, input_y = view.text_to_layout(input_start)
-                    if click_y + 1.0 >= float(input_y):
-                        session.output.focus_composer(
-                            force_show=True, steal_focus=True)
+            if "y" not in event:
+                return
+            try:
+                layout = view.window_to_layout((event.get("x", 0), event["y"]))
+                click_y = float(layout[1])
+            except Exception:
+                return
+            try:
+                _lx, input_y = view.text_to_layout(input_start)
+            except Exception:
+                return
+            # Click clearly below view content (padding under EOF) → draft EOF
+            try:
+                _ex, eof_y = view.text_to_layout(view.size())
+                line_h = max(view.line_height(), 1.0)
+                if click_y > float(eof_y) + line_h * 0.5:
+                    session.output.focus_composer(
+                        force_show=True, steal_focus=True, preserve_caret=False)
+                    return
+            except Exception:
+                pass
+            # Click on ◎ marker line (near input_start, left side) → draft start
+            try:
+                if abs(click_y - float(input_y)) < view.line_height():
+                    # Only yank to draft start if click is on the marker column
+                    # (left side of line) — otherwise leave ST caret placement.
+                    row, col = view.rowcol(input_start)
+                    click_pt = view.layout_to_text(layout)
+                    crow, ccol = view.rowcol(click_pt)
+                    if crow == row and ccol <= 2:
+                        view.sel().clear()
+                        view.sel().add(sublime.Region(input_start, input_start))
                         return
-                except Exception:
-                    pass
-            # Fallback: caret landed in draft / EOF after click
-            sel = view.sel()
-            if sel and sel[0].begin() >= input_start:
-                session.output.focus_composer(
-                    force_show=True, steal_focus=True)
+            except Exception:
+                pass
+            # History or mid-draft: do nothing — caret already where user clicked
         except Exception:
             pass
 
     def on_selection_modified(self):
-        """Dynamically toggle read_only based on cursor position to protect conversation history."""
+        """Observe only — never move caret or re-pin composer."""
         s = get_session_for_view(self.view)
-        if not s:
+        if not s or not s.output.is_input_mode():
             return
-
-        # Only manage read_only state when in input mode
-        if not s.output.is_input_mode():
-            return
-
-        # CRITICAL BUG FIX: Sublime Text requires at least one region in sel()
-        # for mouse clicks to work. If sel is completely empty, restore a cursor.
+        # ST requires at least one region for mouse interaction
         sel = self.view.sel()
         if len(sel) == 0:
-            cursor_pos = self.view.size() if self.view.size() > 0 else 0
-            self.view.sel().add(sublime.Region(cursor_pos, cursor_pos))
+            # Prefer keeping last known point; fall back to draft end only if
+            # we have no better option — use EOF without scrolling.
+            pt = self.view.size()
+            self.view.sel().add(sublime.Region(pt, pt))
             return
-
-        # Check if ALL cursors/selections are in the input region
-        input_start = s.output._input_start
-        all_in_input_region = True
-
-        for region in sel:
-            # If any part of any selection is before input_start, not safe to edit
-            if region.begin() < input_start:
-                all_in_input_region = False
-                break
-
-        # Keep view editable - we handle protection via on_modified (Terminus approach)
-        # This allows typing anywhere, then we redirect it to input area
+        # Keep buffer editable; history protection is pre-mutation (on_text_command)
         if self.view.is_read_only():
             self.view.set_read_only(False)
 
     def on_query_context(self, key, operator, operand, match_all):
-        """Provide context for key bindings."""
-        if key == "claude_outside_input_area":
-            s = get_session_for_view(self.view)
-            if not s or not s.output.is_input_mode():
-                return False
-
-            input_start = s.output._input_start
-            sel = self.view.sel()
-            for region in sel:
-                if region.begin() < input_start:
-                    return True
-            return False
-
-        if key == "claude_submit_with_modifier":
-            val = bool(sublime.load_settings("ClaudeCode.sublime-settings")
-                       .get("submit_with_modifier", False))
+        """Selection-geometry contexts for key bindings."""
+        def _bool_match(val: bool):
             if operator == sublime.OP_EQUAL:
                 return val == bool(operand)
             if operator == sublime.OP_NOT_EQUAL:
                 return val != bool(operand)
             return None
 
+        if key in (
+            "claude_caret_in_draft",
+            "claude_selection_in_history",
+            "claude_selection_crosses_draft",
+            "claude_outside_input_area",
+        ):
+            s = get_session_for_view(self.view)
+            if not s or not s.output.is_input_mode():
+                return _bool_match(False)
+            geom = self._geometry(s)
+            if key == "claude_caret_in_draft":
+                return _bool_match(geom == "draft")
+            if key == "claude_selection_in_history":
+                return _bool_match(geom == "history")
+            if key == "claude_selection_crosses_draft":
+                return _bool_match(geom == "crossing")
+            if key == "claude_outside_input_area":
+                # legacy name: anything not wholly in draft
+                return _bool_match(geom != "draft")
+
+        if key == "claude_submit_with_modifier":
+            val = bool(sublime.load_settings("ClaudeCode.sublime-settings")
+                       .get("submit_with_modifier", False))
+            return _bool_match(val)
+
         return None
 
     _in_soft_undo = False
 
     def on_modified(self):
-        """Track modifications and redirect typing from history to input area."""
+        """Draft draft capture + safety undo if history was mutated."""
         if self._in_soft_undo:
             return
 
         s = get_session_for_view(self.view)
-        if not s:
+        if not s or not s.output.is_input_mode():
             return
 
-        # Check what command just ran (Terminus trick)
         command, args, _ = self.view.command_history(0)
 
-        # Don't redirect during input mode setup
-        if not s.output.is_input_mode():
-            return
-
-        # Safety net: if an insert still landed in history (on_text_command miss),
-        # pull it into the draft and scroll to true bottom (◎ + hline).
+        # Safety net only: undo illegal history mutation; do NOT re-insert into draft
         if command == "insert" and args and "characters" in args and len(self.view.sel()) == 1:
             chars = args["characters"]
             input_start = s.output._input_start
             current_cursor = self.view.sel()[0].end()
             insert_pos = max(current_cursor - len(chars), 0)
-
             if insert_pos < input_start:
                 self._in_soft_undo = True
                 try:
                     self.view.run_command("soft_undo")
                 finally:
                     self._in_soft_undo = False
-                self._focus_draft_bottom(s)
-                # Avoid re-entering on_modified recursion on the re-insert
-                self._in_soft_undo = True
-                try:
-                    self.view.run_command("insert", {"characters": chars})
-                finally:
-                    self._in_soft_undo = False
-                s.draft_prompt = s.output.get_input_text()
+                # Leave caret where user had it after undo — no park/redirect
                 return
 
-        # Soft-undo other edits that landed in history
         elif command and not command.startswith("claude"):
             if command in self._INPUT_EDIT_COMMANDS:
                 input_start = s.output._input_start
@@ -811,20 +819,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                         self.view.run_command("soft_undo")
                     finally:
                         self._in_soft_undo = False
-                    # Undo-only path: park without scroll thrash (deletes etc.)
-                    self._park_caret_in_draft(s)
-                    s.draft_prompt = s.output.get_input_text()
                     return
 
-        # Don't capture an AskUserQuestion free-text answer as the prompt draft
-        # (question input reuses _input_mode) — it would reappear next prompt.
+        # Don't capture AskUser free-text as prompt draft
         if getattr(s.output, "_question_input_mode", False):
             return
 
-        # Save draft. Whitespace-only (legacy spare ``\\n``) → empty so we never
-        # rehydrate blank rows under ◎.
-        input_text = s.output.get_input_text()
-        s.draft_prompt = "" if not input_text.strip() else input_text
+        # Save draft only when composing
+        if self._wholly_in_draft(s):
+            input_text = s.output.get_input_text()
+            s.draft_prompt = "" if not input_text.strip() else input_text
 
         # Re-pin bottom split under the last draft line (Enter must move it one
         # row — size()-1 stayed on the previous line after a trailing \\n).

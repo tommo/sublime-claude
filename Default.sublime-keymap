@@ -17,11 +17,82 @@
         "command": "claude_code_interrupt"
     },
     {
-        // Clear composer if non-empty; only interrupt when empty
+        // Ctrl+C with selection → ST default copy (do not clear/interrupt)
+        // Ctrl+C empty selection → clear non-empty draft or interrupt
         "keys": ["ctrl+c"],
         "command": "claude_code_interrupt",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "selection_empty", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        // Cmd/Ctrl+A in draft → draft only
+        "keys": ["super+a"],
+        "command": "claude_select_draft",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+a"],
+        "command": "claude_select_draft",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        // Cmd/Ctrl+A while browsing → history only (exclude ◎ draft)
+        "keys": ["super+a"],
+        "command": "claude_select_history",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        "keys": ["ctrl+a"],
+        "command": "claude_select_history",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        // Soft undo only while composing (draft geometry)
+        "keys": ["super+z"],
+        "command": "soft_undo",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+z"],
+        "command": "soft_undo",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["ctrl+shift+z"],
+        "command": "soft_redo",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["super+y"],
+        "command": "soft_redo",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true }
         ]
     },
     {
@@ -222,26 +293,40 @@
         ]
     },
     {
+        // Super+K clear chat when browsing history (sticky ◎ may still exist).
+        // In draft: leave Super+K to ST chords / line ops.
         "keys": ["super+k"],
         "command": "claude_code_clear",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
         ]
     },
     {
+        // Super+Shift+K: clear older rounds, keep last turn visible.
+        "keys": ["super+shift+k"],
+        "command": "claude_code_clear_keep_last",
+        "context": [
+            { "key": "setting.claude_output", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
+        ]
+    },
+    {
+        // Conversation undo when not composing (caret in history)
         "keys": ["super+shift+z"],
         "command": "claude_undo_message",
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": false }
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
         ]
     },
     {
+        // Empty draft: conversation undo still available
         "keys": ["super+shift+z"],
         "command": "claude_undo_message",
         "context": [
             { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "setting.claude_input_mode", "operator": "equal", "operand": true },
+            { "key": "claude_caret_in_draft", "operator": "equal", "operand": true },
             { "key": "following_text", "operator": "regex_match", "operand": "^$" },
             { "key": "preceding_text", "operator": "regex_match", "operand": "^◎\\s*$" }
         ]

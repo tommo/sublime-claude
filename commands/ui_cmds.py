@@ -29,6 +29,17 @@ class ClaudeCodeClearCommand(sublime_plugin.WindowCommand):
                 s.output.set_pending_context(s.context.items)
 
 
+class ClaudeCodeClearKeepLastCommand(sublime_plugin.WindowCommand):
+    """Clear log history but keep the last conversation round."""
+    def run(self) -> None:
+        s = get_active_session(self.window)
+        if s:
+            s.output.clear_keep_last()
+            s._update_status_bar()
+            if s.context.items:
+                s.output.set_pending_context(s.context.items)
+
+
 class ClaudeCodeCopyCommand(sublime_plugin.WindowCommand):
     """Copy entire conversation to clipboard."""
     def run(self) -> None:

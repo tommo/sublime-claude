@@ -48,6 +48,7 @@ from .context_cmds import (  # noqa: F401
 )
 from .ui_cmds import (  # noqa: F401
     ClaudeCodeClearCommand,
+    ClaudeCodeClearKeepLastCommand,
     ClaudeCodeCopyCommand,
     ClaudeCodeSaveCheckpointCommand,
     ClaudeCodeUsageCommand,
@@ -85,6 +86,9 @@ from .text_cmds import (  # noqa: F401
     ClaudeReplaceCommand,
     ClaudeReplaceContentCommand,
     ClaudeInsertNewlineCommand,
+    NoopCommand,
+    ClaudeSelectDraftCommand,
+    ClaudeSelectHistoryCommand,
     ClaudePermissionAllowCommand,
     ClaudePermissionDenyCommand,
     ClaudeUndoMessageCommand,
