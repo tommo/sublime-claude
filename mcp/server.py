@@ -657,9 +657,10 @@ find parent — call this. Parent routing for signal_complete is automatic.""",
 
 ONLY for sessions spawned via spawn_session. Host looks up parent_view_id from
 this sheet — do NOT search for parent ids. session_id defaults to this MCP
-session (omit it). Host attaches context_budget (tokens used, headroom) to the
-parent notification so the parent can choose continue / fork / new-worker
-strategy — you only need result_summary for the work product.
+session (omit it). Host attaches context_budget and notifies the parent only
+after *this* turn is fully idle (so parallel toolcalls with your final message
+do not wake the parent early). Prefer: finish your final summary text, then
+call signal_complete alone — not in the same parallel batch as other tools.
 
 Example:
   signal_complete(result_summary="Task done. Files: … Findings: …")""",
@@ -672,7 +673,7 @@ Example:
                             },
                             "result_summary": {
                                 "type": "string",
-                                "description": "Brief summary of what was accomplished"
+                                "description": "Brief summary of what was accomplished (full work product for parent)"
                             }
                         },
                         "required": []

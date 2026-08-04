@@ -1395,9 +1395,10 @@ class MCPSocketServer:
             return body
         return (
             body
-            + "\n\nWhen done, call MCP signal_complete(result_summary=…) "
-            "(not prose alone; parent routes automatically and receives "
-            "your context_budget for strategy)."
+            + "\n\nWhen fully done, call MCP signal_complete(result_summary=…) "
+            "as its own step after your final message — not in parallel with "
+            "other tools. Parent is notified only after this turn idles; "
+            "host attaches context_budget for strategy."
         )
 
     def _send_to_session(self, view_id: int, prompt: str) -> dict:
@@ -2486,16 +2487,13 @@ class MCPSocketServer:
     def _signal_subsession_complete(self, session_id: int = None, result_summary: str = None) -> dict:
         """Signal that this subsession has completed.
 
-        Directly injects result_summary into parent session's prompt queue,
-        plus host-attached context budget so the parent can choose
-        continue / fork / new-worker strategy.
+        Injects result_summary into the parent prompt queue with context budget.
 
-        Args:
-            session_id: Subsession view_id. Defaults to MCP caller (_caller_view_id).
-            result_summary: Optional summary of what was accomplished
-
-        Returns:
-            {status: "signaled", subsession_id: str, parent_view_id: …, context_budget: …}
+        Agents often call signal_complete in parallel with their final prose.
+        Notifying the parent mid-turn confuses orchestration (incomplete view,
+        stale budget). Host always waits until the *child* turn is idle, then
+        until the *parent* is free, before injecting. Multiple calls coalesce
+        to the latest result_summary.
         """
         # MCP process is bound to the child sheet — prefer that over agent-passed ids.
         if session_id is None:
@@ -2528,52 +2526,150 @@ class MCPSocketServer:
             available = list(sublime._claude_sessions.keys())
             return {"error": f"Parent session not found: {parent_view_id}", "available": available}
 
-        # Check if parent session is ready to receive
-        if not parent_session.client:
-            return {"error": f"Parent session {parent_view_id} has no client connection"}
-        if not parent_session.initialized:
+        # Parent may be sleeping — still queue; inject path will need client later
+        if not getattr(parent_session, "initialized", False) and not getattr(
+            parent_session, "is_sleeping", False
+        ):
+            if not parent_session.client:
+                return {"error": f"Parent session {parent_view_id} has no client connection"}
             return {"error": f"Parent session {parent_view_id} not initialized"}
 
-        budget = self._session_context_budget(session)
-        budget_line = budget.get("summary") or "ctx:unknown"
         view_id = None
         try:
-            view_id = session.output.view.id() if session.output and session.output.view else session_id
+            view_id = (
+                session.output.view.id()
+                if session.output and session.output.view
+                else session_id
+            )
         except Exception:
             view_id = session_id
 
-        # Build wake prompt — always include context budget for parent strategy
-        wake_prompt = (
-            f"✅ Subsession {subsession_id or view_id} completed "
-            f"(view_id={view_id})\n"
-            f"context_budget: {budget_line}"
+        # Snapshot for immediate tool response (budget refreshed at deliver)
+        budget = self._session_context_budget(session)
+        budget_line = budget.get("summary") or "ctx:unknown"
+        child_busy = bool(getattr(session, "working", False))
+
+        # Coalesce: later signal_complete in the same turn wins
+        pending = {
+            "result_summary": result_summary,
+            "subsession_id": subsession_id,
+            "parent_view_id": parent_view_id,
+            "view_id": view_id,
+            "gen": int(getattr(session, "_signal_complete_gen", 0) or 0) + 1,
+            "started": time.time(),
+        }
+        session._signal_complete_gen = pending["gen"]
+        session._pending_signal_complete = pending
+
+        print(
+            f"[Claude] signal_complete: schedule parent={parent_view_id} "
+            f"child_busy={child_busy} gen={pending['gen']} "
+            f"summary={(result_summary or '')[:60]!r}"
         )
-        if budget.get("headroom"):
-            wake_prompt += (
-                f"\nstrategy_hint: headroom={budget['headroom']}"
-                " — tight/critical → prefer fork_from_view_id of a lighter base "
-                "or a fresh worker over piling more into this session; "
-                "comfortable → safe to send_to_session for follow-ups"
+
+        def _build_wake():
+            # Budget after child turn settles (more accurate than mid-tool snapshot)
+            b = self._session_context_budget(session)
+            line = b.get("summary") or "ctx:unknown"
+            vid = pending.get("view_id") or view_id
+            sid = pending.get("subsession_id") or subsession_id
+            summary = pending.get("result_summary")
+            wake = (
+                f"✅ Subsession {sid or vid} completed "
+                f"(view_id={vid})\n"
+                f"context_budget: {line}"
             )
-        if result_summary:
-            wake_prompt += f"\n\n{result_summary}"
+            if b.get("headroom"):
+                wake += (
+                    f"\nstrategy_hint: headroom={b['headroom']}"
+                    " — tight/critical → prefer fork_from_view_id of a lighter base "
+                    "or a fresh worker over piling more into this session; "
+                    "comfortable → safe to send_to_session for follow-ups"
+                )
+            if summary:
+                wake += f"\n\n{summary}"
+            return wake, b, line
 
-        print(f"[Claude] signal_complete: queuing for parent {parent_view_id}: {wake_prompt[:80]}...")
+        # Settle: require child idle for two consecutive polls so we don't fire
+        # in a micro-gap between tool batches of the same turn.
+        idle_ticks = {"n": 0}
+        max_wait_s = 180.0
+        child_poll_ms = 250
+        parent_poll_ms = 500
+        settle_ticks_needed = 2  # ~500ms idle
 
-        # Queue injection with retry if parent is busy
-        def try_inject():
-            if not parent_session.working:
-                print(f"[Claude] signal_complete: injecting now to {parent_view_id}")
-                parent_session.query(wake_prompt, display_prompt=f"📬 Subsession complete")
+        def try_deliver():
+            # Superseded by a newer signal_complete
+            cur = getattr(session, "_pending_signal_complete", None)
+            if not cur or cur.get("gen") != pending["gen"]:
+                return
+
+            elapsed = time.time() - pending["started"]
+            if elapsed > max_wait_s:
+                print(
+                    f"[Claude] signal_complete: force-deliver after {elapsed:.0f}s "
+                    f"(child_working={getattr(session, 'working', None)})"
+                )
             else:
-                # Parent still busy, retry in 500ms
-                print(f"[Claude] signal_complete: parent {parent_view_id} busy, retrying...")
-                sublime.set_timeout(try_inject, 500)
+                # 1) Wait for child turn to finish (parallel final message + tool)
+                if getattr(session, "working", False):
+                    idle_ticks["n"] = 0
+                    sublime.set_timeout(try_deliver, child_poll_ms)
+                    return
+                idle_ticks["n"] += 1
+                if idle_ticks["n"] < settle_ticks_needed:
+                    sublime.set_timeout(try_deliver, child_poll_ms)
+                    return
 
-        sublime.set_timeout(try_inject, 0)
+            # 2) Parent must be ready
+            if getattr(parent_session, "is_sleeping", False):
+                try:
+                    parent_session.wake()
+                except Exception as e:
+                    print(f"[Claude] signal_complete: parent wake failed: {e}")
+                sublime.set_timeout(try_deliver, parent_poll_ms)
+                return
+            if not parent_session.client or not parent_session.initialized:
+                sublime.set_timeout(try_deliver, parent_poll_ms)
+                return
+            if parent_session.working:
+                print(
+                    f"[Claude] signal_complete: parent {parent_view_id} busy, retrying..."
+                )
+                sublime.set_timeout(try_deliver, parent_poll_ms)
+                return
 
+            # 3) Deliver once
+            if getattr(session, "_pending_signal_complete", None) is not cur:
+                return
+            session._pending_signal_complete = None
+            wake_prompt, b, line = _build_wake()
+            print(
+                f"[Claude] signal_complete: injecting parent={parent_view_id} "
+                f"after child idle ({elapsed:.1f}s) budget={line!r}"
+            )
+            try:
+                parent_session.query(
+                    wake_prompt, display_prompt="📬 Subsession complete"
+                )
+            except Exception as e:
+                print(f"[Claude] signal_complete: inject failed: {e}")
+                # Re-queue once on hard failure
+                session._pending_signal_complete = cur
+                sublime.set_timeout(try_deliver, parent_poll_ms)
+
+        sublime.set_timeout(try_deliver, 0)
+
+        status = "queued" if child_busy else "signaled"
         return {
-            "status": "signaled",
+            "status": status,
+            "deferred": child_busy,
+            "message": (
+                "Parent will be notified after this turn finishes "
+                "(signal_complete ran while you were still working)."
+                if child_busy
+                else "Parent notified when free."
+            ),
             "subsession_id": subsession_id,
             "parent_view_id": parent_view_id,
             "view_id": view_id,

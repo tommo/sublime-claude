@@ -327,6 +327,8 @@ def _signal_complete(view: "OutputView", tool: "ToolCall") -> str:
     if summary:
         bits.append(_clip(str(summary), 45))
     if tool.status == "done" and isinstance(tool.result, dict):
+        if tool.result.get("deferred") or tool.result.get("status") == "queued":
+            bits.append("defer→parent")
         cs = tool.result.get("context_summary") or (
             (tool.result.get("context_budget") or {}).get("summary")
         )
