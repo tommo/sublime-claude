@@ -4327,6 +4327,7 @@ class OutputView:
                 pass
             return
 
+        import re
         content = self.view.substr(sublime.Region(0, self.view.size()))
         phantoms = []
         used_pts = set()
@@ -4343,14 +4344,14 @@ class OutputView:
             # Locate tool line (last match for this name+path wins).
             # Names may be mcp__sublime__read_image or short read_image.
             candidates = []
-            name_pat = _re.escape(tool.name)
+            name_pat = re.escape(tool.name)
             # Also match lines that only show the short tool tail (read_image)
             short = tool.name.split("__")[-1] if "__" in tool.name else tool.name
             if short != tool.name:
-                name_pat = f"(?:{_re.escape(tool.name)}|{_re.escape(short)})"
-            pat = (r"(?m)^  " + _re.escape(sym) + r" " + name_pat + r".*")
+                name_pat = f"(?:{re.escape(tool.name)}|{re.escape(short)})"
+            pat = (r"(?m)^  " + re.escape(sym) + r" " + name_pat + r".*")
             base = os.path.basename(path)
-            for m in _re.finditer(pat, content):
+            for m in re.finditer(pat, content):
                 line = m.group(0)
                 if disp and disp in line:
                     candidates.append(m.start())

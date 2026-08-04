@@ -2621,7 +2621,7 @@ class MCPSocketServer:
                     sublime.set_timeout(try_deliver, child_poll_ms)
                     return
 
-            # 2) Parent must be ready
+            # 2) Parent bridge: wake sleepers; wait only while still connecting
             if getattr(parent_session, "is_sleeping", False):
                 try:
                     parent_session.wake()
@@ -2630,31 +2630,46 @@ class MCPSocketServer:
                 sublime.set_timeout(try_deliver, parent_poll_ms)
                 return
             if not parent_session.client or not parent_session.initialized:
-                sublime.set_timeout(try_deliver, parent_poll_ms)
-                return
-            if parent_session.working:
-                print(
-                    f"[Claude] signal_complete: parent {parent_view_id} busy, retrying..."
-                )
+                if elapsed > max_wait_s:
+                    print(
+                        f"[Claude] signal_complete: parent {parent_view_id} "
+                        f"never ready after {elapsed:.0f}s — drop"
+                    )
+                    session._pending_signal_complete = None
+                    return
+                # Log at most once every 10s (avoid spam while waking)
+                last_log = cur.get("_ready_log_at", 0)
+                if time.time() - last_log > 10:
+                    cur["_ready_log_at"] = time.time()
+                    print(
+                        f"[Claude] signal_complete: waiting for parent "
+                        f"{parent_view_id} ready…"
+                    )
                 sublime.set_timeout(try_deliver, parent_poll_ms)
                 return
 
-            # 3) Deliver once
+            # 3) Deliver once — if parent is mid-turn, queue (no busy-spin spam)
             if getattr(session, "_pending_signal_complete", None) is not cur:
                 return
             session._pending_signal_complete = None
             wake_prompt, b, line = _build_wake()
-            print(
-                f"[Claude] signal_complete: injecting parent={parent_view_id} "
-                f"after child idle ({elapsed:.1f}s) budget={line!r}"
-            )
             try:
-                parent_session.query(
-                    wake_prompt, display_prompt="📬 Subsession complete"
-                )
+                if parent_session.working:
+                    print(
+                        f"[Claude] signal_complete: parent {parent_view_id} busy "
+                        f"— queue_prompt ({elapsed:.1f}s) budget={line!r}"
+                    )
+                    parent_session.queue_prompt(wake_prompt)
+                else:
+                    print(
+                        f"[Claude] signal_complete: injecting parent={parent_view_id} "
+                        f"after child idle ({elapsed:.1f}s) budget={line!r}"
+                    )
+                    parent_session.query(
+                        wake_prompt, display_prompt="📬 Subsession complete"
+                    )
             except Exception as e:
                 print(f"[Claude] signal_complete: inject failed: {e}")
-                # Re-queue once on hard failure
                 session._pending_signal_complete = cur
                 sublime.set_timeout(try_deliver, parent_poll_ms)
 
