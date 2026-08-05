@@ -5549,9 +5549,9 @@ class Session:
             interval = 160
             show_tool = False
         else:
-            # waiting: circle (or bar/classic — see constants.SPINNER_WAITING)
+            # waiting: diamond ping-pong (see constants.SPINNER_WAITING)
             frames = SPINNER_WAITING
-            interval = 120
+            interval = 240  # half speed vs prior 120ms
             show_tool = False
             if getattr(self, "turn_phase", None) != "waiting":
                 self.turn_phase = "waiting"
