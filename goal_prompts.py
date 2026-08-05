@@ -265,10 +265,20 @@ IMPLEMENTER CLAIM (untrusted):
 {plan_block}
 
 Rules:
-1. Inspect with tools (read files, run tests/commands) first. Prose alone fails.
+1. Inspect with tools (read files, run tests/commands, open captures) first.
+   Prose alone fails. Host re-checks evidence[] for real files on disk.
 2. Judge ONLY against plan acceptance criteria / verification steps.
-3. Partial / almost / LGTM → not achieved, list gaps.
+3. Partial / almost / LGTM / \"v1 non-blocker residuals\" → not achieved; list gaps.
 4. Adversarial: missing proof = gap, not benefit of the doubt.
+5. **Naming fraud is not achieved**: if the code is a stub/dens/copy of a
+   technique (\"Hi-Z\" mip0-only, \"froxel\" without a grid, \"object velocity\"
+   without a moving-object proof) but ARSENAL/claim says the full name with ✅,
+   mark **not achieved** and gap the honest rename OR real implementation.
+   Do not launder stubs as \"honest v1 / documented later\".
+6. **Visual/render goals**: green unit tests alone are insufficient. Require
+   on-disk captures (png/…) under evidence/ that show the effect; host rejects
+   structure/API/README-only evidence lists.
+7. Message must not list residuals while gaps=[] and achieved=true — host rejects.
 
 REQUIRED — structured verdict (not prose):
 
@@ -276,10 +286,13 @@ REQUIRED — structured verdict (not prose):
    tool_name=\"sublime__goal_verdict\" or \"goal_verdict\"):
 
   goal_verdict(
-    achieved=false,   # or true only if every criterion is proven
-    evidence=["criterion → path/test/command proof", ...],  # if achieved=true
-    gaps=["what is still missing", ...],   # if achieved=false
-    message="one-line summary"
+    achieved=false,   # default; true only if every criterion is proven on disk
+    evidence=[
+      \"AC → evidence/foo_test.log (exit 0)\",
+      \"AC → evidence/capture.png (non-black)\"
+    ],  # paths must exist; narrative \"Structure:…\" lines are rejected
+    gaps=[\"what is still missing or misnamed\", ...],
+    message=\"one-line summary (no residual theater)\"
   )
 
 2) If this agent cannot call MCP (common for Task children), write:
@@ -287,6 +300,8 @@ REQUIRED — structured verdict (not prose):
    (achieved, evidence, gaps, message). Host ingests that file at verify end.
 
 Host applies only structured tool or VERDICT.json. Omit both → not_achieved.
+Host demotes achieved→false when evidence files missing, visual goals lack
+captures, or message admits non-blocker residuals with empty gaps.
 </goal-verifier>
 """
 
@@ -320,6 +335,9 @@ A complete claim was deferred to host verification. This turn:
    MCP, either ensure VERDICT.json exists from the child, or call
    ``goal_verdict`` yourself using **only** its evidence (weak/no proof →
    achieved=false with gaps). Do not invent evidence the reviewer did not run.
+8. Do **not** rubber-stamp green test counts or ARSENAL ✅ when the reviewer
+   (or you) only re-ran tests without inspecting whether the feature name
+   matches the implementation. Naming fraud → not achieved.
 
 OBJECTIVE: {objective}
 CLAIM (untrusted): {claim}

@@ -361,12 +361,17 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
         )
         # Soft-hide Quick Agent: sheet goes away, bridge stays in quick_agent registry
         if view.settings().get("claude_quick_soft_close"):
-            sublime._claude_sessions.pop(view.id(), None)
+            from .session_registry import unregister_view
+            unregister_view(view.id())
             return
         # Clean up session when output view is closed
-        if view.id() in sublime._claude_sessions:
-            sublime._claude_sessions[view.id()].stop()
-            del sublime._claude_sessions[view.id()]
+        if view.id() in getattr(sublime, "_claude_sessions", {}):
+            from .session_registry import unregister_view
+            try:
+                sublime._claude_sessions[view.id()].stop()
+            except Exception:
+                pass
+            unregister_view(view.id())
 
         # Check if closed view was a terminal mode view
         tag = view.settings().get("terminus_view.tag") or ""
@@ -501,6 +506,29 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             if resume_session_at:
                 session._pending_resume_at = resume_session_at
 
+            # Restore stable agent identity (not view_id)
+            from .session_registry import new_agent_id, register_session
+            aid = (
+                view.settings().get("claude_agent_id")
+                or (matched or {}).get("agent_id")
+                or None
+            )
+            if not aid:
+                aid = new_agent_id()
+            session.agent_id = aid
+            session.subsession_id = (
+                view.settings().get("claude_subsession_id")
+                or (matched or {}).get("subsession_id")
+                or None
+            )
+            session.parent_agent_id = (
+                view.settings().get("claude_parent_agent_id")
+                or (matched or {}).get("parent_agent_id")
+                or None
+            )
+            # parent_view_id is cache only — relinked after all sheets restore
+            session.parent_view_id = None
+
             # session_id set immediately so is_sleeping is True (no client yet)
             if resume_id:
                 session.session_id = resume_id
@@ -508,8 +536,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     session._persist_view_identity()
                 except Exception:
                     pass
+            else:
+                try:
+                    session._persist_view_identity()
+                except Exception:
+                    pass
 
-            sublime._claude_sessions[view.id()] = session
+            register_session(session)
 
             # Theme (no focus side effects)
             if view.settings().get("claude_quick"):
@@ -707,7 +740,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 line_h = max(view.line_height(), 1.0)
                 if click_y > float(eof_y) + line_h * 0.5:
                     session.output.focus_composer(
-                        force_show=True, steal_focus=True, preserve_caret=False)
+                        force_show=True, steal_focus=True, park_at_end=True)
                     return
             except Exception:
                 pass
@@ -737,9 +770,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # ST requires at least one region for mouse interaction
         sel = self.view.sel()
         if len(sel) == 0:
-            # Prefer keeping last known point; fall back to draft end only if
-            # we have no better option — use EOF without scrolling.
-            pt = self.view.size()
+            # Prefer draft *start* over EOF — EOF pin was yanking mid-draft
+            # whenever a buffer edit momentarily cleared the selection.
+            try:
+                start = int(getattr(s.output, "_input_start", 0) or 0)
+            except Exception:
+                start = 0
+            pt = min(max(0, start), self.view.size())
             self.view.sel().add(sublime.Region(pt, pt))
             return
         # Keep buffer editable; history protection is pre-mutation (on_text_command)

@@ -369,9 +369,9 @@ The output view shows:
 - **Retry hint** - `⚠ 503 retry 3/10` (muted) appears under the spinner while the provider retries a 429/5xx, and is cleared automatically when content resumes.
 
 View title shows session status:
-- `◉` Active + working
+- `◉` / `•` Responding (streaming text) or running a tool
+- `◐` / `○` Waiting (turn open but not streaming — model gap / between tools)
 - `◇` Idle (focused or not — always shown)
-- `•` Inactive + working
 - `⏸` Sleeping (bridge stopped)
 - `❓` Waiting for permission/question response
 

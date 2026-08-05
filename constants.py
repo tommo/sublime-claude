@@ -37,14 +37,35 @@ FONT_SIZE = 12
 
 # ─── Status Indicators ────────────────────────────────────────────────────────
 # Status prefixes for view titles
-STATUS_ACTIVE_WORKING = "◉"    # Active session, working
+STATUS_ACTIVE_WORKING = "◉"    # Active + responding (streaming)
+STATUS_ACTIVE_WAITING = "◐"    # Active + waiting (model/tool gap, no stream yet)
 STATUS_ACTIVE_IDLE = "◇"       # Active session, idle
-STATUS_INACTIVE_WORKING = "•"  # Inactive session, working
+STATUS_INACTIVE_WORKING = "•"  # Inactive + responding
+STATUS_INACTIVE_WAITING = "○"  # Inactive + waiting
 STATUS_INACTIVE_IDLE = "◇"     # Inactive session, idle (same hollow diamond; never hide)
 STATUS_ERROR_HALT = "⚠"        # Turn/bridge error — session idle but failed
 
-# Spinner frames for loading
-SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Turn activity (session.turn_phase) — distinct animations for busy honesty
+# waiting    = turn open, no stream yet (or between tools / waiting on model)
+# responding = streaming assistant text or thinking
+# tool       = a foreground tool is in flight
+TURN_PHASE_IDLE = "idle"
+TURN_PHASE_WAITING = "waiting"
+TURN_PHASE_RESPONDING = "responding"
+TURN_PHASE_TOOL = "tool"
+
+# Busy animations (glyph only — never "waiting"/"responding" labels).
+# Pick one SPINNER_WAITING string; each char is one frame (ping-pong baked in).
+#
+#   circle pulse  "○◔◑◕●◕◑◔"   (default) soft fill in/out
+#   bar bounce    "▁▂▃▄▅▆▇█▇▆▅▄▃▂"
+#   classic       "|/-\\"
+#   diamond       "◇◈◆◈"
+#   corners       "◰◳◲◱"
+#
+SPINNER_WAITING = "◇◈◆◈"
+SPINNER_RESPONDING = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPINNER_FRAMES = SPINNER_RESPONDING  # default / transcript spinner
 
 # ─── Input Mode ───────────────────────────────────────────────────────────────
 INPUT_MARKER = "◎ "

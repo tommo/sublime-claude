@@ -167,7 +167,7 @@ class OutputView:
         # base name (e.g. a ↻/◇ prefix leaking back in → "◇ ↻ name").
         import re
         name = re.sub(
-            r'^(?:[◉◇•❓⏸↻⚠✘❌!❗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', name or ""
+            r'^(?:[◉◇•○◐◓◑◒❓⏸↻⚠✘❌!❗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+', '', name or ""
         ) or "Claude"
         self._name = name  # Store for refresh_title
         self._update_title()
@@ -181,8 +181,9 @@ class OutputView:
         window = self.view.window()
         is_active = window and window.settings().get("claude_active_view") == self.view.id()
         # Tab icons (active = this view is claude_active_view):
-        #   ◉ active + working   • inactive + working
-        #   ◇ idle (active or not — always visible)
+        #   ◉ / •  responding (streaming) or tool
+        #   ◐ / ○  waiting (busy but not streaming — model/tool gap)
+        #   ◇      idle (active or not — always visible)
         #   ❓ permission/question/plan   ⏸ sleeping   ↻ pending self-wake
         #   ⚠ error-halted (turn/bridge failed; cleared on next query)
         from . import claude_code
@@ -199,6 +200,9 @@ class OutputView:
             (session and session.working)
             or (self.current and self.current.working)
         )
+        turn_phase = (
+            getattr(session, "turn_phase", None) if session else None
+        ) or "waiting"
         is_error_halt = bool(
             session and getattr(session, "error_halted", False) and not is_working
         )
@@ -217,7 +221,12 @@ class OutputView:
             # Don't hide a live turn behind ↻ — busy wins.
             prefix = "↻ "
         elif is_working:
-            prefix = "◉ " if is_active else "• "
+            # waiting = half/empty circle (honest "not streaming yet")
+            # responding / tool = solid mark
+            if turn_phase == "waiting":
+                prefix = "◐ " if is_active else "○ "
+            else:
+                prefix = "◉ " if is_active else "• "
         else:
             # Idle diamond always shown (focused or not) — do not autohide.
             prefix = "◇ "
@@ -684,8 +693,8 @@ class OutputView:
             except Exception:
                 pass
 
-        # Pin ◎ + hline; do not steal focus from other files mid-stream
-        self.focus_composer(force_show=True, steal_focus=False)
+        # Scroll ◎ into view; caret already at draft start — do not yank to EOF
+        self.focus_composer(force_show=True, steal_focus=False, preserve_caret=True)
 
     def exit_input_mode(self, keep_text: bool = False) -> str:
         """Exit input mode and return the input text."""
@@ -899,7 +908,9 @@ class OutputView:
         try:
             if self._input_mode and self.view and self.view.is_valid():
                 self.view.set_read_only(False)
-                self.focus_composer(force_show=True)
+                # User clicked pad under ◎ → park at draft end (intentional)
+                self.focus_composer(
+                    force_show=True, steal_focus=True, park_at_end=True)
         except Exception as e:
             print(f"[Claude] pad click: {e}")
 
@@ -1000,18 +1011,17 @@ class OutputView:
 
     def focus_composer(
             self, force_show: bool = True, *, steal_focus: bool = False,
-            preserve_caret: bool = False) -> None:
-        """Park caret in ◎ and optionally scroll to the true view bottom.
+            preserve_caret: bool = True, park_at_end: bool = False) -> None:
+        """Scroll/pin sticky ◎ chrome without stealing mid-draft caret.
 
-        Does NOT steal window focus unless steal_focus=True (user action: click
-        below, Enter outside draft). Stream/goal/idle re-pins must never call
-        focus_view — that made the agent sheet unusable while working in other
-        files.
+        Does NOT steal window focus unless steal_focus=True (user click pad /
+        Enter outside draft). Stream/goal/idle re-pins must never call
+        focus_view.
 
-        preserve_caret=True: do not yank caret to draft EOF if it already sits
-        inside the ◎ strip (stream re-pins must use this).
+        preserve_caret=True (default): never yank caret to draft EOF when it
+        already sits in the ◎ strip. Stream ticks and idle re-pins use this.
 
-        AskUserQuestion free-text reuses _input_mode — park caret only (no pad).
+        park_at_end=True: explicit user action (click pad below) → draft EOF.
         """
         if not self.view or not self.view.is_valid() or not self._input_mode:
             return
@@ -1022,46 +1032,79 @@ class OutputView:
                     win.focus_view(self.view)
             self.view.set_read_only(False)
             if getattr(self, "_question_input_mode", False):
-                # Free-text "Other..." — keep caret at type-in end, no sticky chrome
+                # Free-text "Other..." — no sticky chrome
                 self._update_composer_pad_phantom()  # clears pad
                 caret = self.view.size()
-                if not preserve_caret:
+                if park_at_end or not preserve_caret:
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(caret, caret))
                 if force_show and self._view_is_focused():
                     try:
-                        self.view.show(caret)
+                        self.view.show(self.view.sel()[0].begin() if self.view.sel() else caret)
                     except Exception:
                         pass
                 return
-            # Wipe legacy blank rows under ◎ before parking caret
+
+            # Snapshot caret *before* collapse (buffer edit can move/clear sel)
+            saved_off = None
+            try:
+                start = int(self._input_start or 0)
+                size0 = self.view.size()
+                sel = self.view.sel()
+                if sel:
+                    b = sel[0].begin()
+                    if start <= b <= size0:
+                        saved_off = b - start
+            except Exception:
+                saved_off = None
+
+            # Wipe legacy blank rows under ◎ (empty draft only)
             self.collapse_empty_composer_tail()
-            # Stream/idle re-pin: keep mid-draft caret (do not force EOF)
-            if preserve_caret:
+            self._update_composer_pad_phantom()
+
+            start = int(self._input_start or 0)
+            size = self.view.size()
+            end = size
+
+            # Intentional park at draft end (pad click)
+            if park_at_end or not preserve_caret:
+                self.view.sel().clear()
+                self.view.sel().add(sublime.Region(end, end))
+            else:
+                # Keep mid-draft caret; restore snapshot if ST wiped selection
+                restored = False
                 try:
                     sel = self.view.sel()
                     if sel:
                         b = sel[0].begin()
-                        if self._input_start <= b <= self.view.size():
-                            self._update_composer_pad_phantom()
-                            if force_show and self._view_is_focused():
-                                self._scroll_layout_to_bottom(force=False)
-                            return
+                        if start <= b <= size:
+                            restored = True
                 except Exception:
                     pass
-            caret = self.view.size()
-            self.view.sel().clear()
-            self.view.sel().add(sublime.Region(caret, caret))
-            # Pin pad/hline first so we can scroll past it
-            self._update_composer_pad_phantom()
+                if not restored and saved_off is not None:
+                    pos = min(start + max(0, saved_off), size)
+                    self.view.sel().clear()
+                    self.view.sel().add(sublime.Region(pos, pos))
+                elif not restored:
+                    # No prior caret in draft — leave alone if ST has a selection;
+                    # only default to draft start (not EOF) so we never pin tail.
+                    try:
+                        if not self.view.sel() or not (
+                            start <= self.view.sel()[0].begin() <= size
+                        ):
+                            self.view.sel().clear()
+                            self.view.sel().add(sublime.Region(start, start))
+                    except Exception:
+                        pass
+
             if force_show:
-                # Only scroll this sheet's viewport — never when user is elsewhere
-                # (set_viewport on background views is fine; show() only if focused).
+                # Only scroll viewport — never yank caret
                 self._scroll_layout_to_bottom(force=True)
                 if self._view_is_focused():
                     for ms in (16, 80):
                         sublime.set_timeout(
-                            lambda: self._scroll_layout_to_bottom(force=True), ms)
+                            lambda: self._scroll_layout_to_bottom(force=True)
+                            if self._view_is_focused() else None, ms)
         except Exception:
             pass
 
@@ -2122,7 +2165,9 @@ class OutputView:
                     self.view.set_read_only(False)
                     self.view.run_command("append", {"characters": draft})
                     self._update_composer_pad_phantom()
-                    self.focus_composer(force_show=True)
+                    # Full draft just re-appended — caret at end is correct once
+                    self.focus_composer(
+                        force_show=True, preserve_caret=True, park_at_end=True)
                 except Exception:
                     pass
 
@@ -3363,10 +3408,15 @@ class OutputView:
         self._auto_scroll = auto_scroll  # Store for _do_render
         sublime.set_timeout(self._do_render, 10)
 
-    def advance_spinner(self) -> None:
-        """Advance spinner animation frame and re-render if working."""
+    def advance_spinner(self, frames: str = None) -> None:
+        """Advance spinner animation frame and re-render if working.
+
+        frames: optional character set (waiting pulse vs responding braille).
+        """
         if not self.current or not self.current.working or not self.view:
             return
+        if frames:
+            self._spinner_frames = frames
         self._spinner_frame += 1
         # User reading mid-history: do not full-rewrite the buffer every tick
         # just to flip ⠋→⠙ at the tail (main source of "fullscreen flash").
@@ -3436,7 +3486,8 @@ class OutputView:
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(pos, pos))
         self.view.set_read_only(False)
-        self.focus_composer(force_show=True)
+        # Keep restored mid-draft caret — never re-yank to EOF after replant
+        self.focus_composer(force_show=True, preserve_caret=True)
 
     def _do_render(self) -> None:
         """Actually perform the render.
@@ -3658,9 +3709,16 @@ class OutputView:
                 lines.append(gline + "\n")
             _append_task_lines()
 
-        # Spinner under the live work strip (never above ◆ goal / todos).
+        # Spinner under the live work strip (glyph only — never phase text).
+        # waiting: circle pulse (constants.SPINNER_WAITING); responding: braille
         if is_working:
-            spinner = SPINNER_FRAMES[self._spinner_frame % len(SPINNER_FRAMES)]
+            frames = getattr(self, "_spinner_frames", None) or SPINNER_FRAMES
+            if not frames:
+                frames = SPINNER_FRAMES
+            if isinstance(frames, (list, tuple)):
+                spinner = frames[self._spinner_frame % len(frames)]
+            else:
+                spinner = frames[self._spinner_frame % len(frames)]
             lines.append(f"  {spinner}\n")
             try:
                 from . import claude_code

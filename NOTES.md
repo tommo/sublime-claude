@@ -197,9 +197,9 @@ Multiple permission requests are queued - only one shown at a time.
 - Closing output view stops its session
 
 **View title status indicators:**
-- `◉` Active + working
+- `◉` / `•` Responding (streaming) or tool
+- `◐` / `○` Waiting (busy, not streaming)
 - `◇` Idle (active or inactive — always shown)
-- `•` Inactive + working
 
 ### UX Details
 - New Session command creates fresh view + immediately opens input prompt

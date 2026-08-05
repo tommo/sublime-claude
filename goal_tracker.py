@@ -694,6 +694,7 @@ class GoalTracker:
             }
         ev = [str(x).strip() for x in (evidence or []) if str(x).strip()][:20]
         gp = [str(x).strip() for x in (gaps or []) if str(x).strip()][:12]
+        host_notes: List[str] = []
         # Structured fail-closed: achieved requires non-empty evidence, no gaps
         if achieved:
             if gp:
@@ -719,39 +720,65 @@ class GoalTracker:
             if pre:
                 achieved = False
                 gp = gp + [f"Host: {p}" for p in pre[:4]]
+            # Evidence must be on-disk artifacts; visual goals need captures.
+            # Blocks marketing-name stubs + green-test theater + residual laundering.
+            if achieved:
+                try:
+                    from .goal_evidence import validate_evidence_for_achieved
+                except ImportError:
+                    from goal_evidence import validate_evidence_for_achieved  # type: ignore
+                cwd = ""
+                try:
+                    if self.plan_path:
+                        # project root ≈ parent of .claude/goals/
+                        pdir = os.path.dirname(os.path.abspath(self.plan_path))
+                        # …/project/.claude/goals/<id> → climb to project
+                        for _ in range(4):
+                            if os.path.basename(pdir) == "goals":
+                                pdir = os.path.dirname(pdir)
+                                if os.path.basename(pdir) == ".claude":
+                                    cwd = os.path.dirname(pdir)
+                                break
+                            pdir = os.path.dirname(pdir)
+                except Exception:
+                    cwd = ""
+                ok_ev, host_gaps, host_notes = validate_evidence_for_achieved(
+                    ev,
+                    message=claim,
+                    objective=self.objective or "",
+                    plan_body=self.plan_body or self.plan_baseline or "",
+                    plan_path=self.plan_path or "",
+                    cwd=cwd,
+                )
+                if not ok_ev:
+                    achieved = False
+                    gp = gp + host_gaps
         else:
             if not gp:
                 gp = ["not achieved (tool)"]
-        # One verify run, one decisive verdict. Do not let a later soft
-        # not_achieved (or empty re-call) overwrite a stronger achieved.
+        # Last structured call wins within a verify run. Host-demoted achieved
+        # must stick; a later honest not_achieved must not be ignored.
         prev = self.pending_tool_verdict
         if prev and prev.get("achieved") and not achieved:
+            # Prefer fail-closed later verdict (host gaps / skeptic correction)
             self._push(
-                "tool_verdict_ignored",
-                f"keep achieved; ignore later not_achieved gaps={len(gp)}",
+                "tool_verdict_override",
+                f"prior achieved → not_achieved gaps={len(gp)}",
             )
-            return {
-                "ok": True,
-                "recorded": False,
-                "deduped": True,
-                "achieved": True,
-                "evidence_count": len(prev.get("evidence") or []),
-                "gaps": list(prev.get("gaps") or []),
-                "message": (
-                    "Prior achieved verdict already recorded this verify run; "
-                    "later not_achieved ignored."
-                ),
-            }
-        if prev and prev.get("achieved") and achieved:
-            # Keep the richer evidence set
-            if len(ev) < len(prev.get("evidence") or []):
-                self._push("tool_verdict_ignored", "keep earlier achieved with more evidence")
+        elif prev and prev.get("achieved") and achieved:
+            # Keep richer grounded evidence if both claim achieved
+            prev_ev = prev.get("evidence") or []
+            if len(ev) < len(prev_ev) and not gp:
+                self._push(
+                    "tool_verdict_ignored",
+                    "keep earlier achieved with more evidence",
+                )
                 return {
                     "ok": True,
                     "recorded": False,
                     "deduped": True,
                     "achieved": True,
-                    "evidence_count": len(prev.get("evidence") or []),
+                    "evidence_count": len(prev_ev),
                     "gaps": [],
                     "message": "Earlier achieved verdict with more evidence kept.",
                 }
@@ -761,6 +788,7 @@ class GoalTracker:
             "gaps": gp,
             "message": (message or "").strip()[:500],
             "source": "tool",
+            "host_notes": host_notes,
         }
         self._push(
             "tool_verdict",
@@ -772,7 +800,12 @@ class GoalTracker:
             "achieved": bool(achieved),
             "evidence_count": len(ev),
             "gaps": gp,
-            "message": "Verdict recorded; host applies at end of verify turn.",
+            "host_notes": host_notes,
+            "message": (
+                "Verdict recorded; host applies at end of verify turn."
+                if achieved
+                else "Verdict recorded as not_achieved (host gates may have demoted)."
+            ),
         }
 
     def take_tool_verdict(self) -> Optional[Dict[str, Any]]:

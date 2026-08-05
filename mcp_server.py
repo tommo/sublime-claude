@@ -384,6 +384,7 @@ class MCPSocketServer:
             # Notification tools (notalone2)
             "register_notification": self._register_notification,
             "subscribe_to_service": self._subscribe_to_service,
+            "wait_for_subsession": self._wait_for_subsession,
             "signal_subsession_complete": self._signal_subsession_complete,
             "list_notifications": self._list_notifications,
             "discover_services": self._discover_services,
@@ -1194,31 +1195,36 @@ class MCPSocketServer:
         wait_for_completion: bool = False,
         backend: str = None,
         fork_from_view_id: int = None,
+        fork_from_agent_id: str = None,
         _caller_view_id: int = None,
     ) -> dict:
-        """Spawn a new session with the given prompt. Returns with _wait_for_init flag.
+        """Spawn a new session. Public id is agent_id; view_id is runtime only.
 
         Fork sources (pick one; checkpoint wins if set):
           - fork_current: fork the caller's transcript
-          - fork_from_view_id: fork any open session's transcript (explorer → workers)
-        Fork requires same backend family as the source (session IDs are not portable
-        across bridges). parent_view_id is always the caller (orchestrator), even when
-        forking a sibling/child explorer.
-
-        Args:
-            _caller_view_id: view_id of the calling session → parent for signal_complete.
+          - fork_from_agent_id: fork any open session (preferred; stable)
+          - fork_from_view_id: legacy runtime view handle
+        parent_agent_id is always the caller (orchestrator).
         """
         from .core import create_session, get_active_session
-        import uuid
+        from . import session_registry
 
         window = self._get_window()
         if not window:
             return {"error": "No window"}
 
-        if fork_current and fork_from_view_id is not None:
+        fork_srcs = sum(
+            1 for x in (
+                fork_current,
+                fork_from_view_id is not None,
+                bool(fork_from_agent_id),
+            )
+            if x
+        )
+        if fork_srcs > 1:
             return {
-                "error": "Pass only one of fork_current or fork_from_view_id "
-                         "(not both)"
+                "error": "Pass only one of fork_current, fork_from_agent_id, "
+                         "or fork_from_view_id"
             }
 
         project_path = _get_project_profiles_path()
@@ -1291,13 +1297,18 @@ class MCPSocketServer:
             fork_source_backend = src_backend
             return None
 
-        # Fork from an arbitrary open session (context explorer → workers)
-        if fork_from_view_id is not None:
+        # Fork from stable agent_id (preferred) or legacy view_id
+        if fork_from_agent_id:
+            source = session_registry.get_session_by_agent_id(str(fork_from_agent_id))
+            err = _resolve_fork_source(source, f"agent_id {fork_from_agent_id}")
+            if err:
+                return err
+        elif fork_from_view_id is not None:
             try:
                 fork_from_view_id = int(fork_from_view_id)
             except (TypeError, ValueError):
                 return {"error": f"Invalid fork_from_view_id: {fork_from_view_id!r}"}
-            source = sublime._claude_sessions.get(fork_from_view_id)
+            source = session_registry.get_session_for_view_id(fork_from_view_id)
             err = _resolve_fork_source(source, f"view_id {fork_from_view_id}")
             if err:
                 return err
@@ -1305,7 +1316,7 @@ class MCPSocketServer:
         # Fork from caller session if requested
         elif fork_current:
             caller_session = (
-                sublime._claude_sessions.get(_caller_view_id)
+                session_registry.get_session_for_view_id(_caller_view_id)
                 if _caller_view_id else None
             )
             if not caller_session:
@@ -1314,7 +1325,7 @@ class MCPSocketServer:
             if err:
                 return err
 
-        # Load checkpoint if specified (overrides fork_current / fork_from_view_id)
+        # Load checkpoint if specified (overrides fork_current / fork_from_*)
         if checkpoint:
             if checkpoint not in checkpoints:
                 return {"error": f"Checkpoint '{checkpoint}' not found"}
@@ -1327,41 +1338,61 @@ class MCPSocketServer:
             settings = sublime.load_settings("ClaudeCode.sublime-settings")
             backend = settings.get("default_backend", "claude") or "claude"
 
-        # Generate unique subsession ID for notalone2 completion tracking
-        subsession_id = f"subsession-{uuid.uuid4().hex[:8]}"
+        # Stable agent_id for this child (also used as subsession_id)
+        agent_id = session_registry.new_agent_id()
+        subsession_id = agent_id
 
-        # Get parent view_id - prefer explicit _caller_view_id, fall back to inference
+        # Parent identity: prefer stable agent_id; view_id is runtime cache only
+        parent_session = None
         if _caller_view_id:
-            parent_view_id = _caller_view_id
+            parent_session = session_registry.get_session_for_view_id(_caller_view_id)
+        if not parent_session:
+            parent_session, _ = self._get_session_for_tool()
+        parent_view_id = None
+        parent_agent_id = None
+        if parent_session:
+            parent_agent_id = getattr(parent_session, "agent_id", None)
+            try:
+                if parent_session.output and parent_session.output.view:
+                    parent_view_id = parent_session.output.view.id()
+            except Exception:
+                parent_view_id = _caller_view_id
         else:
-            # Fall back to inferring from execution context (less reliable with multiple sessions)
-            current_session, _ = self._get_session_for_tool()
-            parent_view_id = current_session.output.view.id() if current_session and current_session.output.view else None
+            parent_view_id = _caller_view_id
 
         # Prepare initial context for subsession
         initial_context = {
+            "agent_id": agent_id,
             "subsession_id": subsession_id,
             "parent_view_id": parent_view_id,
+            "parent_agent_id": parent_agent_id,
         }
 
         # Create new session with initial context
         print(f"[MCP spawn] backend={backend} fork_current={fork_current} "
+              f"fork_from_agent_id={fork_from_agent_id!r} "
               f"fork_from_view_id={fork_from_view_id!r} "
               f"resume_id={resume_id!r} fork={fork} "
               f"profile={profile!r} checkpoint={checkpoint!r} persona_id={persona_id} "
-              f"caller_view={_caller_view_id} subsession_id={subsession_id}")
+              f"caller_view={_caller_view_id} agent_id={agent_id}")
         # Background subsession — do not steal focus from the parent sheet.
         session = create_session(
             window, resume_id=resume_id, fork=fork, profile=profile_config,
             initial_context=initial_context, backend=backend, focus=False,
         )
-        print(f"[MCP spawn] created view_id={session.output.view.id() if session.output and session.output.view else None} "
+        print(f"[MCP spawn] created agent_id={session.agent_id} "
+              f"view_id={session.output.view.id() if session.output and session.output.view else None} "
               f"backend={session.backend} prompt_preview={prompt[:80]!r}")
         if name:
             session.name = name
             session.output.set_name(name)
 
         view_id = session.output.view.id() if session.output.view else None
+        try:
+            session._persist_view_identity()
+            session_registry.register_session(session)
+        except Exception:
+            pass
 
         # One-liner: parent often says "report back" without naming the tool.
         prompt = self._with_subsession_report_contract(prompt or "")
@@ -1374,8 +1405,10 @@ class MCPSocketServer:
             "_wait_for_completion": wait_for_completion,  # Whether to also wait for completion
             "spawned": True,
             "name": name or "(unnamed)",
-            "view_id": view_id,
-            "subsession_id": subsession_id,  # Return subsession_id for parent to track
+            "agent_id": agent_id,
+            "view_id": view_id,  # runtime only — prefer agent_id for send/list
+            "subsession_id": subsession_id,
+            "parent_agent_id": parent_agent_id,
             "parent_view_id": parent_view_id,
             "backend": backend,
             "fork": fork,
@@ -1385,6 +1418,8 @@ class MCPSocketServer:
         if fork_source_view_id is not None:
             out["forked_from_view_id"] = fork_source_view_id
             out["forked_from_backend"] = fork_source_backend
+        if fork_from_agent_id:
+            out["forked_from_agent_id"] = fork_from_agent_id
         return out
 
     @staticmethod
@@ -1401,34 +1436,71 @@ class MCPSocketServer:
             "host attaches context_budget for strategy."
         )
 
-    def _send_to_session(self, view_id: int, prompt: str) -> dict:
-        """Send a message to an existing session.
+    def _send_to_session(
+        self,
+        prompt: str,
+        agent_id: str = None,
+        view_id: int = None,
+    ) -> dict:
+        """Send a message to an existing session by stable agent_id (preferred).
 
-        Sleeping workers (⏸ / is_sleeping) are auto-woken; the MCP socket
-        handler waits for init then fires the prompt (same path as spawn).
+        view_id is legacy/runtime-only — breaks after ST restart. Prefer
+        agent_id from spawn_session / list_sessions. Sleeping workers auto-wake.
         """
-        session = sublime._claude_sessions.get(view_id)
-        if not session:
-            return {"error": f"Session not found for view_id {view_id}"}
+        from . import session_registry
+
+        if not prompt:
+            return {"error": "prompt is required"}
+        if agent_id is None and view_id is None:
+            return {
+                "error": "Pass agent_id (preferred) or view_id",
+                "hint": "view_id is runtime-only and changes after ST restart",
+            }
+
+        session = None
+        if agent_id is not None:
+            session = session_registry.get_session_by_agent_id(str(agent_id))
+            if not session:
+                return {
+                    "error": f"Session not found for agent_id {agent_id!r}",
+                    "hint": "Call list_sessions; do not reuse pre-restart view_ids",
+                }
+        else:
+            session = session_registry.get_session_by_ref(view_id)
+            if not session:
+                return {
+                    "error": f"Session not found for view_id {view_id}",
+                    "hint": "Prefer agent_id; view_id changes after ST restart. "
+                            "Call list_sessions.",
+                }
+
+        rid = session_registry.runtime_view_id(session)
+        aid = getattr(session, "agent_id", None)
+        name = session.name or "(unnamed)"
 
         if session.working:
-            return {"error": "Session is busy", "view_id": view_id}
+            return {
+                "error": "Session is busy",
+                "agent_id": aid,
+                "view_id": rid,
+            }
 
-        name = session.name or "(unnamed)"
         sleeping = False
         try:
             sleeping = bool(session.is_sleeping)
         except Exception:
             pass
 
+        tag = aid or rid
         # ⏸ worker: resume bridge, then wait+query via _wait_for_init
         if sleeping:
             if not getattr(session, "session_id", None):
                 return {
                     "error": "Session sleeping but has no session_id — cannot wake",
-                    "view_id": view_id,
+                    "agent_id": aid,
+                    "view_id": rid,
                 }
-            print(f"[MCP send:{view_id}] sleeping → wake for prompt")
+            print(f"[MCP send:{tag}] sleeping → wake for prompt")
             session.wake()
             return {
                 "_wait_for_init": True,
@@ -1437,14 +1509,15 @@ class MCPSocketServer:
                 "_wait_for_completion": False,
                 "sent": True,
                 "waking": True,
-                "view_id": view_id,
+                "agent_id": aid,
+                "view_id": rid,
                 "name": name,
             }
 
         # Bridge still coming up (wake already in flight, or first start)
         if not session.initialized:
             if session.client or getattr(session, "session_id", None):
-                print(f"[MCP send:{view_id}] not ready → wait for init")
+                print(f"[MCP send:{tag}] not ready → wait for init")
                 return {
                     "_wait_for_init": True,
                     "_session": session,
@@ -1452,15 +1525,21 @@ class MCPSocketServer:
                     "_wait_for_completion": False,
                     "sent": True,
                     "waking": True,
-                    "view_id": view_id,
+                    "agent_id": aid,
+                    "view_id": rid,
                     "name": name,
                 }
-            return {"error": "Session not initialized", "view_id": view_id}
+            return {
+                "error": "Session not initialized",
+                "agent_id": aid,
+                "view_id": rid,
+            }
 
         session.query(prompt)
         return {
             "sent": True,
-            "view_id": view_id,
+            "agent_id": aid,
+            "view_id": rid,
             "name": name,
         }
 
@@ -1475,46 +1554,62 @@ class MCPSocketServer:
         return {"summary": "ctx:unknown", "has_usage": False}
 
     def _list_sessions(self) -> dict:
-        """List subsessions only (spawned via spawn_session)."""
+        """List subsessions of the caller (by stable parent_agent_id)."""
+        from . import session_registry
+
         caller_id = self._caller_view_id
+        caller = (
+            session_registry.get_session_for_view_id(caller_id)
+            if caller_id is not None else None
+        )
+        parent_agent_id = getattr(caller, "agent_id", None) if caller else None
+
+        children = session_registry.list_children_of(
+            parent_view_id=caller_id,
+            parent_agent_id=parent_agent_id,
+        )
         sessions = []
         lines = []
-        for view_id, session in sublime._claude_sessions.items():
-            # Skip the calling session itself
-            if view_id == caller_id:
-                continue
-            # Only show subsessions (spawned sessions have a parent_view_id)
-            if not getattr(session, 'parent_view_id', None):
-                continue
+        for session in children:
+            view_id = session_registry.runtime_view_id(session)
             sleeping = False
             try:
                 sleeping = bool(session.is_sleeping)
             except Exception:
                 pass
+            phase = getattr(session, "turn_phase", None) or (
+                "waiting" if session.working else "idle"
+            )
             if sleeping:
                 status = "⏸"
             elif session.working:
-                status = "⏳"
+                status = {
+                    "waiting": "…",
+                    "responding": "▸",
+                    "tool": "⚙",
+                }.get(phase, "⏳")
             else:
                 status = "✓"
             budget = self._session_context_budget(session)
             name = session.name or "(unnamed)"
-            sid = getattr(session, "subsession_id", None) or ""
+            aid = getattr(session, "agent_id", None) or ""
             budget_s = budget.get("summary") or ""
+            phase_s = f" {phase}" if session.working else ""
             lines.append(
-                f"{status} [{view_id}] {name}"
+                f"{status} {aid} [{view_id}] {name}{phase_s}"
                 + (f" · {budget_s}" if budget_s else "")
-                + (f" sub={sid}" if sid else "")
             )
             sessions.append({
+                "agent_id": aid,
                 "view_id": view_id,
                 "name": name,
                 "working": bool(session.working),
                 "sleeping": sleeping,
-                "subsession_id": getattr(session, "subsession_id", None),
+                "turn_phase": phase,
+                "subsession_id": getattr(session, "subsession_id", None) or aid,
+                "parent_agent_id": getattr(session, "parent_agent_id", None),
                 "parent_view_id": getattr(session, "parent_view_id", None),
                 "backend": getattr(session, "backend", None),
-                # True when fork_from_view_id can use this sheet as a base
                 "forkable": bool(getattr(session, "session_id", None)),
                 "context_budget": budget,
                 "context_summary": budget.get("summary"),
@@ -1523,7 +1618,12 @@ class MCPSocketServer:
             })
 
         if not lines:
-            return {"summary": "No subsessions", "sessions": []}
+            return {
+                "summary": "No subsessions (use agent_id from spawn; "
+                           "view_id alone is not stable across ST restart)",
+                "sessions": [],
+                "count": 0,
+            }
         return {"summary": "\n".join(lines), "sessions": sessions, "count": len(sessions)}
 
     # ─── Plugin self-debug (devtools) ─────────────────────────────────────────
@@ -1560,27 +1660,35 @@ class MCPSocketServer:
         from . import devtools
         return devtools.goal_command(args=args, view_id=view_id)
 
-    def _read_session_output(self, view_id: int, lines: int = None, max_chars: int = 30000) -> dict:
-        """Read conversation output from a session's view.
+    def _read_session_output(
+        self,
+        agent_id: str = None,
+        view_id: int = None,
+        lines: int = None,
+        max_chars: int = 30000,
+    ) -> dict:
+        """Read conversation output from a session (prefer agent_id)."""
+        from . import session_registry
 
-        Args:
-            lines: Limit to last N lines
-            max_chars: Maximum characters to return (default 30000). Use -1 for unlimited.
-                       Smart truncation preserves message boundaries.
-        """
-        # Debug: log all session view_ids
-        all_view_ids = list(sublime._claude_sessions.keys())
-        print(f"[Claude] read_session_output: looking for {view_id}, _sessions={id(sublime._claude_sessions)}, available: {all_view_ids}")
-
-        session = sublime._claude_sessions.get(view_id)
+        ref = agent_id if agent_id is not None else view_id
+        session = session_registry.get_session_by_ref(ref)
         if not session:
             return {
-                "error": f"Session not found for view_id {view_id}",
-                "available_sessions": all_view_ids,
+                "error": f"Session not found for {ref!r}",
+                "hint": "Prefer agent_id from list_sessions; view_id is runtime-only",
+                "available_agent_ids": list(
+                    getattr(sublime, "_claude_agents", {}) or {}
+                ),
             }
 
+        rid = session_registry.runtime_view_id(session)
+        aid = getattr(session, "agent_id", None)
         if not session.output or not session.output.view:
-            return {"error": "Session output view not found", "view_id": view_id}
+            return {
+                "error": "Session output view not found",
+                "agent_id": aid,
+                "view_id": rid,
+            }
 
         # Read text content from the output view
         view = session.output.view
@@ -1621,7 +1729,8 @@ class MCPSocketServer:
 
         budget = self._session_context_budget(session)
         return {
-            "view_id": view_id,
+            "agent_id": aid,
+            "view_id": rid,
             "name": session.name or "(unnamed)",
             "working": bool(session.working),
             "sleeping": bool(getattr(session, "is_sleeping", False)),
@@ -2250,33 +2359,103 @@ class MCPSocketServer:
     # ─── Notification Tools (notalone2) ────────────────────────────────
     # Uses notalone2 daemon for timer and subsession notifications
 
-    def _register_notification(self, notification_type: str, params: dict, wake_prompt: str) -> dict:
-        """Register a notification via notalone2 daemon (direct sync socket).
+    def _wait_for_subsession(
+        self,
+        subsession_id: str = None,
+        agent_id: str = None,
+        wake_prompt: str = "",
+    ) -> dict:
+        """Host-local wait for a child agent; fires when signal_complete runs.
 
-        Args:
-            notification_type: 'timer', 'subsession_complete', or service type
-            params: Type-specific parameters (e.g., {'seconds': 30} for timer)
-            wake_prompt: Prompt to inject when notification fires
-
-        Returns:
-            {notification_id: str, status: "registered"}
+        Prefer agent_id (stable). subsession_id is an alias (same value for new
+        spawns). Also best-effort registers with notalone2 if the daemon is up.
         """
-        session, error = self._get_session_for_tool()
+        from . import session_registry
+
+        child_id = (agent_id or subsession_id or "").strip()
+        if not child_id:
+            return {"error": "agent_id or subsession_id required"}
+        if not wake_prompt:
+            wake_prompt = f"✅ Subsession {child_id} completed"
+
+        parent, error = self._get_session_for_tool()
         if error:
             return error
 
-        # Get view_id for session_id
-        view_id = session.output.view.id() if session.output and session.output.view else None
-        if not view_id:
-            return {"error": "Session has no view"}
+        parent_view_id = None
+        try:
+            if parent.output and parent.output.view:
+                parent_view_id = parent.output.view.id()
+        except Exception:
+            parent_view_id = getattr(self, "_caller_view_id", None)
 
-        # Direct sync socket call to daemon (like hive does)
+        wait_id = session_registry.register_subsession_wait(
+            child_id=child_id,
+            parent_view_id=parent_view_id,
+            parent_agent_id=getattr(parent, "agent_id", None),
+            wake_prompt=wake_prompt,
+        )
+        print(
+            f"[Claude] wait_for_subsession: host wait {wait_id} "
+            f"child={child_id} parent_agent={getattr(parent, 'agent_id', None)}"
+        )
+
+        out = {
+            "status": "registered",
+            "notification_id": wait_id,
+            "wait_id": wait_id,
+            "agent_id": child_id,
+            "subsession_id": child_id,
+            "parent_agent_id": getattr(parent, "agent_id", None),
+            "parent_view_id": parent_view_id,
+            "host_local": True,
+        }
+
+        # Best-effort daemon registration (legacy) — never recurse into host wait
+        try:
+            daemon = self._daemon_register(
+                "subsession",
+                {"subsession_id": child_id},
+                wake_prompt,
+                parent_view_id=parent_view_id,
+            )
+            if isinstance(daemon, dict) and daemon.get("notification_id"):
+                out["daemon_notification_id"] = daemon["notification_id"]
+                out["daemon_session_id"] = daemon.get("session_id")
+            elif isinstance(daemon, dict) and daemon.get("error"):
+                out["daemon_note"] = daemon.get("error")
+        except Exception as e:
+            out["daemon_note"] = str(e)
+
+        return out
+
+    def _daemon_register(
+        self,
+        notification_type: str,
+        params: dict,
+        wake_prompt: str,
+        parent_view_id: int = None,
+    ) -> dict:
+        """Low-level notalone2 register (no host-local redirection)."""
         import socket
         from pathlib import Path
 
-        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
-        session_id = f"sublime.{view_id}"
+        if parent_view_id is None:
+            session, error = self._get_session_for_tool()
+            if error:
+                return error
+            try:
+                parent_view_id = (
+                    session.output.view.id()
+                    if session.output and session.output.view else None
+                )
+            except Exception:
+                parent_view_id = None
+        if not parent_view_id:
+            return {"error": "Session has no view"}
 
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        session_id = f"sublime.{parent_view_id}"
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(5)
@@ -2285,50 +2464,113 @@ class MCPSocketServer:
                 "method": "register",
                 "session_id": session_id,
                 "type": notification_type,
-                "params": params,
-                "wake_prompt": wake_prompt
+                "params": params or {},
+                "wake_prompt": wake_prompt or "",
             }) + "\n").encode())
-
             data = b""
             while b"\n" not in data:
                 chunk = sock.recv(1024)
                 if not chunk:
                     break
                 data += chunk
-
             sock.close()
+            if not data.strip():
+                return {"error": "empty daemon response"}
             resp = json.loads(data.decode().strip())
-
             if resp.get("notification_id"):
                 return {
                     "notification_id": resp["notification_id"],
                     "status": "registered",
-                    "session_id": session_id
+                    "session_id": session_id,
                 }
-            else:
-                error_msg = resp.get("error", "Registration failed")
-                # Fetch available services to help agent
-                try:
-                    services_resp = self._discover_services()
-                    available = services_resp.get("services", {})
-                    service_types = []
-                    for svc, types in available.items():
-                        for t in types:
-                            service_types.append(f"{svc}.{t}")
-                except:
-                    service_types = []
-
-                return {
-                    "error": error_msg,
-                    "hint": f"Invalid type '{notification_type}'. Use discover_services() or try one of these.",
-                    "builtin_types": ["timer", "subsession"],
-                    "service_types": service_types
-                }
-
+            return {"error": resp.get("error", "Registration failed")}
         except FileNotFoundError:
             return {"error": "notalone2 daemon not running"}
         except Exception as e:
             return {"error": str(e)}
+
+    def _notify_daemon_subsession_complete(
+        self, subsession_id: str, result_summary: str = None
+    ) -> dict:
+        """Fire notalone2 signal_complete so daemon waiters receive injects."""
+        import socket
+        from pathlib import Path
+
+        if not subsession_id:
+            return {"ok": False, "error": "no subsession_id"}
+        socket_path = str(Path.home() / ".notalone" / "notalone.sock")
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect(socket_path)
+            sock.sendall((json.dumps({
+                "method": "signal_complete",
+                "subsession_id": str(subsession_id),
+                "result_summary": result_summary,
+            }) + "\n").encode())
+            data = b""
+            while b"\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            sock.close()
+            if not data.strip():
+                return {"ok": False, "error": "empty daemon response"}
+            resp = json.loads(data.decode().strip())
+            return {"ok": bool(resp.get("ok")), "resp": resp}
+        except FileNotFoundError:
+            return {"ok": False, "error": "notalone2 daemon not running"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _register_notification(self, notification_type: str, params: dict, wake_prompt: str) -> dict:
+        """Register a notification via notalone2 daemon (direct sync socket).
+
+        Args:
+            notification_type: 'timer', 'subsession' / 'subsession_complete', or service type
+            params: Type-specific parameters (e.g., {'seconds': 30} for timer)
+            wake_prompt: Prompt to inject when notification fires
+
+        Returns:
+            {notification_id: str, status: "registered"}
+        """
+        # Normalize legacy alias used by older wait_for_subsession router path
+        if notification_type in ("subsession_complete", "subsession_done"):
+            notification_type = "subsession"
+
+        # Host-local path for subsession waits (works without daemon / after ST restart)
+        if notification_type == "subsession" and isinstance(params, dict):
+            sid = params.get("subsession_id") or params.get("agent_id")
+            if sid:
+                return self._wait_for_subsession(
+                    subsession_id=str(sid),
+                    wake_prompt=wake_prompt or "",
+                )
+
+        result = self._daemon_register(notification_type, params or {}, wake_prompt or "")
+        if result.get("notification_id"):
+            return result
+        if result.get("error") == "notalone2 daemon not running":
+            return result
+        if result.get("error"):
+            try:
+                services_resp = self._discover_services()
+                available = services_resp.get("services", {})
+                service_types = [
+                    f"{svc}.{t}"
+                    for svc, types in available.items()
+                    for t in types
+                ]
+            except Exception:
+                service_types = []
+            return {
+                "error": result.get("error", "Registration failed"),
+                "hint": f"Invalid type '{notification_type}'. Use discover_services().",
+                "builtin_types": ["timer", "subsession"],
+                "service_types": service_types,
+            }
+        return result
 
     def _subscribe_to_service(self, notification_type: str, params: dict, wake_prompt: str) -> dict:
         """Subscribe to a service - handles HTTP endpoints for channel services.
@@ -2436,10 +2678,12 @@ class MCPSocketServer:
             return {"error": str(e)}
 
     def _session_info(self) -> dict:
-        """Identity for the MCP caller session (view_id from --view-id).
+        """Identity for the MCP caller session.
 
-        Parent linkage lives on the host Session — agents must not search for it.
+        agent_id is stable; view_id is runtime. Parent linkage is host state.
         """
+        from . import session_registry
+
         view_id = getattr(self, "_caller_view_id", None)
         if view_id is None:
             return {"error": "No caller view_id (MCP not bound to a session)"}
@@ -2448,16 +2692,21 @@ class MCPSocketServer:
         except (TypeError, ValueError):
             return {"error": f"Invalid caller view_id: {view_id!r}"}
 
-        session = sublime._claude_sessions.get(view_id)
+        session = session_registry.get_session_for_view_id(view_id)
         if not session:
             return {
                 "error": f"Session {view_id} not found",
                 "view_id": view_id,
-                "available": list(sublime._claude_sessions.keys()),
+                "available_agent_ids": list(
+                    getattr(sublime, "_claude_agents", {}) or {}
+                ),
             }
 
+        session_registry.relink_parent_view(session)
         parent_view_id = getattr(session, "parent_view_id", None)
+        parent_agent_id = getattr(session, "parent_agent_id", None)
         subsession_id = getattr(session, "subsession_id", None)
+        agent_id = getattr(session, "agent_id", None)
         sleeping = bool(getattr(session, "is_sleeping", False))
         if callable(getattr(type(session), "is_sleeping", None)):
             try:
@@ -2468,15 +2717,20 @@ class MCPSocketServer:
         name = session.name or "(unnamed)"
         budget = self._session_context_budget(session)
         return {
+            "agent_id": agent_id,
             "view_id": view_id,
+            "parent_agent_id": parent_agent_id,
             "parent_view_id": parent_view_id,
-            "subsession_id": subsession_id,
-            "is_subsession": bool(parent_view_id or subsession_id),
+            "subsession_id": subsession_id or agent_id,
+            "is_subsession": bool(
+                parent_agent_id or parent_view_id or subsession_id
+            ),
             "name": name,
             "backend": getattr(session, "backend", None) or "claude",
             "initialized": bool(getattr(session, "initialized", False)),
             "working": bool(getattr(session, "working", False)),
             "sleeping": sleeping,
+            "turn_phase": getattr(session, "turn_phase", None),
             "session_id": getattr(session, "session_id", None),
             "context_budget": budget,
             "context_summary": budget.get("summary"),
@@ -2495,6 +2749,8 @@ class MCPSocketServer:
         until the *parent* is free, before injecting. Multiple calls coalesce
         to the latest result_summary.
         """
+        from . import session_registry
+
         # MCP process is bound to the child sheet — prefer that over agent-passed ids.
         if session_id is None:
             session_id = getattr(self, "_caller_view_id", None)
@@ -2503,28 +2759,38 @@ class MCPSocketServer:
                 "error": "session_id missing and no MCP caller view_id — "
                          "cannot route signal_complete"
             }
-        try:
-            session_id = int(session_id)
-        except (TypeError, ValueError):
-            return {"error": f"Invalid session_id: {session_id!r}"}
 
-        session = sublime._claude_sessions.get(session_id)
+        # session_id may be view_id (legacy) or agent_id string
+        session = session_registry.get_session_by_ref(session_id)
         if not session:
-            available = list(sublime._claude_sessions.keys())
-            return {"error": f"Session {session_id} not found", "available": available}
+            return {
+                "error": f"Session {session_id!r} not found",
+                "available_agent_ids": list(
+                    getattr(sublime, "_claude_agents", {}) or {}
+                ),
+            }
 
-        # Get parent_view_id from this subsession (host state — not agent-discovered)
-        parent_view_id = getattr(session, 'parent_view_id', None)
-        subsession_id = getattr(session, 'subsession_id', None)
+        # Parent via stable parent_agent_id (view_id is runtime cache)
+        parent_session = session_registry.resolve_parent_session(session)
+        session_registry.relink_parent_view(session)
+        parent_view_id = getattr(session, "parent_view_id", None)
+        parent_agent_id = getattr(session, "parent_agent_id", None)
+        subsession_id = (
+            getattr(session, "subsession_id", None)
+            or getattr(session, "agent_id", None)
+        )
 
-        if not parent_view_id:
-            return {"error": f"Session {session_id} is not a subsession - no parent_view_id"}
-
-        # Look up parent session directly in Sublime
-        parent_session = sublime._claude_sessions.get(parent_view_id)
         if not parent_session:
-            available = list(sublime._claude_sessions.keys())
-            return {"error": f"Parent session not found: {parent_view_id}", "available": available}
+            return {
+                "error": (
+                    f"Session {getattr(session, 'agent_id', session_id)!r} "
+                    f"is not a subsession or parent not loaded "
+                    f"(parent_agent_id={parent_agent_id!r})"
+                ),
+            }
+        parent_view_id = (
+            session_registry.runtime_view_id(parent_session) or parent_view_id
+        )
 
         # Parent may be sleeping — still queue; inject path will need client later
         if not getattr(parent_session, "initialized", False) and not getattr(
@@ -2574,17 +2840,18 @@ class MCPSocketServer:
             vid = pending.get("view_id") or view_id
             sid = pending.get("subsession_id") or subsession_id
             summary = pending.get("result_summary")
+            child_aid = getattr(session, "agent_id", None) or sid
             wake = (
-                f"✅ Subsession {sid or vid} completed "
-                f"(view_id={vid})\n"
+                f"✅ Subsession {child_aid} completed "
+                f"(agent_id={child_aid}, view_id={vid})\n"
                 f"context_budget: {line}"
             )
             if b.get("headroom"):
                 wake += (
                     f"\nstrategy_hint: headroom={b['headroom']}"
-                    " — tight/critical → prefer fork_from_view_id of a lighter base "
+                    " — tight/critical → prefer fork_from_agent_id of a lighter base "
                     "or a fresh worker over piling more into this session; "
-                    "comfortable → safe to send_to_session for follow-ups"
+                    "comfortable → safe to send_to_session(agent_id=…) for follow-ups"
                 )
             if summary:
                 wake += f"\n\n{summary}"
@@ -2653,6 +2920,7 @@ class MCPSocketServer:
                 return
             session._pending_signal_complete = None
             wake_prompt, b, line = _build_wake()
+            summary = pending.get("result_summary")
             try:
                 if parent_session.working:
                     print(
@@ -2672,6 +2940,31 @@ class MCPSocketServer:
                 print(f"[Claude] signal_complete: inject failed: {e}")
                 session._pending_signal_complete = cur
                 sublime.set_timeout(try_deliver, parent_poll_ms)
+                return
+
+            # 4) Host-local wait_for_subsession waiters + notalone2 daemon
+            try:
+                n = session_registry.fire_subsession_waits(session, summary)
+                if n:
+                    print(f"[Claude] signal_complete: fired {n} host wait(s)")
+            except Exception as e:
+                print(f"[Claude] signal_complete: host waits failed: {e}")
+            for alias in (
+                getattr(session, "agent_id", None),
+                getattr(session, "subsession_id", None),
+                str(view_id) if view_id is not None else None,
+            ):
+                if not alias:
+                    continue
+                try:
+                    d = self._notify_daemon_subsession_complete(str(alias), summary)
+                    if d.get("ok"):
+                        print(
+                            f"[Claude] signal_complete: daemon ok for {alias!r}"
+                        )
+                        break
+                except Exception as e:
+                    print(f"[Claude] signal_complete: daemon signal {alias}: {e}")
 
         sublime.set_timeout(try_deliver, 0)
 

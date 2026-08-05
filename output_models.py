@@ -7,7 +7,7 @@ from .constants import BACKEND_ABBREV
 import re as _re
 
 # Status-icon chars that prefix a tab title (see ClaudeOutput._update_title).
-_TITLE_ICON_RE = _re.compile(r'^(?:[◉◇•❓⏸↻⚠✘❌!❗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+')
+_TITLE_ICON_RE = _re.compile(r'^(?:[◉◇•○◐◓◑◒❓⏸↻⚠✘❌!❗⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*)+')
 
 
 def _title_abbrev_tokens():

@@ -210,6 +210,9 @@ class Session:
         self.output = OutputView(window)
         self.initialized = False
         self.working = False
+        # Busy sub-state for tab/status honesty (Grok: waiting vs responding)
+        # idle | waiting | responding | tool — see constants.TURN_PHASE_*
+        self.turn_phase: str = "idle"
         self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
         self.next_wake_at: Optional[float] = None  # epoch of the pending self-wake (for the wakeup banner)
         # Quick Agent: lives in a bottom panel (not a doc tab). Lightweight
@@ -291,15 +294,26 @@ class Session:
         self._bg_flush_scheduled: bool = False
         self._bg_poll_timer = None  # sublime.set_timeout handle for between-query bg task polling
 
-        # Extract subsession_id and parent_view_id if provided
+        # Stable agent identity (not view_id — view_id is runtime-only)
+        from .session_registry import new_agent_id
         if initial_context:
-            self.subsession_id = initial_context.get("subsession_id")
+            self.agent_id = (
+                initial_context.get("agent_id")
+                or initial_context.get("subsession_id")
+                or new_agent_id()
+            )
+            self.subsession_id = (
+                initial_context.get("subsession_id") or self.agent_id
+            )
             self.parent_view_id = initial_context.get("parent_view_id")
+            self.parent_agent_id = initial_context.get("parent_agent_id")
             # Host goal skeptic subsession (never owns the goal tracker)
             self.goal_role = (initial_context.get("goal_role") or "") or None
         else:
+            self.agent_id = new_agent_id()
             self.subsession_id = None
             self.parent_view_id = None
+            self.parent_agent_id = None
             self.goal_role = None
 
         # Persona info (for release on close)
@@ -1627,6 +1641,8 @@ class Session:
                 self.output.current.duration = 0
                 self.output.current.has_meta = False
                 self.output._render_current()
+        # Fresh turn: waiting on first model/tool activity (not yet "responding")
+        self._set_turn_phase("waiting")
         self.output._update_title()
         self._animate()
         self._query_start = time.time()
@@ -1640,6 +1656,7 @@ class Session:
 
         if not self.client.send("query", query_params, _on_done_for_gen):
             self.working = False
+            self._set_turn_phase("idle")
             self._mark_error_halt("bridge died")
             self._status("error: bridge died")
             self.output.text("\n\n*Failed to send query. Bridge process died.*\n")
@@ -1836,12 +1853,29 @@ class Session:
             except Exception as e:
                 print(f"[Claude] response callback error: {e}")
 
-        # Notify subsession completion (for notalone2)
-        if self.output.view:
-            view_id = str(self.output.view.id())
-            for session in sublime._claude_sessions.values():
-                if session.client:
-                    session.client.send("subsession_complete", {"subsession_id": view_id})
+        # Notify subsession completion (stable agent_id, not runtime view_id)
+        # Host-local waiters + notalone2 daemon; MCP signal_complete also does this.
+        if getattr(self, "parent_agent_id", None) or getattr(self, "parent_view_id", None):
+            try:
+                from . import session_registry
+                session_registry.fire_subsession_waits(self, None)
+            except Exception as e:
+                print(f"[Claude] fire_subsession_waits on turn end: {e}")
+            sid = (
+                getattr(self, "agent_id", None)
+                or getattr(self, "subsession_id", None)
+            )
+            if sid:
+                for other in list(getattr(sublime, "_claude_sessions", {}).values()):
+                    if other.client and other is not self:
+                        try:
+                            other.client.send(
+                                "subsession_complete",
+                                {"subsession_id": str(sid)},
+                            )
+                        except Exception:
+                            pass
+                        break  # one bridge notify is enough
 
         # 4. Check for pending retain (interrupt was triggered by compact_boundary)
         if completion == "interrupted" and self._pending_retain:
@@ -1859,6 +1893,7 @@ class Session:
         # user-queued messages (clear_queue=False) and flushes the next one.
         if completion != "success":
             self.working = False
+            self._set_turn_phase("idle")
             if self.output and self.output.current:
                 self.output.current.working = False
             # Reset idle clock when the turn ends (long ACP runs + sticky ◎).
@@ -1931,6 +1966,7 @@ class Session:
 
         # 7. Now set working=False and enter input mode
         self.working = False
+        self._set_turn_phase("idle")
         now = time.time()
         self.last_activity = now
         # Idle clock starts when the turn ends — not when sticky ◎ opened
@@ -2152,7 +2188,10 @@ class Session:
                     self.output.ensure_composer_spare_line()
             try:
                 if self.output._view_is_focused():
-                    self.output.focus_composer(force_show=True, steal_focus=False)
+                    # Draft just restored; caret is at draft end from set_composer_text
+                    # — preserve it, do not re-pin to a different EOF after phantoms.
+                    self.output.focus_composer(
+                        force_show=True, steal_focus=False, preserve_caret=True)
             except Exception:
                 pass
         elif self.output and self.output.is_input_mode():
@@ -3378,12 +3417,29 @@ class Session:
             "tool_result": self._on_msg_tool_result,
             "text_delta": self._on_msg_text,
             "text": self._on_msg_text,
+            "thinking": self._on_msg_thinking,
             "turn_usage": self._on_msg_turn_usage,
             "result": self._on_msg_result,
             "system": self._on_msg_system,
             # Kimi TodoWrite → ACP plan entries (title/status)
             "plan_todos": self._on_msg_plan_todos,
         }
+
+    def _set_turn_phase(self, phase: str) -> None:
+        """Update busy sub-state (waiting | responding | tool | idle).
+
+        Drives tab glyph + status-bar spinner so a stalled wait is not mistaken
+        for active streaming.
+        """
+        phase = phase or "idle"
+        if getattr(self, "turn_phase", None) == phase:
+            return
+        self.turn_phase = phase
+        try:
+            if self.output:
+                self.output._update_title()
+        except Exception:
+            pass
 
     # ── method-level handlers ────────────────────────────────────────────
 
@@ -3530,6 +3586,8 @@ class Session:
                 and self.current_tool != name):
             self.output.tool_done(self.current_tool)
         self.current_tool = name
+        if not background:
+            self._set_turn_phase("tool")
         self.output.tool(name, tool_input, tool_id=tool_id, background=False)
 
     def _on_msg_tool_result(self, params: dict) -> None:
@@ -3559,14 +3617,26 @@ class Session:
             self.output.tool_done(tool_name, content, tool_id=tool_use_id)
         if tool_name == self.current_tool:
             self.current_tool = None
+        # Tool finished — waiting for next model tokens (not streaming yet)
+        if self.working:
+            self._set_turn_phase("waiting")
         self._update_status_bar()
 
     def _on_msg_text(self, params: dict) -> None:
         self._clear_api_retry_hint()
+        if self.working:
+            self._set_turn_phase("responding")
         # Late post-interrupt tokens still paint (text() won't re-arm spinner
         # when session.working is False). Composer re-arm is handled by
         # _ensure_idle_input settle timers on interrupt.
         self.output.text(params.get("text", ""))
+
+    def _on_msg_thinking(self, params: dict) -> None:
+        """ACP agent_thought_chunk — count as responding (model is active)."""
+        self._clear_api_retry_hint()
+        if self.working:
+            self._set_turn_phase("responding")
+        # Thought text is not painted into the transcript by default.
 
     def _on_msg_turn_usage(self, params: dict) -> None:
         usage = params.get("usage", {})
@@ -4252,19 +4322,26 @@ class Session:
         self._save_session()
 
     def _persist_view_identity(self) -> None:
-        """Stamp session_id + backend on the view so ST restart can resume.
+        """Stamp stable agent_id + bridge session_id on the view for ST restart.
 
-        Tab-title matching is fragile (truncation, newlines, GM> prefix). View
-        settings survive session restore and are the reliable reconnect key.
+        agent_id is the public MCP identity (survives restart). view_id is only
+        a runtime handle. Bridge session_id enables transcript resume.
         """
-        sid = self.session_id or self.resume_id
-        if not sid or not self.output or not self.output.view:
+        if not self.output or not self.output.view:
             return
         try:
             view = self.output.view
             if not view.is_valid():
                 return
-            view.settings().set("claude_session_id", sid)
+            if getattr(self, "agent_id", None):
+                view.settings().set("claude_agent_id", self.agent_id)
+            if getattr(self, "subsession_id", None):
+                view.settings().set("claude_subsession_id", self.subsession_id)
+            if getattr(self, "parent_agent_id", None):
+                view.settings().set("claude_parent_agent_id", self.parent_agent_id)
+            sid = self.session_id or self.resume_id
+            if sid:
+                view.settings().set("claude_session_id", sid)
             if self.backend:
                 view.settings().set("claude_backend", self.backend)
         except Exception:
@@ -4294,6 +4371,14 @@ class Session:
         entry["query_count"] = self.query_count
         entry["backend"] = self.backend
         entry["last_activity"] = self.last_activity
+        if getattr(self, "agent_id", None):
+            entry["agent_id"] = self.agent_id
+        if getattr(self, "subsession_id", None):
+            entry["subsession_id"] = self.subsession_id
+        if getattr(self, "parent_agent_id", None):
+            entry["parent_agent_id"] = self.parent_agent_id
+        else:
+            entry.pop("parent_agent_id", None)
         # Derive state from current session state
         if self.client is not None and self.initialized:
             entry["state"] = "open"
@@ -5449,18 +5534,43 @@ class Session:
 
     def _animate(self) -> None:
         if not self.working:
+            self.turn_phase = "idle"
             # Restore normal title when done
             self.output.set_name(self.name or "Claude")
             return
-        chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        s = chars[self.spinner_frame % len(chars)]
+        from .constants import SPINNER_WAITING, SPINNER_RESPONDING
+        phase = getattr(self, "turn_phase", None) or "waiting"
+        if phase == "tool" and self.current_tool:
+            frames = SPINNER_RESPONDING
+            interval = 200
+            show_tool = True
+        elif phase == "responding":
+            frames = SPINNER_RESPONDING
+            interval = 160
+            show_tool = False
+        else:
+            # waiting: circle (or bar/classic — see constants.SPINNER_WAITING)
+            frames = SPINNER_WAITING
+            interval = 120
+            show_tool = False
+            if getattr(self, "turn_phase", None) != "waiting":
+                self.turn_phase = "waiting"
+        # frames: str of 1-char glyphs (or sequence of frame strings)
+        if isinstance(frames, (list, tuple)):
+            s = frames[self.spinner_frame % len(frames)]
+        else:
+            s = frames[self.spinner_frame % len(frames)]
         self.spinner_frame += 1
-        # Show spinner in status bar only (not title - causes cursor flicker)
-        status = self.current_tool or "thinking..."
-        self._status(f"{s} {status}")
-        # Animate spinner in output view
-        self.output.advance_spinner()
-        sublime.set_timeout(self._animate, 200)
+        # Status bar: glyph alone (never "waiting"/"responding" text)
+        if show_tool and self.current_tool:
+            self._status(f"{s} {self.current_tool}")
+        else:
+            self._status(s)
+        try:
+            self.output.advance_spinner(frames=frames)
+        except TypeError:
+            self.output.advance_spinner()
+        sublime.set_timeout(self._animate, interval)
 
     def _handle_permission_request(self, params: dict) -> None:
         """Handle permission request from bridge - show in output view."""

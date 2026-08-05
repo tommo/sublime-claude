@@ -146,15 +146,25 @@ def create_sublime_router() -> ToolRouter:
         + (f", backend={args['backend']!r}" if args.get('backend') else "")
         + (f", fork_from_view_id={int(args['fork_from_view_id'])}"
            if args.get('fork_from_view_id') is not None else "")
+        + (f", fork_from_agent_id={args['fork_from_agent_id']!r}"
+           if args.get('fork_from_agent_id') else "")
         + f", _caller_view_id={args.get('_caller_view_id')})")
 
     router.register("send_to_session", lambda args:
-        f"return send_to_session({args.get('view_id')}, {args.get('prompt', '')!r})")
+        f"return send_to_session("
+        f"prompt={args.get('prompt', '')!r}"
+        + (f", agent_id={args['agent_id']!r}" if args.get('agent_id') else "")
+        + (f", view_id={args.get('view_id')}"
+           if args.get('view_id') is not None else "")
+        + ")")
 
     router.register("read_session_output", lambda args:
-        f"return read_session_output({args.get('view_id')}, {args.get('lines')})"
-        if args.get('lines') else
-        f"return read_session_output({args.get('view_id')})")
+        f"return read_session_output("
+        + (f"agent_id={args['agent_id']!r}, " if args.get('agent_id') else "")
+        + (f"view_id={args.get('view_id')}, "
+           if args.get('view_id') is not None else "")
+        + f"lines={args.get('lines')!r})"
+        )
 
     router.register("read_profile_doc", lambda args:
         f"return read_profile_doc({args.get('path', '')!r})")
@@ -213,10 +223,10 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('wake_prompt')!r})")
 
     router.register("wait_for_subsession", lambda args:
-        f"return register_notification("
-        f"'subsession_complete', "
-        f"{{'subsession_id': {args.get('subsession_id')!r}}}, "
-        f"{args.get('wake_prompt')!r})")
+        f"return wait_for_subsession("
+        f"subsession_id={args.get('subsession_id')!r}, "
+        f"agent_id={args.get('agent_id')!r}, "
+        f"wake_prompt={args.get('wake_prompt', '')!r})")
 
     router.register("signal_complete", lambda args:
         f"return signal_subsession_complete("

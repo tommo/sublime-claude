@@ -336,64 +336,66 @@ def handle_request(request: dict) -> dict:
                 },
                 {
                     "name": "spawn_session",
-                    "description": """Spawn a subsession. Returns view_id + subsession_id.
+                    "description": """Spawn a subsession. Returns stable agent_id (+ runtime view_id).
 
+ALWAYS address workers by agent_id — view_id changes after Sublime restart.
 Workflow for base context then workers:
-  1) spawn_session(prompt=…, name="explorer", backend=X)  # fresh base builder
-  2) after it finishes, spawn workers with fork_from_view_id=<explorer view_id>
-     so each worker inherits the explorer transcript (same backend family).
+  1) spawn_session(prompt=…, name="explorer", backend=X)  # returns agent_id
+  2) spawn workers with fork_from_agent_id=<explorer agent_id>
 
 Fork rules:
   - fork_current: fork THIS (caller) session
-  - fork_from_view_id: fork any open session (e.g. explorer base) — preferred for derived workers
-  - Do not pass both. checkpoint overrides either.
-  - Cross-backend fork is impossible (session IDs are not portable). backend defaults to the fork source when forking; otherwise settings default.
-  - Prefer list_sessions + send_to_session to reuse idle/sleeping workers over re-spawning.
+  - fork_from_agent_id: fork any open session (preferred)
+  - fork_from_view_id: legacy only
+  - Prefer list_sessions + send_to_session(agent_id=…) over re-spawning.
 
-Host appends a one-line signal_complete reminder. Child parent_view_id is always the caller (orchestrator), even when forking a sibling explorer.""",
+Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "prompt": {"type": "string", "description": "Task for the child (host adds signal_complete reminder)."},
                             "name": {"type": "string", "description": "Optional: name for the session"},
                             "profile": {"type": "string", "description": "Optional: profile name from list_profiles"},
-                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from (overrides fork_current / fork_from_view_id)"},
+                            "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
-                            "backend": {"type": "string", "description": "Optional: backend (claude, codex, grok, … or custom). When forking, defaults to the source session's backend; otherwise settings default_backend."},
-                            "fork_current": {"type": "boolean", "description": "Fork caller's history into the child (default false). Only same backend family."},
-                            "fork_from_view_id": {"type": "integer", "description": "Fork that open session's history (view_id from list_sessions / prior spawn). Use for explorer→worker. Same backend family only; backend defaults to source."},
-                            "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish processing (default: false). Set true only for quick tasks."}
+                            "backend": {"type": "string", "description": "Optional: backend (claude, codex, grok, …). When forking, defaults to source."},
+                            "fork_current": {"type": "boolean", "description": "Fork caller's history into the child (default false)."},
+                            "fork_from_agent_id": {"type": "string", "description": "Fork that session by stable agent_id (preferred over view_id)."},
+                            "fork_from_view_id": {"type": "integer", "description": "Legacy: fork by runtime view_id (breaks after ST restart)."},
+                            "wait_for_completion": {"type": "boolean", "description": "Optional: wait for prompt to finish (default false)."}
                         },
                         "required": ["prompt"]
                     }
                 },
                 {
                     "name": "send_to_session",
-                    "description": "Send a message to an existing session by view_id. Prefer this over spawn_session when list_sessions shows an idle (✓) or sleeping (⏸) worker with the right context. Sleeping workers are auto-woken — do not treat ⏸ as failure and spawn a new worker.",
+                    "description": "Send a message by stable agent_id (preferred). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. Prefer reuse over spawn.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "view_id": {"type": "integer", "description": "The view_id from spawn_session or list_sessions"},
+                            "agent_id": {"type": "string", "description": "Stable id from spawn_session / list_sessions (preferred)"},
+                            "view_id": {"type": "integer", "description": "Legacy runtime view handle — do not cache across restarts"},
                             "prompt": {"type": "string", "description": "Message to send"}
                         },
-                        "required": ["view_id", "prompt"]
+                        "required": ["prompt"]
                     }
                 },
                 {
                     "name": "list_sessions",
-                    "description": "List your subsessions (view_id, backend, sleeping ⏸ / working ⏳ / idle ✓, forkable, context_budget/headroom). Prefer send_to_session to a ✓ or ⏸ worker with comfortable headroom over spawn_session. ⏸ auto-wakes on send. tight/critical headroom → fork a lighter base or spawn fresh instead of stuffing one agent. fork_from_view_id when forkable=true.",
+                    "description": "List your subsessions with agent_id (stable), view_id (runtime), sleeping/working, context_budget. Always use agent_id for send_to_session / fork_from_agent_id — never cache view_id across Sublime restarts.",
                     "inputSchema": {"type": "object", "properties": {}}
                 },
                 {
                     "name": "read_session_output",
-                    "description": "Read conversation output from a subsession. Also returns context_budget (tokens used, pct, headroom: comfortable|moderate|tight|critical) so you can decide continue vs fork vs new worker — do not keep pushing into a tight/critical session.",
+                    "description": "Read subsession output by agent_id (preferred). Also returns context_budget/headroom for continue vs fork strategy.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "view_id": {"type": "integer", "description": "The view_id from spawn_session or list_sessions"},
-                            "lines": {"type": "integer", "description": "Number of lines to read from end (default: all)"}
+                            "agent_id": {"type": "string", "description": "Stable agent_id (preferred)"},
+                            "view_id": {"type": "integer", "description": "Legacy runtime view_id"},
+                            "lines": {"type": "integer", "description": "Number of lines from end (default: all)"}
                         },
-                        "required": ["view_id"]
+                        "required": []
                     }
                 },
                 {
@@ -528,28 +530,32 @@ Do not invent a goal; user activates with /goal <objective>.""",
                     "name": "goal_verdict",
                     "description": """Submit the host skeptic verdict during goal verify turns only.
 
-Use after inspecting evidence with real tools. Host prefers this structured
-result over free-text VERDICT lines.
+Use after inspecting evidence with real tools. Host re-validates evidence[]:
 
-- achieved=true only if every plan criterion is proven; requires non-empty evidence[]
-- achieved=false with gaps[] listing what is missing (default / fail-closed)
+- achieved=true only if every plan criterion is proven
+- evidence[] must cite on-disk files (logs/captures under evidence/) that exist
+- narrative-only lines (\"Structure:…\", \"API:…\") are rejected
+- visual/render goals need ≥1 image capture + ≥2 grounded lines — green tests alone fail
+- message must not launder residuals/stubs as \"non-blockers\" with gaps=[]
+- naming fraud (feature name ≠ implementation) → achieved=false with gaps
+- achieved=false with gaps[] (default / fail-closed)
 - Do not use for normal implementer progress (use update_goal instead)""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "achieved": {
                                 "type": "boolean",
-                                "description": "True only if fully proven against the plan"
+                                "description": "True only if fully proven against the plan with on-disk artifacts"
                             },
                             "evidence": {
-                                "description": "List of concrete proofs (paths, tests, command outputs). Required when achieved=true.",
+                                "description": "Proof lines that include real paths (evidence/*.log, evidence/*.png). Host checks files exist. Not prose theater.",
                                 "oneOf": [
                                     {"type": "array", "items": {"type": "string"}},
                                     {"type": "string"}
                                 ]
                             },
                             "gaps": {
-                                "description": "What's still missing (required when achieved=false).",
+                                "description": "What's still missing or misnamed (required when achieved=false). Residuals go here, not in message.",
                                 "oneOf": [
                                     {"type": "array", "items": {"type": "string"}},
                                     {"type": "string"}
@@ -557,7 +563,7 @@ result over free-text VERDICT lines.
                             },
                             "message": {
                                 "type": "string",
-                                "description": "One-line summary"
+                                "description": "One-line summary; do not list non-blocker residuals while claiming achieved"
                             }
                         },
                         "required": ["achieved"]
@@ -643,9 +649,9 @@ Returns notification_id for cancellation via unregister_notification().""",
                     "name": "session_info",
                     "description": """Identity for THIS Claude/Sublime session (MCP is bound to your sheet).
 
-Returns view_id, parent_view_id (if subsession), subsession_id, sleeping, backend, name,
-and context_budget (tokens / pct / headroom). Do NOT search files or list_sessions to
-find parent — call this. Parent routing for signal_complete is automatic.""",
+Returns agent_id (stable), view_id (runtime only), parent_agent_id, sleeping, backend,
+context_budget. Prefer agent_id everywhere. Do NOT search files for parent — call this.
+Parent routing for signal_complete is automatic.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -681,29 +687,33 @@ Example:
                 },
                 {
                     "name": "wait_for_subsession",
-                    "description": """Wait for a subsession to complete.
+                    "description": """Wait for a child agent to complete (host-local; fires on signal_complete).
+
+Prefer agent_id from spawn_session (stable). subsession_id is the same value for
+new spawns. Do NOT use runtime view_id.
 
 Example:
-  result = spawn_session(prompt="Design solution", name="architect")
-  wait_for_subsession(
-      subsession_id=result['subsession_id'],
-      wake_prompt="Architect done! Review the design."
-  )
+  r = spawn_session(prompt="Design solution", name="architect")
+  wait_for_subsession(agent_id=r['agent_id'], wake_prompt="Architect done — review.")
 
-Returns notification_id for cancellation.""",
+Child must call signal_complete when finished. Returns wait_id / notification_id.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Stable agent_id from spawn_session (preferred)"
+                            },
                             "subsession_id": {
                                 "type": "string",
-                                "description": "Subsession ID from spawn_session() result"
+                                "description": "Alias for agent_id (same for new spawns)"
                             },
                             "wake_prompt": {
                                 "type": "string",
-                                "description": "Prompt to inject when subsession completes"
+                                "description": "Prompt to inject when child completes"
                             }
                         },
-                        "required": ["subsession_id", "wake_prompt"]
+                        "required": ["wake_prompt"]
                     }
                 },
                 {

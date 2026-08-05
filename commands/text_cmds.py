@@ -85,10 +85,12 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
                     pass
             return
 
-        # Caret in history: focus ◎, don't submit
+        # Caret in history: focus ◎, don't submit (park draft end only when
+        # coming from history — user is entering the composer, not mid-edit)
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(force_show=True, steal_focus=True)
+                s.output.focus_composer(
+                    force_show=True, steal_focus=True, park_at_end=True)
             except Exception:
                 pass
             return
@@ -132,7 +134,7 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
                         s._update_queue_phantom()
                     except Exception:
                         pass
-                    s.output.focus_composer(force_show=True)
+                    s.output.focus_composer(force_show=True, park_at_end=True)
                     # Second pass after phantoms/layout settle
                     def _refocus_after_queue():
                         if not s.output or not s.output.is_input_mode():
@@ -377,7 +379,8 @@ class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
         # Outside ◎: focus composer instead of a no-op / history edit
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(force_show=True, steal_focus=True)
+                s.output.focus_composer(
+                    force_show=True, steal_focus=True, park_at_end=True)
             except Exception:
                 pass
             return

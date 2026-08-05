@@ -202,9 +202,12 @@ def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
         bits.append(f"profile={profile}")
     if inp.get("fork_current"):
         bits.append("fork:self")
+    fa = inp.get("fork_from_agent_id")
+    if fa:
+        bits.append(f"fork:{fa}")
     ff = inp.get("fork_from_view_id")
-    if ff is not None:
-        bits.append(f"fork:{ff}")
+    if ff is not None and not fa:
+        bits.append(f"fork:view:{ff}")
     if prompt:
         bits.append(_clip(str(prompt), 45))
     out = _join_bits(*bits)
@@ -215,10 +218,13 @@ def _spawn_session(view: "OutputView", tool: "ToolCall") -> str:
 
 def _send_to_session(view: "OutputView", tool: "ToolCall") -> str:
     inp = _tool_input(tool)
+    aid = inp.get("agent_id")
     vid = inp.get("view_id")
     prompt = inp.get("prompt") or ""
     bits = []
-    if vid is not None:
+    if aid:
+        bits.append(str(aid))
+    elif vid is not None:
         bits.append(f"view {vid}")
     if prompt:
         bits.append(_clip(str(prompt), 50))

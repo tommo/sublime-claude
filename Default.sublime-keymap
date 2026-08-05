@@ -293,22 +293,20 @@
         ]
     },
     {
-        // Super+K clear chat when browsing history (sticky ◎ may still exist).
-        // In draft: leave Super+K to ST chords / line ops.
+        // Super+K clear chat — works in history *and* sticky ◎ draft.
+        // clear() re-opens ◎ after wipe so the input area is not lost.
         "keys": ["super+k"],
         "command": "claude_code_clear",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
         ]
     },
     {
-        // Super+Shift+K: clear older rounds, keep last turn visible.
+        // Super+Shift+K: clear older rounds, keep last turn (also from draft).
         "keys": ["super+shift+k"],
         "command": "claude_code_clear_keep_last",
         "context": [
-            { "key": "setting.claude_output", "operator": "equal", "operand": true },
-            { "key": "claude_caret_in_draft", "operator": "equal", "operand": false }
+            { "key": "setting.claude_output", "operator": "equal", "operand": true }
         ]
     },
     {

@@ -33,6 +33,7 @@ def plugin_loaded() -> None:
     # Package reload leaves *stale* Session objects here (old module instance).
     # Touching them in on_activated (set_name / sleep UI / input) cycles focus
     # across every Claude sheet. Drop them; reattach is lazy on real focus.
+    from . import session_registry
     prev = getattr(sublime, "_claude_sessions", None) or {}
     if prev:
         print(f"[Claude] plugin_loaded: dropping {len(prev)} stale session(s)")
@@ -53,6 +54,8 @@ def plugin_loaded() -> None:
                 pass
         prev.clear()
     sublime._claude_sessions = prev if isinstance(prev, dict) else {}
+    sublime._claude_agents = {}  # agent_id → view_id (rebuilt on restore)
+    session_registry.ensure_registries()
 
     # Also sweep every Claude sheet (covers orphans not in the registry)
     try:
@@ -119,6 +122,11 @@ def _startup_settle_views() -> None:
         _startup_strip_composers()
         from .listeners import settle_startup_claude_views
         settle_startup_claude_views()
+        # Re-bind parent_view_id from stable parent_agent_id after all sheets load
+        from . import session_registry
+        n = session_registry.relink_all_parents()
+        if n:
+            print(f"[Claude] startup settle: relinked {n} parent view_id(s)")
     except Exception as e:
         print(f"[Claude] startup settle: {e}")
 
@@ -148,6 +156,8 @@ def plugin_unloaded() -> None:
 
 def get_session_for_view(view: sublime.View) -> Optional[Session]:
     """Get session for a specific output view."""
+    from . import session_registry
+    session_registry.ensure_registries()
     return sublime._claude_sessions.get(view.id())
 
 
@@ -222,10 +232,18 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         # Register before start so any later activation finds this session.
         if s.output.view:
             view_id = s.output.view.id()
-            sublime._claude_sessions[view_id] = s
+            from . import session_registry
+            try:
+                s._persist_view_identity()
+            except Exception:
+                pass
+            session_registry.register_session(s)
             # Track as last-active session for commands; view focus is separate.
             window.settings().set("claude_active_view", view_id)
-            print(f"[Claude] create_session: view_id={view_id} focus={focus}")
+            print(
+                f"[Claude] create_session: agent_id={getattr(s, 'agent_id', None)} "
+                f"view_id={view_id} focus={focus}"
+            )
         else:
             print(f"[Claude] create_session: ERROR - no output view!")
         s.start()
