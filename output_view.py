@@ -71,6 +71,9 @@ class OutputView:
         self._input_start: int = 0  # Start position of editable input region
         self._input_area_start: int = 0  # Start of entire input area (context + marker)
         self._input_marker: str = "◎ "  # Marker for input line
+        # Mid-draft caret offset (from _input_start). Survives stream re-renders
+        # when ST remaps selection or view.show(EOF) would yank to tail.
+        self._draft_caret_off: Optional[int] = None
         self._spinner_frame: int = 0  # Current spinner animation frame
         self._media_phantom_set = None  # inline image previews (minihtml data: URIs)
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
@@ -472,6 +475,61 @@ class OutputView:
 
         sublime.set_timeout(_pass1, 0)
 
+    def note_draft_caret(self) -> None:
+        """Remember mid-draft caret offset (call from selection / render paths)."""
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        if getattr(self, "_question_input_mode", False):
+            return
+        try:
+            start = int(self._input_start or 0)
+            size = self.view.size()
+            sel = self.view.sel()
+            if not sel:
+                return
+            b = sel[0].begin()
+            if start <= b <= size:
+                self._draft_caret_off = b - start
+        except Exception:
+            pass
+
+    def restore_draft_caret(self) -> bool:
+        """Put selection back at saved mid-draft offset. True if restored."""
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return False
+        off = getattr(self, "_draft_caret_off", None)
+        if off is None:
+            return False
+        try:
+            start = int(self._input_start or 0)
+            size = self.view.size()
+            # Clamp to current draft length (user may have deleted text)
+            max_off = max(0, size - start)
+            pos = start + max(0, min(int(off), max_off))
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(pos, pos))
+            return True
+        except Exception:
+            return False
+
+    def _draft_caret_is_mid(self) -> bool:
+        """True if caret is in ◎ draft and not at draft EOF (mid-edit)."""
+        if not self.view or not self._input_mode:
+            return False
+        try:
+            start = int(self._input_start or 0)
+            size = self.view.size()
+            sel = self.view.sel()
+            if not sel:
+                off = getattr(self, "_draft_caret_off", None)
+                return off is not None and off < max(0, size - start)
+            b = sel[0].begin()
+            if b < start or b > size:
+                return False
+            return b < size  # mid if not at absolute EOF
+        except Exception:
+            return False
+
     def _scroll_to_end(self, force: bool = False) -> None:
         """Scroll to end when following the stream; leave history view alone.
 
@@ -491,9 +549,18 @@ class OutputView:
         if not force and not self._is_following_tail():
             return  # User is reading history — don't steal the viewport
 
-        # Scroll to end without moving the caret
-        end = self.view.size()
-        self.view.show(end, keep_to_left=False, animate=False)
+        # Viewport only — never view.show(EOF) (yanks selection while composing)
+        try:
+            end = self.view.size()
+            if end <= 0:
+                return
+            _x, y = self.view.text_to_layout(end)
+            vh = float(self.view.viewport_extent()[1])
+            vx, _vy = self.view.viewport_position()
+            target_y = max(0.0, float(y) + float(self.view.line_height() or 16) - vh)
+            self.view.set_viewport_position((float(vx), target_y), False)
+        except Exception:
+            pass
 
     # --- Inline Input ---
 
@@ -941,15 +1008,16 @@ class OutputView:
     def _scroll_layout_to_bottom(self, *, force: bool = False) -> None:
         """Scroll so ◎ + bottom split sit at the foot of the viewport.
 
-        When the transcript grows, the sticky composer must ride the bottom —
-        not float mid-pane. LAYOUT_BELOW pad is tiny; pin by last-line Y.
-
-        force=False: skip if already glued (avoids 1-row thrash on spinner).
-        force=True: always re-pin (content growth / focus_composer).
+        Viewport-only. Never view.show(EOF) while the user is mid-draft in ◎ —
+        that was pinning the caret to the tail on every busy stream tick.
         """
         view = self.view
         if not view or not view.is_valid():
             return
+        # Snapshot mid-draft caret before any viewport work
+        mid = self._draft_caret_is_mid()
+        if self._input_mode:
+            self.note_draft_caret()
         try:
             end = view.size()
             if end > 0:
@@ -973,28 +1041,29 @@ class OutputView:
             target_y = max(0.0, y_bottom - vh)
             # Already glued to bottom — don't thrash spinner frames
             if not force and abs(vy - target_y) < max(2.0, line_h * 0.35):
+                if mid:
+                    self.restore_draft_caret()
                 return
             view.set_viewport_position((vx, target_y), False)
-            # ST sometimes clamps; soft show only when this sheet is focused —
-            # view.show() on a background sheet can yank window focus.
+            # Never view.show(EOF) while composing mid-draft — ST moves the
+            # selection to the shown region and pins caret at the tail.
+            if mid or (self._input_mode and self._view_is_focused()):
+                self.restore_draft_caret()
+                return
             if not self._view_is_focused():
                 return
             _vx2, vy2 = view.viewport_position()
             if force or abs(float(vy2) - target_y) > line_h * 0.5:
+                # Caret already at draft EOF or not composing — show is safe
                 try:
                     view.show(sublime.Region(end, end), False)
                 except Exception:
-                    try:
-                        view.show(end)
-                    except Exception:
-                        pass
-                view.set_viewport_position((vx, target_y), False)
-        except Exception:
-            if self._view_is_focused():
-                try:
-                    self.view.show(self.view.size())
-                except Exception:
                     pass
+                view.set_viewport_position((vx, target_y), False)
+                self.restore_draft_caret()
+        except Exception:
+            if mid:
+                self.restore_draft_caret()
 
     def _view_is_focused(self) -> bool:
         """True if this output sheet is the window's active view."""
@@ -1066,10 +1135,11 @@ class OutputView:
             size = self.view.size()
             end = size
 
-            # Intentional park at draft end (pad click)
+            # Intentional park at draft end (pad click / enter from history)
             if park_at_end or not preserve_caret:
                 self.view.sel().clear()
                 self.view.sel().add(sublime.Region(end, end))
+                self._draft_caret_off = max(0, end - start)
             else:
                 # Keep mid-draft caret; restore snapshot if ST wiped selection
                 restored = False
@@ -1079,32 +1149,41 @@ class OutputView:
                         b = sel[0].begin()
                         if start <= b <= size:
                             restored = True
+                            self._draft_caret_off = b - start
                 except Exception:
                     pass
                 if not restored and saved_off is not None:
                     pos = min(start + max(0, saved_off), size)
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(pos, pos))
+                    self._draft_caret_off = saved_off
                 elif not restored:
-                    # No prior caret in draft — leave alone if ST has a selection;
-                    # only default to draft start (not EOF) so we never pin tail.
-                    try:
-                        if not self.view.sel() or not (
-                            start <= self.view.sel()[0].begin() <= size
-                        ):
-                            self.view.sel().clear()
-                            self.view.sel().add(sublime.Region(start, start))
-                    except Exception:
-                        pass
+                    # Prefer last known offset, else draft start (never force EOF)
+                    if getattr(self, "_draft_caret_off", None) is not None:
+                        self.restore_draft_caret()
+                    else:
+                        try:
+                            if not self.view.sel() or not (
+                                start <= self.view.sel()[0].begin() <= size
+                            ):
+                                self.view.sel().clear()
+                                self.view.sel().add(sublime.Region(start, start))
+                                self._draft_caret_off = 0
+                        except Exception:
+                            pass
 
             if force_show:
-                # Only scroll viewport — never yank caret
+                # Viewport only; re-apply caret after deferred scrolls
                 self._scroll_layout_to_bottom(force=True)
+                self.restore_draft_caret()
                 if self._view_is_focused():
+                    def _scroll_keep_caret():
+                        if not self._view_is_focused():
+                            return
+                        self._scroll_layout_to_bottom(force=True)
+                        self.restore_draft_caret()
                     for ms in (16, 80):
-                        sublime.set_timeout(
-                            lambda: self._scroll_layout_to_bottom(force=True)
-                            if self._view_is_focused() else None, ms)
+                        sublime.set_timeout(_scroll_keep_caret, ms)
         except Exception:
             pass
 
@@ -3525,8 +3604,15 @@ class OutputView:
                         caret_off = b - self._input_start
                         # Clamp to draft (stale spare-line caret / mid-rewrite)
                         caret_off = max(0, min(caret_off, len(draft)))
+                        self._draft_caret_off = caret_off
+                elif getattr(self, "_draft_caret_off", None) is not None:
+                    # Sel briefly lost (e.g. mid-replace) — keep last known offset
+                    caret_in_composer = True
+                    caret_off = max(0, min(int(self._draft_caret_off), len(draft)))
             except Exception:
-                pass
+                if getattr(self, "_draft_caret_off", None) is not None:
+                    caret_in_composer = True
+                    caret_off = max(0, min(int(self._draft_caret_off), len(draft or "")))
 
         # Read region from Sublime's tracked region (auto-adjusts when view shifts)
         view_size = self.view.size()
@@ -3925,7 +4011,9 @@ class OutputView:
         if was_input:
             self.view.set_read_only(False)
             if not self._input_marker_intact():
-                self._replant_composer(draft, min(caret_off, len(draft or "")))
+                off = min(caret_off, len(draft or ""))
+                self._draft_caret_off = off
+                self._replant_composer(draft, off)
                 # Peel moved — re-anchor hairline after replant
                 try:
                     from . import claude_code
@@ -3934,50 +4022,63 @@ class OutputView:
                         _s._update_queue_phantom()
                 except Exception:
                     pass
-            elif caret_in_composer:
-                # Keep caret in draft; never past EOF (replant if draft wiped)
+            elif caret_in_composer or getattr(self, "_draft_caret_off", None) is not None:
+                # Always re-apply saved mid-draft offset after buffer rewrite
+                if not caret_in_composer and self._draft_caret_off is not None:
+                    caret_off = int(self._draft_caret_off)
                 max_off = max(0, self.view.size() - self._input_start)
-                pos = self._input_start + max(0, min(caret_off, max_off, len(draft or "")))
+                pos = self._input_start + max(
+                    0, min(caret_off, max_off, len(draft or "")))
+                self._draft_caret_off = pos - self._input_start
                 try:
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(pos, pos))
                 except Exception:
                     pass
 
+        def _reapply_draft_caret():
+            if was_input and self._input_mode:
+                self.restore_draft_caret()
+
         if pin is not None:
             # Immediate + deferred restore (beats ST auto-scroll-to-caret).
             # Sticky composer: pin composer_caret so deferred restores keep the
             # mid-draft caret (never park at viewport top / draft EOF).
-            if was_input and caret_in_composer:
+            if was_input and (
+                caret_in_composer
+                or getattr(self, "_draft_caret_off", None) is not None
+            ):
                 pin = dict(pin)
                 pin["sels"] = []
                 pin["preserve_sel"] = True
                 if self._input_marker_intact():
                     max_off = max(0, self.view.size() - self._input_start)
+                    off = caret_off if caret_in_composer else int(
+                        self._draft_caret_off or 0)
                     pin["composer_caret"] = self._input_start + max(
-                        0, min(caret_off, max_off, len(draft or "")))
+                        0, min(off, max_off, len(draft or "")))
             self._restore_view_state(pin)
             self._schedule_viewport_restore(pin)
-            if was_input and caret_in_composer and self._input_marker_intact():
-                pos = min(self._input_start + max(0, caret_off), self.view.size())
-                try:
-                    self.view.sel().clear()
-                    self.view.sel().add(sublime.Region(pos, pos))
-                except Exception:
-                    pass
+            _reapply_draft_caret()
+            if was_input:
+                sublime.set_timeout(_reapply_draft_caret, 0)
+                sublime.set_timeout(_reapply_draft_caret, 30)
         elif was_input and self._input_mode and (following or want_scroll or typing_at_tail):
-            # Sticky composer: keep ◎ + bottom split on the viewport floor when
-            # the transcript grows — only if this sheet is focused (never yank
-            # the user out of another file on stream ticks).
-            # Do NOT move the caret — only scroll.
+            # Sticky composer: keep ◎ on the viewport floor while streaming.
+            # Viewport only + re-apply caret (never view.show → EOF).
             if self._view_is_focused():
                 self._scroll_layout_to_bottom(force=(delta != 0))
+                _reapply_draft_caret()
                 if delta != 0:
-                    sublime.set_timeout(
-                        lambda: self._scroll_layout_to_bottom(force=True)
-                        if self._view_is_focused() else None, 0)
+                    def _after_scroll():
+                        if self._view_is_focused():
+                            self._scroll_layout_to_bottom(force=True)
+                        self.restore_draft_caret()
+                    sublime.set_timeout(_after_scroll, 0)
+                    sublime.set_timeout(_after_scroll, 30)
         elif want_scroll or typing_at_tail:
             self._scroll_to_end(force=False)
+            _reapply_draft_caret()
 
         # Keep typeable zones editable after _replace (sticky ◎ or free-text Other)
         if self._input_mode or getattr(self, "_question_input_mode", False):

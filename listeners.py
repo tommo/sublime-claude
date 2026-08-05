@@ -770,8 +770,9 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # ST requires at least one region for mouse interaction
         sel = self.view.sel()
         if len(sel) == 0:
-            # Prefer draft *start* over EOF — EOF pin was yanking mid-draft
-            # whenever a buffer edit momentarily cleared the selection.
+            # Restore last mid-draft offset if we have one; never jump to EOF
+            if s.output.restore_draft_caret():
+                return
             try:
                 start = int(getattr(s.output, "_input_start", 0) or 0)
             except Exception:
@@ -779,6 +780,11 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             pt = min(max(0, start), self.view.size())
             self.view.sel().add(sublime.Region(pt, pt))
             return
+        # Track mid-draft caret so busy stream re-renders can re-apply it
+        try:
+            s.output.note_draft_caret()
+        except Exception:
+            pass
         # Keep buffer editable; history protection is pre-mutation (on_text_command)
         if self.view.is_read_only():
             self.view.set_read_only(False)
