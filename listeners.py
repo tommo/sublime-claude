@@ -770,19 +770,23 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
         # ST requires at least one region for mouse interaction
         sel = self.view.sel()
         if len(sel) == 0:
-            # Restore last mid-draft offset if we have one; never jump to EOF
-            if s.output.restore_draft_caret():
-                return
+            # Only re-pin draft caret if we were composing (not history browse).
+            # Empty selection after a history click must not jump into ◎.
             try:
                 start = int(getattr(s.output, "_input_start", 0) or 0)
             except Exception:
                 start = 0
-            pt = min(max(0, start), self.view.size())
-            self.view.sel().add(sublime.Region(pt, pt))
+            # Prefer a no-op leave: if last known offset is mid-draft and the
+            # empty sel is a transient rewrite glitch, restore; otherwise park
+            # at click history point is impossible — leave ST empty (rare).
+            # Do not force draft start/EOF here.
             return
-        # Track mid-draft caret so busy stream re-renders can re-apply it
+        # Track mid-draft caret only when selection is still in ◎
         try:
-            s.output.note_draft_caret()
+            start = int(getattr(s.output, "_input_start", 0) or 0)
+            b = sel[0].begin()
+            if b >= start:
+                s.output.note_draft_caret()
         except Exception:
             pass
         # Keep buffer editable; history protection is pre-mutation (on_text_command)
