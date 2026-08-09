@@ -80,11 +80,12 @@ BACKGROUND_PREFIX = "⚙ "       # Background tool indicator
 # (looked up via backends.get(name)); these maps are just a last-resort fallback.
 BACKEND_ABBREV = {
     "codex": "CX", "copilot": "CP", "pi": "Pi", "dsr": "DSR",
-    "grok": "GR", "kimi": "KM",
+    "grok": "GR", "kimi": "KM", "opencode": "OC",
 }
 BACKEND_LABELS = {
     "claude": "Claude", "codex": "Codex", "copilot": "Copilot",
     "pi": "Pi", "dsr": "DSR", "grok": "Grok", "kimi": "Kimi Code",
+    "opencode": "opencode",
 }
 
 # ─── Timing ───────────────────────────────────────────────────────────────────

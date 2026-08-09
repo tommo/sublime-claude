@@ -85,6 +85,10 @@
                         "caption": "Kimi Code: New Session",
                         "command": "kimi_start"
                     },
+                    {
+                        "caption": "opencode: New Session",
+                        "command": "opencode_start"
+                    },
                     { "caption": "-" },
                     {
                         "caption": "Manage Anthropic Providers…",

@@ -273,6 +273,21 @@ class DsrStartCommand(sublime_plugin.WindowCommand):
         create_session(self.window, backend="dsr")
 
 
+class OpencodeStartCommand(sublime_plugin.WindowCommand):
+    """Start a native opencode session via ACP (`opencode acp`)."""
+    def run(self) -> None:
+        from .. import backends
+        if not backends.resolve_opencode_bin():
+            sublime.error_message(
+                "opencode CLI not found.\n\n"
+                "Install opencode (https://opencode.ai) and put `opencode` in "
+                "PATH, or set the OPENCODE_BIN environment variable.\n"
+                "Then run `opencode auth login` once."
+            )
+            return
+        create_session(self.window, backend="opencode")
+
+
 class GrokStartCommand(sublime_plugin.WindowCommand):
     """Start a native Grok Build session via ACP (`grok agent stdio`)."""
     def run(self) -> None:
@@ -793,6 +808,29 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 backend_models = list(grok_backend.grok_picker_models(extra=extra))
             except Exception as e:
                 print(f"[Claude] grok session model list: {e}")
+        # opencode: live ACP configOptions catalog wins over the cached CLI list
+        if backend == "opencode":
+            try:
+                live = getattr(active_session, "available_models", None) or []
+                merged, seen_ids = [], set()
+                for item in list(live) + list(backend_models):
+                    if isinstance(item, dict):
+                        mid = (item.get("modelId") or item.get("model_id")
+                               or item.get("id"))
+                        label = item.get("name") or item.get("label") or mid
+                    elif isinstance(item, (list, tuple)) and item:
+                        mid = item[0]
+                        label = item[1] if len(item) > 1 else item[0]
+                    else:
+                        mid = label = item
+                    if not mid or mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    merged.append((mid, label or mid))
+                if merged:
+                    backend_models = merged
+            except Exception as e:
+                print(f"[Claude] opencode session model list: {e}")
         for m in backend_models:
             if isinstance(m, str):
                 model_id, model_name = m, m
@@ -836,7 +874,7 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             # Stable built-in order (incl. ACP: grok, kimi) then remaining available.
             for name in (
                 "claude", "codex", "copilot", "pi", "dsr",
-                "grok", "kimi", "grok_cc",
+                "grok", "kimi", "opencode", "grok_cc",
             ):
                 if name in available_backends and name not in ordered:
                     ordered.append(name)

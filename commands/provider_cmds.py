@@ -863,7 +863,8 @@ class ClaudeSetDefaultModelCommand(sublime_plugin.WindowCommand):
         # and has its own legacy default_model key handled below).
         seen = set()
         backends_list = []
-        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
+        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok",
+                     "opencode", "grok_cc"):
             if backends.is_available(name) or name == "claude":
                 backends_list.append(name)
                 seen.add(name)
@@ -938,7 +939,8 @@ class ClaudeSetDefaultProviderCommand(sublime_plugin.WindowCommand):
         # available custom providers. Same ordering as ClaudeSetDefaultModelCommand.
         seen = set()
         backends_list = []
-        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok", "grok_cc"):
+        for name in ("claude", "codex", "copilot", "pi", "dsr", "grok",
+                     "opencode", "grok_cc"):
             if name == "claude" or backends.is_available(name):
                 backends_list.append(name)
                 seen.add(name)
