@@ -812,21 +812,16 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         if backend == "opencode":
             try:
                 live = getattr(active_session, "available_models", None) or []
-                merged, seen_ids = [], set()
-                for item in list(live) + list(backend_models):
-                    if isinstance(item, dict):
-                        mid = (item.get("modelId") or item.get("model_id")
-                               or item.get("id"))
-                        label = item.get("name") or item.get("label") or mid
-                    elif isinstance(item, (list, tuple)) and item:
-                        mid = item[0]
-                        label = item[1] if len(item) > 1 else item[0]
-                    else:
-                        mid = label = item
-                    if not mid or mid in seen_ids:
-                        continue
-                    seen_ids.add(mid)
-                    merged.append((mid, label or mid))
+                # Registry catalog (`opencode models`, incl. custom providers
+                # from opencode.json). sublime_cached_models.json can predate
+                # the CLI fetch and pin the static zen-only fallback, and the
+                # cache otherwise wins over the registry above.
+                try:
+                    registry = list(backends.get(backend).default_models)
+                except Exception:
+                    registry = []
+                merged = backends.merge_model_catalog(
+                    live, registry, backend_models)
                 if merged:
                     backend_models = merged
             except Exception as e:

@@ -339,6 +339,34 @@ def _opencode_fetch_models() -> None:
         _opencode_models_cache = models
 
 
+def merge_model_catalog(*sources) -> List[Tuple[str, str]]:
+    """Merge model lists into ordered unique ``(id, label)`` pairs.
+
+    Accepts ACP ``availableModels`` dicts ({modelId, name}), ``(id, label)``
+    pairs and bare id strings, in any mix. Earlier sources win on duplicates,
+    so callers pass the freshest catalog first (live session → registry →
+    on-disk cache).
+    """
+    merged: List[Tuple[str, str]] = []
+    seen = set()
+    for src in sources:
+        for item in src or []:
+            if isinstance(item, dict):
+                mid = (item.get("modelId") or item.get("model_id")
+                       or item.get("id"))
+                label = item.get("name") or item.get("label") or mid
+            elif isinstance(item, (list, tuple)) and item:
+                mid = item[0]
+                label = item[1] if len(item) > 1 else item[0]
+            else:
+                mid = label = item
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            merged.append((str(mid), str(label or mid)))
+    return merged
+
+
 def opencode_picker_models() -> List[Tuple[str, str]]:
     """Model catalog for the picker; kicks off the CLI fetch on first call."""
     global _opencode_fetch_started

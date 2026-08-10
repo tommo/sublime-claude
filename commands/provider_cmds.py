@@ -851,6 +851,22 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
                 models = [list(m) for m in grok_backend.grok_picker_models(extra=extra)]
             except Exception as e:
                 print(f"[Claude] grok model merge: {e}")
+        # opencode ACP: live session configOptions + `opencode models` registry
+        # (custom providers from opencode.json). Both outrank the on-disk cache,
+        # which can predate the CLI fetch and pin the static zen-only fallback.
+        if backend == "opencode":
+            try:
+                s = get_active_session(self.window)
+                live = getattr(s, "available_models", None) or []
+                try:
+                    registry = list(backends.get(backend).default_models)
+                except Exception:
+                    registry = []
+                merged = backends.merge_model_catalog(live, registry, models)
+                if merged:
+                    models = [list(m) for m in merged]
+            except Exception as e:
+                print(f"[Claude] opencode model merge: {e}")
         return models
 
 
