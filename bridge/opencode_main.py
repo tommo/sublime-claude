@@ -104,6 +104,46 @@ class OpencodeBridge(AcpBridge):
             env["PATH"] = local_bin + os.pathsep + path
         return env
 
+    def usage_from_prompt_result(self, result: dict) -> Optional[dict]:
+        """opencode reports tokens on the session/prompt result itself.
+
+        The base hook only looks at `_meta` (Grok's shape); opencode sends
+        `usage` top-level and leaves `_meta` empty, so the context meter got
+        nothing.
+        """
+        usage = (result or {}).get("usage") or {}
+        keys = ("inputTokens", "outputTokens", "cachedReadTokens",
+                "reasoningTokens", "totalTokens")
+        if not isinstance(usage, dict) or not any(k in usage for k in keys):
+            return super().usage_from_prompt_result(result)
+
+        def _tok(key: str) -> int:
+            try:
+                return int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return {
+            "input_tokens": _tok("inputTokens"),
+            "output_tokens": _tok("outputTokens"),
+            "cache_read_input_tokens": _tok("cachedReadTokens"),
+            "reasoning_tokens": _tok("reasoningTokens"),
+            "total_tokens": _tok("totalTokens"),
+            "model": self.model or None,
+        }
+
+    def _canonical_mcp_name(self, name: str) -> str:
+        """`sublime_read_view` → the plugin's own formatter name.
+
+        opencode namespaces MCP tools as `{server}_{tool}` (single underscore);
+        the plugin's formatters key off Claude's `mcp__sublime__` / `sublime__`
+        convention, so the rows would render raw.
+        """
+        if not name.startswith("sublime_") or name.startswith("sublime__"):
+            return ""
+        bare = name[len("sublime_"):]
+        return self.TOOL_TO_CANONICAL.get(bare) or ("mcp__sublime__" + bare)
+
     def _normalize_tool_name(self, upd: dict) -> str:
         """Prefer the ACP `kind`; opencode's title is prose, not a tool id.
 
@@ -121,6 +161,9 @@ class OpencodeBridge(AcpBridge):
         title = (upd.get("title") or "").strip()
         # Exact tool id (opening tool_call) or an mcp__/sublime__ name
         if title:
+            mapped = self._canonical_mcp_name(title)
+            if mapped:
+                return mapped
             mapped = self.TOOL_TO_CANONICAL.get(title.lower())
             if mapped:
                 return mapped
