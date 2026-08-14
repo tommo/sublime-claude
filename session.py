@@ -753,6 +753,11 @@ class Session:
         self._composer_allowed = True
         if self.output and self.output.view:
             self.output.view.settings().erase("claude_sleeping")
+        if self.resume_id and not self.fork and not getattr(self, "quick_mode", False):
+            try:
+                self._paint_resume_preview()
+            except Exception as e:
+                print(f"[Claude] resume preview: {e}")
         # Same inline input UX as a normal session
         self._enter_input_with_draft()
 
@@ -1522,6 +1527,38 @@ class Session:
         if not rewind_to:
             return None, ""
         return rewind_to, undone_prompt
+
+    def _paint_resume_preview(self) -> None:
+        """Paint last conversation turn(s) into a newly reopened history view."""
+        if not self.output or not self.output.view or not self.output.view.is_valid():
+            return
+        view = self.output.view
+        existing = view.substr(sublime.Region(0, view.size())).strip()
+        if len(existing) > 400:
+            return
+        from .resume_preview import load_turns, select_preview, display_prompt, format_turn_body
+        sid = self.session_id or self.resume_id or ""
+        cwd = ""
+        try:
+            cwd = self._cwd() or ""
+        except Exception:
+            cwd = ""
+        claude_jsonl = ""
+        try:
+            claude_jsonl = self._find_jsonl_path() or ""
+        except Exception:
+            claude_jsonl = ""
+        turns = load_turns(sid, self.backend or "claude", cwd, claude_jsonl)
+        chosen = select_preview(turns)
+        if not chosen:
+            return
+        for t in chosen:
+            prompt = display_prompt(t.get("prompt") or "") or "(turn)"
+            self.output.prompt(prompt)
+            body = format_turn_body(t)
+            if body:
+                self.output.text(body if body.endswith("\n") else body + "\n")
+            self.output.meta(0)
 
     def _find_jsonl_path(self) -> Optional[str]:
         """Find the JSONL file for this session."""

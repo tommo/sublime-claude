@@ -18,8 +18,16 @@ HISTORY_CAP = 40
 COMPACT_COLS = 56
 
 
+def one_line_title(name: str, limit: int = 200) -> str:
+    """Keep a list row on one line; show ↵ where the name had a newline."""
+    text = (name or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\n", "↵")
+    text = " ".join(text.split())
+    return text[:limit].strip()
+
+
 def _name_from_prompt(prompt: str, limit: int = 200) -> str:
-    return " ".join((prompt or "").split())[:limit].strip()
+    return one_line_title(prompt, limit)
 
 
 def session_title(session) -> str:
@@ -39,7 +47,7 @@ def session_title(session) -> str:
                     return one
         except Exception:
             pass
-    return name or "(unnamed)"
+    return one_line_title(name) or "(unnamed)"
 
 
 def _status_of(session) -> str:
@@ -206,7 +214,7 @@ def collect_history(live_ids: set, cwd: str) -> Tuple[List[dict], List[dict]]:
             "kind": "saved",
             "session_id": sid,
             "view_id": None,
-            "name": s.get("name") or "(unnamed)",
+            "name": one_line_title(s.get("name") or "") or "(unnamed)",
             "backend": s.get("backend") or "claude",
             "status": s.get("state") or "closed",
             "query_count": int(s.get("query_count") or 0),
@@ -242,7 +250,7 @@ def _right_meta(r: dict) -> str:
 def _fmt_row(r: dict, starred: set, compact: bool = False, cols: int = 0) -> str:
     live = r.get("kind") == "live"
     star = "★ " if r.get("session_id") in starred else ""
-    name = r.get("name") or ""
+    name = one_line_title(r.get("name") or "")
     mark = _mark(r["status"]) if live else "·"
     if compact:
         pre = f"{mark} {star}{backend_abbrev(r.get('backend'))} "
@@ -320,7 +328,11 @@ def focus_live(window, row: dict) -> bool:
         return False
     win = view.window() or window
     win.focus_view(view)
-    win.settings().set("claude_active_view", view.id())
+    try:
+        from .session_split import remember_active_session
+        remember_active_session(win, view)
+    except Exception:
+        win.settings().set("claude_active_view", view.id())
     reveal_session_bottom(session)
     return True
 

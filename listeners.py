@@ -411,7 +411,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         # Mark this as the "active" session for the window only when truly focused
         old_active = window.settings().get("claude_active_view")
-        window.settings().set("claude_active_view", self.view.id())
+        from .session_split import remember_active_session
+        remember_active_session(window, self.view)
 
         # Orphan after restart: one path — restore as sleeping (or start if new)
         s = get_session_for_view(self.view)

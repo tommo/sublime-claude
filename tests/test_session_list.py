@@ -106,6 +106,22 @@ class TestRenderSessionList(unittest.TestCase):
         s.name = "read pml_editor package"
         self.assertEqual(sl.session_title(s), "read pml_editor package")
 
+    def test_one_line_title_escapes_newline(self):
+        sl = _load()
+        self.assertEqual(
+            sl.one_line_title("merge\n- **P1 — `merge` 1"),
+            "merge↵- **P1 — `merge` 1")
+        self.assertNotIn("\n", sl.one_line_title("a\r\nb\nc"))
+        here = [{
+            "kind": "saved", "session_id": "n1", "view_id": None,
+            "name": "head\n- **P1 — merge", "backend": "grok",
+            "status": "closed", "query_count": 0, "project": "/p",
+            "last_activity": 1, "last_access": 1,
+        }]
+        text, _ = sl.render_list([], here, [], cols=80)
+        self.assertEqual(text.count("\n- **P1"), 0)
+        self.assertIn("↵", text)
+
     def test_backend_abbrev(self):
         sl = _load()
         self.assertEqual(sl.backend_abbrev("grok"), "GR")

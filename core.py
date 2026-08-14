@@ -7,6 +7,10 @@ from typing import Dict, Optional
 
 from .session import Session
 from . import backends
+from .session_split import (
+    remember_active_session,
+    place_in_last_session_split,
+)
 
 
 _auto_sleep_timer = None
@@ -223,6 +227,9 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     window.settings().set("claude_creating_session", True)
     try:
         s.output.show(focus=focus)
+        if resume_id and s.output and s.output.view:
+            if place_in_last_session_split(window, s.output.view) and focus:
+                window.focus_view(s.output.view)
         if s.output.view and backend != "claude":
             spec = backends.get(backend)
             s.output.view.settings().set("claude_backend", backend)
@@ -239,7 +246,7 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
                 pass
             session_registry.register_session(s)
             # Track as last-active session for commands; view focus is separate.
-            window.settings().set("claude_active_view", view_id)
+            remember_active_session(window, s.output.view)
             print(
                 f"[Claude] create_session: agent_id={getattr(s, 'agent_id', None)} "
                 f"view_id={view_id} focus={focus}"
