@@ -28,6 +28,7 @@ def _load():
         sess = types.ModuleType(sess_name)
         sess.load_saved_sessions = lambda: []
         sess.load_bookmarks = lambda p=None: set()
+        sess.remove_saved_session = lambda sid: False
         sys.modules[sess_name] = sess
     be_name = _PKG + ".backends"
     if be_name not in sys.modules:
@@ -134,8 +135,9 @@ class TestRenderSessionList(unittest.TestCase):
         wide = sl.format_header(72)
         self.assertEqual(len(wide), 72)
         self.assertTrue(wide.startswith("SESSIONS"))
-        self.assertTrue(wide.endswith("r refresh"))
+        self.assertTrue(wide.endswith("del close"))
         self.assertIn("enter", wide)
+        self.assertIn("del", wide)
         narrow = sl.format_header(28)
         self.assertLessEqual(len(narrow), 28)
         self.assertTrue(narrow.startswith("SESSIONS"))
@@ -373,6 +375,19 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertNotIn("elsewhere", text)
         self.assertNotIn("other projects", text)
         self.assertEqual([r["session_id"] for r in index], ["h"])
+
+    def test_close_row_drops_saved(self):
+        sl = _load()
+        gone = []
+        sl.remove_saved_session = lambda sid, g=gone: (g.append(sid) or True)
+        row = {
+            "kind": "saved", "session_id": "dead", "name": "old",
+            "backend": "grok",
+        }
+        self.assertTrue(sl.close_row(None, row))
+        self.assertEqual(gone, ["dead"])
+        self.assertFalse(sl.close_row(None, None))
+        self.assertFalse(sl.close_row(None, {"kind": "saved"}))
 
 
 if __name__ == "__main__":

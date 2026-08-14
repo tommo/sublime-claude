@@ -199,6 +199,18 @@ def save_sessions(sessions: List[Dict]) -> None:
         print(f"[Claude] Failed to save sessions: {e}")
 
 
+def remove_saved_session(session_id: str) -> bool:
+    """Drop a session from the on-disk resume list. True if something was removed."""
+    if not session_id:
+        return False
+    sessions = load_saved_sessions()
+    nxt = [s for s in sessions if s.get("session_id") != session_id]
+    if len(nxt) == len(sessions):
+        return False
+    save_sessions(nxt)
+    return True
+
+
 # NOTE: ContextItem moved to context_manager.py and re-exported above for callers
 
 

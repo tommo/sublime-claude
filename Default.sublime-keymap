@@ -368,6 +368,20 @@
         ]
     },
     {
+        "keys": ["delete"],
+        "command": "claude_session_list_close",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["backspace"],
+        "command": "claude_session_list_close",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
         "keys": ["enter"],
         "command": "claude_order_goto",
         "context": [
@@ -811,5 +825,9 @@
     { "keys": ["enter"], "command": "claude_session_list_open",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["r"], "command": "claude_session_list_refresh",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
+    { "keys": ["delete"], "command": "claude_session_list_close",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
+    { "keys": ["backspace"], "command": "claude_session_list_close",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] }
 ]

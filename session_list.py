@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import sublime
 import sublime_plugin
 
-from .session import load_saved_sessions, load_bookmarks
+from .session import load_saved_sessions, load_bookmarks, remove_saved_session
 
 
 SETTING = "claude_session_list"
@@ -128,10 +128,10 @@ def use_compact(cols: int) -> bool:
 
 def format_header(cols: int = 0) -> str:
     left = "SESSIONS"
-    right = "enter / dclick open · r refresh"
+    right = "enter / dclick open · r refresh · del close"
     if not cols:
         return f"{left}                  {right}"
-    for cand in (right, "↵ open · r", "r refresh"):
+    for cand in (right, "↵ open · r · del", "r · del", "r refresh"):
         if cols >= len(left) + 1 + len(cand):
             right = cand
             break
@@ -519,6 +519,72 @@ def open_row(window, row: dict) -> bool:
     return resume_saved(window, row)
 
 
+def _live_session_for_row(row: dict):
+    if not row:
+        return None
+    sessions = getattr(sublime, "_claude_sessions", None) or {}
+    vid = row.get("view_id")
+    if vid is not None and vid in sessions:
+        return sessions.get(vid)
+    sid = row.get("session_id")
+    if sid:
+        try:
+            from .session_registry import find_live_by_session_id
+            return find_live_by_session_id(sid)
+        except Exception:
+            pass
+        for s in sessions.values():
+            if getattr(s, "session_id", None) == sid:
+                return s
+    return None
+
+
+def close_row(window, row: dict) -> bool:
+    """Stop a live session or drop a history entry. Removes it from the list."""
+    if not row:
+        return False
+    sid = row.get("session_id")
+    if row.get("kind") == "live":
+        session = _live_session_for_row(row)
+        if session:
+            view = None
+            try:
+                view = session.output.view if session.output else None
+            except Exception:
+                view = None
+            try:
+                session.stop()
+            except Exception:
+                pass
+            try:
+                from .session_registry import unregister_view, ensure_registries
+                ensure_registries()
+                if view:
+                    unregister_view(view.id())
+                aid = getattr(session, "agent_id", None)
+                bg = getattr(sublime, "_claude_background", None)
+                if aid and isinstance(bg, dict):
+                    bg.pop(aid, None)
+            except Exception:
+                pass
+            if view:
+                try:
+                    if view.is_valid():
+                        view.settings().set("claude_soft_close", True)
+                        view.close()
+                except Exception:
+                    pass
+        if sid:
+            try:
+                remove_saved_session(sid)
+            except Exception:
+                pass
+        return True
+    if sid:
+        return bool(remove_saved_session(sid))
+    return False
+
+
 class SessionListView:
     def __init__(self, window):
         self.window = window
@@ -631,6 +697,8 @@ class SessionListClickListener(sublime_plugin.EventListener):
     def on_text_command(self, view, name, args):
         if not view or not view.settings().get(SETTING):
             return None
+        if name in ("left_delete", "right_delete"):
+            return ("claude_session_list_close", {})
         if name != "insert":
             return None
         ch = (args or {}).get("characters") or ""
@@ -724,3 +792,39 @@ def _session_list_poll() -> None:
         return
     refresh_all_session_lists()
     sublime.set_timeout(_session_list_poll, 900)
+
+
+class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
+    """Delete/close the session under the caret in the Sessions list."""
+
+    def run(self, edit):
+        import json
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        name = (row.get("name") or "").strip() or "session"
+        if close_row(win, row):
+            refresh_session_list(win)
+            try:
+                pt = self.view.text_point(max(0, line - 1), 0)
+                self.view.sel().clear()
+                self.view.sel().add(pt)
+            except Exception:
+                pass
+            sublime.status_message("Claude: closed {}".format(name))
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
