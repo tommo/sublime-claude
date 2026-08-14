@@ -135,6 +135,89 @@ def parse_grok_chat(path: str) -> List[dict]:
     return turns
 
 
+def _kimi_prompt_text(rec: dict) -> str:
+    inp = rec.get("input")
+    if isinstance(inp, list):
+        return _flatten(inp)
+    if isinstance(inp, dict):
+        return _flatten(inp)
+    if isinstance(inp, str):
+        return inp.strip()
+    return ""
+
+
+def _kimi_skip_prompt(text: str, origin: str) -> bool:
+    if origin == "task":
+        return True
+    t = (text or "").lstrip()
+    return t.startswith((
+        "<system-reminder>",
+        "<task-notification>",
+        "<notification",
+    ))
+
+
+def parse_kimi_wire(path: str) -> List[dict]:
+    """Kimi agents/main/wire.jsonl → turns (user prompt + text + tools)."""
+    turns: List[dict] = []
+    cur = None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = rec.get("type")
+                if kind == "turn.prompt":
+                    text = _kimi_prompt_text(rec)
+                    origin = str((rec.get("origin") or {}).get("kind") or "")
+                    if not text or _kimi_skip_prompt(text, origin):
+                        continue
+                    cur = _new_turn(text)
+                    turns.append(cur)
+                    continue
+                if kind != "context.append_loop_event" or cur is None:
+                    continue
+                ev = rec.get("event") if isinstance(rec.get("event"), dict) else {}
+                et = ev.get("type")
+                if et == "tool.call" and ev.get("name"):
+                    cur["tools"].append(str(ev["name"]))
+                elif et == "content.part":
+                    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+                    if part.get("type") == "text" and part.get("text"):
+                        cur["reply"] += part["text"]
+    except OSError:
+        return []
+    return turns
+
+
+def find_kimi_wire(session_id: str, cwd: str = "") -> Optional[str]:
+    if not session_id:
+        return None
+    root = os.path.expanduser("~/.kimi-code/sessions")
+    if not os.path.isdir(root):
+        return None
+    names = [session_id]
+    if not session_id.startswith("session_"):
+        names.append("session_" + session_id)
+    try:
+        for wd in os.listdir(root):
+            base = os.path.join(root, wd)
+            if not os.path.isdir(base):
+                continue
+            for name in names:
+                cand = os.path.join(base, name, "agents", "main", "wire.jsonl")
+                if os.path.isfile(cand):
+                    return cand
+    except OSError:
+        return None
+    return None
+
+
 def find_grok_chat(session_id: str, cwd: str = "") -> Optional[str]:
     if not session_id:
         return None
@@ -162,6 +245,9 @@ def load_turns(session_id: str, backend: str, cwd: str = "",
     if backend == "grok":
         path = find_grok_chat(session_id, cwd)
         return parse_grok_chat(path) if path else []
+    if backend == "kimi":
+        path = find_kimi_wire(session_id, cwd)
+        return parse_kimi_wire(path) if path else []
     if claude_jsonl and os.path.isfile(claude_jsonl):
         return parse_claude_jsonl(claude_jsonl)
     return []

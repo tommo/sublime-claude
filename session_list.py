@@ -128,10 +128,10 @@ def use_compact(cols: int) -> bool:
 
 def format_header(cols: int = 0) -> str:
     left = "SESSIONS"
-    right = "enter / dclick open · r refresh · del close"
+    right = "enter open · v reveal · r refresh · del close"
     if not cols:
         return f"{left}                  {right}"
-    for cand in (right, "↵ open · r · del", "r · del", "r refresh"):
+    for cand in (right, "↵ open · v · r · del", "v · r · del", "r · del", "r refresh"):
         if cols >= len(left) + 1 + len(cand):
             right = cand
             break
@@ -390,19 +390,23 @@ def focus_live(window, row: dict) -> bool:
     return True
 
 
-def reveal_live_session(window, session) -> bool:
+def reveal_live_session(window, session, focus: bool = True) -> bool:
     """Show a live session, reattaching a sheet if it was backgrounded."""
     if not session or not window:
         return False
     view = session.output.view if session.output else None
     if view and view.is_valid():
         win = view.window() or window
+        prev = None if focus else win.active_view()
         win.focus_view(view)
-        try:
-            from .session_split import remember_active_session
-            remember_active_session(win, view)
-        except Exception:
-            pass
+        if focus:
+            try:
+                from .session_split import remember_active_session
+                remember_active_session(win, view)
+            except Exception:
+                pass
+        elif prev and prev.is_valid() and prev.id() != view.id():
+            win.focus_view(prev)
         reveal_session_bottom(session)
         return True
     session.window = window
@@ -415,15 +419,16 @@ def reveal_live_session(window, session) -> bool:
         pass
     if not session.output:
         return False
-    session.output.show(focus=True)
+    session.output.show(focus=focus)
     view = session.output.view
     if not view or not view.is_valid():
         return False
     try:
         from .session_split import place_in_last_session_split, remember_active_session
         place_in_last_session_split(window, view)
-        window.focus_view(view)
-        remember_active_session(window, view)
+        if focus:
+            window.focus_view(view)
+            remember_active_session(window, view)
     except Exception:
         pass
     try:
@@ -445,7 +450,7 @@ def reveal_live_session(window, session) -> bool:
     except Exception:
         pass
     reveal_session_bottom(session)
-    if not session.working:
+    if focus and not session.working:
         try:
             session._enter_input_with_draft()
         except Exception:
@@ -479,7 +484,7 @@ def reveal_session_bottom(session) -> None:
             pass
 
 
-def resume_saved(window, row: dict) -> bool:
+def resume_saved(window, row: dict, focus: bool = True) -> bool:
     from .core import create_session
     sid = row.get("session_id")
     if not sid:
@@ -487,12 +492,12 @@ def resume_saved(window, row: dict) -> bool:
     try:
         from .session_registry import find_live_by_session_id
         live = find_live_by_session_id(sid)
-        if live and reveal_live_session(window, live):
+        if live and reveal_live_session(window, live, focus=focus):
             return True
     except Exception:
         pass
     backend = row.get("backend") or "claude"
-    s = create_session(window, resume_id=sid, backend=backend)
+    s = create_session(window, resume_id=sid, backend=backend, focus=focus)
     name = row.get("name")
     if s and name and name != "(unnamed)":
         s.name = name
@@ -517,6 +522,26 @@ def open_row(window, row: dict) -> bool:
         if focus_live(window, row):
             return True
     return resume_saved(window, row)
+
+
+def reveal_row(window, row: dict) -> bool:
+    """Show the session sheet but keep keyboard focus on the list."""
+    if not row or not window:
+        return False
+    keep = window.active_view()
+    ok = False
+    if row.get("kind") == "live":
+        session = _live_session_for_row(row)
+        if session is not None:
+            ok = reveal_live_session(window, session, focus=False)
+    if not ok:
+        ok = resume_saved(window, row, focus=False)
+    if keep and keep.is_valid():
+        try:
+            window.focus_view(keep)
+        except Exception:
+            pass
+    return ok
 
 
 def _live_session_for_row(row: dict):
@@ -704,6 +729,8 @@ class SessionListClickListener(sublime_plugin.EventListener):
         ch = (args or {}).get("characters") or ""
         if ch == "r":
             return ("claude_session_list_refresh", {})
+        if ch == "v":
+            return ("claude_session_list_reveal", {})
         if ch in ("\n", "\r"):
             return ("claude_session_list_open", {})
         return None
@@ -824,6 +851,36 @@ class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
             except Exception:
                 pass
             sublime.status_message("Claude: closed {}".format(name))
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListRevealCommand(sublime_plugin.TextCommand):
+    """Show the session under the caret; keep focus on the Sessions list."""
+
+    def run(self, edit):
+        import json
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        if reveal_row(win, row):
+            try:
+                win.focus_view(self.view)
+            except Exception:
+                pass
 
     def is_enabled(self):
         return bool(self.view.settings().get(SETTING))

@@ -129,6 +129,10 @@
         "command": "claude_session_list"
     },
     {
+        "caption": "Claude: Session List Reveal (keep focus)",
+        "command": "claude_session_list_reveal"
+    },
+    {
         "caption": "Claude: Hide Session (keep running)",
         "command": "claude_hide_session"
     },

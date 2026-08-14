@@ -11,7 +11,7 @@ if _ROOT not in sys.path:
 
 from resume_preview import (
     display_prompt, select_preview, parse_claude_jsonl, parse_grok_chat,
-    format_turn_body,
+    parse_kimi_wire, load_turns, format_turn_body,
 )
 
 
@@ -77,6 +77,20 @@ class TestResumePreview(unittest.TestCase):
         self.assertEqual(turns[0]["reply"], "yo")
         self.assertIn("⚙ read_file", format_turn_body(turns[0]))
         self.assertIn("yo", format_turn_body(turns[0]))
+
+    def test_parse_kimi_wire(self):
+        path = os.path.join(_ROOT, "tests", "fixtures", "kimi_wire_preview.jsonl")
+        turns = parse_kimi_wire(path)
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["prompt"], "what's the performance?")
+        self.assertEqual(turns[0]["tools"], ["Read"])
+        self.assertEqual(turns[0]["reply"], "Let me check RichLabel.")
+        self.assertEqual(turns[1]["prompt"], "so richlabel has no cache?")
+        self.assertEqual(turns[1]["tools"], ["Grep"])
+        self.assertIn("no cache", turns[1]["reply"])
+
+    def test_load_turns_kimi_empty_without_store(self):
+        self.assertEqual(load_turns("session_missing", "kimi"), [])
 
 
 if __name__ == "__main__":

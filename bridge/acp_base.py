@@ -697,12 +697,7 @@ class AcpBridge(BaseBridge):
             return
 
         if self._loading_session:
-            upd = params.get("update", {})
-            kind = upd.get("sessionUpdate")
-            if kind == "current_mode_update":
-                self._handle_mode_update(upd)
-            elif kind == "available_commands_update":
-                self._handle_commands_update(upd)
+            self._forward_load_replay(params)
             return
 
         upd = params.get("update", {})
@@ -1019,6 +1014,99 @@ class AcpBridge(BaseBridge):
         ):
             self._handle_schedule_lifecycle(upd)
         # turn_completed / session_summary_generated: ignore (result RPC covers end)
+
+    def _forward_load_replay(self, params: dict) -> None:
+        """Paint session/load history. Kimi replays before load settles.
+
+        Live `_forward_update` would adopt these as a new turn (⚙) and skip
+        `user_message_chunk`. Replay must not pair terminals or mark ⚙.
+        """
+        upd = params.get("update", {}) or {}
+        kind = upd.get("sessionUpdate")
+        if kind == "current_mode_update":
+            self._handle_mode_update(upd)
+            return
+        if kind == "available_commands_update":
+            self._handle_commands_update(upd)
+            return
+        if kind == "user_message_chunk":
+            text = (upd.get("content") or {}).get("text", "")
+            if text:
+                send_notification("message", {
+                    "type": "replay_user", "text": text,
+                })
+            return
+        if kind == "agent_message_chunk":
+            text = (upd.get("content") or {}).get("text", "")
+            if text:
+                send_notification("message", {
+                    "type": "text_delta", "text": text, "replay": True,
+                })
+            return
+        if kind == "agent_thought_chunk":
+            return
+        if kind == "tool_call":
+            tool_name = self._normalize_tool_name(upd)
+            tool_input = self._tool_input_from_update(upd, tool_name)
+            tool_name, tool_input = self._reclassify_read_dir(
+                tool_name, tool_input)
+            tid = upd.get("toolCallId")
+            if self._should_suppress_tool_row(upd, tool_name):
+                return
+            if tool_name == "tool" and not tool_input:
+                return
+            if tid:
+                if tool_name and tool_name != "tool":
+                    self._tool_names_by_id[tid] = tool_name
+                if tool_input:
+                    prev = self._tool_inputs_by_id.get(tid) or {}
+                    self._tool_inputs_by_id[tid] = {**prev, **tool_input}
+                self._tool_ids_emitted.add(tid)
+            send_notification("message", {
+                "type": "tool_use",
+                "id": tid,
+                "name": tool_name,
+                "input": tool_input,
+                "background": False,
+                "replay": True,
+            })
+            return
+        if kind == "tool_call_update":
+            status = upd.get("status")
+            tid = self._resolve_tool_id(upd.get("toolCallId"))
+            tool_name = self._normalize_tool_name(upd)
+            if (not tool_name or tool_name == "tool") and tid:
+                tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
+            elif tid and tool_name and tool_name != "tool":
+                self._tool_names_by_id[tid] = tool_name
+            enriched = self._tool_input_from_update(upd, tool_name)
+            tool_name, enriched = self._reclassify_read_dir(tool_name, enriched)
+            if tid and enriched:
+                prev = self._tool_inputs_by_id.get(tid) or {}
+                self._tool_inputs_by_id[tid] = {**prev, **enriched}
+            if tid not in self._tool_ids_emitted and (
+                    enriched or upd.get("title")
+                    or status in ("completed", "failed")):
+                if not self._should_suppress_tool_row(upd, tool_name):
+                    self._tool_ids_emitted.add(tid)
+                    send_notification("message", {
+                        "type": "tool_use",
+                        "id": tid,
+                        "name": tool_name,
+                        "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                        "background": False,
+                        "replay": True,
+                    })
+            if status in ("completed", "failed"):
+                text = self._extract_tool_content(upd, tool_name)
+                send_notification("message", {
+                    "type": "tool_result",
+                    "tool_use_id": tid,
+                    "content": text,
+                    "is_error": status == "failed",
+                    "replay": True,
+                })
+                self._tool_ids_emitted.discard(tid)
 
     # ── Scheduler / /loop (Grok native) ────────────────────────────────
 
@@ -2269,12 +2357,17 @@ class AcpBridge(BaseBridge):
         additional_dirs = params.get("additional_dirs") or []
 
         try:
+            # kimi-code 0.36: AskUser Q1+ only via elicitation/create.
+            # request_permission handleQuestion drops every question after q0.
+            client_caps: Dict[str, Any] = {
+                "fs": {"readTextFile": True, "writeTextFile": True},
+                "terminal": True,
+            }
+            if getattr(self, "BACKEND_NAME", "") == "kimi":
+                client_caps["elicitation"] = {"form": {}}
             init_request = {
                 "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": True, "writeTextFile": True},
-                    "terminal": True,
-                },
+                "clientCapabilities": client_caps,
                 "clientInfo": {
                     "name": self.CLIENT_NAME,
                     "version": self.CLIENT_VERSION,
@@ -3370,6 +3463,7 @@ class AcpBridge(BaseBridge):
 
     _ACP_REQUEST_HANDLERS = {
         "session/request_permission": "_acp_request_permission",
+        "elicitation/create": "_acp_elicitation_create",
         # Grok Build asks the user via an xAI extension (not a plain tool result).
         "_x.ai/ask_user_question": "_acp_ask_user_question",
         "x.ai/ask_user_question": "_acp_ask_user_question",
@@ -3778,6 +3872,141 @@ class AcpBridge(BaseBridge):
                 return True
         return False
 
+    async def _acp_elicitation_create(self, params: dict) -> dict:
+        """kimi-code AskUser: full question set via elicitation/create form."""
+        questions, keys = self._questions_from_elicitation(params)
+        if not questions:
+            self.file_log("elicitation/create: empty schema; cancel")
+            return {"action": "cancel"}
+        self.question_id += 1
+        qid = self.question_id
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self.pending_questions[qid] = fut
+        send_notification("question_request", {
+            "id": qid,
+            "questions": questions,
+        })
+        try:
+            answers = await fut
+        except Exception as e:
+            self.file_log(f"elicitation/create cancelled: {e}")
+            answers = None
+        finally:
+            self.pending_questions.pop(qid, None)
+        if answers is None:
+            return {"action": "cancel"}
+        content = self._elicitation_content_from_answers(
+            questions, keys, answers)
+        if not content:
+            return {"action": "cancel"}
+        self.file_log(
+            f"elicitation/create accept keys={list(content.keys())}")
+        return {"action": "accept", "content": content}
+
+    @staticmethod
+    def _questions_from_elicitation(params: dict):
+        """Map kimi requestedSchema (q0/q1…) into plugin question rows."""
+        schema = (params or {}).get("requestedSchema") or {}
+        props = schema.get("properties") or {}
+        if not isinstance(props, dict) or not props:
+            return [], []
+        required = schema.get("required") or []
+        keys = [k for k in required if k in props]
+        for k in sorted(props.keys()):
+            if k not in keys:
+                keys.append(k)
+        msg_lines = [
+            ln for ln in str((params or {}).get("message") or "").split("\n")
+            if ln.strip()
+        ]
+        questions = []
+        for i, key in enumerate(keys):
+            prop = props.get(key) or {}
+            if not isinstance(prop, dict):
+                continue
+            if prop.get("type") == "array":
+                items = prop.get("items") or {}
+                enums = items.get("anyOf") or items.get("oneOf") or []
+                multi = True
+            else:
+                enums = prop.get("oneOf") or prop.get("anyOf") or []
+                multi = False
+            options = []
+            for e in enums:
+                if not isinstance(e, dict):
+                    continue
+                label = e.get("const") or e.get("title") or ""
+                if label == "" and e.get("const") is not None:
+                    label = str(e.get("const"))
+                options.append({
+                    "label": str(label),
+                    "description": str(e.get("description") or ""),
+                })
+            qtext = msg_lines[i] if i < len(msg_lines) else ""
+            if not qtext:
+                qtext = str(prop.get("title") or "Question?")
+            questions.append({
+                "question": qtext,
+                "header": str(prop.get("title") or ""),
+                "options": options,
+                "multiSelect": multi,
+            })
+        return questions, keys
+
+    @staticmethod
+    def _elicitation_content_from_answers(
+            questions: list, keys: list, answers: dict) -> dict:
+        """Plugin answers → {q0: label, q1: [labels]} for kimi form accept."""
+        if not isinstance(answers, dict):
+            return {}
+        content: Dict[str, Any] = {}
+        for i, q in enumerate(questions or []):
+            if not isinstance(q, dict):
+                continue
+            key = keys[i] if i < len(keys) else f"q{i}"
+            val = None
+            for k in (q.get("question") or "", q.get("header") or ""):
+                if k and k in answers:
+                    val = answers[k]
+                    break
+            if val is None:
+                continue
+            allowed = [
+                str(o.get("label") or "")
+                for o in (q.get("options") or [])
+                if isinstance(o, dict)
+            ]
+            if q.get("multiSelect"):
+                raw = list(val) if isinstance(val, (list, tuple)) else [val]
+                picked = []
+                for item in raw:
+                    label = str(item or "")
+                    if label in allowed:
+                        picked.append(label)
+                        continue
+                    for ol in allowed:
+                        if AcpBridge._labels_match(label, ol):
+                            picked.append(ol)
+                            break
+                # declared order
+                picked = [ol for ol in allowed if ol in picked]
+                if picked:
+                    content[key] = picked
+                continue
+            label = (
+                str(val[0]) if isinstance(val, (list, tuple)) and val
+                else str(val or "")
+            )
+            if label in allowed:
+                content[key] = label
+                continue
+            for ol in allowed:
+                if AcpBridge._labels_match(label, ol):
+                    content[key] = ol
+                    break
+        return content
+
     async def _handle_acp_ask_user_permission(
             self, tool_call: dict, options: list,
             tool_input: dict) -> dict:
@@ -3860,7 +4089,9 @@ class AcpBridge(BaseBridge):
         oid = self._kimi_q0_option_id(options, questions, label)
         extra = self._kimi_followup_answers(questions, answers)
         if extra:
-            self._inject_ask_user_followup(extra)
+            # After this permission RPC returns, Kimi resumes with Q0 only.
+            # Inject on the next tick so we don't cancel before optionId lands.
+            loop.call_later(0.08, lambda t=extra: self._inject_ask_user_followup(t))
         if oid:
             self.file_log(
                 f"ask_user permission selected label={label!r} optionId={oid!r}")
@@ -4019,6 +4250,7 @@ class AcpBridge(BaseBridge):
         send_notification("notification_wake", {
             "wake_prompt": str(text).strip(),
             "display_message": "AskUserQuestion answers",
+            "interrupt": True,
         })
         self.file_log(f"ask_user follow-up injected ({len(text)} chars)")
 
@@ -5084,8 +5316,14 @@ class AcpBridge(BaseBridge):
         if not slot:
             # Already released/killed (e.g. on interrupt) — report cancelled.
             return {"exitCode": None, "signal": "SIGTERM"}
-        # Always wait for a real exit. Detached still blocks ACP (extract).
-        # Interrupt kills the proc so this unblocks with cancelled/signal.
+        # kimi-code AcpTerminalProcess: exitCode ?? -1. A null exit is
+        # "killed", then ProcessTask fails and terminal/release kills the
+        # still-running command. wait_for_exit MUST stay pending until the
+        # process actually exits. Dispatch is create_task so this does not
+        # block the ACP reader. session/prompt already returned for
+        # run_in_background; ⚙ clears on real exit via wait_and_close.
+        # if slot.get("bg") and slot.get("exit_status") is None:
+        #     return {"exitCode": None, "signal": None}
         reader = slot.get("reader")
         timeout = self.terminal_wait_timeout_s
         if reader is not None and not reader.done():

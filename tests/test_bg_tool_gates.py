@@ -155,7 +155,15 @@ class TestMarkTerminalBg(unittest.TestCase):
     def test_wait_for_exit_has_no_fake_success(self):
         import inspect
         src = inspect.getsource(AcpBridge._acp_terminal_wait)
+        # kimi-code: exitCode ?? -1. Must not return 0 or null while running.
         self.assertNotIn('return {"exitCode": 0, "signal": None}', src)
+        live = [
+            ln for ln in src.splitlines()
+            if "return" in ln and "exitCode" in ln and not ln.lstrip().startswith("#")
+        ]
+        self.assertTrue(any("es.get(" in ln for ln in live))
+        self.assertFalse(any(
+            'None, "signal": None' in ln for ln in live))
 
 
 class TestOutputViewBgDemote(unittest.TestCase):
@@ -193,6 +201,50 @@ class TestOutputViewBgDemote(unittest.TestCase):
         tc = apply("Read", False, existing=tc)
         self.assertEqual(tc.status, PENDING)
         self.assertEqual(tc.name, "Read")
+
+
+class _ReplayStub(AcpBridge):
+    def __init__(self):
+        self._tool_names_by_id = {}
+        self._tool_inputs_by_id = {}
+        self._tool_ids_emitted = set()
+        self._tool_id_alias = {}
+
+    def _handle_mode_update(self, upd):
+        pass
+
+    def _handle_commands_update(self, upd):
+        pass
+
+
+class TestLoadReplay(unittest.TestCase):
+    def test_load_replay_forwards_user_and_assistant(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _ReplayStub()
+            b._forward_load_replay({
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "hello"},
+                },
+            })
+            b._forward_load_replay({
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "hi back"},
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        kinds = [p.get("type") for _, p in notes]
+        self.assertIn("replay_user", kinds)
+        self.assertIn("text_delta", kinds)
+        text = next(p for _, p in notes if p.get("type") == "text_delta")
+        self.assertTrue(text.get("replay"))
+        self.assertEqual(text.get("text"), "hi back")
 
 
 if __name__ == "__main__":

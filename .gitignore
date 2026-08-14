@@ -1,6 +1,7 @@
 .DS_Store
 *.pyc
 __pycache__/
+.irr/
 .sessions.json
 .claude/settings.json
 .claude/settings.local.json

@@ -3612,6 +3612,7 @@ class Session:
             "tool_result": self._on_msg_tool_result,
             "text_delta": self._on_msg_text,
             "text": self._on_msg_text,
+            "replay_user": self._on_msg_replay_user,
             "thinking": self._on_msg_thinking,
             "turn_usage": self._on_msg_turn_usage,
             "result": self._on_msg_result,
@@ -3692,6 +3693,23 @@ class Session:
             first_line = wake_prompt.split("\n")[0].strip() if wake_prompt else ""
             user_message = first_line if first_line else "🔔 Notification received"
 
+        # AskUserQuestion Q1+ cannot wait for idle — Kimi already continued
+        # with only q0_opt and will invent the rest.
+        if params.get("interrupt") and self.working:
+            try:
+                self.interrupt()
+            except Exception:
+                pass
+
+            def start_interrupt_wake():
+                try:
+                    self.query(wake_prompt, display_prompt=user_message)
+                except Exception as e:
+                    print(f"[Claude] interrupt wake query error: {e}")
+
+            sublime.set_timeout(start_interrupt_wake, 600)
+            return
+
         # If still working, defer until idle (poll every 500ms)
         if self.working:
             def start_wake_query():
@@ -3724,12 +3742,29 @@ class Session:
         except Exception as e:
             print(f"[Claude] plan_todos: {e}")
 
+    def _on_msg_replay_user(self, params: dict) -> None:
+        """session/load replay of a prior user turn — no ⚙, no adopt."""
+        text = (params.get("text") or "").strip()
+        if text and self.output:
+            try:
+                self.output.prompt(text)
+            except Exception as e:
+                print(f"[Claude] replay_user: {e}")
+
     def _on_msg_tool_use(self, params: dict) -> None:
         name = params.get("name", "")
         tool_input = params.get("input", {})
         background = params.get("background", False)
         tool_id = params.get("id")
         if not name or not name.strip():
+            return
+        if params.get("replay"):
+            try:
+                if self.output:
+                    self.output.tool(
+                        name, tool_input, tool_id=tool_id, background=False)
+            except Exception as e:
+                print(f"[Claude] replay tool_use: {e}")
             return
         _shell_bg = (
             "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
@@ -3843,6 +3878,22 @@ class Session:
         if len(content) > 10000:
             content = content[:10000]
         is_error = params.get("is_error")
+        if params.get("replay"):
+            if not self.output:
+                return
+            matched = (
+                self.output.find_tool_by_id(tool_use_id)
+                if tool_use_id else None
+            )
+            name = matched.name if matched else "tool"
+            try:
+                if is_error:
+                    self.output.tool_error(name, content, tool_id=tool_use_id)
+                else:
+                    self.output.tool_done(name, content, tool_id=tool_use_id)
+            except Exception as e:
+                print(f"[Claude] replay tool_result: {e}")
+            return
 
         matched = self.output.find_tool_by_id(tool_use_id) if tool_use_id else None
         was_background = matched is not None and matched.status == "background"
@@ -3966,6 +4017,10 @@ class Session:
     def _on_msg_text(self, params: dict) -> None:
         self._clear_api_retry_hint()
         text = params.get("text", "") or ""
+        if params.get("replay"):
+            if text and self.output:
+                self.output.text(text)
+            return
         # Compaction finished — paint into compact turn, not a new ⚙ wake
         if getattr(self, "_compacting", False) and self._looks_like_compact_done(text):
             self._note_agent_activity()

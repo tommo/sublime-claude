@@ -138,6 +138,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertTrue(wide.endswith("del close"))
         self.assertIn("enter", wide)
         self.assertIn("del", wide)
+        self.assertIn("reveal", wide)
         narrow = sl.format_header(28)
         self.assertLessEqual(len(narrow), 28)
         self.assertTrue(narrow.startswith("SESSIONS"))

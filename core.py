@@ -43,18 +43,9 @@ def plugin_loaded() -> None:
         print(f"[Claude] plugin_loaded: dropping {len(prev)} stale session(s)")
         for _vid, s in list(prev.items()):
             try:
-                c = getattr(s, "client", None)
-                if c is not None:
-                    proc = getattr(c, "proc", None)
-                    try:
-                        c.running = False
-                    except Exception:
-                        pass
-                    if proc is not None:
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
+                if getattr(s, "client", None):
+                    # Drop the Python ref only. terminate() on reload SIGTERM'd
+                    # every live bridge (exit -15) and killed all sessions.
                     s.client = None
             except Exception:
                 pass
@@ -75,18 +66,7 @@ def plugin_loaded() -> None:
         print(f"[Claude] plugin_loaded: dropping {len(bg)} background session(s)")
         for s in list(bg.values()):
             try:
-                c = getattr(s, "client", None)
-                if c is not None:
-                    proc = getattr(c, "proc", None)
-                    try:
-                        c.running = False
-                    except Exception:
-                        pass
-                    if proc is not None:
-                        try:
-                            proc.terminate()
-                        except Exception:
-                            pass
+                if getattr(s, "client", None):
                     s.client = None
             except Exception:
                 pass
@@ -249,7 +229,7 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
             existing = find_live_by_session_id(resume_id)
             if existing:
                 from .session_list import reveal_live_session
-                if reveal_live_session(window, existing):
+                if reveal_live_session(window, existing, focus=focus):
                     return existing
         except Exception:
             pass

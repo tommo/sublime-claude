@@ -1,0 +1,9 @@
+{"type":"turn.prompt","input":[{"type":"text","text":"what's the performance?"}],"origin":{"kind":"user"}}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Read"}}
+{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"think","think":"ignore this"}}}
+{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Let me check RichLabel."}}}
+{"type":"turn.prompt","input":[{"type":"text","text":"<task-notification>bg done"}],"origin":{"kind":"user"}}
+{"type":"turn.prompt","input":[{"type":"text","text":"bg ping"}],"origin":{"kind":"task"}}
+{"type":"turn.prompt","input":[{"type":"text","text":"so richlabel has no cache?"}],"origin":{"kind":"user"}}
+{"type":"context.append_loop_event","event":{"type":"tool.call","name":"Grep"}}
+{"type":"context.append_loop_event","event":{"type":"content.part","part":{"type":"text","text":"Correct — no cache."}}}
