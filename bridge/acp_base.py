@@ -177,6 +177,10 @@ class AcpBridge(BaseBridge):
         self._tool_inputs_by_id: Dict[str, dict] = {}
         # toolCallId → normalized name (completed updates often omit title/_meta).
         self._tool_names_by_id: Dict[str, str] = {}
+        self._last_execute_id: Optional[str] = None
+        self._pending_execute_ids: List[str] = []
+        self._last_bg_tool_id: Optional[str] = None
+        self._agent_exited: bool = False
         # Client-side backup timers when host does not inject scheduled prompts.
         # task_id (or toolCallId) → asyncio.Task
         self._client_schedule_tasks: Dict[str, Any] = {}
@@ -439,11 +443,50 @@ class AcpBridge(BaseBridge):
         except Exception:
             pass
 
+    def _fail_all_pending(self, err: BaseException) -> None:
+        """Unblock prompt/RPC waiters when the agent stdio dies."""
+        for _rid, fut in list(self.pending.items()):
+            if fut is not None and not fut.done():
+                fut.set_exception(err)
+        self.pending.clear()
+        pf = self._prompt_fut
+        if pf is not None and not pf.done():
+            pf.set_exception(err)
+
+    def _mark_agent_dead(self, reason: str) -> None:
+        """Drop a dead agent handle so we do not write to a closed stdin."""
+        self._agent_exited = True
+        proc = self.proc
+        self.proc = None
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self.file_log(f"agent dead: {reason}")
+        try:
+            send_notification("message", {
+                "type": "result",
+                "session_id": self.session_id or "",
+                "duration_ms": 0,
+                "is_error": True,
+                "num_turns": 1,
+                "total_cost_usd": 0,
+                "stop_reason": "error",
+                "error": reason,
+            })
+        except Exception:
+            pass
+
     # ── Subprocess lifecycle ───────────────────────────────────────────
 
     async def _spawn(self) -> None:
-        if self.proc is not None:
+        if self.proc is not None and self.proc.returncode is None:
             return
+        if self.proc is not None:
+            self.proc = None
+        if self._agent_exited and self.session_id:
+            raise RuntimeError("agent process died; restart the session")
         args = self.agent_argv()
         try:
             with open(self.log_path(), "w") as f:
@@ -486,8 +529,16 @@ class AcpBridge(BaseBridge):
             except ValueError as e:
                 # Over stream limit — transport may be wedged; stop cleanly.
                 self.file_log(f"agent stdout readline failed (limit): {e}")
+                self._fail_all_pending(RuntimeError(
+                    f"agent stdout readline failed: {e}"))
+                self._mark_agent_dead(f"agent stdout readline failed: {e}")
                 break
             if not line:
+                rc = self.proc.returncode if self.proc else None
+                reason = f"agent stdout closed (returncode={rc})"
+                self.file_log(f"agent stdout EOF (returncode={rc})")
+                self._fail_all_pending(RuntimeError(reason))
+                self._mark_agent_dead(reason)
                 break
             if len(line) > max_line:
                 self.file_log(
@@ -727,6 +778,7 @@ class AcpBridge(BaseBridge):
                             f"alias {tool_name} {tid} → open {oid} (no 2nd row)")
                         return
             self._tool_ids_emitted.add(tid)
+            self._note_shell_execute(tid, tool_name)
             is_bg = self._looks_like_background_tool(upd, tool_input)
             # Only shell may be ⚙ — TaskOutput/"Reading output…" never.
             if is_bg and not self._is_shell_tool_name(tool_name):
@@ -760,6 +812,8 @@ class AcpBridge(BaseBridge):
                 tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
             elif tid and tool_name and tool_name != "tool":
                 self._tool_names_by_id[tid] = tool_name
+            if status not in ("completed", "failed"):
+                self._note_shell_execute(tid, tool_name)
             # Lifecycle rows that never opened a real tool — drop entirely
             if (self._should_suppress_tool_row(upd, tool_name)
                     and (not tid or tid not in self._tool_ids_emitted)):
@@ -831,6 +885,11 @@ class AcpBridge(BaseBridge):
                 )
                 for term_id in self._terminal_ids_from_update(upd):
                     self._bind_terminal_to_bg_tool(term_id, tid)
+                    slot = self._terminals.get(term_id)
+                    if slot is not None:
+                        slot["bg"] = True
+                        slot["tool_use_id"] = tid
+                self._drop_pending_execute(tid)
 
             if status in ("completed", "failed"):
                 # No open row for this id → nothing to close (noise already dropped)
@@ -1938,18 +1997,17 @@ class AcpBridge(BaseBridge):
 
     @staticmethod
     def _looks_like_background_tool(upd: dict, tool_input: Optional[dict] = None) -> bool:
-        """True only for explicit detach signals — not every shell.
+        """True only for explicit detach — not every Kimi `Running:` shell.
 
-        Live Kimi sessions title execute `Running:` and never
-        `Starting background` (sandbox/kimi_bg). This gate stays conservative
-        until that pair is wired. TaskOutput / "Reading output of task" is never ⚙.
+        Kimi titles *all* execute `Running: <cmd>`. That is foreground +
+        wait_for_exit. Only `run_in_background` / `detached` / Starting
+        background is ⚙. TaskOutput is never ⚙.
         """
         title = str(upd.get("title") or "")
         low = title.lower().strip()
         # Poll tools are foreground — never ⚙
         if "reading output of task" in low or low.startswith("taskoutput"):
             return False
-        # Title must *start* with Starting background (avoid path noise)
         if low.startswith("starting background"):
             return True
         if low.startswith("running in background") or low.startswith("background task"):
@@ -1968,9 +2026,52 @@ class AcpBridge(BaseBridge):
         if isinstance(ri, dict) and (
                 ri.get("task_id") or ri.get("taskId")) and not ri.get("command"):
             return False
-        if isinstance(ri, dict) and ri.get("run_in_background") is True:
+        if isinstance(ri, dict) and (
+                ri.get("run_in_background") is True
+                or ri.get("detached") is True):
             return True
         return False
+
+    def _note_shell_execute(self, tid: Optional[str], tool_name: str) -> None:
+        """Remember this shell tool so the next terminal/create can pair to it."""
+        if not tid or not self._is_shell_tool_name(tool_name):
+            return
+        self._last_execute_id = tid
+        pending = getattr(self, "_pending_execute_ids", None)
+        if pending is None:
+            self._pending_execute_ids = []
+            pending = self._pending_execute_ids
+        if tid not in pending:
+            pending.append(tid)
+
+    def _drop_pending_execute(self, tid: Optional[str]) -> None:
+        if not tid:
+            return
+        pending = getattr(self, "_pending_execute_ids", None) or []
+        self._pending_execute_ids = [x for x in pending if x != tid]
+        if getattr(self, "_last_execute_id", None) == tid:
+            self._last_execute_id = None
+
+    def _take_pending_execute_id(self) -> Optional[str]:
+        pending = getattr(self, "_pending_execute_ids", None) or []
+        if pending:
+            eid = pending.pop(0)
+            self._pending_execute_ids = pending
+            if getattr(self, "_last_execute_id", None) == eid:
+                self._last_execute_id = None
+            return eid
+        eid = getattr(self, "_last_execute_id", None)
+        self._last_execute_id = None
+        return eid
+
+    @staticmethod
+    def _script_from_terminal_params(cmd, args_in) -> str:
+        """Real command for display/match. Kimi: /bin/bash + args=['-c', script]."""
+        args = list(args_in or [])
+        for i, a in enumerate(args):
+            if str(a) in ("-c",) and i + 1 < len(args):
+                return str(args[i + 1])
+        return str(cmd or "")
 
     @classmethod
     def _terminal_ids_from_update(upd: dict) -> List[str]:
@@ -2035,6 +2136,7 @@ class AcpBridge(BaseBridge):
             name = "Bash"
         already = tool_use_id in self._bg_tool_ids
         self._bg_tool_ids.add(tool_use_id)
+        self._last_bg_tool_id = tool_use_id
         inp = dict(tool_input or self._tool_inputs_by_id.get(tool_use_id) or {})
         if title and not inp.get("command"):
             cmd = title
@@ -2131,6 +2233,7 @@ class AcpBridge(BaseBridge):
         self.model = self.normalize_model(params.get("model") or self.model)
         # Capture effort before first agent spawn (Grok CLI flag is spawn-time).
         self.effort = self.normalize_effort(params.get("effort"))
+        self._agent_exited = False
         if self.effort:
             self.file_log(f"initialize: effort={self.effort!r}")
         self.cwd = params.get("cwd") or self.cwd
@@ -2616,7 +2719,9 @@ class AcpBridge(BaseBridge):
             if self._query_req_id == req_id:
                 self._query_req_id = None
             self._prompt_cancelled = False
-            self._cancel_in_flight = False
+            # Leave _cancel_in_flight set after interrupt so the NEXT query
+            # still session/cancel+settles (Kimi agent_busy). Cleared when
+            # that next query actually starts sending.
             self._prompt_fut = None
             self._prompt_acp_id = None
 
@@ -2761,7 +2866,21 @@ class AcpBridge(BaseBridge):
         async with self._get_acp_write_lock():
             self.proc.stdin.write((line + "\n").encode())
             await self.proc.stdin.drain()
+        exit_task = None
         try:
+            if self.proc is not None:
+                exit_task = asyncio.create_task(self.proc.wait())
+                done, _pend = await asyncio.wait(
+                    {fut, exit_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if fut not in done:
+                    rc = self.proc.returncode
+                    self.file_log(
+                        f"agent exited during session/prompt id={rid} "
+                        f"returncode={rc}")
+                    raise RuntimeError(
+                        f"agent process exited during prompt (returncode={rc})")
             result = await fut
             try:
                 self.file_log(
@@ -2772,6 +2891,8 @@ class AcpBridge(BaseBridge):
                     f"← acp session/prompt (id={rid}) result: {result!r}")
             return result
         finally:
+            if exit_task is not None and not exit_task.done():
+                exit_task.cancel()
             self.pending.pop(rid, None)
             if self._prompt_fut is fut:
                 self._prompt_fut = None
@@ -4794,14 +4915,8 @@ class AcpBridge(BaseBridge):
         else:
             proc = await asyncio.create_subprocess_exec(cmd, *args, **common)
         tid = "term_" + uuidlib.uuid4().hex[:10]
-        # Display command (shell -c often puts real cmd in args)
-        cmd_show = cmd
-        if use_shell and args_in:
-            # bash -c "real cmd"
-            for i, a in enumerate(args_in):
-                if str(a) in ("-c",) and i + 1 < len(args_in):
-                    cmd_show = str(args_in[i + 1])
-                    break
+        # Kimi: command=/bin/bash args=["-c", real] even when use_shell=False
+        cmd_show = self._script_from_terminal_params(cmd, args_in)
         if isinstance(cmd_show, str) and len(cmd_show) > 240:
             cmd_show = cmd_show[:239] + "…"
         slot: Dict[str, Any] = {
@@ -4810,7 +4925,10 @@ class AcpBridge(BaseBridge):
             "cmd": (cmd_show or cmd)[:200],
         }
         self._terminals[tid] = slot
-        self.file_log(f"terminal/create {tid} pid={proc.pid} shell={use_shell}")
+        self._mark_terminal_bg(tid, slot)
+        self.file_log(
+            f"terminal/create {tid} pid={proc.pid} shell={use_shell} "
+            f"bg={bool(slot.get('bg'))}")
 
         # Kimi often runs tools ONLY via terminal/* with zero session/update
         # tool_call — host UI then shows empty "waiting" while agent is busy.
@@ -4922,12 +5040,52 @@ class AcpBridge(BaseBridge):
         return {"output": out, "truncated": bool(slot["truncated"]),
                 "exitStatus": slot.get("exit_status")}
 
+    def _mark_terminal_bg(self, tid: str, slot: dict) -> None:
+        """⚙ only for this execute's explicit detach or native kimi detached."""
+        eid = self._take_pending_execute_id()
+        inp = (self._tool_inputs_by_id.get(eid) or {}) if eid else {}
+        explicit = bool(
+            eid and (
+                inp.get("run_in_background") is True
+                or inp.get("detached") is True
+                or eid in self._bg_tool_ids
+            )
+        )
+        native = None
+        if hasattr(self, "_kimi_detached_meta"):
+            try:
+                native = self._kimi_detached_meta(str(slot.get("cmd") or ""))
+            except Exception:
+                native = None
+        if not explicit and not native:
+            if hasattr(self, "_schedule_kimi_detached_probe"):
+                try:
+                    self._schedule_kimi_detached_probe(tid)
+                except Exception:
+                    pass
+            return
+        if not eid:
+            eid = f"term-bg-{tid}"
+        slot["bg"] = True
+        slot["tool_use_id"] = eid
+        if eid not in self._bg_tool_ids:
+            self._register_bg_tool(
+                eid, inp if inp else {"command": slot.get("cmd")})
+        self._bind_terminal_to_bg_tool(tid, eid)
+        if native and hasattr(self, "_link_terminal_to_kimi_task"):
+            try:
+                self._link_terminal_to_kimi_task(tid, eid, native)
+            except Exception:
+                pass
+
     async def _acp_terminal_wait(self, params: dict) -> dict:
         tid = params.get("terminalId") or ""
         slot = self._terminals.get(tid)
         if not slot:
             # Already released/killed (e.g. on interrupt) — report cancelled.
             return {"exitCode": None, "signal": "SIGTERM"}
+        # Always wait for a real exit. Detached still blocks ACP (extract).
+        # Interrupt kills the proc so this unblocks with cancelled/signal.
         reader = slot.get("reader")
         timeout = self.terminal_wait_timeout_s
         if reader is not None and not reader.done():

@@ -146,6 +146,89 @@ class OutputView:
             # Undo new_file()'s implicit focus steal
             self.window.focus_view(prev)
 
+        if self.conversations or self.current:
+            try:
+                self.repaint_from_state()
+            except Exception as e:
+                print(f"[Claude] repaint_from_state: {e}")
+
+    def _conversation_body(self, conv, *, leading_nl: bool = False) -> str:
+        """Plain transcript text for one conversation (no live spinner)."""
+        lines = []
+        prefix = "\n" if leading_nl else ""
+        if conv.prompt:
+            prompt_lines = conv.prompt.split("\n")
+            if len(prompt_lines) > 1:
+                indented = prompt_lines[0] + "\n" + "\n".join(
+                    "  " + l for l in prompt_lines[1:])
+            else:
+                indented = conv.prompt
+            if conv.context_names or conv.context_refs:
+                lines.append(f"{prefix}◎ {indented} ▶\n")
+                lines.append(f"  {CONTEXT_PREFIX}\n")
+            else:
+                lines.append(f"{prefix}◎ {indented} ▶\n")
+            prefix = ""
+        if conv.events:
+            lines.append("\n" if not prefix else prefix + "\n")
+            prefix = ""
+            i = 0
+            evs = conv.events
+            n_ev = len(evs)
+            while i < n_ev:
+                event = evs[i]
+                if isinstance(event, str):
+                    parts = [event]
+                    i += 1
+                    while i < n_ev and isinstance(evs[i], str):
+                        parts.append(evs[i])
+                        i += 1
+                    block = "".join(parts)
+                    if block:
+                        lines.append(block)
+                        if not block.endswith("\n"):
+                            lines.append("\n")
+                    continue
+                if isinstance(event, ToolCall) and not self.is_host_control_tool(
+                        event.name):
+                    symbol = self.SYMBOLS.get(event.status, "☐")
+                    detail = self._format_tool_detail(event)
+                    lines.append(f"  {symbol} {event.name}{detail}\n")
+                i += 1
+        if conv.has_meta or conv.duration > 0:
+            meta_parts = []
+            if conv.duration > 0:
+                meta_parts.append(f"{conv.duration:.1f}s")
+            if not meta_parts:
+                meta_parts.append("ok")
+            lines.append(f"\n  @done({', '.join(meta_parts)})\n")
+        return "".join(lines)
+
+    def repaint_from_state(self) -> None:
+        """Rewrite the buffer from in-memory conversations (new sheet)."""
+        if not self.view or not self.view.is_valid():
+            return
+        parts = []
+        for conv in self.conversations:
+            parts.append(self._conversation_body(conv, leading_nl=bool(parts)))
+        cur_start = sum(len(p) for p in parts)
+        if self.current:
+            parts.append(self._conversation_body(
+                self.current, leading_nl=bool(parts)))
+        body = "".join(parts)
+        self._replace(0, self.view.size(), body)
+        if self.current:
+            end = cur_start + (len(parts[-1]) if parts else 0)
+            self.current.region = (cur_start, end)
+            try:
+                self.view.add_regions(
+                    "claude_conversation",
+                    [sublime.Region(cur_start, end)],
+                    "", "", sublime.HIDDEN,
+                )
+            except Exception:
+                pass
+
     def _show_panel(self, panel_name: str, focus: bool = True) -> None:
         """Bind this OutputView to a bottom panel (not a document sheet)."""
         v = self.window.find_output_panel(panel_name)

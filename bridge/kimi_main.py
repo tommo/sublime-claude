@@ -204,6 +204,10 @@ class KimiBridge(KimiBgMixin, AcpBridge):
         active = fut is not None and not fut.done()
         has_query = self._query_req_id is not None
         if not active and not has_query:
+            if self._cancel_in_flight:
+                self.file_log("interrupt: idle already cancelled")
+                send_result(req_id, {"status": "interrupted"})
+                return
             # Still cancel orphan agent-side work (auto-continue) if any
             if self.session_id is not None:
                 try:

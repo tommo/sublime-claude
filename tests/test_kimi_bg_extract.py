@@ -38,6 +38,11 @@ class TestKimiBgExtract(unittest.TestCase):
         rc = ex.main(["--session", sess, "--bridge-log", log])
         self.assertEqual(rc, 0)
 
+    def test_host_gate_matches_fixture_extract(self):
+        import check_host_gate as gate
+        rc = gate.main([])
+        self.assertEqual(rc, 0, "run sandbox/kimi_bg/check_host_gate.py")
+
 
 if __name__ == "__main__":
     unittest.main()

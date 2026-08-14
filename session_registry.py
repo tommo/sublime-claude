@@ -6,6 +6,7 @@ view and in sessions.json). Registry maps:
 
   _claude_sessions: view_id (int) -> Session   # ST lookup
   _claude_agents:   agent_id (str) -> view_id  # stable → runtime
+  _claude_background: agent_id (str) -> Session  # live, no sheet
 """
 from __future__ import annotations
 
@@ -25,6 +26,8 @@ def ensure_registries() -> None:
         sublime._claude_sessions = {}
     if not hasattr(sublime, "_claude_agents") or sublime._claude_agents is None:
         sublime._claude_agents = {}
+    if not hasattr(sublime, "_claude_background") or sublime._claude_background is None:
+        sublime._claude_background = {}
 
 
 def clear_registries() -> None:
@@ -32,6 +35,7 @@ def clear_registries() -> None:
     ensure_registries()
     sublime._claude_sessions.clear()
     sublime._claude_agents.clear()
+    sublime._claude_background.clear()
 
 
 def register_session(session: Any) -> None:
@@ -60,6 +64,8 @@ def register_session(session: Any) -> None:
 
     sublime._claude_sessions[vid] = session
     sublime._claude_agents[aid] = vid
+    sublime._claude_background.pop(aid, None)
+    session.backgrounded = False
 
     try:
         relink_parent_view(session)
@@ -97,6 +103,9 @@ def get_session_by_agent_id(agent_id: str) -> Optional[Any]:
         s = sublime._claude_sessions.get(vid)
         if s is not None:
             return s
+    bg = sublime._claude_background.get(aid)
+    if bg is not None:
+        return bg
     for s in sublime._claude_sessions.values():
         if getattr(s, "agent_id", None) == aid:
             register_session(s)
@@ -104,7 +113,138 @@ def get_session_by_agent_id(agent_id: str) -> Optional[Any]:
         if getattr(s, "subsession_id", None) == aid:
             register_session(s)
             return s
+    for s in list(sublime._claude_background.values()):
+        if getattr(s, "agent_id", None) == aid:
+            return s
+        if getattr(s, "subsession_id", None) == aid:
+            return s
     return None
+
+
+def iter_sessions() -> List[Any]:
+    """All live sessions, including background (no sheet)."""
+    ensure_registries()
+    out = []
+    seen = set()
+    for s in list(sublime._claude_sessions.values()) + list(
+            sublime._claude_background.values()):
+        if s is None or id(s) in seen:
+            continue
+        seen.add(id(s))
+        out.append(s)
+    return out
+
+
+def find_live_by_session_id(session_id: str) -> Optional[Any]:
+    if not session_id:
+        return None
+    for s in iter_sessions():
+        if getattr(s, "session_id", None) == session_id:
+            return s
+    return None
+
+
+def close_or_detach_session(session: Any, view: Any = None) -> str:
+    """Detach a live session, or stop a sleeping/disabled one.
+
+    Returns 'detach' or 'stop'.
+    """
+    if keep_running_on_close(session):
+        if view is not None:
+            try:
+                view.settings().set("claude_soft_close", True)
+            except Exception:
+                pass
+        detach_session(session)
+        return "detach"
+    try:
+        session.stop()
+    except Exception:
+        pass
+    vid = None
+    try:
+        if view is not None:
+            vid = view.id()
+    except Exception:
+        vid = None
+    if vid is not None:
+        unregister_view(vid)
+    else:
+        try:
+            ov = getattr(session, "output", None)
+            v = getattr(ov, "view", None) if ov else None
+            if v:
+                unregister_view(v.id())
+        except Exception:
+            pass
+    return "stop"
+
+
+def sessions_for_window(window: Any) -> List[Any]:
+    if window is None:
+        return []
+    return [s for s in iter_sessions() if getattr(s, "window", None) == window]
+
+
+def keep_running_on_close(session: Any) -> bool:
+    """True when closing the sheet should detach, not kill the bridge."""
+    if not session or getattr(session, "quick_mode", False):
+        return False
+    if getattr(session, "is_sleeping", False):
+        return False
+    try:
+        settings = sublime.load_settings("ClaudeCode.sublime-settings")
+        if settings.get("keep_running_on_close", True) is False:
+            return False
+    except Exception:
+        pass
+    if getattr(session, "client", None) is not None:
+        return True
+    if getattr(session, "working", False):
+        return True
+    return bool(getattr(session, "initialized", False))
+
+
+def detach_session(session: Any) -> bool:
+    """Drop the sheet, keep the live session in the background map."""
+    if not session:
+        return False
+    ensure_registries()
+    aid = getattr(session, "agent_id", None)
+    if not aid:
+        aid = new_agent_id()
+        session.agent_id = aid
+    view = getattr(getattr(session, "output", None), "view", None)
+    vid = None
+    try:
+        if view and view.is_valid():
+            vid = view.id()
+    except Exception:
+        vid = None
+    if vid is not None:
+        if sublime._claude_sessions.get(vid) is session:
+            sublime._claude_sessions.pop(vid, None)
+        if sublime._claude_agents.get(aid) == vid:
+            sublime._claude_agents.pop(aid, None)
+    try:
+        if hasattr(session, "reset_phantoms_for_new_view"):
+            session.reset_phantoms_for_new_view()
+    except Exception:
+        pass
+    if session.output:
+        session.output.view = None
+        try:
+            session.output._input_mode = False
+        except Exception:
+            pass
+    session.backgrounded = True
+    sublime._claude_background[aid] = session
+    try:
+        from .session_list import schedule_session_list_refresh
+        schedule_session_list_refresh()
+    except Exception:
+        pass
+    return True
 
 
 def get_session_by_ref(ref) -> Optional[Any]:

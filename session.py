@@ -1700,6 +1700,11 @@ class Session:
             # Never steal focus on every turn — user may be editing another file
             # while the agent streams / goal continues.
             self.output.show(focus=False)
+            try:
+                from .session_registry import register_session
+                register_session(self)
+            except Exception:
+                pass
             # Auto-name from first prompt. Keep the full line — tab title
             # truncates for the tab bar; the session list uses this name.
             if not self.name:

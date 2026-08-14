@@ -43,8 +43,19 @@ def plugin_loaded() -> None:
         print(f"[Claude] plugin_loaded: dropping {len(prev)} stale session(s)")
         for _vid, s in list(prev.items()):
             try:
-                if getattr(s, "client", None):
-                    s.client = None  # don't block load on shutdown
+                c = getattr(s, "client", None)
+                if c is not None:
+                    proc = getattr(c, "proc", None)
+                    try:
+                        c.running = False
+                    except Exception:
+                        pass
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    s.client = None
             except Exception:
                 pass
             # Clear sleep/connect phantoms while we still have a view ref —
@@ -59,6 +70,28 @@ def plugin_loaded() -> None:
         prev.clear()
     sublime._claude_sessions = prev if isinstance(prev, dict) else {}
     sublime._claude_agents = {}  # agent_id → view_id (rebuilt on restore)
+    bg = getattr(sublime, "_claude_background", None)
+    if isinstance(bg, dict) and bg:
+        print(f"[Claude] plugin_loaded: dropping {len(bg)} background session(s)")
+        for s in list(bg.values()):
+            try:
+                c = getattr(s, "client", None)
+                if c is not None:
+                    proc = getattr(c, "proc", None)
+                    try:
+                        c.running = False
+                    except Exception:
+                        pass
+                    if proc is not None:
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                    s.client = None
+            except Exception:
+                pass
+        bg.clear()
+    sublime._claude_background = bg if isinstance(bg, dict) else {}
     session_registry.ensure_registries()
 
     # Also sweep every Claude sheet (covers orphans not in the registry)
@@ -210,6 +243,16 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     Startup multi-tab restore does not use this path; orphans reconnect via
     listeners with a quiet window so they never raise every sheet.
     """
+    if resume_id and not fork:
+        try:
+            from .session_registry import find_live_by_session_id
+            existing = find_live_by_session_id(resume_id)
+            if existing:
+                from .session_list import reveal_live_session
+                if reveal_live_session(window, existing):
+                    return existing
+        except Exception:
+            pass
     if backend is None:
         backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
 
@@ -278,7 +321,12 @@ def _check_auto_sleep():
     threshold = now - (timeout_min * 60)
     force_threshold = now - (timeout_min * 60 * 2)
 
-    for view_id, session in list(sublime._claude_sessions.items()):
+    try:
+        from .session_registry import iter_sessions
+        live = iter_sessions()
+    except Exception:
+        live = list((getattr(sublime, "_claude_sessions", None) or {}).values())
+    for session in live:
         if getattr(session, 'sleep_disabled', False):
             continue
         if getattr(session, 'quick_mode', False):
@@ -317,5 +365,13 @@ def _check_auto_sleep():
 
 def schedule_auto_sleep():
     global _auto_sleep_timer
-    if _auto_sleep_timer is None and hasattr(sublime, '_claude_sessions') and sublime._claude_sessions:
-        _auto_sleep_timer = sublime.set_timeout(_check_auto_sleep, 60000)
+    if _auto_sleep_timer is not None:
+        return
+    try:
+        from .session_registry import iter_sessions
+        if not iter_sessions():
+            return
+    except Exception:
+        if not (hasattr(sublime, '_claude_sessions') and sublime._claude_sessions):
+            return
+    _auto_sleep_timer = sublime.set_timeout(_check_auto_sleep, 60000)

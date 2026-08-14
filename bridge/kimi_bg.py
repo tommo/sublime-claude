@@ -3,8 +3,8 @@
 Not on AcpBridge — Grok/other ACP backends must not walk Kimi session files.
 
 Real wire (see sandbox/kimi_bg): every detached bash-* also has terminal/create
-+ wait_for_exit; titles are `Running:` not `Starting background`. Detection of
-that pair is a follow-up; this module only owns the Kimi registries + poll.
++ wait_for_exit; titles are `Running:` not `Starting background`. ⚙ comes from
+bash-*.json / wire `detached: true` or explicit ACP flags — never from `Running:`.
 """
 from __future__ import annotations
 
@@ -303,6 +303,49 @@ class KimiBgMixin:
 
     def _find_matching_kimi_task(self, cmd: str = "") -> Optional[dict]:
         return self.find_matching_kimi_task(cmd)
+
+    def _kimi_detached_meta(self, cmd: str = "") -> Optional[dict]:
+        """Native bash-*.json with detached:true matching this command."""
+        meta = self.find_matching_kimi_task(cmd)
+        if meta and meta.get("detached") is True:
+            return meta
+        return None
+
+    def _schedule_kimi_detached_probe(self, terminal_id: str) -> None:
+        """Task json often appears after terminal/create — promote later."""
+        delays = (0.3, 1.0, 2.5, 5.0)
+
+        async def _retries():
+            for d in delays:
+                try:
+                    await asyncio.sleep(d)
+                except asyncio.CancelledError:
+                    return
+                slot = (getattr(self, "_terminals", None) or {}).get(terminal_id)
+                if not slot or slot.get("bg"):
+                    return
+                meta = self._kimi_detached_meta(str(slot.get("cmd") or ""))
+                if not meta:
+                    continue
+                eid = (
+                    slot.get("tool_use_id")
+                    or getattr(self, "_last_execute_id", None)
+                    or f"term-bg-{terminal_id}"
+                )
+                slot["bg"] = True
+                slot["tool_use_id"] = eid
+                if eid not in getattr(self, "_bg_tool_ids", ()):
+                    self._register_bg_tool(
+                        eid, {"command": slot.get("cmd"), "detached": True})
+                self._bind_terminal_to_bg_tool(terminal_id, eid)
+                self._link_terminal_to_kimi_task(terminal_id, eid, meta)
+                return
+            self.file_log(f"kimi detached probe gave up term={terminal_id}")
+
+        try:
+            asyncio.create_task(_retries())
+        except Exception as e:
+            self.file_log(f"kimi detached probe schedule: {e}")
 
     def _link_terminal_to_kimi_task(
             self, terminal_id: str, tool_use_id: str, meta: dict) -> None:

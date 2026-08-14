@@ -499,6 +499,30 @@ class ClaudeCodeStopCommand(sublime_plugin.WindowCommand):
                 del sublime._claude_sessions[view_id]
 
 
+class ClaudeHideSessionCommand(sublime_plugin.WindowCommand):
+    """Close the sheet; keep the live session in the background."""
+
+    def run(self):
+        from ..session_registry import detach_session
+        s = get_active_session(self.window)
+        if not s or not s.output or not s.output.view:
+            return
+        view = s.output.view
+        if not view.is_valid():
+            return
+        view.settings().set("claude_soft_close", True)
+        detach_session(s)
+        try:
+            view.close()
+        except Exception:
+            pass
+        sublime.status_message("Claude: session still running (open from Sessions)")
+
+    def is_enabled(self):
+        s = get_active_session(self.window)
+        return bool(s and s.output and s.output.view and s.output.view.is_valid())
+
+
 class ClaudeTerminalModeCommand(sublime_plugin.WindowCommand):
     """Switch active session to CLI terminal mode."""
     def run(self):

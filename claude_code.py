@@ -38,6 +38,7 @@ from .commands import (
     ClaudeCodeRenameCommand,
     ClaudeCodeToggleCommand,
     ClaudeCodeStopCommand,
+    ClaudeHideSessionCommand,
     ClaudeCodeResumeCommand,
     ClaudeCodeSwitchCommand,
     ClaudeSessionListCommand,

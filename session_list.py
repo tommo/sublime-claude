@@ -171,17 +171,21 @@ def format_when(ts, now=None) -> str:
 
 def collect_live(window) -> List[dict]:
     out = []
-    sessions = getattr(sublime, "_claude_sessions", None) or {}
-    for vid, s in list(sessions.items()):
+    try:
+        from .session_registry import iter_sessions
+        live_sessions = iter_sessions()
+    except Exception:
+        live_sessions = list((getattr(sublime, "_claude_sessions", None) or {}).values())
+    for s in live_sessions:
         if getattr(s, "quick_mode", False):
             continue
         try:
             view = s.output.view if s.output else None
             view_ok = bool(view and view.is_valid())
-            view_id = view.id() if view_ok else vid
+            view_id = view.id() if view_ok else id(s)
         except Exception:
             view_ok = False
-            view_id = vid
+            view_id = id(s)
         win = getattr(s, "window", None)
         out.append({
             "kind": "live",
@@ -317,15 +321,21 @@ def focus_live(window, row: dict) -> bool:
     if vid is not None and vid in sessions:
         session = sessions[vid]
     if session is None and sid:
-        for s in sessions.values():
-            if getattr(s, "session_id", None) == sid:
-                session = s
-                break
+        try:
+            from .session_registry import find_live_by_session_id
+            session = find_live_by_session_id(sid)
+        except Exception:
+            session = None
+        if session is None:
+            for s in sessions.values():
+                if getattr(s, "session_id", None) == sid:
+                    session = s
+                    break
     if session is None:
         return False
     view = session.output.view if session.output else None
     if not view or not view.is_valid():
-        return False
+        return reveal_live_session(window, session)
     win = view.window() or window
     win.focus_view(view)
     try:
@@ -334,6 +344,69 @@ def focus_live(window, row: dict) -> bool:
     except Exception:
         win.settings().set("claude_active_view", view.id())
     reveal_session_bottom(session)
+    return True
+
+
+def reveal_live_session(window, session) -> bool:
+    """Show a live session, reattaching a sheet if it was backgrounded."""
+    if not session or not window:
+        return False
+    view = session.output.view if session.output else None
+    if view and view.is_valid():
+        win = view.window() or window
+        win.focus_view(view)
+        try:
+            from .session_split import remember_active_session
+            remember_active_session(win, view)
+        except Exception:
+            pass
+        reveal_session_bottom(session)
+        return True
+    session.window = window
+    if session.output:
+        session.output.window = window
+        session.output.view = None
+    try:
+        session.reset_phantoms_for_new_view()
+    except Exception:
+        pass
+    if not session.output:
+        return False
+    session.output.show(focus=True)
+    view = session.output.view
+    if not view or not view.is_valid():
+        return False
+    try:
+        from .session_split import place_in_last_session_split, remember_active_session
+        place_in_last_session_split(window, view)
+        window.focus_view(view)
+        remember_active_session(window, view)
+    except Exception:
+        pass
+    try:
+        from .session_registry import register_session
+        register_session(session)
+    except Exception:
+        pass
+    try:
+        if session.backend and session.backend != "claude":
+            from . import backends
+            spec = backends.get(session.backend)
+            view.settings().set("claude_backend", session.backend)
+            if getattr(spec, "theme", None):
+                view.settings().set("color_scheme", spec.theme)
+    except Exception:
+        pass
+    try:
+        session.output.set_name(session.display_name)
+    except Exception:
+        pass
+    reveal_session_bottom(session)
+    if not session.working:
+        try:
+            session._enter_input_with_draft()
+        except Exception:
+            pass
     return True
 
 
@@ -368,6 +441,13 @@ def resume_saved(window, row: dict) -> bool:
     sid = row.get("session_id")
     if not sid:
         return False
+    try:
+        from .session_registry import find_live_by_session_id
+        live = find_live_by_session_id(sid)
+        if live and reveal_live_session(window, live):
+            return True
+    except Exception:
+        pass
     backend = row.get("backend") or "claude"
     s = create_session(window, resume_id=sid, backend=backend)
     name = row.get("name")

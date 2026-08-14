@@ -17,6 +17,7 @@ from .session_cmds import (  # noqa: F401
     ClaudeCodeRenameCommand,
     ClaudeCodeToggleCommand,
     ClaudeCodeStopCommand,
+    ClaudeHideSessionCommand,
     ClaudeTerminalModeCommand,
     ClaudeSleepSessionCommand,
     ClaudeWakeSessionCommand,

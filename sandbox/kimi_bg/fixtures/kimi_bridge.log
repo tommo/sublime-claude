@@ -1,0 +1,6 @@
+← acp update tool_call_update: {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "t1", "title": "Running: cd /proj && pil test…", "kind": "execute", "status": "in_progress", "rawInput": {"command": "cd /proj && pil test -t tree_editor 2>&1 | head -5"}}}
+← acp REQ terminal/create (id=1): {"command": "/bin/bash", "args": ["-c", "cd '/proj' && cd /proj && pil test -t tree_editor 2>&1 | head -5"]}
+terminal/create term_deadbeef pid=9 shell=False
+← acp REQ terminal/wait_for_exit (id=2): {"terminalId": "term_deadbeef"}
+← acp REQ terminal/output (id=3): {"terminalId": "term_deadbeef"}
+← acp update tool_call_update: {"update": {"sessionUpdate": "tool_call_update", "toolCallId": "t2", "title": "Reading output of task bash-abc123", "kind": "other", "status": "in_progress"}}

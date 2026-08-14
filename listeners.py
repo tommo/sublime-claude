@@ -227,14 +227,27 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
 
     def on_window_command(self, window: sublime.Window, command: str, args: dict):
         if command == "close_window":
-            # Stop all sessions in this window
-            to_remove = []
-            for view_id, session in sublime._claude_sessions.items():
-                if session.window == window:
+            from .session_registry import sessions_for_window, unregister_view
+            for session in list(sessions_for_window(window)):
+                try:
                     session.stop()
-                    to_remove.append(view_id)
-            for view_id in to_remove:
-                del sublime._claude_sessions[view_id]
+                except Exception:
+                    pass
+                view = None
+                try:
+                    view = session.output.view if session.output else None
+                except Exception:
+                    view = None
+                if view:
+                    try:
+                        unregister_view(view.id())
+                    except Exception:
+                        pass
+                aid = getattr(session, "agent_id", None)
+                if aid:
+                    bg = getattr(sublime, "_claude_background", None)
+                    if isinstance(bg, dict):
+                        bg.pop(aid, None)
 
         # Intercept close for claude output views
         if command in ("close", "close_file", "close_by_index"):
@@ -252,15 +265,28 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
                 session = sublime._claude_sessions.get(view.id())
                 if session and (session.initialized or session.is_sleeping):
                     def _ask():
+                        from .session_registry import (
+                            keep_running_on_close, close_or_detach_session,
+                        )
                         s = sublime._claude_sessions.get(view.id())
                         if not s or not (s.initialized or s.is_sleeping):
                             view.close()
                             return
+                        if keep_running_on_close(s):
+                            close_or_detach_session(s, view)
+                            try:
+                                view.close()
+                            except Exception:
+                                pass
+                            sublime.status_message(
+                                "Claude: session still running (open from Sessions)")
+                            return
                         if sublime.ok_cancel_dialog("Close this Claude session?", "Close"):
-                            s.stop()
-                            if view.id() in sublime._claude_sessions:
-                                del sublime._claude_sessions[view.id()]
-                            view.close()
+                            close_or_detach_session(s, view)
+                            try:
+                                view.close()
+                            except Exception:
+                                pass
                     sublime.set_timeout(_ask, 0)
                     return ("noop",)
 
@@ -364,11 +390,19 @@ class ClaudeCodeEventListener(sublime_plugin.EventListener):
             from .session_registry import unregister_view
             unregister_view(view.id())
             return
-        # Clean up session when output view is closed
-        if view.id() in getattr(sublime, "_claude_sessions", {}):
+        if view.settings().get("claude_soft_close"):
             from .session_registry import unregister_view
+            unregister_view(view.id())
+            return
+        # Live close: detach (keep bridge) unless keep_running_on_close is off.
+        session = (getattr(sublime, "_claude_sessions", {}) or {}).get(view.id())
+        if session:
+            from .session_registry import keep_running_on_close, detach_session, unregister_view
+            if keep_running_on_close(session):
+                detach_session(session)
+                return
             try:
-                sublime._claude_sessions[view.id()].stop()
+                session.stop()
             except Exception:
                 pass
             unregister_view(view.id())

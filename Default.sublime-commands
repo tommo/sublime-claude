@@ -129,6 +129,10 @@
         "command": "claude_session_list"
     },
     {
+        "caption": "Claude: Hide Session (keep running)",
+        "command": "claude_hide_session"
+    },
+    {
         "caption": "Claude: Quick Agent (⌘⇧\\ toggle show/hide)",
         "command": "claude_quick_agent"
     },

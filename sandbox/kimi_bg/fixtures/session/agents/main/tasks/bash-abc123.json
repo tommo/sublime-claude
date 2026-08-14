@@ -1,0 +1,13 @@
+{
+  "taskId": "bash-abc123",
+  "description": "Bash: pil test -t tree_editor",
+  "status": "completed",
+  "detached": true,
+  "startedAt": 1,
+  "endedAt": 2,
+  "timeoutMs": 600000,
+  "kind": "process",
+  "command": "cd /proj && pil test -t tree_editor 2>&1 | head -5",
+  "pid": 0,
+  "exitCode": 0
+}

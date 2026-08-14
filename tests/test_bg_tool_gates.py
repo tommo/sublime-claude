@@ -51,10 +51,111 @@ class TestNormalizeTaskOutputTitle(unittest.TestCase):
             "title": "Starting background: sleep 999",
         }))
 
+    def test_looks_like_bg_running_title_is_foreground(self):
+        # Kimi titles every execute `Running:` — that is wait_for_exit, not ⚙.
+        self.assertFalse(AcpBridge._looks_like_background_tool({
+            "title": "Running: echo ok && which pil",
+            "kind": "execute",
+        }))
+        self.assertFalse(AcpBridge._looks_like_background_tool({
+            "title": "Bash",
+            "kind": "execute",
+        }, {"command": "echo ok && which pil"}))
+
+    def test_looks_like_bg_accepts_detached_input(self):
+        self.assertTrue(AcpBridge._looks_like_background_tool({
+            "title": "Bash",
+            "kind": "execute",
+        }, {"command": "pil test", "detached": True}))
+        self.assertTrue(AcpBridge._looks_like_background_tool({
+            "title": "Bash",
+        }, {"command": "pil test", "run_in_background": True}))
+
     def test_shell_name_gate(self):
         self.assertTrue(AcpBridge._is_shell_tool_name("Bash"))
         self.assertFalse(AcpBridge._is_shell_tool_name("Read"))
         self.assertFalse(AcpBridge._is_shell_tool_name("TaskGet"))
+
+    def test_script_from_kimi_bash_c_args(self):
+        cmd = AcpBridge._script_from_terminal_params(
+            "/bin/bash", ["-c", "echo ok && which pil"])
+        self.assertEqual(cmd, "echo ok && which pil")
+        self.assertEqual(
+            AcpBridge._script_from_terminal_params("echo hi", []),
+            "echo hi")
+
+
+class _TermStub(AcpBridge):
+    def __init__(self):
+        self._last_execute_id = None
+        self._pending_execute_ids = []
+        self._tool_inputs_by_id = {}
+        self._bg_tool_ids = set()
+        self._terminal_bg = {}
+        self._tool_names_by_id = {}
+        self._tool_ids_emitted = set()
+        self._terminals = {}
+
+    def file_log(self, msg):
+        pass
+
+    def _emit_system(self, *a, **k):
+        pass
+
+    def _emit_bg_finished(self, *a, **k):
+        pass
+
+    def _should_skip_bg_notify(self, *a, **k):
+        return False
+
+    def _write_bg_output_file(self, *a, **k):
+        return ""
+
+    def _clip_bg_summary(self, *a, **k):
+        return ""
+
+
+class TestMarkTerminalBg(unittest.TestCase):
+    def test_explicit_detached_marks_and_consumes(self):
+        b = _TermStub()
+        b._note_shell_execute("tool-1", "Bash")
+        b._tool_inputs_by_id["tool-1"] = {
+            "command": "sleep 9", "detached": True}
+        slot = {"cmd": "sleep 9"}
+        b._mark_terminal_bg("term_a", slot)
+        self.assertTrue(slot.get("bg"))
+        self.assertEqual(slot.get("tool_use_id"), "tool-1")
+        self.assertIsNone(b._last_execute_id)
+        self.assertEqual(b._pending_execute_ids, [])
+        # next terminal must not inherit
+        slot2 = {"cmd": "echo ok"}
+        b._mark_terminal_bg("term_b", slot2)
+        self.assertFalse(slot2.get("bg"))
+
+    def test_running_title_only_is_not_bg(self):
+        b = _TermStub()
+        b._note_shell_execute("tool-2", "Bash")
+        b._tool_inputs_by_id["tool-2"] = {"command": "echo ok && which pil"}
+        slot = {"cmd": "echo ok && which pil"}
+        b._mark_terminal_bg("term_c", slot)
+        self.assertFalse(slot.get("bg"))
+        # still consumed so it cannot stain a later execute
+        self.assertEqual(b._pending_execute_ids, [])
+
+    def test_native_detached_meta_marks(self):
+        b = _TermStub()
+        b._kimi_detached_meta = lambda cmd: {
+            "taskId": "bash-abc", "detached": True, "command": cmd,
+        } if "pil test" in cmd else None
+        b._link_terminal_to_kimi_task = lambda *a, **k: None
+        slot = {"cmd": "cd /proj && pil test -t tree_editor"}
+        b._mark_terminal_bg("term_d", slot)
+        self.assertTrue(slot.get("bg"))
+
+    def test_wait_for_exit_has_no_fake_success(self):
+        import inspect
+        src = inspect.getsource(AcpBridge._acp_terminal_wait)
+        self.assertNotIn('return {"exitCode": 0, "signal": None}', src)
 
 
 class TestOutputViewBgDemote(unittest.TestCase):
