@@ -319,7 +319,7 @@ BACKENDS: Dict[str, BackendSpec] = {
         label="Grok",
         abbrev="GR",
         bridge_script="grok_main.py",
-        fallback_model="grok-4.5",
+        fallback_model="grok-4.6",
         default_models=list(grok_backend.GROK_MODELS),
         available=_grok_available,
         pinned=True,
@@ -346,7 +346,7 @@ BACKENDS: Dict[str, BackendSpec] = {
         label="Grok (Claude Code)",
         abbrev="GCC",
         bridge_script="main.py",
-        fallback_model="grok-4.5",
+        fallback_model="grok-4.6",
         default_models=grok_backend.GROK_MODELS,
         dynamic_env=grok_backend.grok_dynamic_env,
         available=grok_backend.grok_available,
@@ -490,6 +490,17 @@ def all_backends() -> Dict[str, "BackendSpec"]:
 def get(name: str) -> "BackendSpec":
     """Look up backend spec; falls back to claude if unknown."""
     return all_backends().get(name, BACKENDS["claude"])
+
+
+def abbrev_for(name: str) -> str:
+    """Tab / list abbrev: registry → BACKEND_ABBREV → first two letters."""
+    b = (name or "claude").strip() or "claude"
+    spec = get(b)
+    tok = (spec.abbrev or "").strip()
+    if tok:
+        return tok
+    from .constants import BACKEND_ABBREV
+    return BACKEND_ABBREV.get(b) or b[:2].upper()
 
 
 def is_available(name: str) -> bool:

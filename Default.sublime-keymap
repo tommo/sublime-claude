@@ -355,6 +355,20 @@
     },
     {
         "keys": ["enter"],
+        "command": "claude_session_list_open",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["r"],
+        "command": "claude_session_list_refresh",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
+        "keys": ["enter"],
         "command": "claude_order_goto",
         "context": [
             { "key": "setting.order_table_view", "operator": "equal", "operand": true }
@@ -792,5 +806,10 @@
     { "keys": ["shift+home"], "command": "claude_terminal_keypress", "args": {"key": "home", "shift": true}, "context": [{"key": "claude_terminal"}] },
     { "keys": ["shift+end"], "command": "claude_terminal_keypress", "args": {"key": "end", "shift": true}, "context": [{"key": "claude_terminal"}] },
     { "keys": ["shift+tab"], "command": "claude_terminal_keypress", "args": {"key": "tab", "shift": true}, "context": [{"key": "claude_terminal"}] },
-    { "keys": ["shift+backspace"], "command": "claude_terminal_keypress", "args": {"key": "backspace", "shift": true}, "context": [{"key": "claude_terminal"}] }
+    { "keys": ["shift+backspace"], "command": "claude_terminal_keypress", "args": {"key": "backspace", "shift": true}, "context": [{"key": "claude_terminal"}] },
+
+    { "keys": ["enter"], "command": "claude_session_list_open",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
+    { "keys": ["r"], "command": "claude_session_list_refresh",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] }
 ]

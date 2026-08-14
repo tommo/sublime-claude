@@ -496,6 +496,16 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
             session = Session(window, resume_id=resume_id, backend=saved_backend)
             session.name = session_name
+            if matched:
+                try:
+                    session.last_activity = float(
+                        matched.get("last_activity") or session.last_activity)
+                    session.last_access = float(
+                        matched.get("last_access")
+                        or matched.get("last_activity")
+                        or session.last_access)
+                except (TypeError, ValueError):
+                    pass
             session.output.view = view
             session.draft_prompt = ""
             # BEFORE any UI: forbid ◎. Never add-then-strip.
@@ -688,10 +698,17 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 return ("claude_paste_image", {})
             return ("noop", {})
 
+        # Type-to-compose: printable insert while browsing history → ◎ draft
+        if command_name == "insert" and not in_draft:
+            chars = (args or {}).get("characters") or ""
+            if chars and not getattr(s.output, "_question_input_mode", False):
+                self._guide_insert_to_composer(s, chars)
+            return ("noop", {})
+
         if command_name not in self._INPUT_EDIT_COMMANDS:
             return None
 
-        # Mutations only when wholly in draft; else no-op, keep selection
+        # Other mutations only when wholly in draft; else no-op, keep selection
         if not in_draft:
             return ("noop", {})
 
@@ -706,6 +723,32 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                         return ("noop", {})
 
         return None
+
+    def _guide_insert_to_composer(self, session, characters: str) -> None:
+        """Park caret at ◎ draft EOF and re-issue insert (type-to-compose)."""
+        view = self.view
+        chars = characters or ""
+        if not chars or not session or not session.output:
+            return
+
+        def _go(v=view, s=session, c=chars):
+            try:
+                if not v or not v.is_valid():
+                    return
+                if not s.output or not s.output.is_input_mode():
+                    return
+                if getattr(s.output, "_question_input_mode", False):
+                    return
+                v.set_read_only(False)
+                s.output.set_caret_owner("draft")
+                s.output.park_composer_caret("end")
+                s.output.scroll_composer_chrome(force=True)
+                # Caret is in draft now — normal insert path updates draft_prompt
+                v.run_command("insert", {"characters": c})
+            except Exception as e:
+                print(f"[Claude] guide insert: {e}")
+
+        sublime.set_timeout(_go, 0)
 
     def _handle_composer_click(self, session, args: dict) -> None:
         """Explicit ◎-marker / pad-below-EOF only; history clicks stay put.
@@ -739,8 +782,9 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 _ex, eof_y = view.text_to_layout(view.size())
                 line_h = max(view.line_height(), 1.0)
                 if click_y > float(eof_y) + line_h * 0.5:
-                    session.output.focus_composer(
-                        force_show=True, steal_focus=True, park_at_end=True)
+                    session.output.set_caret_owner("draft")
+                    session.output.park_composer_caret("end")
+                    session.output.scroll_composer_chrome(force=True)
                     return
             except Exception:
                 pass
@@ -753,40 +797,44 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     click_pt = view.layout_to_text(layout)
                     crow, ccol = view.rowcol(click_pt)
                     if crow == row and ccol <= 2:
+                        session.output.set_caret_owner("draft")
                         view.sel().clear()
                         view.sel().add(sublime.Region(input_start, input_start))
+                        session.output.note_draft_caret()
                         return
             except Exception:
                 pass
-            # History or mid-draft: do nothing — caret already where user clicked
+            # History or mid-draft: ownership follows click geometry (no yank)
+            try:
+                click_pt = view.layout_to_text(layout)
+                if click_pt < input_start:
+                    session.output.set_caret_owner("history")
+                else:
+                    session.output.set_caret_owner("draft")
+                    session.output.note_draft_caret()
+            except Exception:
+                pass
         except Exception:
             pass
 
     def on_selection_modified(self):
-        """Observe only — never move caret or re-pin composer."""
+        """Observe only — update ownership; never move caret or re-pin composer."""
         s = get_session_for_view(self.view)
         if not s or not s.output.is_input_mode():
             return
         # ST requires at least one region for mouse interaction
         sel = self.view.sel()
         if len(sel) == 0:
-            # Only re-pin draft caret if we were composing (not history browse).
             # Empty selection after a history click must not jump into ◎.
-            try:
-                start = int(getattr(s.output, "_input_start", 0) or 0)
-            except Exception:
-                start = 0
-            # Prefer a no-op leave: if last known offset is mid-draft and the
-            # empty sel is a transient rewrite glitch, restore; otherwise park
-            # at click history point is impossible — leave ST empty (rare).
-            # Do not force draft start/EOF here.
             return
-        # Track mid-draft caret only when selection is still in ◎
+        # Track ownership + mid-draft offset from live geometry
         try:
-            start = int(getattr(s.output, "_input_start", 0) or 0)
-            b = sel[0].begin()
-            if b >= start:
+            geom = self._geometry(s)
+            if geom == "draft":
+                s.output.set_caret_owner("draft")
                 s.output.note_draft_caret()
+            elif geom in ("history", "crossing"):
+                s.output.set_caret_owner("history")
         except Exception:
             pass
         # Keep buffer editable; history protection is pre-mutation (on_text_command)
@@ -842,7 +890,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
         command, args, _ = self.view.command_history(0)
 
-        # Safety net only: undo illegal history mutation; do NOT re-insert into draft
+        # Safety net: illegal history insert should not stick; recover into ◎.
         if command == "insert" and args and "characters" in args and len(self.view.sel()) == 1:
             chars = args["characters"]
             input_start = s.output._input_start
@@ -854,7 +902,8 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                     self.view.run_command("soft_undo")
                 finally:
                     self._in_soft_undo = False
-                # Leave caret where user had it after undo — no park/redirect
+                if chars and not getattr(s.output, "_question_input_mode", False):
+                    self._guide_insert_to_composer(s, chars)
                 return
 
         elif command and not command.startswith("claude"):

@@ -112,3 +112,73 @@ def draft_select_range(input_start: int, eof: int) -> Tuple[int, int]:
     start = max(0, int(input_start))
     end_pt = max(start, int(eof))
     return (start, end_pt)
+
+
+# --- Caret ownership (draft vs history) while sticky ◎ is open ---
+# User events set owner; stream/idle must only re-pin when draft-owned.
+
+OWNER_DRAFT = "draft"
+OWNER_HISTORY = "history"
+
+
+def owner_from_geometry(geom: str) -> str:
+    """Map classify_regions result to caret owner.
+
+    crossing → history (protected: stream must not yank into ◎).
+    none → draft (default when chrome opens / no selection info).
+    """
+    if geom == "draft":
+        return OWNER_DRAFT
+    if geom in ("history", "crossing"):
+        return OWNER_HISTORY
+    return OWNER_DRAFT
+
+
+def stream_may_move_caret(owner: str) -> bool:
+    """Stream/idle may re-apply saved draft offset only under draft ownership."""
+    return owner == OWNER_DRAFT
+
+
+def stream_may_force_bottom(owner: str, following_tail: bool) -> bool:
+    """Force-scroll to ◎ only when composing and viewport is following the tail."""
+    return owner == OWNER_DRAFT and bool(following_tail)
+
+
+def stream_treat_as_composing(
+        live_sel_in_draft: bool,
+        sel_empty: bool,
+        owner: str,
+        has_saved_draft_off: bool,
+) -> bool:
+    """Whether a stream tick should re-pin draft caret.
+
+    Live geometry wins. Empty selection mid-replace only keeps composing if
+    the user was draft owner (not history browse with a stale offset).
+    """
+    if live_sel_in_draft:
+        return True
+    if sel_empty and owner == OWNER_DRAFT and has_saved_draft_off:
+        return True
+    return False
+
+
+def stream_tick_actions(
+        owner: str,
+        following_tail: bool,
+        *,
+        live_sel_in_draft: bool = False,
+        sel_empty: bool = False,
+        has_saved_draft_off: bool = False,
+) -> Tuple[bool, bool]:
+    """Return (force_bottom, reapply_draft_caret) for one stream tick.
+
+    History owner (and not live in draft): no automated scroll or caret.
+    Draft owner / live draft sel: reapply caret; force bottom only if following.
+    """
+    if owner == OWNER_HISTORY and not live_sel_in_draft:
+        return (False, False)
+    composing = stream_treat_as_composing(
+        live_sel_in_draft, sel_empty, owner, has_saved_draft_off)
+    if not composing:
+        return (False, False)
+    return (bool(following_tail), True)

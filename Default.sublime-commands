@@ -125,6 +125,10 @@
         "command": "claude_code_switch"
     },
     {
+        "caption": "Claude: Session List",
+        "command": "claude_session_list"
+    },
+    {
         "caption": "Claude: Quick Agent (⌘⇧\\ toggle show/hide)",
         "command": "claude_quick_agent"
     },

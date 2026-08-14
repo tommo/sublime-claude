@@ -29,7 +29,7 @@ DEFAULT_DATA_DIR = os.path.expanduser("~/.claude/grok_proxy")
 
 # Embedded minimal Grok catalog for GET /v1/models (Anthropic shape).
 GROK_MODELS = [
-    ("grok-4.5", "Grok 4.5"),
+    ("grok-4.6", "Grok 4.6"),
     ("grok-4-fast", "Grok 4 Fast"),
     ("grok-4.3", "Grok 4.3"),
     ("grok-4", "Grok 4"),

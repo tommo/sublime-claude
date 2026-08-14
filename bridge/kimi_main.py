@@ -16,7 +16,8 @@ sys.path.insert(0, _BRIDGE_DIR)
 sys.path.insert(0, _PLUGIN_DIR)
 
 from acp_base import AcpBridge, run_bridge  # noqa: E402
-from rpc_helpers import send_notification  # noqa: E402
+from kimi_bg import KimiBgMixin  # noqa: E402
+from rpc_helpers import send_notification, send_result  # noqa: E402
 
 try:
     from kimi_backend import (  # noqa: E402
@@ -43,9 +44,12 @@ except ImportError:
         return (model or default).strip() or default
 
 
-class KimiBridge(AcpBridge):
+class KimiBridge(KimiBgMixin, AcpBridge):
     BACKEND_NAME = "kimi"
     DEFAULT_MODEL = "kimi-code/k3"  # matches kimi default_model / ACP currentValue
+    # Do NOT always cancel before every prompt (spams session/cancel and races
+    # the agent). Cancel only when busy / post-interrupt / agent_busy retry.
+    PREEMPT_PROMPT = False
     LOG_PATH = os.path.join(
         os.environ.get("TMPDIR")
         or os.environ.get("TEMP")
@@ -188,41 +192,43 @@ class KimiBridge(AcpBridge):
 
     async def handle_interrupt(self, req_id: Optional[int],
                                 params: dict) -> None:
-        """Cancel turn; second Esc hard-kills hung Agent subagents.
+        """Cancel the in-flight turn only — never kill the ACP process.
 
-        Kimi Code Agent tools can ignore session/cancel for 30–60+ min while
-        the parent session/prompt never returns — UI stays busy forever.
-        First interrupt: cancel + force local prompt settle.
-        Second interrupt within 15s: SIGKILL the kimi-code process (session
-        must be reopened — better than a stuck hour-long spinner).
+        Killing the agent on Esc was the "Connection lost" bug: double Esc
+        within 15s always hard-killed kimi-code, so the next prompt failed.
+
+        Interrupt = session/cancel + stop agent shells + settle host waiters.
+        Session stays alive for the next message.
         """
-        now = time.time()
-        last = float(getattr(self, "_kimi_last_interrupt_at", 0) or 0)
-        count = int(getattr(self, "_kimi_interrupt_streak", 0) or 0)
-        if now - last < 15.0:
-            count += 1
-        else:
-            count = 1
-        self._kimi_last_interrupt_at = now
-        self._kimi_interrupt_streak = count
-
-        # Longer wait than default — subagents need cancel to propagate
         fut = self._prompt_fut
         active = fut is not None and not fut.done()
         has_query = self._query_req_id is not None
-        if not active and not has_query and count < 2:
-            self.file_log("interrupt: idle (no in-flight prompt)")
+        if not active and not has_query:
+            # Still cancel orphan agent-side work (auto-continue) if any
+            if self.session_id is not None:
+                try:
+                    await self._cancel_agent_turn(
+                        reason="interrupt_idle", wait_s=0.5, settle_s=0.3,
+                        force_local=True, orphan_ok=True)
+                except Exception as e:
+                    self.file_log(f"interrupt idle cancel: {e}")
+            self.file_log("interrupt: idle (cancel sent if session live)")
+            self._cancel_in_flight = True
             send_result(req_id, {"status": "interrupted"})
             return
 
+        # Stop agent shells so wait_for_exit cannot hold the turn open
         for tid in list(self._terminals):
             try:
                 await self._terminal_close(tid)
             except Exception:
                 pass
 
+        # Prefer waiting for real cancelled stopReason; force_local only after
+        # a long wait so UI unsticks without tearing down ACP.
         await self._cancel_agent_turn(
-            reason="interrupt", wait_s=3.0, settle_s=0.4, force_local=True)
+            reason="interrupt", wait_s=5.0, settle_s=0.5,
+            force_local=True, orphan_ok=True)
 
         for pid, pfut in list(self.pending_permissions.items()):
             if pfut and not pfut.done():
@@ -237,46 +243,9 @@ class KimiBridge(AcpBridge):
                 pfut.set_result(None)
             self.pending_plan_approvals.pop(pid, None)
 
-        # Hard kill if still hung after cancel (Agent subagent ignores cancel)
-        still_busy = (
-            (self._prompt_fut is not None and not self._prompt_fut.done())
-            or count >= 2
-        )
-        if still_busy and count >= 2:
-            await self._kimi_hard_kill_agent(reason="double_interrupt")
-            self._kimi_interrupt_streak = 0
-
-        send_result(req_id, {"status": "interrupted"})
-
-    async def _kimi_hard_kill_agent(self, *, reason: str = "") -> None:
-        """SIGKILL kimi-code ACP process so a stuck Agent cannot hold the UI."""
-        proc = getattr(self, "proc", None)
-        if proc is None:
-            self.file_log(f"kimi hard kill ({reason}): no proc")
-            return
-        pid = getattr(proc, "pid", None)
-        self.file_log(f"kimi hard kill ({reason}): pid={pid}")
-        try:
-            if proc.returncode is None:
-                proc.kill()
-        except Exception as e:
-            self.file_log(f"kimi hard kill failed: {e}")
-        # Settle local waiters
-        fut = self._prompt_fut
-        if fut is not None and not fut.done():
-            fut.set_result({"stopReason": "cancelled"})
-        self._prompt_cancelled = True
+        # Mark so next query does a short post-interrupt settle (not kill)
         self._cancel_in_flight = True
-        send_notification("message", {
-            "type": "system",
-            "subtype": "init",
-            "data": {
-                "message": (
-                    "Kimi agent process killed (stuck turn). "
-                    "Restart this session to continue."
-                ),
-            },
-        })
+        send_result(req_id, {"status": "interrupted"})
 
 
 def main() -> None:

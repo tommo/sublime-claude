@@ -684,12 +684,23 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             items.append([f"{prefix}{star}{name}", detail])
             actions.append(("focus", active_session))
 
-        # Add other sessions (not the active one) — starred float to top
+        # Other sessions: live first (working → ready → sleeping), starred within each band
         other_in_window = [(v, s) for v, s in sessions_in_window
                            if v != active_view_id and s is not active_session]
-        starred_sessions = [(v, s) for v, s in other_in_window if s.session_id in starred]
-        plain_sessions = [(v, s) for v, s in other_in_window if s.session_id not in starred]
-        for view_id, s in starred_sessions + plain_sessions:
+
+        def _session_list_key(pair):
+            _v, s = pair
+            if s.is_sleeping:
+                liveness = 2
+            elif s.working:
+                liveness = 0
+            else:
+                liveness = 1
+            starred_rank = 0 if s.session_id in starred else 1
+            return (liveness, starred_rank)
+
+        other_in_window.sort(key=_session_list_key)
+        for view_id, s in other_in_window:
             name = s.name or "(unnamed)"
             is_starred = s.session_id in starred
             if s.is_sleeping:
@@ -1161,5 +1172,56 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
                 sublime.status_message(f"Forked session: {forked_name}")
 
         self.window.show_quick_panel(items, on_select)
+
+
+class ClaudeSessionListCommand(sublime_plugin.WindowCommand):
+    """Open the Sessions scratch list (live + history)."""
+
+    def run(self):
+        from ..session_list import show_session_list
+        show_session_list(self.window)
+
+
+class ClaudeSessionListRefreshCommand(sublime_plugin.TextCommand):
+    def run(self, edit):
+        from ..session_list import SETTING, refresh_session_list
+        if not self.view.settings().get(SETTING):
+            return
+        win = self.view.window()
+        if win:
+            refresh_session_list(win)
+
+    def is_enabled(self):
+        from ..session_list import SETTING
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListOpenCommand(sublime_plugin.TextCommand):
+    def run(self, edit):
+        import json
+        from ..session_list import (
+            SETTING, ROWS_KEY, row_at_line, open_row, refresh_session_list,
+        )
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        if open_row(win, row):
+            refresh_session_list(win)
+
+    def is_enabled(self):
+        from ..session_list import SETTING
+        return bool(self.view.settings().get(SETTING))
 
 

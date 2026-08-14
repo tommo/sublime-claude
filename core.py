@@ -250,6 +250,11 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     finally:
         window.settings().erase("claude_creating_session")
     schedule_auto_sleep()
+    try:
+        from .session_list import schedule_session_list_refresh
+        schedule_session_list_refresh()
+    except Exception:
+        pass
     return s
 
 

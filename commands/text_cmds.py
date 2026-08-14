@@ -89,8 +89,9 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         # coming from history — user is entering the composer, not mid-edit)
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(
-                    force_show=True, steal_focus=True, park_at_end=True)
+                s.output.set_caret_owner("draft")
+                s.output.park_composer_caret("end")
+                s.output.scroll_composer_chrome(force=True)
             except Exception:
                 pass
             return
@@ -223,7 +224,17 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         sublime.status_message("Claude: conversation cleared")
 
     def _cmd_compact(self, session):
-        """Send /compact to Claude for context summarization."""
+        """Send /compact to Claude for context summarization.
+
+        Kimi returns immediately while compaction runs agent-side — Session
+        keeps busy (_compacting) until 'Compaction completed' text arrives.
+        """
+        session._compacting = True
+        session.current_tool = "compact…"
+        try:
+            session._status("compacting…")
+        except Exception:
+            pass
         session.query("/compact", display_prompt="/compact")
 
     def _cmd_context(self, session):
@@ -379,8 +390,9 @@ class ClaudeInsertNewlineCommand(sublime_plugin.TextCommand):
         # Outside ◎: focus composer instead of a no-op / history edit
         if _caret_outside_composer(self.view, s.output):
             try:
-                s.output.focus_composer(
-                    force_show=True, steal_focus=True, park_at_end=True)
+                s.output.set_caret_owner("draft")
+                s.output.park_composer_caret("end")
+                s.output.scroll_composer_chrome(force=True)
             except Exception:
                 pass
             return

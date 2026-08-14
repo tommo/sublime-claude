@@ -1,0 +1,67 @@
+%YAML 1.2
+---
+name: Session List
+scope: text.session-list
+hidden: true
+
+contexts:
+  main:
+    - match: '^SESSIONS\b'
+      scope: markup.heading.session-list
+      push: header_rest
+
+    - match: '^(RUNNING|HISTORY)(?: \(other projects\))?\s+\((\d+)\)'
+      captures:
+        0: entity.name.section.session-list
+        2: constant.numeric.session-list
+
+    - match: '^\s+\(none\)$'
+      scope: comment.line.session-list
+
+    - match: '^●'
+      scope: keyword.working.session-list
+      push: row_rest
+
+    - match: '^○'
+      scope: keyword.ready.session-list
+      push: row_rest
+
+    - match: '^⏸'
+      scope: keyword.sleeping.session-list
+      push: row_rest
+
+    - match: '^·'
+      scope: comment.mark.session-list
+      push: row_rest
+
+  header_rest:
+    - match: '\b(enter|dclick|r)\b'
+      scope: keyword.operator.session-list
+    - match: '\b(open|refresh)\b'
+      scope: comment.line.session-list
+    - match: '·'
+      scope: comment.line.session-list
+    - match: '$'
+      pop: true
+
+  row_rest:
+    - match: '★'
+      scope: keyword.star.session-list
+    - match: '\b([A-Z][A-Z0-9]{1,3}|Pi|CL)\b'
+      scope: storage.type.backend.session-list
+    - match: '\b(working)\b'
+      scope: keyword.working.session-list
+    - match: '\b(ready)\b'
+      scope: keyword.ready.session-list
+    - match: '\b(sleeping)\b'
+      scope: keyword.sleeping.session-list
+    - match: '\b(other-win)\b'
+      scope: comment.line.session-list
+    - match: '\b(\d+q)\b'
+      scope: constant.numeric.session-list
+    - match: '\b(now|\d+[smhdw])\b'
+      scope: comment.line.time.session-list
+    - match: '\b(claude|grok|kimi|codex|copilot|pi|dsr|deepseek)\b'
+      scope: storage.type.backend.session-list
+    - match: '$'
+      pop: true

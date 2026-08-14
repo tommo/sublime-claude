@@ -74,6 +74,11 @@ class OutputView:
         # Mid-draft caret offset (from _input_start). Survives stream re-renders
         # when ST remaps selection or view.show(EOF) would yank to tail.
         self._draft_caret_off: Optional[int] = None
+        # User caret ownership: "draft" | "history". Stream/idle must not steal
+        # when "history"; only user enter-composer gestures may switch to draft.
+        self._caret_owner: str = "draft"
+        # Coalesce deferred draft re-pins (stream ticks must not stack).
+        self._pending_caret_token: int = 0
         self._spinner_frame: int = 0  # Current spinner animation frame
         self._media_phantom_set = None  # inline image previews (minihtml data: URIs)
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
@@ -236,11 +241,9 @@ class OutputView:
         # Show backend for non-claude sessions
         backend = self.view.settings().get("claude_backend")
         if backend:
-            # Prefer the registry's abbrev (covers custom providers); fall back
-            # to the static constants map, then to a 2-char upper of the name.
             try:
-                from . import backends as _backends
-                abbr = _backends.get(backend).abbrev or BACKEND_ABBREV.get(backend, backend[:2].upper())
+                from .backends import abbrev_for
+                abbr = abbrev_for(backend)
             except Exception:
                 abbr = BACKEND_ABBREV.get(backend, backend[:2].upper())
             name = f"{abbr}> {name}"
@@ -257,7 +260,7 @@ class OutputView:
         """Remove reconnect status spam from the view tail.
 
         Effort/connect hints used to be appended on every init and stacked:
-          *Grok: grok-4.5 · reasoning effort **high***
+          *Grok: grok-4.6 · reasoning effort **high***
         Also drops trailing blank lines. Leaves real conversation content.
         """
         if not self.view or not self.view.is_valid():
@@ -475,6 +478,16 @@ class OutputView:
 
         sublime.set_timeout(_pass1, 0)
 
+    def caret_owner(self) -> str:
+        """Current user ownership: 'draft' or 'history'."""
+        o = getattr(self, "_caret_owner", None) or "draft"
+        return o if o in ("draft", "history") else "draft"
+
+    def set_caret_owner(self, owner: str) -> None:
+        """User-event path only — stream must not call this."""
+        if owner in ("draft", "history"):
+            self._caret_owner = owner
+
     def note_draft_caret(self) -> None:
         """Remember mid-draft caret offset (call from selection / render paths)."""
         if not self.view or not self.view.is_valid() or not self._input_mode:
@@ -490,6 +503,8 @@ class OutputView:
             b = sel[0].begin()
             if start <= b <= size:
                 self._draft_caret_off = b - start
+                # Live draft sel implies draft ownership (user composing)
+                self._caret_owner = "draft"
         except Exception:
             pass
 
@@ -501,6 +516,8 @@ class OutputView:
         selection is still in the draft (or empty after a buffer rewrite).
         """
         if not self.view or not self.view.is_valid() or not self._input_mode:
+            return False
+        if not force and self.caret_owner() == "history":
             return False
         off = getattr(self, "_draft_caret_off", None)
         if off is None:
@@ -726,23 +743,9 @@ class OutputView:
         # Peel = start of ◎ line (no blank row between split hairline and ◎).
         self._input_area_start = self.view.size()
 
-        # Add background task hints
-        bg_tools = self.active_background_tools()
-        if bg_tools:
-            for bt in bg_tools:
-                detail = self._format_tool_detail(bt)
-                self.view.run_command("append", {"characters": f"  {BACKGROUND_PREFIX}{bt.name}{detail}\n"})
-
-        # Add context anchor if any. Names + open/reveal live in the inline
-        # phantom only (buffer keeps just 📎 so we don't double-render).
-        from . import claude_code
-        session = claude_code.get_session_for_view(self.view)
-        if session and session.pending_context:
-            ctx_start = self.view.size()
-            self.view.run_command("append", {"characters": f"{CONTEXT_PREFIX}\n"})
-            self._pending_context_region = (ctx_start, self.view.size())
-        else:
-            self._pending_context_region = (0, 0)
+        # Background task hints + context sit between peel and ◎ (see
+        # refresh_background_hints — sticky already open still updates).
+        self._append_composer_prefix()
 
         self.view.run_command("append", {"characters": self._input_marker})
         self._input_start = self.view.size()  # After the marker
@@ -752,12 +755,17 @@ class OutputView:
         # This ensures on_modified won't save wrong content as draft
         self._input_mode = True
         self.view.settings().set("claude_input_mode", True)
+        # First open is a system enter-composer gesture → draft ownership
+        self._caret_owner = "draft"
+        self._draft_caret_off = 0
 
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(self._input_start, self._input_start))
         self.collapse_empty_composer_tail()
         self._update_composer_pad_phantom()
 
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
         # Clickable open/reveal chips inline after 📎 (same line, not a 2nd row)
         items = list(session.pending_context) if session and session.pending_context else []
         sublime.set_timeout(
@@ -774,6 +782,126 @@ class OutputView:
 
         # Scroll ◎ into view; caret already at draft start — do not yank to EOF
         self.focus_composer(force_show=True, steal_focus=False, preserve_caret=True)
+
+    def _append_composer_prefix(self) -> None:
+        """Append ⚙ bg-tool lines + optional 📎 context at EOF (pre-◎)."""
+        if not self.view:
+            return
+        bg_tools = self.active_background_tools()
+        if bg_tools:
+            for bt in bg_tools:
+                detail = self._format_tool_detail(bt)
+                self.view.run_command(
+                    "append",
+                    {"characters": f"  {BACKGROUND_PREFIX}{bt.name}{detail}\n"},
+                )
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view)
+        if session and session.pending_context:
+            ctx_start = self.view.size()
+            self.view.run_command("append", {"characters": f"{CONTEXT_PREFIX}\n"})
+            self._pending_context_region = (ctx_start, self.view.size())
+        else:
+            self._pending_context_region = (0, 0)
+
+    def _composer_prefix_text(self) -> str:
+        """Buffer text for ⚙ hints + 📎 that sits above sticky ◎."""
+        parts: list = []
+        for bt in self.active_background_tools():
+            detail = self._format_tool_detail(bt)
+            parts.append(f"  {BACKGROUND_PREFIX}{bt.name}{detail}\n")
+        from . import claude_code
+        session = claude_code.get_session_for_view(self.view) if self.view else None
+        if session and session.pending_context:
+            parts.append(f"{CONTEXT_PREFIX}\n")
+        return "".join(parts)
+
+    def refresh_background_hints(self) -> None:
+        """Rebuild ⚙ lines above sticky ◎ without exit/re-enter.
+
+        Mid-turn sticky opens before sidecar Bash registers; turn end used to
+        no-op enter_input (already open) so hints never appeared until the
+        next round. Call whenever bg tools start/finish while ◎ is live.
+        """
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        if not self._input_marker_intact():
+            return
+        peel = self._composer_peel_start()
+        if peel is None:
+            return
+        marker_start = self._input_start - len(self._input_marker)
+        if marker_start < peel or marker_start > self.view.size():
+            return
+        # Preserve draft caret relative to ◎
+        draft = self.get_input_text()
+        caret_off = 0
+        try:
+            sel = self.view.sel()
+            if sel and self._input_start is not None:
+                b = sel[0].begin()
+                if b >= self._input_start:
+                    caret_off = max(0, min(b - self._input_start, len(draft)))
+        except Exception:
+            caret_off = int(getattr(self, "_draft_caret_off", 0) or 0)
+
+        new_prefix = self._composer_prefix_text()
+        old = self.view.substr(sublime.Region(peel, marker_start))
+        if old == new_prefix:
+            return
+
+        was_ro = self.view.is_read_only()
+        self.view.set_read_only(False)
+        try:
+            self.view.run_command("claude_replace", {
+                "start": peel,
+                "end": marker_start,
+                "text": new_prefix,
+            })
+        finally:
+            if was_ro and not self._input_mode:
+                self.view.set_read_only(True)
+
+        # Peel fixed; ◎ and draft shift by delta
+        delta = len(new_prefix) - (marker_start - peel)
+        self._input_area_start = peel
+        self._input_start = marker_start + delta + len(self._input_marker)
+        # Context region (if any) is last line of prefix before ◎
+        if new_prefix.endswith(f"{CONTEXT_PREFIX}\n"):
+            ctx_end = peel + len(new_prefix)
+            ctx_start = ctx_end - len(f"{CONTEXT_PREFIX}\n")
+            self._pending_context_region = (ctx_start, ctx_end)
+        else:
+            self._pending_context_region = (0, 0)
+
+        # Keep draft + caret; pad phantom may need re-anchor
+        pos = min(self._input_start + caret_off, self.view.size())
+        try:
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(pos, pos))
+            self._draft_caret_off = caret_off
+        except Exception:
+            pass
+        self.view.set_read_only(False)
+        try:
+            self._update_composer_pad_phantom()
+        except Exception:
+            pass
+        try:
+            from . import claude_code
+            session = claude_code.get_session_for_view(self.view)
+            items = list(session.pending_context) if session and session.pending_context else []
+            sublime.set_timeout(
+                lambda it=items: self._refresh_context_phantoms(it), 10)
+        except Exception:
+            pass
+        try:
+            from . import claude_code
+            _s = claude_code.get_session_for_view(self.view)
+            if _s and hasattr(_s, "_update_queue_phantom"):
+                sublime.set_timeout(_s._update_queue_phantom, 15)
+        except Exception:
+            pass
 
     def exit_input_mode(self, keep_text: bool = False) -> str:
         """Exit input mode and return the input text."""
@@ -988,8 +1116,12 @@ class OutputView:
             if self._input_mode and self.view and self.view.is_valid():
                 self.view.set_read_only(False)
                 # User clicked pad under ◎ → park at draft end (intentional)
-                self.focus_composer(
-                    force_show=True, steal_focus=True, park_at_end=True)
+                self.set_caret_owner("draft")
+                self.park_composer_caret("end")
+                win = self.view.window()
+                if win:
+                    win.focus_view(self.view)
+                self.scroll_composer_chrome(force=True)
         except Exception as e:
             print(f"[Claude] pad click: {e}")
 
@@ -1010,6 +1142,8 @@ class OutputView:
         caret = self._input_start + len(body)
         self.view.sel().clear()
         self.view.sel().add(sublime.Region(caret, caret))
+        self._caret_owner = "draft"
+        self._draft_caret_off = len(body)
         self.collapse_empty_composer_tail()
         self._update_composer_pad_phantom()
 
@@ -1017,17 +1151,47 @@ class OutputView:
         """Check if currently in input mode."""
         return self._input_mode
 
-    def _scroll_layout_to_bottom(self, *, force: bool = False) -> None:
+    def scroll_composer_chrome(self, *, force: bool = False) -> None:
+        """Viewport-only: pin ◎ + pad to the foot of the viewport. Never touches sel."""
+        self._scroll_layout_to_bottom(force=force, reapply_caret=False)
+
+    def park_composer_caret(self, mode: str = "end") -> None:
+        """Explicit user/system park into ◎. Sets draft ownership."""
+        if not self.view or not self.view.is_valid() or not self._input_mode:
+            return
+        if getattr(self, "_question_input_mode", False):
+            return
+        try:
+            self.view.set_read_only(False)
+            start = int(self._input_start or 0)
+            size = self.view.size()
+            if mode == "start":
+                pos = start
+            else:
+                pos = size
+            self.view.sel().clear()
+            self.view.sel().add(sublime.Region(pos, pos))
+            self._draft_caret_off = max(0, pos - start)
+            self._caret_owner = "draft"
+        except Exception:
+            pass
+
+    def _scroll_layout_to_bottom(
+            self, *, force: bool = False, reapply_caret: bool = True) -> None:
         """Scroll so ◎ + bottom split sit at the foot of the viewport.
 
         Viewport-only. Never view.show(EOF) while the user is mid-draft in ◎ —
         that was pinning the caret to the tail on every busy stream tick.
+
+        reapply_caret: when True, re-pin draft offset only if draft-owned.
+        History ownership: never reapply (caller should usually pass False).
         """
         view = self.view
         if not view or not view.is_valid():
             return
+        history = self.caret_owner() == "history"
         # Snapshot mid-draft caret only when still composing (not in history)
-        mid = self._draft_caret_is_mid()
+        mid = (not history) and self._draft_caret_is_mid()
         if self._input_mode and mid:
             self.note_draft_caret()
         try:
@@ -1053,19 +1217,16 @@ class OutputView:
             target_y = max(0.0, y_bottom - vh)
             # Already glued to bottom — don't thrash spinner frames
             if not force and abs(vy - target_y) < max(2.0, line_h * 0.35):
-                if mid:
-                    self.restore_draft_caret()  # only if still in draft
+                if reapply_caret and mid and not history:
+                    self.restore_draft_caret()
                 return
             view.set_viewport_position((vx, target_y), False)
             # Never view.show(EOF) while composing mid-draft — ST moves the
             # selection to the shown region and pins caret at the tail.
-            if mid:
+            if reapply_caret and not history:
                 self.restore_draft_caret()
                 return
-            # In draft at EOF (or not composing): viewport only; no show(EOF)
-            # that would yank a history selection back into ◎.
-            if self._input_mode:
-                self.restore_draft_caret()  # no-op if caret is in history
+            if history or self._input_mode:
                 return
             if not self._view_is_focused():
                 return
@@ -1077,7 +1238,7 @@ class OutputView:
                     pass
                 view.set_viewport_position((vx, target_y), False)
         except Exception:
-            if mid:
+            if reapply_caret and mid and not history:
                 self.restore_draft_caret()
 
     def _view_is_focused(self) -> bool:
@@ -1096,16 +1257,14 @@ class OutputView:
     def focus_composer(
             self, force_show: bool = True, *, steal_focus: bool = False,
             preserve_caret: bool = True, park_at_end: bool = False) -> None:
-        """Scroll/pin sticky ◎ chrome without stealing mid-draft caret.
+        """User/system enter-composer OR draft-owned chrome pin.
 
-        Does NOT steal window focus unless steal_focus=True (user click pad /
-        Enter outside draft). Stream/goal/idle re-pins must never call
-        focus_view.
+        Stream/idle re-pins should prefer scroll_composer_chrome +
+        restore_draft_caret — and must pass preserve_caret=True without
+        park_at_end. History ownership: never mutates selection; only scrolls
+        when force_show and caller is an explicit park path (park_at_end).
 
-        preserve_caret=True (default): never yank caret to draft EOF when it
-        already sits in the ◎ strip. Stream ticks and idle re-pins use this.
-
-        park_at_end=True: explicit user action (click pad below) → draft EOF.
+        park_at_end=True / preserve_caret=False: explicit user enter → draft EOF.
         """
         if not self.view or not self.view.is_valid() or not self._input_mode:
             return
@@ -1116,17 +1275,25 @@ class OutputView:
                     win.focus_view(self.view)
             self.view.set_read_only(False)
             if getattr(self, "_question_input_mode", False):
-                # Free-text "Other..." — no sticky chrome
-                self._update_composer_pad_phantom()  # clears pad
+                self._update_composer_pad_phantom()
                 caret = self.view.size()
                 if park_at_end or not preserve_caret:
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(caret, caret))
                 if force_show and self._view_is_focused():
                     try:
-                        self.view.show(self.view.sel()[0].begin() if self.view.sel() else caret)
+                        self.view.show(
+                            self.view.sel()[0].begin() if self.view.sel() else caret)
                     except Exception:
                         pass
+                return
+
+            explicit_park = bool(park_at_end or not preserve_caret)
+            history = (not explicit_park) and self.caret_owner() == "history"
+
+            # History browse (stream/idle re-pin): never touch selection or
+            # force the viewport to the bottom — user owns both.
+            if history:
                 return
 
             # Snapshot caret *before* collapse (buffer edit can move/clear sel)
@@ -1142,7 +1309,6 @@ class OutputView:
             except Exception:
                 saved_off = None
 
-            # Wipe legacy blank rows under ◎ (empty draft only)
             self.collapse_empty_composer_tail()
             self._update_composer_pad_phantom()
 
@@ -1150,13 +1316,14 @@ class OutputView:
             size = self.view.size()
             end = size
 
-            # Intentional park at draft end (pad click / enter from history)
-            if park_at_end or not preserve_caret:
+            if explicit_park:
                 self.view.sel().clear()
                 self.view.sel().add(sublime.Region(end, end))
                 self._draft_caret_off = max(0, end - start)
+                self._caret_owner = "draft"
             else:
-                # Keep mid-draft caret; restore snapshot if ST wiped selection
+                # Draft-owned: keep mid-draft caret; never park at start as
+                # fallback when selection is outside draft (that stole history).
                 restored = False
                 try:
                     sel = self.view.sel()
@@ -1165,6 +1332,7 @@ class OutputView:
                         if start <= b <= size:
                             restored = True
                             self._draft_caret_off = b - start
+                            self._caret_owner = "draft"
                 except Exception:
                     pass
                 if not restored and saved_off is not None:
@@ -1172,33 +1340,35 @@ class OutputView:
                     self.view.sel().clear()
                     self.view.sel().add(sublime.Region(pos, pos))
                     self._draft_caret_off = saved_off
+                    self._caret_owner = "draft"
                 elif not restored:
-                    # Prefer last known offset, else draft start (never force EOF)
-                    if getattr(self, "_draft_caret_off", None) is not None:
+                    # Only re-apply saved offset if still draft-owned; never
+                    # invent a draft-start caret while browsing history.
+                    if self.caret_owner() == "draft":
                         self.restore_draft_caret()
-                    else:
-                        try:
-                            if not self.view.sel() or not (
-                                start <= self.view.sel()[0].begin() <= size
-                            ):
-                                self.view.sel().clear()
-                                self.view.sel().add(sublime.Region(start, start))
-                                self._draft_caret_off = 0
-                        except Exception:
-                            pass
 
             if force_show:
-                # Viewport only; re-apply caret after deferred scrolls
-                self._scroll_layout_to_bottom(force=True)
-                self.restore_draft_caret()
-                if self._view_is_focused():
-                    def _scroll_keep_caret():
-                        if not self._view_is_focused():
-                            return
-                        self._scroll_layout_to_bottom(force=True)
-                        self.restore_draft_caret()
-                    for ms in (16, 80):
-                        sublime.set_timeout(_scroll_keep_caret, ms)
+                self._scroll_layout_to_bottom(
+                    force=True, reapply_caret=(self.caret_owner() == "draft"))
+                if self.caret_owner() == "draft":
+                    self.restore_draft_caret()
+                    # One coalesced deferred reapply (not stacked 16+80 thrash)
+                    if self._view_is_focused():
+                        tok = int(getattr(self, "_pending_caret_token", 0) or 0) + 1
+                        self._pending_caret_token = tok
+
+                        def _once(t=tok):
+                            if getattr(self, "_pending_caret_token", 0) != t:
+                                return
+                            if not self._view_is_focused():
+                                return
+                            if self.caret_owner() != "draft":
+                                return
+                            self._scroll_layout_to_bottom(
+                                force=True, reapply_caret=True)
+                            self.restore_draft_caret()
+
+                        sublime.set_timeout(_once, 30)
         except Exception:
             pass
 
@@ -1500,22 +1670,44 @@ class OutputView:
             return
 
         tool_input = tool_input or {}
+        # Only shell/workflow tools may sit as ⚙ — never Read / TaskGet / etc.
+        # (Kimi TaskOutput was misnamed "Read" and stuck as "⚙ Read (background)".)
+        _SHELL_BG = (
+            "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
+        )
+        if background and name not in _SHELL_BG:
+            background = False
         status = BACKGROUND if background else PENDING
         # Upsert by id when still open — avoids duplicate ☐ rows.
+        existing = None
         if tool_id:
             existing = self._find_pending_or_background_by_id(tool_id)
-            if existing is not None and existing.status in (PENDING, BACKGROUND):
-                existing.name = name
-                if tool_input:
-                    existing.tool_input = tool_input
-                if background:
-                    existing.status = BACKGROUND
-                # Fall through to TodoWrite/Task* side effects below, then re-render.
-                tool_call = existing
-            else:
-                tool_call = ToolCall(
-                    name=name, tool_input=tool_input, status=status, id=tool_id)
-                self.current.events.append(tool_call)
+        # ExitPlanMode / EnterPlanMode: agent or ACP often opens twice with
+        # different toolCallIds (tool_call + permission / ext method) →
+        # "✔ ExitPlanMode: awaiting approval..." twice. Collapse to one open row.
+        if existing is None and name in ("ExitPlanMode", "EnterPlanMode"):
+            for event in reversed(self.current.events):
+                if (isinstance(event, ToolCall)
+                        and event.name == name
+                        and event.status in (PENDING, BACKGROUND)):
+                    existing = event
+                    if tool_id:
+                        event.id = tool_id
+                    break
+        if existing is not None and existing.status in (PENDING, BACKGROUND):
+            existing.name = name
+            if tool_input:
+                existing.tool_input = tool_input
+            if tool_id and not existing.id:
+                existing.id = tool_id
+            if background and name in _SHELL_BG:
+                existing.status = BACKGROUND
+            elif existing.status == BACKGROUND and (
+                    not background or name not in _SHELL_BG):
+                # Demote: enrich renamed Bash→Read, or poll re-open
+                existing.status = PENDING
+            # Fall through to TodoWrite/Task* side effects below, then re-render.
+            tool_call = existing
         else:
             tool_call = ToolCall(
                 name=name, tool_input=tool_input, status=status, id=tool_id)
@@ -2832,11 +3024,29 @@ class OutputView:
                 print(f"[Claude] Failed to save settings: {e}")
 
     def _move_cursor_to_end(self) -> None:
-        """Move cursor to end of view."""
-        if self.view and self.view.is_valid():
-            end = self.view.size()
-            self.view.sel().clear()
-            self.view.sel().add(sublime.Region(end, end))
+        """Move cursor to end of view.
+
+        Sticky ◎ + history ownership: do not steal caret with view.show(EOF).
+        Modal question/permission paths still park at end intentionally.
+        """
+        if not self.view or not self.view.is_valid():
+            return
+        if (self._input_mode and self.caret_owner() == "history"
+                and not getattr(self, "_question_input_mode", False)
+                and not self.has_turn_modal_ui()):
+            return
+        end = self.view.size()
+        self.view.sel().clear()
+        self.view.sel().add(sublime.Region(end, end))
+        if self._input_mode and not getattr(self, "_question_input_mode", False):
+            self._caret_owner = "draft"
+            try:
+                start = int(self._input_start or 0)
+                self._draft_caret_off = max(0, end - start)
+            except Exception:
+                pass
+            self.scroll_composer_chrome(force=True)
+        else:
             self.view.show(end)
 
     def _process_permission_queue(self) -> None:
@@ -3610,24 +3820,29 @@ class OutputView:
             except Exception:
                 pass
             peel = self._composer_peel_start()
+            from .composer_geometry import stream_treat_as_composing
+            owner = self.caret_owner()
+            live_in_draft = False
+            sel_empty = False
             try:
                 sel = self.view.sel()
-                if sel and self._input_start is not None:
+                if not sel:
+                    sel_empty = True
+                elif self._input_start is not None:
                     b = sel[0].begin()
                     if b >= self._input_start:
-                        caret_in_composer = True
+                        live_in_draft = True
                         caret_off = b - self._input_start
-                        # Clamp to draft (stale spare-line caret / mid-rewrite)
                         caret_off = max(0, min(caret_off, len(draft)))
                         self._draft_caret_off = caret_off
-                elif getattr(self, "_draft_caret_off", None) is not None:
-                    # Sel briefly lost (e.g. mid-replace) — keep last known offset
-                    caret_in_composer = True
-                    caret_off = max(0, min(int(self._draft_caret_off), len(draft)))
             except Exception:
-                if getattr(self, "_draft_caret_off", None) is not None:
-                    caret_in_composer = True
-                    caret_off = max(0, min(int(self._draft_caret_off), len(draft or "")))
+                sel_empty = True
+            has_off = getattr(self, "_draft_caret_off", None) is not None
+            caret_in_composer = stream_treat_as_composing(
+                live_in_draft, sel_empty, owner, has_off)
+            if caret_in_composer and has_off and not live_in_draft:
+                caret_off = max(
+                    0, min(int(self._draft_caret_off), len(draft or "")))
 
         # Read region from Sublime's tracked region (auto-adjusts when view shifts)
         view_size = self.view.size()
@@ -4029,7 +4244,6 @@ class OutputView:
                 off = min(caret_off, len(draft or ""))
                 self._draft_caret_off = off
                 self._replant_composer(draft, off)
-                # Peel moved — re-anchor hairline after replant
                 try:
                     from . import claude_code
                     _s = claude_code.get_session_for_view(self.view)
@@ -4037,9 +4251,8 @@ class OutputView:
                         _s._update_queue_phantom()
                 except Exception:
                     pass
-            elif caret_in_composer:
-                # Only re-pin when caret was already in ◎ this frame.
-                # If user clicked history, leave selection where ST put it.
+            elif caret_in_composer and self.caret_owner() == "draft":
+                # Only re-pin when draft-owned and was in ◎ this frame.
                 max_off = max(0, self.view.size() - self._input_start)
                 pos = self._input_start + max(
                     0, min(caret_off, max_off, len(draft or "")))
@@ -4049,17 +4262,17 @@ class OutputView:
                     self.view.sel().add(sublime.Region(pos, pos))
                 except Exception:
                     pass
-            # else: browsing history while busy — do not restore_draft_caret
+            # else: history owner — do not restore_draft_caret
 
         def _reapply_draft_caret_if_composing():
-            """Re-pin mid-draft after stream tick only if still in ◎."""
-            if was_input and self._input_mode and caret_in_composer:
+            """Re-pin mid-draft after stream tick only if draft-owned."""
+            if (was_input and self._input_mode and caret_in_composer
+                    and self.caret_owner() == "draft"):
                 self.restore_draft_caret()
 
         if pin is not None:
             # Immediate + deferred restore (beats ST auto-scroll-to-caret).
-            # Only force composer_caret when we were composing this frame.
-            if was_input and caret_in_composer:
+            if was_input and caret_in_composer and self.caret_owner() == "draft":
                 pin = dict(pin)
                 pin["sels"] = []
                 pin["preserve_sel"] = True
@@ -4067,32 +4280,58 @@ class OutputView:
                     max_off = max(0, self.view.size() - self._input_start)
                     pin["composer_caret"] = self._input_start + max(
                         0, min(caret_off, max_off, len(draft or "")))
+            elif was_input and self.caret_owner() == "history":
+                # Never carry a composer_caret into history browse restores
+                pin = dict(pin)
+                pin.pop("composer_caret", None)
+                pin["preserve_sel"] = True
             self._restore_view_state(pin)
             self._schedule_viewport_restore(pin)
             _reapply_draft_caret_if_composing()
-            if was_input and caret_in_composer:
-                sublime.set_timeout(_reapply_draft_caret_if_composing, 0)
-                sublime.set_timeout(_reapply_draft_caret_if_composing, 30)
+            if (was_input and caret_in_composer
+                    and self.caret_owner() == "draft"):
+                tok = int(getattr(self, "_pending_caret_token", 0) or 0) + 1
+                self._pending_caret_token = tok
+
+                def _once(t=tok):
+                    if getattr(self, "_pending_caret_token", 0) != t:
+                        return
+                    _reapply_draft_caret_if_composing()
+
+                sublime.set_timeout(_once, 0)
         else:
             # History browse while busy: drop deferred pins that still hold an
             # old composer_caret (would yank selection back into ◎ on next tick).
-            if was_input and not caret_in_composer:
+            if was_input and (
+                    not caret_in_composer or self.caret_owner() == "history"):
                 self._pending_vp_pin = None
-            if was_input and self._input_mode and (
-                following or want_scroll or typing_at_tail
-            ):
-                # Sticky ◎ on floor while streaming; only re-pin caret if in ◎.
+            # Force bottom only when draft-owned and following the stream
+            may_scroll = (
+                was_input and self._input_mode
+                and self.caret_owner() == "draft"
+                and (following or want_scroll or typing_at_tail)
+            )
+            if may_scroll:
                 if self._view_is_focused():
-                    self._scroll_layout_to_bottom(force=(delta != 0))
+                    self._scroll_layout_to_bottom(
+                        force=(delta != 0), reapply_caret=True)
                     _reapply_draft_caret_if_composing()
                     if delta != 0 and caret_in_composer:
-                        def _after_scroll():
+                        tok = int(getattr(self, "_pending_caret_token", 0) or 0) + 1
+                        self._pending_caret_token = tok
+
+                        def _after_scroll(t=tok):
+                            if getattr(self, "_pending_caret_token", 0) != t:
+                                return
+                            if self.caret_owner() != "draft":
+                                return
                             if self._view_is_focused():
-                                self._scroll_layout_to_bottom(force=True)
+                                self._scroll_layout_to_bottom(
+                                    force=True, reapply_caret=True)
                             self.restore_draft_caret()
+
                         sublime.set_timeout(_after_scroll, 0)
-                        sublime.set_timeout(_after_scroll, 30)
-            elif want_scroll or typing_at_tail:
+            elif (want_scroll or typing_at_tail) and self.caret_owner() != "history":
                 self._scroll_to_end(force=False)
                 _reapply_draft_caret_if_composing()
 

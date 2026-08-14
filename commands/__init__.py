@@ -23,6 +23,9 @@ from .session_cmds import (  # noqa: F401
     ClaudeToggleAutoSleepCommand,
     ClaudeCodeResumeCommand,
     ClaudeCodeSwitchCommand,
+    ClaudeSessionListCommand,
+    ClaudeSessionListRefreshCommand,
+    ClaudeSessionListOpenCommand,
     ClaudeCodeForkCommand,
     ClaudeCodeForkFromCommand,
 )

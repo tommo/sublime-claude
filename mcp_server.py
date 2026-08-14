@@ -2411,21 +2411,8 @@ class MCPSocketServer:
             "host_local": True,
         }
 
-        # Best-effort daemon registration (legacy) — never recurse into host wait
-        try:
-            daemon = self._daemon_register(
-                "subsession",
-                {"subsession_id": child_id},
-                wake_prompt,
-                parent_view_id=parent_view_id,
-            )
-            if isinstance(daemon, dict) and daemon.get("notification_id"):
-                out["daemon_notification_id"] = daemon["notification_id"]
-                out["daemon_session_id"] = daemon.get("session_id")
-            elif isinstance(daemon, dict) and daemon.get("error"):
-                out["daemon_note"] = daemon.get("error")
-        except Exception as e:
-            out["daemon_note"] = str(e)
+        # Do not also register notalone2 here. Host wait + daemon wait both
+        # fire on signal_complete → two queue rows for the same child.
 
         return out
 
@@ -2915,12 +2902,39 @@ class MCPSocketServer:
                 sublime.set_timeout(try_deliver, parent_poll_ms)
                 return
 
-            # 3) Deliver once — if parent is mid-turn, queue (no busy-spin spam)
+            # 3) Deliver exactly once.
+            # Prefer host wait_for_subsession waiters (custom wake_prompt).
+            # Else direct parent inject. Never both — that double-notified the
+            # parent. wait_for_subsession also best-effort registers notalone2,
+            # so skip daemon when host waiters already fired.
             if getattr(session, "_pending_signal_complete", None) is not cur:
+                return
+            if session_registry.child_parent_already_notified(session):
+                session._pending_signal_complete = None
+                print(
+                    f"[Claude] signal_complete: parent already notified "
+                    f"for {getattr(session, 'agent_id', None)} — skip"
+                )
                 return
             session._pending_signal_complete = None
             wake_prompt, b, line = _build_wake()
             summary = pending.get("result_summary")
+
+            n_waits = 0
+            try:
+                n_waits = session_registry.fire_subsession_waits(
+                    session, summary, default_body=wake_prompt)
+                if n_waits:
+                    print(
+                        f"[Claude] signal_complete: fired {n_waits} host wait(s) "
+                        f"(skip default inject + daemon)"
+                    )
+            except Exception as e:
+                print(f"[Claude] signal_complete: host waits failed: {e}")
+
+            if n_waits > 0:
+                return
+
             try:
                 if parent_session.working:
                     print(
@@ -2936,19 +2950,14 @@ class MCPSocketServer:
                     parent_session.query(
                         wake_prompt, display_prompt="📬 Subsession complete"
                     )
+                session_registry.mark_child_parent_notified(session)
             except Exception as e:
                 print(f"[Claude] signal_complete: inject failed: {e}")
                 session._pending_signal_complete = cur
                 sublime.set_timeout(try_deliver, parent_poll_ms)
                 return
 
-            # 4) Host-local wait_for_subsession waiters + notalone2 daemon
-            try:
-                n = session_registry.fire_subsession_waits(session, summary)
-                if n:
-                    print(f"[Claude] signal_complete: fired {n} host wait(s)")
-            except Exception as e:
-                print(f"[Claude] signal_complete: host waits failed: {e}")
+            # 4) Daemon-only waiters (no host wait registered)
             for alias in (
                 getattr(session, "agent_id", None),
                 getattr(session, "subsession_id", None),

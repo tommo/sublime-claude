@@ -213,6 +213,9 @@ class Session:
         # Busy sub-state for tab/status honesty (Grok: waiting vs responding)
         # idle | waiting | responding | tool — see constants.TURN_PHASE_*
         self.turn_phase: str = "idle"
+        # Kimi /compact returns immediately while compaction runs in the
+        # background — keep UI busy until we see completion text.
+        self._compacting: bool = False
         self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
         self.next_wake_at: Optional[float] = None  # epoch of the pending self-wake (for the wakeup banner)
         # Quick Agent: lives in a bottom panel (not a doc tab). Lightweight
@@ -287,12 +290,15 @@ class Session:
         self._queued_prompts: List[str] = []
         # Track if inject was sent (to skip "done" status until inject query completes)
         self._inject_pending: bool = False
-        # Buffer for coalescing background-task notifications. Multiple bg tasks
-        # finishing close together are combined into a single wake to avoid
-        # spamming the conversation and racing with user input.
+        # Buffer for coalescing background-task notifications (idle only).
+        # Multiple bg tasks finishing close together → single wake.
         self._pending_bg_notifications: List[str] = []
+        self._pending_bg_task_ids: set = set()  # dedupe acp-term + bash-* same job
         self._bg_flush_scheduled: bool = False
+        self._bg_notified_task_ids: set = set()  # already woken / delivered this session
         self._bg_poll_timer = None  # sublime.set_timeout handle for between-query bg task polling
+        # Bumped to invalidate in-flight set_timeout chains (ST cannot cancel them).
+        self._bg_poll_epoch: int = 0
 
         # Stable agent identity (not view_id — view_id is runtime-only)
         from .session_registry import new_agent_id
@@ -328,6 +334,7 @@ class Session:
 
         # Activity tracking for auto-sleep
         self.last_activity: float = time.time()
+        self.last_access: float = self.last_activity  # wake / message in / message out
         self.last_idle_at: float = 0  # set when session enters input mode (truly idle)
         self.sleep_disabled: bool = False  # per-session auto-sleep disable toggle
         # Turn/bridge failed while idle — tab shows ⚠ until next query.
@@ -517,6 +524,12 @@ class Session:
                             self.context_usage = saved.get("context_usage")
                         if saved.get("plan_file"):
                             self.plan_file = saved.get("plan_file")
+                        if saved.get("last_activity"):
+                            self.last_activity = float(saved.get("last_activity"))
+                        if saved.get("last_access") or saved.get("last_activity"):
+                            self.last_access = float(
+                                saved.get("last_access")
+                                or saved.get("last_activity"))
                     except Exception:
                         pass  # benign: restored state is purely cosmetic
                     break
@@ -1551,7 +1564,34 @@ class Session:
             self._auto_retry_pending = False
             self._auto_retry_count = 0
 
+        raw = (prompt or "").strip()
+        is_compact = raw in ("/compact", "compact") or raw.startswith("/compact ")
+        # While Kimi bg-compacts, new prompts race and return empty end_turn.
+        # Queue them until compaction finishes.
+        if (
+            getattr(self, "_compacting", False)
+            and not is_compact
+            and not silent
+            and not _auto_retry
+        ):
+            if raw and raw not in self._queued_prompts:
+                self._queued_prompts.append(prompt)
+                try:
+                    self._update_queue_phantom()
+                except Exception:
+                    pass
+            sublime.status_message("Claude: compacting… (queued)")
+            if self.output:
+                self.output.text(
+                    "\n*Compacting context — message queued.*\n")
+            return
+
+        if is_compact:
+            self._compacting = True
+
+        self.touch_access()
         self.working = True
+        self._awaiting_query_rpc = True  # _on_done owns idle; adopt path does not
         self.query_count += 1
         self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
         query_gen = self._query_gen
@@ -1623,9 +1663,12 @@ class Session:
             # Never steal focus on every turn — user may be editing another file
             # while the agent streams / goal continues.
             self.output.show(focus=False)
-            # Auto-name session from first prompt if not already named
+            # Auto-name from first prompt. Keep the full line — tab title
+            # truncates for the tab bar; the session list uses this name.
             if not self.name:
-                self._set_name(ui_prompt[:30].strip() + ("..." if len(ui_prompt) > 30 else ""))
+                one = " ".join((ui_prompt or "").split())
+                if one:
+                    self._set_name(one[:200])
             self.output.prompt(ui_prompt, context_names, context_refs=context_refs)
         # Always show busy indicator: flip tab title now and start the spinner
         # loop. Silent queries (bg-task wakes, retain injects, …) still need a
@@ -1728,6 +1771,7 @@ class Session:
             )
             return
 
+        self._awaiting_query_rpc = False
         self.current_tool = None
 
         # Clear executing session marker - MCP tools should no longer target this session
@@ -1853,29 +1897,19 @@ class Session:
             except Exception as e:
                 print(f"[Claude] response callback error: {e}")
 
-        # Notify subsession completion (stable agent_id, not runtime view_id)
-        # Host-local waiters + notalone2 daemon; MCP signal_complete also does this.
+        # Parent notify is MCP signal_complete's job. Turn-end is only a
+        # fallback when the child never called it — otherwise we double-queue
+        # (custom waiter + stock "✅ Subsession … completed").
         if getattr(self, "parent_agent_id", None) or getattr(self, "parent_view_id", None):
-            try:
-                from . import session_registry
-                session_registry.fire_subsession_waits(self, None)
-            except Exception as e:
-                print(f"[Claude] fire_subsession_waits on turn end: {e}")
-            sid = (
-                getattr(self, "agent_id", None)
-                or getattr(self, "subsession_id", None)
-            )
-            if sid:
-                for other in list(getattr(sublime, "_claude_sessions", {}).values()):
-                    if other.client and other is not self:
-                        try:
-                            other.client.send(
-                                "subsession_complete",
-                                {"subsession_id": str(sid)},
-                            )
-                        except Exception:
-                            pass
-                        break  # one bridge notify is enough
+            if (getattr(self, "_pending_signal_complete", None)
+                    or getattr(self, "_parent_notified", False)):
+                pass
+            else:
+                try:
+                    from . import session_registry
+                    session_registry.fire_subsession_waits(self, None)
+                except Exception as e:
+                    print(f"[Claude] fire_subsession_waits on turn end: {e}")
 
         # 4. Check for pending retain (interrupt was triggered by compact_boundary)
         if completion == "interrupted" and self._pending_retain:
@@ -1902,13 +1936,19 @@ class Session:
             self.last_idle_at = now
             if completion == "interrupted":
                 self._clear_deferred_state(clear_queue=False)
-                if not getattr(self, "_quick_finished", False):
-                    if self._fire_next_queued():
-                        return
-                    self._ensure_idle_input(reason="completion=interrupted")
-                return
-            self._clear_deferred_state(clear_queue=True)
+            else:
+                self._clear_deferred_state(clear_queue=True)
             if not getattr(self, "_quick_finished", False):
+                # Prefer real bg completions over re-opening empty ◎
+                if self._pending_bg_notifications:
+                    try:
+                        self._flush_bg_notifications()
+                    except Exception as e:
+                        print(f"[Claude] flush bg ({completion}): {e}")
+                    if self.working:
+                        return
+                if completion == "interrupted" and self._fire_next_queued():
+                    return
                 self._ensure_idle_input(reason=f"completion={completion}")
             return
 
@@ -1964,25 +2004,71 @@ class Session:
         # 6. Clear inject_pending - Claude mid-stream inject / bridge queued_inject
         self._inject_pending = False
 
+        # 6b. Kimi /compact: session/prompt returns immediately while compaction
+        # continues agent-side. Stay busy (spinner + no idle ◎) until we see
+        # "Compaction completed" (or timeout).
+        if getattr(self, "_compacting", False) and completion == "success":
+            self._awaiting_query_rpc = False
+            self.working = True
+            self._set_turn_phase("waiting")
+            self.current_tool = "compact…"
+            if self.output and self.output.current is not None:
+                self.output.current.working = True
+            try:
+                self.output._update_title()
+            except Exception:
+                pass
+            self._animate()
+            self._status("compacting…")
+            # Safety: if complete text never arrives, unstick after 3 min
+            gen = int(getattr(self, "_query_gen", 0) or 0)
+
+            def _compact_timeout(g=gen):
+                if (getattr(self, "_compacting", False)
+                        and g == getattr(self, "_query_gen", None)):
+                    print("[Claude] compact timeout — forcing idle")
+                    self._finish_compact(timeout=True)
+
+            sublime.set_timeout(_compact_timeout, 180000)
+            # Sticky composer still allowed so user can queue messages
+            sublime.set_timeout(
+                lambda: self._enter_input_with_draft() if self.working else None,
+                100)
+            return
+
         # 7. Now set working=False and enter input mode
         self.working = False
         self._set_turn_phase("idle")
         now = time.time()
         self.last_activity = now
+        self.touch_access()
         # Idle clock starts when the turn ends — not when sticky ◎ opened
         # mid-stream (that left last_idle_at stale after long ACP runs).
         self.last_idle_at = now
+        # Mid-turn bg completes only finalize ⚙ (no buffer). Idle-only buffer
+        # may still hold notifies that arrived in the end_turn race — flush
+        # those, but never dump a pile of "already known" TaskGet results.
+        if self._pending_bg_notifications:
+            try:
+                self._flush_bg_notifications()
+            except Exception as e:
+                print(f"[Claude] flush bg on turn end: {e}")
+        if self.working:
+            return
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
 
     def _clear_deferred_state(self, clear_queue: bool = True) -> None:
         """Clear deferred action state. Called on error/interrupt.
 
         clear_queue=False on interrupt so user-queued messages survive cancel.
+        Does NOT clear _pending_bg_notifications — those are real task results
+        that must still wake the agent after the failed/interrupted turn.
         """
         if clear_queue:
             self._queued_prompts.clear()
-        self._pending_bg_notifications.clear()
-        self._bg_flush_scheduled = False
+        # Keep bg notify buffer + flush timer — only inject/retain are deferred
+        # turn-local state. Wiping wakes here is how long jobs "finished forever
+        # ago" with no agent follow-up.
         self._inject_pending = False
         self._pending_retain = None
         self._input_mode_entered = False  # Allow re-entry to input mode
@@ -2077,8 +2163,10 @@ class Session:
         # Question / permission / plan owns the tail
         if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
             return
-        # Already in input mode — re-pin scroll only if this sheet is focused
-        # (never focus_view: that stole the editor from other files).
+        # Already in input mode — re-pin only when draft-owned; history browse
+        # must not get force_show bottom or caret yanks from idle/busy re-enter.
+        # Refresh ⚙ hints: mid-turn sticky opens before sidecar Bash registers,
+        # so turn-end must repaint the strip without full exit/re-enter.
         if self.output.is_input_mode():
             self._input_mode_entered = True
             # Critical: sticky ◎ is often already open mid-turn. Without this,
@@ -2088,10 +2176,15 @@ class Session:
                 self.last_idle_at = time.time()
                 self.last_activity = time.time()
             try:
-                if self.output._view_is_focused():
-                    # Re-pin scroll only — never yank mid-draft caret to EOF
-                    self.output.focus_composer(
-                        force_show=True, steal_focus=False, preserve_caret=True)
+                self.output.refresh_background_hints()
+            except Exception as e:
+                print(f"[Claude] refresh_background_hints: {e}")
+            try:
+                if (self.output._view_is_focused()
+                        and getattr(self.output, "caret_owner", lambda: "draft")()
+                        == "draft"):
+                    self.output.scroll_composer_chrome(force=False)
+                    self.output.restore_draft_caret()
             except Exception:
                 pass
             return
@@ -2102,9 +2195,11 @@ class Session:
         if self._input_mode_entered and not self.working:
             if self.output.is_input_mode():
                 try:
-                    if self.output._view_is_focused():
-                        self.output.focus_composer(
-                            force_show=True, steal_focus=False, preserve_caret=True)
+                    if (self.output._view_is_focused()
+                            and getattr(self.output, "caret_owner",
+                                        lambda: "draft")() == "draft"):
+                        self.output.scroll_composer_chrome(force=False)
+                        self.output.restore_draft_caret()
                 except Exception:
                     pass
                 return
@@ -2145,9 +2240,11 @@ class Session:
                     pass
                 if self.output.is_input_mode():
                     self._input_mode_entered = True
-                    if self.output._view_is_focused():
-                        self.output.focus_composer(
-                            force_show=True, steal_focus=False, preserve_caret=True)
+                    if (self.output._view_is_focused()
+                            and getattr(self.output, "caret_owner",
+                                        lambda: "draft")() == "draft"):
+                        self.output.scroll_composer_chrome(force=False)
+                        self.output.restore_draft_caret()
                     return
                 if getattr(self.output, "has_turn_modal_ui", None) and self.output.has_turn_modal_ui():
                     if tries < 8:
@@ -2188,10 +2285,10 @@ class Session:
                     self.output.ensure_composer_spare_line()
             try:
                 if self.output._view_is_focused():
-                    # Draft just restored; caret is at draft end from set_composer_text
-                    # — preserve it, do not re-pin to a different EOF after phantoms.
-                    self.output.focus_composer(
-                        force_show=True, steal_focus=False, preserve_caret=True)
+                    # First open + draft restore: system enter (draft owner)
+                    self.output.set_caret_owner("draft")
+                    self.output.scroll_composer_chrome(force=True)
+                    self.output.restore_draft_caret()
             except Exception:
                 pass
         elif self.output and self.output.is_input_mode():
@@ -2211,14 +2308,20 @@ class Session:
         prompt = (prompt or "").strip()
         if not prompt:
             return
+        try:
+            from . import session_registry
+            self._queued_prompts[:] = session_registry.merge_subsession_queue(
+                self._queued_prompts, prompt)
+        except Exception:
+            if prompt not in self._queued_prompts:
+                self._queued_prompts.append(prompt)
         self._status(f"queued: {prompt[:30]}...")
 
         if self.working and self.client and self.client.is_alive():
-            self._queued_prompts.append(prompt)
             self._update_queue_phantom()
             # Optional Claude mid-stream inject (same turn). If it works, drop
             # the plugin queue entry so we do not double-run on turn end.
-            if self.backend == "claude":
+            if self.backend == "claude" and prompt in self._queued_prompts:
                 def _on_inj(r, p=prompt):
                     if not isinstance(r, dict) or r.get("error"):
                         return  # keep local queue entry
@@ -2235,7 +2338,14 @@ class Session:
             return
 
         if self.client and self.client.is_alive():
-            self._fire_queued_now(prompt)
+            if prompt in self._queued_prompts:
+                try:
+                    self._queued_prompts.remove(prompt)
+                except ValueError:
+                    pass
+                self._fire_queued_now(prompt)
+            else:
+                self._update_queue_phantom()
             return
 
         # Quick: dead bridge → submit starts a new session (same as Enter)
@@ -2248,7 +2358,6 @@ class Session:
             except Exception as e:
                 print(f"[Claude] quick queue→start: {e}")
 
-        self._queued_prompts.append(prompt)
         self._update_queue_phantom()
 
     def send_now(self, prompt: str = "") -> bool:
@@ -2494,6 +2603,9 @@ class Session:
             return
 
         self._interrupting = True
+        if getattr(self, "_compacting", False):
+            self._compacting = False
+            self.current_tool = None
         # Keep user-queued messages — interrupt only cancels the active turn.
         # Do NOT flush the queue here: bridge cancel is still in flight, and
         # starting a new turn immediately races late interrupt _on_done (which
@@ -2606,8 +2718,17 @@ class Session:
         # Persist closed state before cleanup
         self._abort_background_tools(reason="session stopped")
         self._task_tool_map.clear()
-        self._bg_poll_timer = None  # cancel pending poll (map cleared → _bg_poll will bail)
+        self._bg_task_ids.clear()
+        self._bg_poll_epoch = int(getattr(self, "_bg_poll_epoch", 0)) + 1
+        self._bg_poll_timer = None  # epoch kills already-queued timeouts
+        self._bg_flush_scheduled = False
+        self._pending_bg_notifications.clear()
         self._persist_state("closed")
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
         # Clean up terminal mode if active
         if self.terminal_mode:
@@ -2671,7 +2792,11 @@ class Session:
         self._abort_background_tools(reason="session slept")
         # Clear pending background-task ID map; bridge restart loses these mappings.
         self._task_tool_map.clear()
-        self._bg_poll_timer = None  # cancel pending poll (map cleared → _bg_poll will bail)
+        self._bg_task_ids.clear()
+        self._bg_poll_epoch = int(getattr(self, "_bg_poll_epoch", 0)) + 1
+        self._bg_poll_timer = None
+        self._bg_flush_scheduled = False
+        self._pending_bg_notifications.clear()
         if self.client:
             client = self.client
             self.client = None
@@ -2750,6 +2875,11 @@ class Session:
         view.settings().set("claude_sleeping", True)
         view.settings().set("claude_input_mode", False)
         self.output.set_name(self.display_name)
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
         # Always remove ◎ strip — this is what looked like "input on restart"
         self._strip_sticky_composer()
         # Composer pad + queue only make sense with ◎; wrong pad key used to
@@ -3069,6 +3199,15 @@ class Session:
         if self.sleep(force=True):
             sublime.set_timeout(do_wake, 600)
 
+    def touch_access(self) -> None:
+        """Session-list access: wake, inbound prompt, or completed reply. Not focus."""
+        self.last_access = time.time()
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
+
     def wake(self) -> None:
         """Wake a sleeping session — re-spawn bridge with resume."""
         # Always strip sleep/connect chrome first. After soft package reload the
@@ -3089,9 +3228,11 @@ class Session:
                     self.output.set_name(self.display_name)
                 except Exception:
                     pass
+            self.touch_access()
             return
         if not self.session_id:
             return
+        self.touch_access()
         self.terminal_mode = False
         self._terminal_poll_active = False
         self._terminal_tag = None
@@ -3536,8 +3677,43 @@ class Session:
         tool_id = params.get("id")
         if not name or not name.strip():
             return
-        # Drop late tool starts after interrupt / turn end (☐ rows + busy UI)
+        _shell_bg = (
+            "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
+        )
+        # Kimi auto-continues on task.completed while host is idle (Read report
+        # log, then text). Without adopt, tools are dropped and the report is
+        # swallowed — then host wake says "already reported".
+        # Also: bridge synthesizes Bash from terminal/* when Kimi skips
+        # session/update tool_call — those must paint too.
+        if not self.working and not background:
+            self._adopt_agent_turn("⚙ task completed")
+        if not background:
+            self._note_agent_activity()
+        # Late shell ⚙ (bridge race after end_turn): still arm wake gate + row.
+        # Other late tools stay dropped only if still idle after adopt.
         if not self.working:
+            if background and name in _shell_bg and tool_id:
+                try:
+                    if self.output and self.output.current:
+                        self.output.tool(
+                            name, tool_input, tool_id=tool_id, background=True)
+                        tc = self.output.find_tool_by_id(tool_id)
+                        if tc is not None:
+                            self._bg_tools[tool_id] = tc
+                    self._bg_task_ids.add(tool_id)
+                    tid = ""
+                    if isinstance(tool_input, dict):
+                        tid = str(
+                            tool_input.get("task_id")
+                            or tool_input.get("taskId")
+                            or "")
+                    if tid:
+                        self._task_tool_map[tid] = tool_id
+                    self._schedule_bg_poll()
+                    if self.output and self.output.is_input_mode():
+                        self.output.refresh_background_hints()
+                except Exception as e:
+                    print(f"[Claude] late bg tool_use: {e}")
             return
         # A real content event arrived → the retry hint no longer applies.
         self._clear_api_retry_hint()
@@ -3568,17 +3744,32 @@ class Session:
             self.output._update_title()
             self._update_wakeup_banner(show=True)
         if background:
-            # Background tools don't take over current_tool (spinner stays on foreground)
-            self.output.tool(name, tool_input, tool_id=tool_id, background=True)
-            if tool_id:
-                # Hold the ToolCall reference so the symbol patch can still fire
-                # after this turn's Conversation is dropped from history.
-                tc = self.output.find_tool_by_id(tool_id)
-                if tc is not None:
-                    self._bg_tools[tool_id] = tc
-                self._bg_task_ids.add(tool_id)
-            self._update_status_bar()
-            return
+            # Only shell tools may be ⚙ — never Read / TaskOutput / etc.
+            if name not in _shell_bg:
+                background = False
+                # Drop a prior bad ⚙ registration for this id (e.g. TaskOutput
+                # misnamed Read that once got background=True).
+                if tool_id:
+                    self._bg_task_ids.discard(tool_id)
+                    self._bg_tools.pop(tool_id, None)
+            else:
+                # Background tools don't take over current_tool (spinner stays on foreground)
+                self.output.tool(name, tool_input, tool_id=tool_id, background=True)
+                if tool_id:
+                    # Hold the ToolCall reference so the symbol patch can still fire
+                    # after this turn's Conversation is dropped from history.
+                    tc = self.output.find_tool_by_id(tool_id)
+                    if tc is not None:
+                        self._bg_tools[tool_id] = tc
+                    self._bg_task_ids.add(tool_id)
+                # Sticky already open mid-turn: paint ⚙ above ◎ immediately
+                try:
+                    if self.output.is_input_mode():
+                        self.output.refresh_background_hints()
+                except Exception:
+                    pass
+                self._update_status_bar()
+                return
         # Serial Claude path: auto-close previous nameless tool. Concurrent ACP
         # batches all carry ids — auto-done would mark the wrong Read/Bash done
         # early and leave a later same-name ☐ forever pending.
@@ -3615,6 +3806,10 @@ class Session:
             self.output.tool_error(tool_name, content, tool_id=tool_use_id)
         else:
             self.output.tool_done(tool_name, content, tool_id=tool_use_id)
+        # TaskGet/TaskOutput already handed terminal status to the agent — do
+        # not also wake later with the same bash-* completion.
+        if not is_error:
+            self._note_task_poll_delivery(tool_name, content)
         if tool_name == self.current_tool:
             self.current_tool = None
         # Tool finished — waiting for next model tokens (not streaming yet)
@@ -3622,18 +3817,132 @@ class Session:
             self._set_turn_phase("waiting")
         self._update_status_bar()
 
+    def _adopt_agent_turn(self, label: str = "⚙ task completed") -> None:
+        """Agent continued without host query (Kimi automatic_notification).
+
+        Without this, the report streams while host is idle: no turn chrome,
+        sticky ◎ still open, then host task_notification fires a *second* wake
+        that says "already reported" and the real report looks swallowed.
+        """
+        if self.working or not self.output:
+            return
+        self.working = True
+        self._awaiting_query_rpc = False  # no host query RPC; result ends us
+        self._query_start = time.time()
+        self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
+        self._input_mode_entered = False
+        self._clear_error_halt()
+        try:
+            if self.output.is_input_mode():
+                self.draft_prompt = self.output.get_input_text()
+                self.output.exit_input_mode(keep_text=False)
+            self.output.show(focus=False)
+            self.output.prompt(label)
+            if self.output.current is not None:
+                self.output.current.working = True
+            self._set_turn_phase("responding")
+            self.output._update_title()
+            self._animate()
+            # Drop any host wake buffered for the same bg complete
+            self._pending_bg_notifications.clear()
+            self._pending_bg_task_ids.clear()
+            self._bg_flush_scheduled = False
+        except Exception as e:
+            print(f"[Claude] adopt agent turn: {e}")
+        try:
+            sublime.set_timeout(
+                lambda: self._enter_input_with_draft() if self.working else None,
+                40)
+        except Exception:
+            pass
+
+    def _finish_compact(self, timeout: bool = False) -> None:
+        """End host compact-busy state and drain queued prompts."""
+        if not getattr(self, "_compacting", False) and not timeout:
+            return
+        self._compacting = False
+        self.current_tool = None
+        self._awaiting_query_rpc = False
+        self.working = False
+        self._set_turn_phase("idle")
+        if self.output and self.output.current is not None:
+            self.output.current.working = False
+        now = time.time()
+        self.last_activity = now
+        self.last_idle_at = now
+        try:
+            self.output._update_title()
+        except Exception:
+            pass
+        self._update_status_bar()
+        if timeout and self.output:
+            self.output.text("\n*Compaction timed out (host) — check agent.*\n")
+        # Fire queued messages that arrived during compact
+        if self._fire_next_queued():
+            return
+        sublime.set_timeout(
+            lambda: self._enter_input_with_draft() if not self.working else None,
+            80)
+
+    @staticmethod
+    def _looks_like_compact_done(text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        return (
+            "compaction completed" in low
+            or "context compaction completed" in low
+            or (
+                "messages compacted" in low
+                and "tokens after" in low
+            )
+        )
+
+    @staticmethod
+    def _looks_like_compact_start(text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        return (
+            "compaction started" in low
+            or "context compaction started" in low
+            or "compacting context" in low
+        )
+
     def _on_msg_text(self, params: dict) -> None:
         self._clear_api_retry_hint()
+        text = params.get("text", "") or ""
+        # Compaction finished — paint into compact turn, not a new ⚙ wake
+        if getattr(self, "_compacting", False) and self._looks_like_compact_done(text):
+            self._note_agent_activity()
+            if self.working:
+                self._set_turn_phase("responding")
+            if self.output:
+                self.output.text(text)
+            self._finish_compact()
+            return
+        if self._looks_like_compact_start(text):
+            self._compacting = True
+            self.current_tool = "compact…"
+            self._status("compacting…")
+        # Kimi auto-continues on task.completed while host is idle — claim the turn
+        # (but not for compact-complete which we handled above)
+        if not self.working and not getattr(self, "_compacting", False):
+            self._adopt_agent_turn("⚙ task completed")
+        self._note_agent_activity()
         if self.working:
             self._set_turn_phase("responding")
         # Late post-interrupt tokens still paint (text() won't re-arm spinner
         # when session.working is False). Composer re-arm is handled by
         # _ensure_idle_input settle timers on interrupt.
-        self.output.text(params.get("text", ""))
+        self.output.text(text)
 
     def _on_msg_thinking(self, params: dict) -> None:
         """ACP agent_thought_chunk — count as responding (model is active)."""
         self._clear_api_retry_hint()
+        if not self.working:
+            self._adopt_agent_turn("⚙ task completed")
+        self._note_agent_activity()
         if self.working:
             self._set_turn_phase("responding")
         # Thought text is not painted into the transcript by default.
@@ -3700,6 +4009,32 @@ class Session:
         else:
             self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
+        # Adopted agent-only turn (no host query RPC / _on_done): go idle here.
+        if (
+            self.working
+            and not getattr(self, "_awaiting_query_rpc", False)
+            and params.get("status") != "interrupted"
+            and not params.get("is_error")
+        ):
+            self.working = False
+            self._set_turn_phase("idle")
+            if self.output and self.output.current:
+                self.output.current.working = False
+            now = time.time()
+            self.last_activity = now
+            self.touch_access()
+            self.last_idle_at = now
+            # Prefer host bg flush only if agent did not already run
+            if self._pending_bg_notifications:
+                try:
+                    self._flush_bg_notifications()
+                except Exception:
+                    pass
+            if not self.working:
+                sublime.set_timeout(
+                    lambda: self._enter_input_with_draft()
+                    if not self.working else None,
+                    100)
         # Workflows run in the background past turn-end — their redirect/detail
         # are persistent now (no turn-end clear).
 
@@ -3814,10 +4149,13 @@ class Session:
         else:
             self.output.remove_tool(tool)
         self._bg_tools.pop(tool_use_id, None)
-        # Do NOT exit+re-enter sticky ◎ here. That rebuilt the queue hairline /
-        # pad phantoms every bg-task finish and made the composer jump (and
-        # inflated scroll range). Stale ⚙ hints above ◎ clear on next natural
-        # enter_input / turn end.
+        # Update ⚙ strip above sticky ◎ in-place (no exit/re-enter — that
+        # rebuilt queue hairline/pad and made the composer jump).
+        try:
+            if self.output.is_input_mode():
+                self.output.refresh_background_hints()
+        except Exception:
+            pass
 
     def _on_sys_task_started(self, data: dict) -> None:
         task_id = data.get("task_id", "")
@@ -3847,28 +4185,73 @@ class Session:
         # the notification can still wake the agent.
         self._finalize_bg_tool(tool_use_id, keep=(status == "completed"))
 
+    def _note_task_poll_delivery(self, tool_name: str, content: str) -> None:
+        """Mark bash-* tasks the agent already saw via TaskGet/TaskOutput.
+
+        Prevents post-@done '⚙ N task notifications' for work already reported
+        mid-turn.
+        """
+        if not content or tool_name not in (
+            "TaskGet", "TaskOutput", "Task", "get_command_or_subagent_output",
+        ):
+            return
+        text = content if isinstance(content, str) else str(content)
+        low = text.lower()
+        # Terminal or ready → agent has the outcome in-context
+        terminal = (
+            "status: completed" in low
+            or "status: failed" in low
+            or "status: cancelled" in low
+            or "status: canceled" in low
+            or "retrieval_status: ready" in low
+            or "exitcode:" in low.replace(" ", "")
+            or "exit_code" in low
+        )
+        if not terminal and "status: running" in low:
+            return
+        import re
+        for m in re.finditer(r"\b(bash-[\w-]+)\b", text, flags=re.I):
+            tid = m.group(1)
+            self._bg_notified_task_ids.add(tid)
+            # Drop a buffered wake for this id if any
+            self._pending_bg_task_ids.discard(tid)
+        # Strip matching blocks from pending buffer
+        if self._pending_bg_notifications:
+            kept = []
+            for block in self._pending_bg_notifications:
+                drop = False
+                for m in re.finditer(r"\b(bash-[\w-]+)\b", block, flags=re.I):
+                    if m.group(1) in self._bg_notified_task_ids:
+                        drop = True
+                        break
+                if not drop:
+                    kept.append(block)
+            self._pending_bg_notifications = kept
+
     def _on_sys_task_notification(self, data: dict) -> None:
-        task_id = data.get("task_id", "")
-        status = data.get("status", "")
+        task_id = data.get("task_id", "") or ""
+        status = data.get("status", "") or ""
         # Use tool_use_id from the SDK directly; clean up _task_tool_map.
-        tool_use_id = data.get("tool_use_id") or self._task_tool_map.get(task_id)
-        self._task_tool_map.pop(task_id, None)
-        if not status or not tool_use_id:
+        tool_use_id = (
+            data.get("tool_use_id")
+            or self._task_tool_map.get(task_id)
+            or (f"bg-{task_id}" if task_id else "")
+        )
+        if task_id:
+            self._task_tool_map.pop(task_id, None)
+        if not status:
             return
-        # Wake gate. run_in_background tools always wake (their tool_result was
-        # just an ack; this notification carries the real result). For anything
-        # else, only wake when the session is IDLE — that's the orphaned-subagent
-        # case: the SDK backgrounded a task without run_in_background (e.g. a
-        # Task/Agent subagent) and the parent turn already ended expecting a
-        # wake that would otherwise never come. When mid-turn (self.working),
-        # skip: the blocking tool_result drives continuation and a wake here
-        # would duplicate it.
-        is_bg = tool_use_id in self._bg_task_ids
-        self._bg_task_ids.discard(tool_use_id)
-        if not is_bg and self.working:
+        # Dedupe: acp-term exit + bash-*.json complete for the same sidecar
+        if task_id and task_id in self._bg_notified_task_ids:
+            if tool_use_id:
+                self._finalize_bg_tool(tool_use_id, keep=False)
+                self._bg_task_ids.discard(tool_use_id)
+                self._bg_tools.pop(tool_use_id, None)
             return
-        if not is_bg:
-            print(f"[Claude] orphan task_notification (idle session) — waking parent: {tool_use_id}")
+        if task_id and task_id in self._pending_bg_task_ids:
+            return
+        if tool_use_id:
+            self._bg_task_ids.discard(tool_use_id)
         # Read output first — it decides whether the tool line is worth keeping.
         # Cap size: bridge logs show 15–30k task dumps (GLM agent reports) which
         # bloat wake prompts and the session scroll range when echoed.
@@ -3878,8 +4261,8 @@ class Session:
             try:
                 with open(output_file, "r") as f:
                     output = f.read().strip()
-            except Exception as e:
-                print(f"[Claude] task notification output read failed ({output_file}): {e}")
+            except Exception:
+                pass
         _MAX_BG_OUT = 8000
         if len(output) > _MAX_BG_OUT:
             output = (
@@ -3887,39 +4270,125 @@ class Session:
                 + f"\n…[truncated {len(output) - _MAX_BG_OUT} chars; full: {output_file}]"
             )
         # Keep ✓ only for a completed task with a real surfaced result.
-        self._finalize_bg_tool(tool_use_id, keep=(status == "completed" and bool(output)))
-        self._bg_tools.pop(tool_use_id, None)
-        summary = data.get("summary", "")
-        # Prefer short summary for header; long summary alone also blows scroll
-        if summary and len(summary) > 400:
-            summary = summary[:400] + "…"
+        if tool_use_id:
+            self._finalize_bg_tool(
+                tool_use_id, keep=(status == "completed" and bool(output)))
+            self._bg_tools.pop(tool_use_id, None)
+        if task_id:
+            self._bg_notified_task_ids.add(task_id)
+
+        # Mid-turn: only flip ⚙ → ✓ (agent busy / TaskGet path).
+        if self.working:
+            return
+
+        # Idle: Kimi often auto-continues via its own task.completed inject
+        # *before* our host wake. Debounce — if agent is already streaming the
+        # report, drop the host wake (that was the "结果已在上条汇报" lie when
+        # the previous report never painted as its own turn).
+        summary = (data.get("summary") or task_id or "background task").strip()
+        if "\n" in summary:
+            summary = " ⏎ ".join(
+                s.strip() for s in summary.splitlines() if s.strip())
+        if len(summary) > 100:
+            summary = summary[:99] + "…"
         header = f"{summary} [{status}]" if status != "completed" else summary
-        block = (
-            f"<task-notification>{header}\n{output}</task-notification>"
-            if output else f"<task-notification>{header}</task-notification>"
-        )
-        # Coalesce: append to buffer and schedule a debounced flush. Multiple
-        # bg tasks finishing within the window are sent as a single wake.
+        if not output:
+            tip = f"task_id={task_id}" if task_id else "background task"
+            if output_file:
+                tip += f"\nlog: {output_file}"
+            block = f"<task-notification>{header}\n{tip}</task-notification>"
+        else:
+            block = f"<task-notification>{header}\n{output}</task-notification>"
+        if task_id:
+            self._pending_bg_task_ids.add(task_id)
         self._pending_bg_notifications.append(block)
         if not self._bg_flush_scheduled:
             self._bg_flush_scheduled = True
-            sublime.set_timeout(self._flush_bg_notifications, 400)
+            # ≥1s so Kimi auto-continue + adopt can win the race
+            sublime.set_timeout(self._flush_bg_notifications, 1200)
 
     def _flush_bg_notifications(self) -> None:
-        """Flush coalesced bg-task notifications into a single wake prompt."""
+        """Surface completed bg tasks without killing Kimi auto-continue.
+
+        Hard host query() while the agent already auto-continued causes
+        turn.agent_busy → cancel → empty view while kimi keeps working.
+        Soft path: open ⚙ chrome via adopt and let terminal/* synth + streams
+        paint. Only hard-query if still silent after a few seconds.
+        """
         self._bg_flush_scheduled = False
         if not self._pending_bg_notifications:
             return
+        if self.working:
+            # Agent already auto-continued (or user typed) — do NOT second-wake.
+            self._pending_bg_notifications.clear()
+            self._pending_bg_task_ids.clear()
+            return
         blocks = self._pending_bg_notifications
         self._pending_bg_notifications = []
-        wake_prompt = "\n".join(blocks)
-        # Display: short single-line summary regardless of how many merged
+        self._pending_bg_task_ids.clear()
+        seen = set()
+        uniq = []
+        for b in blocks:
+            if b in seen:
+                continue
+            seen.add(b)
+            uniq.append(b)
+        blocks = uniq
+        if not blocks:
+            return
         n = len(blocks)
         display = f"{BACKGROUND_PREFIX}{n} task notification{'s' if n != 1 else ''}"
+        # Compaction complete is host-tracked via _compacting + text, not ⚙ wake
+        joined = "\n".join(blocks)
+        if self._looks_like_compact_done(joined) or (
+                getattr(self, "_compacting", False)
+                and "compaction" in joined.lower()):
+            if self.output and "compaction" in joined.lower():
+                # Prefer plain text under the /compact turn
+                body = joined
+                if "<task-notification>" in body:
+                    body = body.replace("<task-notification>", "").replace(
+                        "</task-notification>", "")
+                self.output.text("\n" + body.strip() + "\n")
+            self._finish_compact()
+            return
+        # Soft adopt: claim the turn UI without session/prompt (Kimi already
+        # injected the notify agent-side). Bridge synth terminal/* → Bash rows.
+        self._bg_soft_wake_prompt = joined
+        self._bg_soft_wake_display = display
+        self._bg_soft_activity = False
+        try:
+            self._adopt_agent_turn(display)
+        except Exception as e:
+            print(f"[Claude] soft bg adopt: {e}")
+        # Fallback hard query only if still no tool/text after 4s
+        sublime.set_timeout(self._bg_soft_fallback_query, 4000)
+
+    def _note_agent_activity(self) -> None:
+        """Mark that auto-continue / soft-wake produced visible work."""
+        self._bg_soft_activity = True
+
+    def _bg_soft_fallback_query(self) -> None:
+        """If soft adopt got no streams, hard-query once (last resort)."""
+        if not getattr(self, "_bg_soft_wake_prompt", None):
+            return
+        if getattr(self, "_bg_soft_activity", False):
+            self._bg_soft_wake_prompt = None
+            return
+        # Still waiting with no paint — agent may not have auto-continued
+        prompt = self._bg_soft_wake_prompt
+        display = getattr(self, "_bg_soft_wake_display", None) or "⚙ task notification"
+        self._bg_soft_wake_prompt = None
+        if self.working and not getattr(self, "_awaiting_query_rpc", False):
+            # Soft adopt left us working without an RPC — reset to send query
+            self.working = False
+            self._set_turn_phase("idle")
         if self.working:
-            self._queued_prompts.append(wake_prompt)
-        else:
-            self.query(wake_prompt, display_prompt=display, silent=True)
+            return  # real query already in flight
+        try:
+            self.query(prompt, display_prompt=display, silent=False)
+        except Exception as e:
+            print(f"[Claude] bg soft fallback query: {e}")
 
     # ── workflow (ultracode) live panel ──────────────────────────────────────
     # state → glyph. start/queued/progress confirmed from the live bridge log;
@@ -4263,29 +4732,78 @@ class Session:
 
     def _schedule_bg_poll(self) -> None:
         """Start bg-task poll timer if not already running."""
-        if self._bg_poll_timer is not None or not self._task_tool_map:
+        if self._bg_poll_timer is not None:
             return
-        self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 5000)
+        if not self._task_tool_map and not self._bg_task_ids:
+            return
+        epoch = int(getattr(self, "_bg_poll_epoch", 0))
+
+        def _tick(e=epoch):
+            if e != getattr(self, "_bg_poll_epoch", 0):
+                return
+            self._bg_poll()
+
+        self._bg_poll_timer = sublime.set_timeout(_tick, 5000)
 
     def _bg_poll(self) -> None:
-        """Periodically poll bridge for buffered task_notification messages."""
+        """Periodically poll bridge for buffered task_notification messages.
+
+        Single chain only — never schedule both here and in the callback while
+        working (that forked exponential timers and froze Sublime).
+        """
         self._bg_poll_timer = None
-        if not self._task_tool_map or not self.client or not self.initialized:
+        epoch = int(getattr(self, "_bg_poll_epoch", 0))
+        if not self.client or not self.initialized:
             return
+        if not self._task_tool_map and not self._bg_task_ids:
+            return
+
+        def _reschedule(delay_ms: int, e=epoch) -> None:
+            if e != getattr(self, "_bg_poll_epoch", 0):
+                return
+            if self._bg_poll_timer is not None:
+                return
+            self._bg_poll_timer = sublime.set_timeout(
+                lambda ee=e: (
+                    self._bg_poll()
+                    if ee == getattr(self, "_bg_poll_epoch", 0) else None
+                ),
+                delay_ms,
+            )
+
         if self.working:
-            # Active query — run_query() handles it; retry after it ends
-            self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 3000)
+            # Bridge push delivers mid-turn; host idle poll for missed events.
+            _reschedule(5000)
             return
-        self.client.send("poll_bg_tasks", {}, self._on_bg_poll_result)
+        try:
+            def _cb(result, e=epoch):
+                if e != getattr(self, "_bg_poll_epoch", 0):
+                    return
+                self._on_bg_poll_result(result)
+
+            self.client.send("poll_bg_tasks", {}, _cb)
+        except Exception as e:
+            print(f"[Claude] bg poll send: {e}")
+            if self._task_tool_map or self._bg_task_ids:
+                _reschedule(8000)
 
     def _on_bg_poll_result(self, result: dict) -> None:
-        checked = result.get("checked", 0)
-        pending = result.get("pending", 0)
-        if checked:
-            print(f"[Claude] bg_poll: checked={checked} pending_bridge={pending} pending_plugin={len(self._task_tool_map)}")
-        self._reconcile_bg_tools(result.get("running"))
-        if self._task_tool_map:
-            self._bg_poll_timer = sublime.set_timeout(self._bg_poll, 8000)
+        try:
+            self._reconcile_bg_tools(result.get("running") if result else None)
+        except Exception as e:
+            print(f"[Claude] bg reconcile: {e}")
+        if self._bg_poll_timer is not None:
+            return
+        if not (self._task_tool_map or self._bg_task_ids):
+            return
+        epoch = int(getattr(self, "_bg_poll_epoch", 0))
+        self._bg_poll_timer = sublime.set_timeout(
+            lambda e=epoch: (
+                self._bg_poll()
+                if e == getattr(self, "_bg_poll_epoch", 0) else None
+            ),
+            8000,
+        )
 
     def _reconcile_bg_tools(self, running=None) -> None:
         """Memory hygiene + missed-event recovery.
@@ -4293,8 +4811,10 @@ class Session:
         Always drops registry entries whose ⚙ line was already finalized. When
         the bridge reports its live-task set (`running`), also finalizes any
         tracked background task that we *saw* running and which has since
-        vanished — i.e. it ended without a terminal event reaching us (the only
-        case the task_updated path can't catch)."""
+        vanished — i.e. it ended without a terminal event reaching us.
+        Vanished tasks MUST wake the agent (old path only flipped ⚙ → gone,
+        so the agent sat on @done forever after a dropped notify).
+        """
         from .output import BACKGROUND
         for tid in list(self._bg_tools):
             tool = self._bg_tools.get(tid)
@@ -4302,17 +4822,31 @@ class Session:
                 self._bg_tools.pop(tid, None)
         if running is None:
             return
-        live = set(running)
+        live = set(running or [])
         self._seen_running |= live
         for task_id, tool_use_id in list(self._task_tool_map.items()):
-            if (tool_use_id in self._bg_task_ids
-                    and task_id in self._seen_running and task_id not in live):
+            if not (
+                tool_use_id in self._bg_task_ids
+                and task_id in self._seen_running
+                and task_id not in live
+            ):
+                continue
+            # Missed terminal event — synthesize the same wake path as
+            # task_notification so the agent actually continues.
+            if task_id not in self._bg_notified_task_ids:
+                self._on_sys_task_notification({
+                    "task_id": task_id,
+                    "tool_use_id": tool_use_id,
+                    "status": "completed",
+                    "summary": f"{task_id} (completed)",
+                    "output_file": "",
+                })
+            else:
                 self._finalize_bg_tool(tool_use_id, keep=False)
                 self._bg_task_ids.discard(tool_use_id)
-                self._task_tool_map.pop(task_id, None)
-                self._bg_task_ids.discard(tool_use_id)
                 self._bg_tools.pop(tool_use_id, None)
-                self._seen_running.discard(task_id)
+            self._task_tool_map.pop(task_id, None)
+            self._seen_running.discard(task_id)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""
@@ -4320,6 +4854,11 @@ class Session:
         self.output.set_name(name)
         self._update_status_bar()
         self._save_session()
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
     def _persist_view_identity(self) -> None:
         """Stamp stable agent_id + bridge session_id on the view for ST restart.
@@ -4371,6 +4910,9 @@ class Session:
         entry["query_count"] = self.query_count
         entry["backend"] = self.backend
         entry["last_activity"] = self.last_activity
+        entry["last_access"] = float(getattr(self, "last_access", 0) or 0) or float(
+            self.last_activity or 0
+        )
         if getattr(self, "agent_id", None):
             entry["agent_id"] = self.agent_id
         if getattr(self, "subsession_id", None):
@@ -4406,6 +4948,11 @@ class Session:
         # Keep last 200 sessions
         sessions = sessions[:200]
         save_sessions(sessions)
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
     def _resolve_effort(self, settings=None, env=None, spec=None) -> str:
         """profile → provider → CLAUDE_CODE_EFFORT_LEVEL → settings (default high)."""

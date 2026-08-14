@@ -18,8 +18,8 @@ def _title_abbrev_tokens():
     toks = set()
     try:
         from . import backends as _b
-        for name, spec in _b.all_backends().items():
-            tok = spec.abbrev or BACKEND_ABBREV.get(name) or name[:2].upper()
+        for name in _b.all_backends():
+            tok = _b.abbrev_for(name)
             if tok:
                 toks.add(tok)
     except Exception:

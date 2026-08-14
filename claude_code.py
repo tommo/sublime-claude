@@ -40,6 +40,9 @@ from .commands import (
     ClaudeCodeStopCommand,
     ClaudeCodeResumeCommand,
     ClaudeCodeSwitchCommand,
+    ClaudeSessionListCommand,
+    ClaudeSessionListRefreshCommand,
+    ClaudeSessionListOpenCommand,
     ClaudeCodeForkCommand,
     ClaudeCodeForkFromCommand,
     ClaudeCodeAddMcpCommand,
@@ -77,3 +80,4 @@ from .listeners import (
     ClaudeCodeEventListener,
     ClaudeOutputEventListener,
 )
+from .session_list import SessionListClickListener  # noqa: F401

@@ -1,0 +1,63 @@
+{
+    "name": "Session List",
+    "globals": {
+        "background": "#1f2430",
+        "foreground": "#cbccc6",
+        "caret": "#ffcc66",
+        "selection": "#33415e",
+        "line_highlight": "#191e2a",
+        "gutter": "#1f2430"
+    },
+    "rules": [
+        {
+            "scope": "markup.heading.session-list",
+            "foreground": "#73d0ff",
+            "font_style": "bold"
+        },
+        {
+            "scope": "entity.name.section.session-list",
+            "foreground": "#d4bfff",
+            "font_style": "bold"
+        },
+        {
+            "scope": "keyword.working.session-list",
+            "foreground": "#ffad66"
+        },
+        {
+            "scope": "keyword.ready.session-list",
+            "foreground": "#bae67e"
+        },
+        {
+            "scope": "keyword.sleeping.session-list",
+            "foreground": "#707a8c"
+        },
+        {
+            "scope": "keyword.star.session-list",
+            "foreground": "#ffcc66"
+        },
+        {
+            "scope": "storage.type.backend.session-list",
+            "foreground": "#5ccfe6"
+        },
+        {
+            "scope": "constant.numeric.session-list",
+            "foreground": "#ffd580"
+        },
+        {
+            "scope": "comment.line.session-list",
+            "foreground": "#707a8c"
+        },
+        {
+            "scope": "comment.mark.session-list",
+            "foreground": "#5c6773"
+        },
+        {
+            "scope": "comment.line.time.session-list",
+            "foreground": "#707a8c"
+        },
+        {
+            "scope": "keyword.operator.session-list",
+            "foreground": "#73d0ff"
+        }
+    ]
+}

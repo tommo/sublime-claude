@@ -9,6 +9,7 @@ view and in sessions.json). Registry maps:
 """
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Optional, Any, List
 
@@ -270,8 +271,71 @@ def pop_subsession_waits(child_ids) -> list:
     return out
 
 
-def fire_subsession_waits(child_session: Any, result_summary: str = None) -> int:
-    """Deliver host-local wait_for_subsession prompts to parents. Returns count."""
+_AGENT_ID_RE = re.compile(r"agent-[0-9a-f]{8,}", re.I)
+
+
+def subsession_notify_key(prompt: str) -> str:
+    """Stable key for one child-completion notify (dedupe queue entries)."""
+    if not prompt:
+        return ""
+    m = _AGENT_ID_RE.search(prompt)
+    return ("subsession:" + m.group(0).lower()) if m else ""
+
+
+def is_stock_subsession_wake(prompt: str) -> bool:
+    s = (prompt or "").lstrip()
+    return s.startswith("✅ Subsession ") or s.startswith("Subsession ")
+
+
+def merge_subsession_queue(queued: list, incoming: str) -> list:
+    """At most one completion notify per child. Prefer custom wait text."""
+    incoming = (incoming or "").strip()
+    if not incoming:
+        return list(queued or [])
+    key = subsession_notify_key(incoming)
+    if not key:
+        return list(queued or []) + [incoming]
+    out = []
+    replaced = False
+    for p in queued or []:
+        if subsession_notify_key(p) != key:
+            out.append(p)
+            continue
+        if is_stock_subsession_wake(incoming) and not is_stock_subsession_wake(p):
+            out.append(p)
+        else:
+            out.append(incoming)
+        replaced = True
+    if not replaced:
+        out.append(incoming)
+    return out
+
+
+def child_parent_already_notified(child_session: Any) -> bool:
+    return bool(getattr(child_session, "_parent_notified", False))
+
+
+def mark_child_parent_notified(child_session: Any) -> None:
+    try:
+        child_session._parent_notified = True
+    except Exception:
+        pass
+
+
+def fire_subsession_waits(
+    child_session: Any,
+    result_summary: str = None,
+    default_body: str = None,
+) -> int:
+    """Deliver host-local wait_for_subsession prompts to parents. Returns count.
+
+    default_body: richer signal_complete wake (budget + summary). Used when the
+    registered wake_prompt is empty or the stock default, so parents get one
+    complete notification instead of a thin stub + a second inject.
+    """
+    if child_parent_already_notified(child_session):
+        return 0
+
     aliases = []
     for attr in ("agent_id", "subsession_id"):
         v = getattr(child_session, attr, None)
@@ -288,6 +352,8 @@ def fire_subsession_waits(child_session: Any, result_summary: str = None) -> int
     if not entries:
         return 0
 
+    # One delivery per parent even if multiple wait entries match aliases
+    delivered_parents = set()
     n = 0
     for entry in entries:
         parent = None
@@ -305,12 +371,32 @@ def fire_subsession_waits(child_session: Any, result_summary: str = None) -> int
             )
             continue
 
-        body = (entry.get("wake_prompt") or "").rstrip()
-        if result_summary:
-            if body:
-                body = f"{body}\n\n{result_summary}"
-            else:
-                body = result_summary
+        parent_key = (
+            getattr(parent, "agent_id", None)
+            or runtime_view_id(parent)
+            or id(parent)
+        )
+        if parent_key in delivered_parents:
+            print(
+                f"[Claude] wait_for_subsession: skip duplicate wait "
+                f"{entry.get('wait_id')} for parent {parent_key!r}"
+            )
+            continue
+
+        reg = (entry.get("wake_prompt") or "").rstrip()
+        stock = (
+            not reg
+            or reg.startswith("✅ Subsession ")
+        )
+        if stock and default_body:
+            body = default_body
+        else:
+            body = reg
+            if result_summary:
+                if body:
+                    body = f"{body}\n\n{result_summary}"
+                else:
+                    body = result_summary
         if not body:
             body = (
                 f"✅ Subsession {entry.get('child_id')} completed "
@@ -321,11 +407,14 @@ def fire_subsession_waits(child_session: Any, result_summary: str = None) -> int
             if getattr(parent, "working", False):
                 parent.queue_prompt(body)
             elif getattr(parent, "is_sleeping", False):
-                parent._queued_prompts.append(body)
+                parent._queued_prompts = merge_subsession_queue(
+                    getattr(parent, "_queued_prompts", None) or [], body)
                 parent.wake()
             else:
                 parent.query(body, display_prompt="📬 Subsession complete")
+            delivered_parents.add(parent_key)
             n += 1
+            mark_child_parent_notified(child_session)
             print(
                 f"[Claude] wait_for_subsession: fired {entry.get('wait_id')} "
                 f"→ parent agent={getattr(parent, 'agent_id', None)}"

@@ -52,12 +52,12 @@ class HelpersTest(unittest.TestCase):
             raw = os.urandom(60)
             grok_sig = base64.b64encode(raw).rstrip(b"=").decode()
         self.assertFalse(tr.is_valid_gpt_reasoning_signature(grok_sig))
-        req = {"model": "grok-4.5", "messages": [
+        req = {"model": "grok-4.6", "messages": [
             {"role": "assistant", "content": [
                 {"type": "thinking", "thinking": "hm", "signature": grok_sig},
                 {"type": "text", "text": "answer"}]},
             {"role": "user", "content": "next"}]}
-        body, _ = tr.translate_request("grok-4.5", req)
+        body, _ = tr.translate_request("grok-4.6", req)
         self.assertFalse(any(i.get("type") == "reasoning" for i in body["input"]))
 
 

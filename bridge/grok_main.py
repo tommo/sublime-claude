@@ -24,9 +24,37 @@ from acp_base import AcpBridge, run_bridge  # noqa: E402
 GROK_BIN = os.environ.get("GROK_BIN") or shutil.which("grok") or "grok"
 
 
+def grok_home_dir() -> str:
+    return os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
+
+
+def remap_cwd_grok_bundled_path(path: str, cwd: str,
+                                grok_home: Optional[str] = None) -> str:
+    """Rewrite {cwd}/.grok/bundled/... → $GROK_HOME/bundled/...
+
+    Models invent a project-local bundled tree after seeing repo skills
+    under {cwd}/.grok/skills/. Bundled skills only live in GROK_HOME.
+    Leave the path alone if the cwd file exists or the home target does not.
+    """
+    if not path or not cwd:
+        return path
+    norm = path.replace("\\", "/")
+    root = cwd.replace("\\", "/").rstrip("/")
+    prefix = root + "/.grok/bundled/"
+    if not norm.startswith(prefix):
+        return path
+    if os.path.exists(path):
+        return path
+    home = (grok_home or grok_home_dir()).replace("\\", "/").rstrip("/")
+    mapped = home + "/bundled/" + norm[len(prefix):]
+    if os.path.exists(mapped):
+        return mapped
+    return path
+
+
 class GrokBridge(AcpBridge):
     BACKEND_NAME = "grok"
-    DEFAULT_MODEL = "grok-4.5"
+    DEFAULT_MODEL = "grok-4.6"
     LOG_PATH = "/tmp/grok_bridge.log"
     # ACP text FS rejects binary; vision goes through sublime MCP read_image.
     MCP_ENABLE_READ_IMAGE = True
@@ -54,7 +82,8 @@ class GrokBridge(AcpBridge):
         MODEL_ALIASES = dict(_GB_ALIASES)
     except Exception:
         MODEL_ALIASES = {
-            "grok-4.5": "grok-4.5",
+            "grok-4.6": "grok-4.6",
+            "grok-4.5": "grok-4.6",
             "grok-4-fast": "grok-4-fast",
             "grok-composer-2.5-fast": "grok-composer-2.5-fast",
             "composer": "grok-composer-2.5-fast",
@@ -236,11 +265,26 @@ class GrokBridge(AcpBridge):
                 "for understanding screenshots. Use file paths and text only; "
                 "do not read binary images via read_file."
             )
-        meta["rules"] = (
-            (existing + "\n" + image_rule).strip()
-            if existing else image_rule
+        skill_rule = (
+            "Bundled skills live only under "
+            f"{grok_home_dir()}/bundled/skills/ "
+            "(never {cwd}/.grok/bundled/). Use the Absolute path from the "
+            "skills list; do not invent a project-local bundled path."
         )
+        meta["rules"] = "\n".join(
+            p for p in (existing, image_rule, skill_rule) if p
+        ).strip()
         return meta
+
+    async def _acp_fs_read(self, params: dict) -> dict:
+        path = params.get("path") or ""
+        mapped = remap_cwd_grok_bundled_path(path, self.cwd or "")
+        if mapped != path:
+            self.file_log(
+                f"fs remap: cwd .grok/bundled → {mapped!r} (from {path!r})")
+            params = dict(params)
+            params["path"] = mapped
+        return await super()._acp_fs_read(params)
 
     def permission_mode_to_agent_mode(self, permission_mode: Optional[str]) -> str:
         pm = permission_mode or "default"

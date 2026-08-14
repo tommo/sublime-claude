@@ -263,13 +263,28 @@ def _x_thread_fetch(view: "OutputView", tool: "ToolCall") -> str:
     return out
 
 
+def _truncate_one_line(text: str, max_len: int) -> str:
+    s = (text or "").strip()
+    if max_len <= 0 or len(s) <= max_len:
+        return s
+    if max_len <= 1:
+        return "…"
+    return s[: max_len - 1] + "…"
+
+
 def _bash(view: "OutputView", tool: "ToolCall") -> str:
-    cmd = tool.tool_input.get("command", "")
+    cmd = tool.tool_input.get("command", "") or tool.tool_input.get("description", "")
     # The agent emits multi-line bash; the tool line is a single-line syntax
     # scope (^\s*☐ .+$), so flatten newlines or they spill below it unscoped.
     if "\n" in cmd:
         cmd = " ⏎ ".join(s.strip() for s in cmd.splitlines() if s.strip())
-    out = f": {cmd}"
+    # Background list sits under ◎ and is easy to blow out with sidecar/grok
+    # payloads — keep a short preview only.
+    if getattr(tool, "status", None) == "background":
+        cmd = _truncate_one_line(cmd, 72)
+    else:
+        cmd = _truncate_one_line(cmd, 160)
+    out = f": {cmd}" if cmd else ""
     if tool.result and tool.status in ("done", "error"):
         out += view._format_bash_result(tool.result)
     return out
@@ -615,7 +630,12 @@ def _enter_plan_mode(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _exit_plan_mode(view: "OutputView", tool: "ToolCall") -> str:
-    allowed = tool.tool_input.get("allowedPrompts", [])
+    st = getattr(tool, "status", None)
+    if st == "done":
+        return ""
+    if st == "error":
+        return ": rejected"
+    allowed = (tool.tool_input or {}).get("allowedPrompts", [])
     if allowed:
         return f": {len(allowed)} requested permissions"
     return ": awaiting approval..."

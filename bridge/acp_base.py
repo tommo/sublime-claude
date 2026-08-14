@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 import uuid as uuidlib
 from typing import Any, Dict, List, Optional
@@ -58,6 +59,8 @@ def apply_plain_terminal_env(env: dict) -> dict:
     env["PAGER"] = "cat"
     env["GIT_PAGER"] = "cat"
     env["DEBIAN_FRONTEND"] = "noninteractive"
+    # Line-buffer Python / many CLIs when stdout is a pipe (ACP terminal).
+    env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 
@@ -140,8 +143,16 @@ class AcpBridge(BaseBridge):
         self.agent_capabilities: Dict[str, Any] = {}
         self.negotiated_protocol_version: int = 1
         self._terminals: Dict[str, Dict[str, Any]] = {}
+        # Generic ACP bg: tool_use ids marked ⚙ + terminalId → job.
+        # Kimi bash-*.json tracking lives on KimiBgMixin, not here.
+        self._bg_tool_ids: set = set()
+        self._terminal_bg: Dict[str, Dict[str, Any]] = {}
+        self._bg_notified_tasks: set = set()
+        self._bg_notified_tools: set = set()
         # toolCallIds already shown as tool_use (avoid duplicate ☐ rows).
         self._tool_ids_emitted: set = set()
+        # Secondary ExitPlanMode/… toolCallId → primary open id (one UI row).
+        self._tool_id_alias: Dict[str, str] = {}
         self._loading_session: bool = False
         self._in_plan_mode: bool = False
         self._available_modes: List[dict] = []
@@ -521,6 +532,11 @@ class AcpBridge(BaseBridge):
                     "scheduled_task_deleted",
                 ):
                     self.file_log(f"← acp update {kind}: {json.dumps(params)[:400]}")
+                if kind in ("tool_call", "tool_call_update",
+                            "agent_message_chunk", "agent_thought_chunk"):
+                    # Host uses this to avoid double-painting synthetic
+                    # terminal/* tool rows when Kimi also emits tool_call.
+                    self._last_session_tool_ts = time.time()
                 self._forward_update(params)
             elif method and "mcp" in method.lower():
                 # Surface MCP lifecycle (servers_updated, init_progress, …)
@@ -640,23 +656,32 @@ class AcpBridge(BaseBridge):
 
         upd = params.get("update", {})
         kind = upd.get("sessionUpdate")
+        # Only suppress streams while *our* host prompt is being cancelled.
+        # When idle / auto-continue after end_turn, _prompt_cancelled must not
+        # black-hole agent activity (that left the view empty while kimi worked).
+        host_prompt_live = (
+            self._prompt_fut is not None and not self._prompt_fut.done())
+        if self._prompt_cancelled and not host_prompt_live:
+            # Stale cancel flag after prompt ended — clear so auto-continue paints
+            self._prompt_cancelled = False
+        suppress = bool(self._prompt_cancelled and host_prompt_live)
         # After user interrupt: drop *new* tool starts so ☐ rows don't appear
         # post-[interrupted]. Still accept tool_call_update completions so
         # already-open rows can settle.
-        if self._prompt_cancelled and kind == "tool_call":
+        if suppress and kind == "tool_call":
             self.file_log(
                 f"drop tool_call after cancel: "
                 f"{(upd.get('title') or upd.get('toolCallId') or '')!r}")
             return
         if kind == "agent_message_chunk":
-            if self._prompt_cancelled:
-                return  # no more assistant stream after cancel
+            if suppress:
+                return
             text = (upd.get("content") or {}).get("text", "")
             if text:
                 send_notification("message",
                                   {"type": "text_delta", "text": text})
         elif kind == "agent_thought_chunk":
-            if self._prompt_cancelled:
+            if suppress:
                 return
             text = (upd.get("content") or {}).get("text", "")
             if text:
@@ -685,12 +710,41 @@ class AcpBridge(BaseBridge):
             if tool_name == "tool" and not tool_input:
                 # Wait for tool_call_update with title/kind/rawInput
                 return
+            # One open ExitPlanMode at a time — second toolCallId aliases the first
+            # (permission + session/update double-open painted two rows).
+            if tool_name in ("ExitPlanMode", "EnterPlanMode") and tid:
+                for oid, oname in list(self._tool_names_by_id.items()):
+                    if (oname == tool_name and oid != tid
+                            and oid in self._tool_ids_emitted):
+                        if not hasattr(self, "_tool_id_alias"):
+                            self._tool_id_alias = {}
+                        self._tool_id_alias[tid] = oid
+                        self._tool_names_by_id[tid] = tool_name
+                        if tool_input:
+                            prev = self._tool_inputs_by_id.get(oid) or {}
+                            self._tool_inputs_by_id[oid] = {**prev, **tool_input}
+                        self.file_log(
+                            f"alias {tool_name} {tid} → open {oid} (no 2nd row)")
+                        return
             self._tool_ids_emitted.add(tid)
+            is_bg = self._looks_like_background_tool(upd, tool_input)
+            # Only shell may be ⚙ — TaskOutput/"Reading output…" never.
+            if is_bg and not self._is_shell_tool_name(tool_name):
+                is_bg = False
+            if is_bg and tid:
+                self._bg_tool_ids.add(tid)
+                if isinstance(tool_input, dict):
+                    tool_input = {**tool_input, "run_in_background": True}
+                    self._tool_inputs_by_id[tid] = {
+                        **(self._tool_inputs_by_id.get(tid) or {}),
+                        **tool_input,
+                    }
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
                 "name": tool_name,
                 "input": tool_input,
+                "background": is_bg,
             })
         elif kind == "tool_call_update":
             usage = self.usage_from_tool_update(upd)
@@ -698,7 +752,7 @@ class AcpBridge(BaseBridge):
                 send_notification("message",
                                   {"type": "turn_usage", "usage": usage})
             status = upd.get("status")
-            tid = upd.get("toolCallId")
+            tid = self._resolve_tool_id(upd.get("toolCallId"))
             tool_name = self._normalize_tool_name(upd)
             # Completed updates often strip title/_meta → name becomes "tool".
             # Recover the name we saw on the open tool_call / earlier update.
@@ -762,8 +816,22 @@ class AcpBridge(BaseBridge):
                             "name": enrich_name,
                             "input": enriched or self._tool_inputs_by_id.get(tid) or {},
                         })
-            # Do not re-emit background=True on in_progress — Claude's UI
-            # waits for task_notification which most ACP agents never send.
+            # Background: Claude host path (⚙ + task_started; notify on exit).
+            is_bg = bool(
+                tid and self._is_shell_tool_name(tool_name) and (
+                    tid in self._bg_tool_ids
+                    or self._looks_like_background_tool(upd, enriched)
+                )
+            )
+            if is_bg and tid:
+                self._register_bg_tool(
+                    tid,
+                    tool_input=enriched or self._tool_inputs_by_id.get(tid),
+                    title=str(upd.get("title") or ""),
+                )
+                for term_id in self._terminal_ids_from_update(upd):
+                    self._bind_terminal_to_bg_tool(term_id, tid)
+
             if status in ("completed", "failed"):
                 # No open row for this id → nothing to close (noise already dropped)
                 if tid not in self._tool_ids_emitted and not self._tool_update_has_substance(upd):
@@ -785,7 +853,13 @@ class AcpBridge(BaseBridge):
                         "id": tid,
                         "name": tool_name,
                         "input": payload,
+                        "background": bool(tid and tid in self._bg_tool_ids),
                     })
+                # Bind terminal ids on completed payload (Kimi attaches them here)
+                if tid and tid in self._bg_tool_ids:
+                    for term_id in self._terminal_ids_from_update(upd):
+                        self._bind_terminal_to_bg_tool(term_id, tid)
+
                 text = self._extract_tool_content(upd, tool_name)
                 is_error = status == "failed"
                 # Grok read_file marks images failed ("Cannot read binary file")
@@ -796,6 +870,45 @@ class AcpBridge(BaseBridge):
                     soft = self._soften_image_read_fail(text, enriched, tool_name)
                     if soft is not None:
                         text, is_error = soft
+
+                # TaskOutput / "Reading output of task …" only *polls* a
+                # bash-* job — never register it as a new ⚙ background tool.
+                _title_l = str(upd.get("title") or "").lower()
+                _inp = enriched if isinstance(enriched, dict) else {}
+                is_task_poll = (
+                    tool_name in ("TaskGet", "TaskOutput", "Task")
+                    or "reading output of task" in _title_l
+                    or bool(_inp.get("task_id") or _inp.get("taskId"))
+                    or (tool_name == "Read" and bool(
+                        _inp.get("task_id") or _inp.get("taskId")))
+                )
+                if self._kimi_handle_tool_result(
+                        tid, tool_name, text, enriched, is_task_poll,
+                        status, upd):
+                    return
+
+                # ACP-terminal background: tool_result is only an ack (host keeps
+                # ⚙ until task_notification). Same as Claude run_in_background.
+                if (
+                    tid
+                    and tid in self._bg_tool_ids
+                    and status == "completed"
+                    and self._is_shell_tool_name(tool_name)
+                    and not is_task_poll
+                ):
+                    send_notification("message", {
+                        "type": "tool_result",
+                        "tool_use_id": tid,
+                        "content": text or "background",
+                        "is_error": False,
+                    })
+                    # Keep name/input maps until process exit notification
+                    return
+                if tid and tid in self._bg_tool_ids and (
+                        is_task_poll or not self._is_shell_tool_name(tool_name)):
+                    # Drop mistaken bg mark so normal tool_result can close the row
+                    self._bg_tool_ids.discard(tid)
+
                 send_notification("message", {
                     "type": "tool_result",
                     "tool_use_id": tid,
@@ -803,6 +916,11 @@ class AcpBridge(BaseBridge):
                     "is_error": is_error,
                 })
                 self._tool_ids_emitted.discard(tid)
+                # Drop aliases that pointed at this primary
+                for alias, primary in list(
+                        getattr(self, "_tool_id_alias", {}).items()):
+                    if primary == tid or alias == tid:
+                        self._tool_id_alias.pop(alias, None)
                 if not is_error and tool_name in (
                     "scheduler_create", "CronCreate", "ScheduleWakeup",
                     "scheduler_delete", "CronDelete", "SchedulerDelete",
@@ -817,6 +935,7 @@ class AcpBridge(BaseBridge):
                         tool_name, merged, text, tool_call_id=tid or "")
                 self._tool_inputs_by_id.pop(tid, None)
                 self._tool_names_by_id.pop(tid, None)
+                self._bg_tool_ids.discard(tid)
         elif kind == "user_message_chunk":
             # Agents (notably Grok) re-broadcast the user prompt. The plugin
             # already renders ◎ <prompt> — do not double-print as text_delta.
@@ -1215,6 +1334,13 @@ class AcpBridge(BaseBridge):
                 return True
         return False
 
+    def _resolve_tool_id(self, tid: Optional[str]) -> Optional[str]:
+        """Map aliased secondary toolCallId → primary open row id."""
+        if not tid:
+            return tid
+        aliases = getattr(self, "_tool_id_alias", None) or {}
+        return aliases.get(tid, tid)
+
     def _tool_update_has_substance(self, upd: dict) -> bool:
         """True if rawInput/locations/content-JSON look like a real tool call."""
         raw = upd.get("rawInput") or {}
@@ -1305,6 +1431,15 @@ class AcpBridge(BaseBridge):
                     return head
             # Human-prefixed activity titles (Kimi streams these often)
             low = t.lower()
+            # TaskOutput polls: "Reading output of task bash-…" — NOT a file Read
+            # (was mis-mapped → "⚙ Read (background)" when bg gates misfired).
+            if (
+                "reading output of task" in low
+                or low.startswith("taskoutput")
+                or low.startswith("task output")
+                or low.startswith("taskget")
+            ):
+                return "TaskGet"
             if low.startswith(("reading ", "read ")):
                 return "Read"
             if low.startswith(("writing ", "write ", "wrote ")):
@@ -1714,7 +1849,272 @@ class AcpBridge(BaseBridge):
             "rewind_points": self.handle_rewind_points,
             "rewind_execute": self.handle_rewind_execute,
             "cancel_loop": self.handle_cancel_loop,
+            # Same RPC as Claude SDK bridge — host polls when idle with ⚙ tasks.
+            "poll_bg_tasks": self.handle_poll_bg_tasks,
         }
+
+    async def handle_poll_bg_tasks(self, req_id: Optional[int],
+                                    params: dict) -> None:
+        """Host idle poll while ⚙ tasks are live. Kimi mixin scans bash-*.json."""
+        checked = 0
+        poll = getattr(self, "_poll_kimi_bg_tasks", None)
+        if callable(poll):
+            try:
+                checked = poll()
+            except Exception as e:
+                self.file_log(f"poll_bg_tasks: {e}")
+        running = list(self._live_bg_task_ids())
+        send_result(req_id, {
+            "pending": len(running),
+            "checked": checked,
+            "running": running,
+        })
+
+    def _live_bg_task_ids(self) -> set:
+        ids = set()
+        for info in (self._terminal_bg or {}).values():
+            tid = info.get("task_id")
+            if tid:
+                ids.add(tid)
+        extra = getattr(self, "_live_kimi_task_ids", None)
+        if callable(extra):
+            ids.update(extra())
+        return ids
+
+    def _kimi_handle_tool_result(
+            self, tid, tool_name, text, enriched, is_task_poll, status, upd) -> bool:
+        return False
+
+    @staticmethod
+    def _clip_bg_summary(summary: str, code=None) -> str:
+        summary = (summary or "").strip()
+        if "\n" in summary:
+            summary = " ⏎ ".join(
+                s.strip() for s in summary.splitlines() if s.strip())
+        if len(summary) > 80:
+            summary = summary[:79] + "…"
+        if code is not None:
+            summary = f"{summary} (exit {code})"
+        return summary
+
+    def _write_bg_output_file(self, prefix: str, body: str) -> str:
+        try:
+            fd, path = tempfile.mkstemp(prefix=prefix, suffix=".log", text=True)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body or "")
+            return path
+        except Exception as e:
+            self.file_log(f"bg output_file write failed: {e}")
+            return ""
+
+    def _emit_bg_finished(
+            self, task_id: str, tool_use_id: str, status: str,
+            summary: str, output_file: str) -> None:
+        self._mark_bg_notified(task_id, tool_use_id)
+        self._emit_system("task_updated", {
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+            "patch": {"status": status},
+        })
+        self._emit_system("task_notification", {
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+            "status": status,
+            "summary": summary,
+            "output_file": output_file,
+        })
+        if tool_use_id:
+            self._bg_tool_ids.discard(tool_use_id)
+            self._tool_inputs_by_id.pop(tool_use_id, None)
+            self._tool_names_by_id.pop(tool_use_id, None)
+
+    _SHELL_BG_NAMES = frozenset({
+        "Bash", "Shell", "execute", "run_terminal_command", "tool",
+    })
+
+    @classmethod
+    def _is_shell_tool_name(cls, name: str) -> bool:
+        return (name or "") in cls._SHELL_BG_NAMES or (name or "") == "Workflow"
+
+    @staticmethod
+    def _looks_like_background_tool(upd: dict, tool_input: Optional[dict] = None) -> bool:
+        """True only for explicit detach signals — not every shell.
+
+        Live Kimi sessions title execute `Running:` and never
+        `Starting background` (sandbox/kimi_bg). This gate stays conservative
+        until that pair is wired. TaskOutput / "Reading output of task" is never ⚙.
+        """
+        title = str(upd.get("title") or "")
+        low = title.lower().strip()
+        # Poll tools are foreground — never ⚙
+        if "reading output of task" in low or low.startswith("taskoutput"):
+            return False
+        # Title must *start* with Starting background (avoid path noise)
+        if low.startswith("starting background"):
+            return True
+        if low.startswith("running in background") or low.startswith("background task"):
+            return True
+        ri = tool_input if isinstance(tool_input, dict) else {}
+        if not ri:
+            raw = upd.get("rawInput")
+            if isinstance(raw, dict):
+                ri = raw
+            elif isinstance(raw, str) and raw.strip().startswith("{"):
+                try:
+                    ri = json.loads(raw)
+                except Exception:
+                    ri = {}
+        # task_id alone = poll args, not a detached shell
+        if isinstance(ri, dict) and (
+                ri.get("task_id") or ri.get("taskId")) and not ri.get("command"):
+            return False
+        if isinstance(ri, dict) and ri.get("run_in_background") is True:
+            return True
+        return False
+
+    @classmethod
+    def _terminal_ids_from_update(upd: dict) -> List[str]:
+        out = []
+        for block in (upd.get("content") or []):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "terminal" and block.get("terminalId"):
+                out.append(str(block["terminalId"]))
+            inner = block.get("content") if block.get("type") == "content" else None
+            if isinstance(inner, dict) and inner.get("type") == "terminal":
+                tid = inner.get("terminalId")
+                if tid:
+                    out.append(str(tid))
+        return out
+
+    def _emit_system(self, subtype: str, data: dict) -> None:
+        """Same envelope as Claude SDK bridge SystemMessage → host dispatch."""
+        send_notification("message", {
+            "type": "system",
+            "subtype": subtype,
+            "data": data or {},
+        })
+
+    def _should_skip_bg_notify(self, task_id: str, tool_use_id: str = "") -> bool:
+        """True if we already sent task_notification for this logical bg job."""
+        if task_id and task_id in self._bg_notified_tasks:
+            return True
+        if tool_use_id and tool_use_id in self._bg_notified_tools:
+            return True
+        return False
+
+    def _mark_bg_notified(self, task_id: str, tool_use_id: str = "") -> None:
+        if task_id:
+            self._bg_notified_tasks.add(task_id)
+        if tool_use_id:
+            self._bg_notified_tools.add(tool_use_id)
+        # Bound aliases for the same terminal/tool
+        for term_id, info in list(self._terminal_bg.items()):
+            if (task_id and info.get("task_id") == task_id) or (
+                    tool_use_id and info.get("tool_use_id") == tool_use_id):
+                tid = info.get("task_id")
+                if tid:
+                    self._bg_notified_tasks.add(str(tid))
+                tuid = info.get("tool_use_id")
+                if tuid:
+                    self._bg_notified_tools.add(str(tuid))
+
+    def _register_bg_tool(self, tool_use_id: str, tool_input: dict = None,
+                          title: str = "") -> None:
+        if not tool_use_id:
+            return
+        # Title-only poll tools must never become ⚙
+        tlow = (title or "").lower()
+        if "reading output of task" in tlow or tlow.startswith("taskoutput"):
+            return
+        name = self._tool_names_by_id.get(tool_use_id) or "Bash"
+        # Never promote Read / TaskOutput / etc. to ⚙ background
+        if not self._is_shell_tool_name(name):
+            return
+        if name == "tool":
+            name = "Bash"
+        already = tool_use_id in self._bg_tool_ids
+        self._bg_tool_ids.add(tool_use_id)
+        inp = dict(tool_input or self._tool_inputs_by_id.get(tool_use_id) or {})
+        if title and not inp.get("command"):
+            cmd = title
+            for prefix in (
+                "Starting background:", "Starting background",
+                "Running:",
+            ):
+                if cmd.startswith(prefix):
+                    cmd = cmd[len(prefix):].strip()
+                    break
+            if cmd:
+                inp.setdefault("command", cmd)
+        inp["run_in_background"] = True
+        self._tool_inputs_by_id[tool_use_id] = {
+            **(self._tool_inputs_by_id.get(tool_use_id) or {}),
+            **inp,
+        }
+        self._tool_names_by_id[tool_use_id] = "Bash"
+        self._tool_ids_emitted.add(tool_use_id)
+        if already:
+            return
+        send_notification("message", {
+            "type": "tool_use",
+            "id": tool_use_id,
+            "name": "Bash",
+            "input": self._tool_inputs_by_id[tool_use_id],
+            "background": True,
+        })
+
+    def _bind_terminal_to_bg_tool(self, terminal_id: str, tool_use_id: str) -> None:
+        if not terminal_id or not tool_use_id:
+            return
+        if tool_use_id not in self._bg_tool_ids:
+            return
+        if terminal_id in self._terminal_bg:
+            return
+        cmd = (self._tool_inputs_by_id.get(tool_use_id) or {}).get("command", "")
+        task_id = f"acp-term-{terminal_id}"
+        self._terminal_bg[terminal_id] = {
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+            "cmd": cmd,
+        }
+        self._emit_system("task_started", {
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+        })
+        self.file_log(
+            f"bg terminal bound term={terminal_id} tool={tool_use_id} "
+            f"task={task_id}")
+        slot = self._terminals.get(terminal_id) or {}
+        reader = slot.get("reader")
+        if slot.get("exit_status") is not None and (
+                reader is None or reader.done()):
+            self._emit_bg_terminal_complete(terminal_id)
+
+    def _emit_bg_terminal_complete(self, terminal_id: str) -> None:
+        """ACP process exit → one Claude task_notification."""
+        info = self._terminal_bg.pop(terminal_id, None)
+        if not info:
+            return
+        task_id = info.get("task_id") or f"acp-term-{terminal_id}"
+        tool_use_id = info.get("tool_use_id") or f"bg-{task_id}"
+        if self._should_skip_bg_notify(task_id, tool_use_id):
+            return
+        slot = self._terminals.get(terminal_id) or {}
+        out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
+        es = slot.get("exit_status") or {}
+        code = es.get("exitCode")
+        if code is None and es.get("signal"):
+            status = "failed"
+        elif code is None or int(code) == 0:
+            status = "completed"
+        else:
+            status = "failed"
+        output_file = self._write_bg_output_file("acp-bg-", out or "")
+        raw = (info.get("cmd") or tool_use_id or task_id or "").strip()
+        summary = self._clip_bg_summary(raw, code)
+        self._emit_bg_finished(
+            task_id, tool_use_id, status, summary, output_file)
 
     async def handle_cancel_loop(self, req_id: Optional[int],
                                   params: dict) -> None:
@@ -2064,16 +2464,23 @@ class AcpBridge(BaseBridge):
         wait_s: float = 2.0,
         settle_s: float = 0.3,
         force_local: bool = True,
+        orphan_ok: bool = True,
     ) -> None:
         """session/cancel + wait until local prompt future settles.
 
         Kimi rejects a new session/prompt while its agent-side turn is still
-        active (``turn.agent_busy``). Forcing the local future after 350ms
-        idles the UI but leaves the agent busy — next Esc-then-type fails.
+        active (``turn.agent_busy`` / "another turn is already in progress").
+
+        Important: after host interrupt we often force the *local* prompt
+        future done while the agent turn is still live (auto-continue, slow
+        cancel). Next user message must still send session/cancel even when
+        ``_prompt_fut`` is already None — otherwise Esc → type fails with
+        agent_busy forever.
         """
         fut = self._prompt_fut
         active = fut is not None and not fut.done()
-        if not active and self._query_req_id is None:
+        has_query = self._query_req_id is not None
+        if not active and not has_query and not orphan_ok:
             return
         self._prompt_cancelled = True
         self._cancel_in_flight = True
@@ -2082,7 +2489,8 @@ class AcpBridge(BaseBridge):
                 await self._notify_acp(
                     "session/cancel", {"sessionId": self.session_id})
                 self.file_log(
-                    f"cancel_agent_turn: session/cancel ({reason})")
+                    f"cancel_agent_turn: session/cancel ({reason})"
+                    f"{'' if active or has_query else ' [orphan agent turn]'}")
             except Exception as e:
                 self.log(f"session/cancel failed ({reason}): {e}")
         fut = self._prompt_fut
@@ -2095,7 +2503,7 @@ class AcpBridge(BaseBridge):
                 fut.set_result({"stopReason": "cancelled"})
                 self.file_log(
                     f"cancel_agent_turn: forced local fut ({reason})")
-        # Agent-side turn teardown lag (Kimi turn IDs)
+        # Agent-side turn teardown lag (Kimi turn IDs / subagents)
         if settle_s > 0:
             try:
                 await asyncio.sleep(settle_s)
@@ -2112,16 +2520,16 @@ class AcpBridge(BaseBridge):
             self.file_log(
                 f"query: superseding in-flight req {self._query_req_id}")
             await self._cancel_agent_turn(
-                reason="supersede", wait_s=2.0, settle_s=0.35)
+                reason="supersede", wait_s=2.0, settle_s=0.5)
         elif self._prompt_fut is not None and not self._prompt_fut.done():
             await self._cancel_agent_turn(
-                reason="stale_prompt", wait_s=2.0, settle_s=0.35)
+                reason="stale_prompt", wait_s=2.0, settle_s=0.5)
         elif self._cancel_in_flight:
-            # Just interrupted — brief settle before new prompt
-            try:
-                await asyncio.sleep(0.25)
-            except Exception:
-                pass
+            # Just interrupted — one more cancel for orphan agent turn + settle.
+            # Do not kill the process; session/cancel only.
+            await self._cancel_agent_turn(
+                reason="post_interrupt", wait_s=2.0, settle_s=0.8,
+                force_local=True, orphan_ok=True)
         prompt = params.get("prompt") or params.get("text") or ""
         images = params.get("images") or []
         if not isinstance(images, list):
@@ -2132,19 +2540,35 @@ class AcpBridge(BaseBridge):
         self._cancel_in_flight = False
         turn_t0 = time.time()
         try:
-            try:
-                result = await self._send_prompt(prompt_blocks) or {}
-            except Exception as e:
-                if self._is_agent_busy_error(e) and not self._prompt_cancelled:
+            result = None
+            last_err: Optional[BaseException] = None
+            # Busy retry: cancel leaves agent laggy; up to 3 attempts
+            for attempt in range(3):
+                try:
+                    result = await self._send_prompt(prompt_blocks) or {}
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    if (not self._is_agent_busy_error(e)
+                            or self._prompt_cancelled):
+                        raise
+                    settle = 0.6 + attempt * 0.8
                     self.file_log(
-                        f"query: agent_busy — cancel+retry once: {e}")
+                        f"query: agent_busy attempt {attempt + 1}/3 "
+                        f"settle={settle:.1f}s: {e}")
                     await self._cancel_agent_turn(
-                        reason="busy_retry", wait_s=2.5, settle_s=0.5)
+                        reason=f"busy_retry_{attempt + 1}",
+                        wait_s=2.0 + attempt,
+                        settle_s=settle,
+                        force_local=True,
+                        orphan_ok=True,
+                    )
                     self._prompt_cancelled = False
                     self._cancel_in_flight = False
-                    result = await self._send_prompt(prompt_blocks) or {}
-                else:
-                    raise
+            if last_err is not None and result is None:
+                raise last_err
+            result = result or {}
             stop_reason = result.get("stopReason", "end_turn")
             cancelled = (
                 self._prompt_cancelled
@@ -3102,10 +3526,8 @@ class AcpBridge(BaseBridge):
             (o.get("optionId") for o in options
              if isinstance(o, dict)
              and (o.get("kind") or "").startswith("reject")), None)
-        if allow_id is None or reject_id is None:
-            self.file_log(
-                f"permission request missing options: {json.dumps(options)[:300]}")
-            return {"outcome": {"outcome": "cancelled"}}
+        # AskUserQuestion is q0_opt_* + q0_skip — do not cancel before that
+        # path just because generic approve/reject ids are missing.
 
         # Prefer Grok's embedded tool name from _meta when present.
         meta_tool = ((tool_call.get("_meta") or {}).get("x.ai/tool") or {})
@@ -3169,6 +3591,11 @@ class AcpBridge(BaseBridge):
             except Exception as e:
                 self.file_log(f"ask_user permission UI failed: {e}")
                 return {"outcome": {"outcome": "cancelled"}}
+
+        if allow_id is None or reject_id is None:
+            self.file_log(
+                f"permission request missing options: {json.dumps(options)[:300]}")
+            return {"outcome": {"outcome": "cancelled"}}
 
         # Always re-read project auto-allows — UI "Always" persists them live.
         self._reload_auto_allow_patterns()
@@ -3305,72 +3732,174 @@ class AcpBridge(BaseBridge):
                 }}
             return {"outcome": {"outcome": "cancelled"}}
 
-        # Map first answer label → optionId (single-q; multi-q is often
-        # sequential q0 / q1 permission requests from Kimi).
+        # Kimi ACP handleQuestion only accepts /^q0_opt_(\d+)$/.
+        # Anything else (Skip, freeform, q1_opt_*) → tool result
+        # "User dismissed the question without answering."
         label = self._first_answer_label(answers, questions)
-        if not label:
-            if skip_id:
-                return {"outcome": {
-                    "outcome": "selected", "optionId": skip_id,
-                }}
-            return {"outcome": {"outcome": "cancelled"}}
-
-        oid = self._match_option_id_for_label(options, label)
-        self.file_log(
-            f"ask_user permission selected label={label!r} optionId={oid!r}")
+        oid = self._kimi_q0_option_id(options, questions, label)
+        extra = self._kimi_followup_answers(questions, answers)
+        if extra:
+            self._inject_ask_user_followup(extra)
         if oid:
+            self.file_log(
+                f"ask_user permission selected label={label!r} optionId={oid!r}")
             return {"outcome": {"outcome": "selected", "optionId": oid}}
 
-        # Free-text Other: never skip/cancel — that silently drops user input.
-        # Prefer system "Other" option if present; else pass free text as the
-        # selected option name via optionId (Kimi may surface it as the answer).
-        other_id = self._find_other_option_id(options)
-        if other_id:
+        # Answered but not a listed q0 option (Other / extra questions).
+        # Never send freeform optionId — Kimi treats it as dismissed.
+        fallback = self._kimi_first_q0_option_id(options)
+        if fallback:
             self.file_log(
-                f"ask_user free-text → Other optionId={other_id!r} "
-                f"text={label!r}")
-            # Include free text in a way agents/logs can see; optionId is Other.
-            return {
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": other_id,
-                    # Nonstandard extras some agents ignore — still log them.
-                    "userInput": label,
-                    "freeText": label,
-                },
-            }
+                f"ask_user unmatched label={label!r} → fallback {fallback}")
+            if not extra:
+                self._inject_ask_user_followup(
+                    self._kimi_followup_answers(questions, answers)
+                    or self._kimi_other_followup(questions, answers, label))
+            return {"outcome": {"outcome": "selected", "optionId": fallback}}
 
-        # No Other option: use free text as optionId (better than skip/cancel).
-        self.file_log(
-            f"ask_user free-text with no Other option — "
-            f"using freeform optionId text={label!r}")
-        return {
-            "outcome": {
-                "outcome": "selected",
-                "optionId": label,
-                "userInput": label,
-                "freeText": label,
-            },
-        }
+        if skip_id:
+            return {"outcome": {
+                "outcome": "selected", "optionId": skip_id,
+            }}
+        return {"outcome": {"outcome": "cancelled"}}
+
+    @staticmethod
+    def _answer_as_label(v) -> str:
+        if isinstance(v, (list, tuple)) and v:
+            return str(v[0])
+        return str(v) if v is not None and str(v) != "" else ""
 
     @staticmethod
     def _first_answer_label(answers: dict, questions: list) -> str:
         if not isinstance(answers, dict) or not answers:
             return ""
-        # Prefer key matching first question text
         if questions:
-            q0 = questions[0].get("question") or ""
-            if q0 and q0 in answers:
-                v = answers[q0]
-                if isinstance(v, (list, tuple)) and v:
-                    return str(v[0])
-                return str(v) if v is not None else ""
+            q0 = questions[0] if isinstance(questions[0], dict) else {}
+            for key in (q0.get("question") or "", q0.get("header") or ""):
+                if key and key in answers:
+                    got = AcpBridge._answer_as_label(answers[key])
+                    if got:
+                        return got
         for v in answers.values():
-            if isinstance(v, (list, tuple)) and v:
-                return str(v[0])
-            if v is not None and str(v) != "":
-                return str(v)
+            got = AcpBridge._answer_as_label(v)
+            if got:
+                return got
         return ""
+
+    @staticmethod
+    def _is_kimi_q0_opt(option_id: str) -> bool:
+        return bool(re.match(r"^q0_opt_\d+$", option_id or ""))
+
+    @staticmethod
+    def _labels_match(a: str, b: str) -> bool:
+        a = (a or "").strip().lower()
+        b = (b or "").strip().lower()
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        a2 = re.sub(r"\s*\(recommended\)\s*$", "", a).strip()
+        b2 = re.sub(r"\s*\(recommended\)\s*$", "", b).strip()
+        if a2 and b2 and a2 == b2:
+            return True
+        # Description / Other text often contains or is contained by the label.
+        if len(a2) >= 8 and (a2 in b2 or b2 in a2):
+            return True
+        return False
+
+    @staticmethod
+    def _kimi_q0_option_id(options: list, questions: list, label: str) -> str:
+        """Map a UI answer onto Kimi's /^q0_opt_N$/ permission id.
+
+        Kimi outcomeToQuestionAnswer returns null (dismissed) for any other id.
+        """
+        label = (label or "").strip()
+        if not label:
+            return ""
+        named = AcpBridge._match_option_id_for_label(options, label)
+        if AcpBridge._is_kimi_q0_opt(named):
+            return named
+        q0 = questions[0] if questions and isinstance(questions[0], dict) else {}
+        qopts = q0.get("options") or []
+        for i, opt in enumerate(qopts):
+            if isinstance(opt, dict):
+                olabel = str(opt.get("label") or opt.get("name") or "")
+                odesc = str(opt.get("description") or "")
+            else:
+                olabel, odesc = str(opt), ""
+            if (AcpBridge._labels_match(label, olabel)
+                    or AcpBridge._labels_match(label, odesc)):
+                cand = f"q0_opt_{i}"
+                if any(
+                    isinstance(o, dict) and o.get("optionId") == cand
+                    for o in (options or [])
+                ):
+                    return cand
+        return ""
+
+    @staticmethod
+    def _kimi_first_q0_option_id(options: list) -> str:
+        for o in options or []:
+            if not isinstance(o, dict):
+                continue
+            oid = str(o.get("optionId") or "")
+            if AcpBridge._is_kimi_q0_opt(oid):
+                return oid
+        return ""
+
+    @staticmethod
+    def _kimi_followup_answers(questions: list, answers: dict) -> str:
+        """Text for Q1+ (Kimi ACP drops them) or a full recap when useful."""
+        if not isinstance(answers, dict) or not answers:
+            return ""
+        if not questions or len(questions) < 2:
+            return ""
+        lines = [
+            "The user answered AskUserQuestion. ACP only forwards the "
+            "first question — do NOT treat this as dismissed. Honor every "
+            "answer below:",
+        ]
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            header = q.get("header") or ""
+            qtext = q.get("question") or header or "Question"
+            val = ""
+            for key in (q.get("question") or "", header):
+                if key and key in answers:
+                    val = AcpBridge._answer_as_label(answers[key])
+                    if val:
+                        break
+            if not val:
+                continue
+            prefix = f"{header}: " if header and header != qtext else ""
+            lines.append(f"- {prefix}{qtext}: {val}" if prefix else f"- {qtext}: {val}")
+        if len(lines) <= 1:
+            return ""
+        lines.append(
+            "If a tool result said the user dismissed or only includes "
+            "the first choice, ignore that and use this list.")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _kimi_other_followup(questions: list, answers: dict, label: str) -> str:
+        q0 = ""
+        if questions and isinstance(questions[0], dict):
+            q0 = questions[0].get("question") or questions[0].get("header") or ""
+        return (
+            "The user answered AskUserQuestion with custom text "
+            f"(not a listed option){': ' + q0 if q0 else ''}: {label}. "
+            "Do NOT treat this as dismissed."
+        )
+
+    def _inject_ask_user_followup(self, text: str) -> None:
+        if not text or not str(text).strip():
+            return
+        send_notification("notification_wake", {
+            "wake_prompt": str(text).strip(),
+            "display_message": "AskUserQuestion answers",
+        })
+        self.file_log(f"ask_user follow-up injected ({len(text)} chars)")
 
     @staticmethod
     def _match_option_id_for_label(options: list, label: str) -> str:
@@ -3839,7 +4368,10 @@ class AcpBridge(BaseBridge):
             f"exit_plan_mode: toolCallId={tool_call_id!r} "
             f"plan_chars={len(plan_content)}")
 
-        if tool_call_id:
+        if tool_call_id and tool_call_id not in self._tool_ids_emitted:
+            # session/update often already opened this id — don't second-paint
+            self._tool_ids_emitted.add(tool_call_id)
+            self._tool_names_by_id[tool_call_id] = "ExitPlanMode"
             send_notification("message", {
                 "type": "tool_use",
                 "id": tool_call_id,
@@ -3973,6 +4505,23 @@ class AcpBridge(BaseBridge):
                 return mime
         return None
 
+    @staticmethod
+    def _is_kimi_plan_file(path: str) -> bool:
+        """True for Kimi Code plan-mode scratch files under session workdir.
+
+        EnterPlanMode picks a plan id then fs/read_text_file the plan path
+        before it exists. ENOENT there must be empty content, not a hard
+        error — otherwise EnterPlanMode fails immediately (seen in
+        kimi_bridge.log: plans/mantis-moon-knight-swamp-thing.md).
+        """
+        if not path:
+            return False
+        norm = path.replace("\\", "/")
+        if "/.kimi-code/sessions/" not in norm:
+            return False
+        # .../agents/<name>/plans/<id>.md  (main or subagent)
+        return "/plans/" in norm and norm.rstrip("/").endswith(".md")
+
     async def _acp_fs_read(self, params: dict) -> dict:
         """fs/read_text_file — UTF-8 text; images as short path metadata.
 
@@ -3988,6 +4537,12 @@ class AcpBridge(BaseBridge):
         limit = params.get("limit")
         max_chars = self.fs_read_max_chars if self.fs_read_max_chars > 0 else (
             2 * 1024 * 1024)
+
+        # Kimi EnterPlanMode: plan file is read before write — empty is OK.
+        if not os.path.exists(path) and self._is_kimi_plan_file(path):
+            self.file_log(
+                f"fs/read_text_file: missing kimi plan file {path!r} → empty")
+            return {"content": ""}
 
         low = path.lower()
         by_ext = any(low.endswith(ext) for ext in self._IMAGE_EXTS)
@@ -4154,10 +4709,46 @@ class AcpBridge(BaseBridge):
             return {"exitCode": None, "signal": sig_name}
         return {"exitCode": int(code), "signal": None}
 
+    def _host_emit_tool_use(
+            self, tool_id: str, name: str, tool_input: dict = None,
+            background: bool = False) -> None:
+        """Push a tool row to the Sublime host (Claude message protocol)."""
+        if not tool_id or not name:
+            return
+        send_notification("message", {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": name,
+            "input": tool_input or {},
+            "background": bool(background),
+        })
+
+    def _host_emit_tool_result(
+            self, tool_id: str, content: str = "",
+            is_error: bool = False) -> None:
+        if not tool_id:
+            return
+        send_notification("message", {
+            "type": "tool_result",
+            "tool_use_id": tool_id,
+            "content": content or "",
+            "is_error": bool(is_error),
+        })
+
+    def _should_synth_terminal_ui(self) -> bool:
+        """True when Kimi is using terminal/* without session/update tool_call.
+
+        When tool_call is also streaming, synthesizing would double-paint Bash.
+        """
+        last = float(getattr(self, "_last_session_tool_ts", 0) or 0)
+        return (time.time() - last) > 1.5
+
     async def _acp_terminal_create(self, params: dict) -> dict:
         # After cancel, refuse new shells so the agent cannot keep spawning
-        # work while the prompt is winding down.
-        if self._prompt_cancelled:
+        # work while the prompt is winding down — only while host prompt lives.
+        host_prompt_live = (
+            self._prompt_fut is not None and not self._prompt_fut.done())
+        if self._prompt_cancelled and host_prompt_live:
             raise ValueError("terminal/create rejected: turn cancelled")
         cmd = params.get("command")
         if not cmd:
@@ -4203,13 +4794,36 @@ class AcpBridge(BaseBridge):
         else:
             proc = await asyncio.create_subprocess_exec(cmd, *args, **common)
         tid = "term_" + uuidlib.uuid4().hex[:10]
+        # Display command (shell -c often puts real cmd in args)
+        cmd_show = cmd
+        if use_shell and args_in:
+            # bash -c "real cmd"
+            for i, a in enumerate(args_in):
+                if str(a) in ("-c",) and i + 1 < len(args_in):
+                    cmd_show = str(args_in[i + 1])
+                    break
+        if isinstance(cmd_show, str) and len(cmd_show) > 240:
+            cmd_show = cmd_show[:239] + "…"
         slot: Dict[str, Any] = {
             "proc": proc, "stdout": "", "stderr": "",
             "limit": limit, "truncated": False, "exit_status": None,
-            "cmd": cmd[:200],
+            "cmd": (cmd_show or cmd)[:200],
         }
         self._terminals[tid] = slot
         self.file_log(f"terminal/create {tid} pid={proc.pid} shell={use_shell}")
+
+        # Kimi often runs tools ONLY via terminal/* with zero session/update
+        # tool_call — host UI then shows empty "waiting" while agent is busy.
+        # Synthesize Bash rows when no recent session tool stream.
+        if self._should_synth_terminal_ui():
+            host_id = f"term-ui-{tid}"
+            slot["host_tool_id"] = host_id
+            self._host_emit_tool_use(
+                host_id, "Bash",
+                {"command": cmd_show or str(cmd)[:240]},
+                background=False,
+            )
+            self.file_log(f"synth host Bash for {tid} (no session tool_call)")
 
         async def drain(stream, key):
             buf = []
@@ -4232,6 +4846,9 @@ class AcpBridge(BaseBridge):
                         continue
                     buf.append(chunk.decode("utf-8", "replace"))
                     total += len(chunk)
+                    # Incremental: Kimi polls terminal/output while running;
+                    # publishing only in finally left every poll empty.
+                    slot[key] = strip_ansi("".join(buf))
             finally:
                 # Plain text for agent + plugin UI (no raw ESC sequences).
                 slot[key] = strip_ansi("".join(buf))
@@ -4261,6 +4878,29 @@ class AcpBridge(BaseBridge):
             except Exception as e:
                 self.file_log(f"terminal {tid} reader error: {e}")
                 slot["exit_status"] = {"exitCode": 1, "signal": None}
+            finally:
+                # Close synthetic host Bash row if we opened one
+                hid = slot.get("host_tool_id")
+                if hid:
+                    try:
+                        out = (
+                            (slot.get("stdout") or "")
+                            + (slot.get("stderr") or "")
+                        )
+                        es = slot.get("exit_status") or {}
+                        code = es.get("exitCode")
+                        is_err = code is not None and int(code) != 0
+                        if len(out) > 6000:
+                            out = out[:6000] + "\n…[truncated]"
+                        self._host_emit_tool_result(
+                            hid, out or f"exit {code}", is_error=is_err)
+                    except Exception as e:
+                        self.file_log(f"synth tool_result {tid}: {e}")
+                # Claude-compatible wake when host is already idle after end_turn
+                try:
+                    self._emit_bg_terminal_complete(tid)
+                except Exception as e:
+                    self.file_log(f"bg terminal complete emit failed: {e}")
 
         slot["reader"] = asyncio.create_task(wait_and_close())
         return {"terminalId": tid}
@@ -4341,6 +4981,11 @@ class AcpBridge(BaseBridge):
         self.file_log(
             f"terminal/wait_for_exit {tid} → "
             f"exitCode={es.get('exitCode')} signal={es.get('signal')}")
+        # Ensure Claude bg wake even if bind raced with process exit
+        try:
+            self._emit_bg_terminal_complete(tid)
+        except Exception as e:
+            self.file_log(f"wait_for_exit bg complete: {e}")
         return {"exitCode": es.get("exitCode"), "signal": es.get("signal")}
 
     async def _acp_terminal_kill(self, params: dict) -> dict:

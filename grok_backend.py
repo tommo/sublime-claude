@@ -21,10 +21,10 @@ import subprocess
 import time
 
 # --- model catalog ----------------------------------------------------------
-# Curated picker only (current defaults). Old grok-4 / 4.3 / 4-fast stay in
-# ALIASES for set_model if already saved, but are not listed.
+# Curated picker only (current defaults). Older grok-4.x stay in ALIASES
+# for set_model if already saved, but are not listed.
 GROK_MODELS = [
-    ("grok-4.5", "Grok 4.5"),
+    ("grok-4.6", "Grok 4.6"),
     ("grok-composer-2.5-fast", "Composer 2.5"),
     ("deepseek-v4-pro", "DeepSeek V4 Pro"),
     ("deepseek-v4-flash", "DeepSeek V4 Flash"),
@@ -32,7 +32,7 @@ GROK_MODELS = [
 
 # Never show these in the picker (legacy / noise from ACP availableModels).
 _GROK_PICKER_HIDDEN = frozenset({
-    "grok-4", "grok-4.0", "grok-4.1", "grok-4.2", "grok-4.3",
+    "grok-4", "grok-4.0", "grok-4.1", "grok-4.2", "grok-4.3", "grok-4.5",
     "grok-4-fast", "grok-4-fast-non-reasoning", "grok-4-fast-reasoning",
     "grok-3", "grok-3-mini", "grok-2", "grok-2-mini",
     "grok-beta", "grok-vision-beta",
@@ -40,7 +40,8 @@ _GROK_PICKER_HIDDEN = frozenset({
 
 # Short aliases → wire modelId for spawn / set_model
 GROK_MODEL_ALIASES = {
-    "grok-4.5": "grok-4.5",
+    "grok-4.6": "grok-4.6",
+    "grok-4.5": "grok-4.6",  # legacy saved sessions → current default
     "grok-4-fast": "grok-composer-2.5-fast",  # legacy → current fast
     "grok-composer-2.5-fast": "grok-composer-2.5-fast",
     "composer": "grok-composer-2.5-fast",
@@ -85,7 +86,7 @@ def model_supports_vision(model_id: str) -> bool:
     return not _is_deepseek_model(model_id)
 
 
-def normalize_grok_model(model_id: str, default: str = "grok-4.5") -> str:
+def normalize_grok_model(model_id: str, default: str = "grok-4.6") -> str:
     if not model_id:
         return default
     key = model_id.strip()
@@ -169,7 +170,7 @@ def _picker_hide(mid: str) -> bool:
         # Allow unknown current grok-* only if not matching old major lines
         if any(low.startswith(p) for p in (
             "grok-2", "grok-3", "grok-4", "grok-beta", "grok-vision",
-        )) and not low.startswith("grok-4.5"):
+        )) and not low.startswith("grok-4.6"):
             return True
     return False
 
@@ -562,10 +563,10 @@ def grok_dynamic_env(settings_dict):
         "ANTHROPIC_BASE_URL": mgr.base_url(),
         "ANTHROPIC_AUTH_TOKEN": mgr.token,
         "ANTHROPIC_API_KEY": "",  # clear sibling (SDK prefers API_KEY over AUTH_TOKEN)
-        # Map the Claude aliases to current Grok models. opus/sonnet -> grok-4.5;
+        # Map the Claude aliases to current Grok models. opus/sonnet -> grok-4.6;
         # haiku (small/fast role) -> grok-4-fast.
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.5",
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": "grok-4.5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "grok-4.6",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "grok-4.6",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "grok-4-fast",
         "ANTHROPIC_MODEL": "",
         "ANTHROPIC_SMALL_FAST_MODEL": "",
