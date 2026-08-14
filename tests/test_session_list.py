@@ -250,6 +250,62 @@ class TestRenderSessionList(unittest.TestCase):
             sublime._claude_sessions = {}
         self.assertEqual([r["session_id"] for r in rows], ["old", "new"])
 
+    def test_input_waiting_status_and_sort(self):
+        sl = _load()
+        q = types.SimpleNamespace(callback=lambda *_a, **_k: None)
+        waiting = types.SimpleNamespace(
+            is_sleeping=False, working=True,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=q, pending_plan=None,
+            ),
+        )
+        busy = types.SimpleNamespace(
+            is_sleeping=False, working=True,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=None, pending_plan=None,
+            ),
+        )
+        self.assertEqual(sl._status_of(waiting), "input")
+        self.assertEqual(sl._status_of(busy), "working")
+        self.assertEqual(sl._mark("input"), "❓")
+        row = {
+            "kind": "live", "session_id": "ask", "view_id": 1,
+            "name": "needs a choice", "backend": "kimi", "status": "input",
+            "query_count": 2, "same_window": True,
+            "last_access": 1, "last_activity": 1,
+        }
+        text, _ = sl.render_list([row], [], [], cols=80)
+        self.assertIn("❓", text)
+        self.assertIn("input", text)
+        import sublime
+        ask = types.SimpleNamespace(
+            session_id="ask", name="ask me", backend="kimi",
+            working=True, is_sleeping=False, query_count=1,
+            last_activity=1, last_access=1,
+            output=types.SimpleNamespace(
+                view=None, pending_permission=None,
+                pending_question=q, pending_plan=None,
+            ),
+            window=None, quick_mode=False,
+        )
+        work = types.SimpleNamespace(
+            session_id="work", name="busy", backend="grok",
+            working=True, is_sleeping=False, query_count=2,
+            last_activity=9, last_access=9,
+            output=types.SimpleNamespace(
+                view=None, pending_permission=None,
+                pending_question=None, pending_plan=None,
+            ),
+            window=None, quick_mode=False,
+        )
+        sublime._claude_sessions = {1: work, 2: ask}
+        try:
+            rows = sl.collect_live(None)
+        finally:
+            sublime._claude_sessions = {}
+        self.assertEqual([r["session_id"] for r in rows], ["ask", "work"])
+        self.assertEqual(rows[0]["status"], "input")
+
     def test_history_sorts_by_access_time(self):
         sl = _load()
         prev = sl.load_saved_sessions
@@ -265,6 +321,58 @@ class TestRenderSessionList(unittest.TestCase):
             sl.load_saved_sessions = prev
         self.assertEqual([r["session_id"] for r in here], ["b", "a"])
         self.assertEqual(other, [])
+
+    def test_live_filters_to_window_project(self):
+        sl = _load()
+        import sublime
+
+        class _Win:
+            def __init__(self, folders):
+                self._folders = folders
+
+            def folders(self):
+                return self._folders
+
+        here_win = _Win(["/proj/here"])
+        other_win = _Win(["/proj/other"])
+        here_s = types.SimpleNamespace(
+            session_id="here", name="this project", backend="grok",
+            working=False, is_sleeping=False, query_count=1,
+            last_activity=1, last_access=1,
+            output=types.SimpleNamespace(view=None), window=here_win,
+            quick_mode=False,
+        )
+        other_s = types.SimpleNamespace(
+            session_id="away", name="other project", backend="kimi",
+            working=True, is_sleeping=False, query_count=2,
+            last_activity=2, last_access=2,
+            output=types.SimpleNamespace(view=None), window=other_win,
+            quick_mode=False,
+        )
+        sublime._claude_sessions = {1: here_s, 2: other_s}
+        try:
+            rows = sl.collect_live(here_win)
+        finally:
+            sublime._claude_sessions = {}
+        self.assertEqual([r["session_id"] for r in rows], ["here"])
+
+    def test_render_hides_other_projects(self):
+        sl = _load()
+        here = [{
+            "kind": "saved", "session_id": "h", "view_id": None,
+            "name": "here", "backend": "grok", "status": "closed",
+            "query_count": 0, "project": "/p", "last_activity": 1,
+        }]
+        other = [{
+            "kind": "saved", "session_id": "o", "view_id": None,
+            "name": "elsewhere", "backend": "kimi", "status": "closed",
+            "query_count": 0, "project": "/q", "last_activity": 1,
+        }]
+        text, index = sl.render_list([], here, other, cols=80)
+        self.assertIn("here", text)
+        self.assertNotIn("elsewhere", text)
+        self.assertNotIn("other projects", text)
+        self.assertEqual([r["session_id"] for r in index], ["h"])
 
 
 if __name__ == "__main__":

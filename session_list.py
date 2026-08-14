@@ -50,9 +50,23 @@ def session_title(session) -> str:
     return one_line_title(name) or "(unnamed)"
 
 
+def awaiting_input(session) -> bool:
+    """True while a permission, question, or plan UI is waiting on the user."""
+    out = getattr(session, "output", None)
+    if not out:
+        return False
+    for attr in ("pending_permission", "pending_question", "pending_plan"):
+        req = getattr(out, attr, None)
+        if req is not None and getattr(req, "callback", None):
+            return True
+    return False
+
+
 def _status_of(session) -> str:
     if getattr(session, "is_sleeping", False):
         return "sleeping"
+    if awaiting_input(session):
+        return "input"
     if getattr(session, "working", False):
         return "working"
     return "ready"
@@ -76,7 +90,12 @@ def access_ts(obj) -> float:
 
 
 def _mark(status: str) -> str:
-    return {"working": "●", "sleeping": "⏸", "ready": "○"}.get(status, "·")
+    return {
+        "input": "❓",
+        "working": "●",
+        "sleeping": "⏸",
+        "ready": "○",
+    }.get(status, "·")
 
 
 def backend_abbrev(backend: str) -> str:
@@ -169,6 +188,32 @@ def format_when(ts, now=None) -> str:
     return f"{sec // (86400 * 7)}w"
 
 
+def window_project(window) -> str:
+    """This window's project root (first folder). Empty if none."""
+    try:
+        folders = window.folders() if window else None
+    except Exception:
+        folders = None
+    if folders:
+        return (folders[0] or "").rstrip("/")
+    return ""
+
+
+def session_project(session) -> str:
+    return window_project(getattr(session, "window", None))
+
+
+def belongs_to_window(session, window) -> bool:
+    """True when the session is this window's project (or this window if none)."""
+    want = window_project(window)
+    got = session_project(session)
+    if want:
+        if got:
+            return got == want
+        return getattr(session, "window", None) == window
+    return getattr(session, "window", None) == window
+
+
 def collect_live(window) -> List[dict]:
     out = []
     try:
@@ -179,6 +224,8 @@ def collect_live(window) -> List[dict]:
     for s in live_sessions:
         if getattr(s, "quick_mode", False):
             continue
+        if not belongs_to_window(s, window):
+            continue
         try:
             view = s.output.view if s.output else None
             view_ok = bool(view and view.is_valid())
@@ -186,7 +233,6 @@ def collect_live(window) -> List[dict]:
         except Exception:
             view_ok = False
             view_id = id(s)
-        win = getattr(s, "window", None)
         out.append({
             "kind": "live",
             "session_id": getattr(s, "session_id", None),
@@ -195,13 +241,14 @@ def collect_live(window) -> List[dict]:
             "backend": getattr(s, "backend", None) or "claude",
             "status": _status_of(s),
             "query_count": int(getattr(s, "query_count", 0) or 0),
-            "same_window": win == window,
+            "same_window": True,
             "last_access": access_ts(s),
             "last_activity": float(getattr(s, "last_activity", 0) or 0),
         })
-    # Awake (ready/working) stay above sleeping; access time within each band.
+    # Input wait first, then awake, then sleeping; access time within each band.
+    _band = {"input": 0, "working": 1, "ready": 1, "sleeping": 2}
     out.sort(key=lambda r: (
-        1 if r.get("status") == "sleeping" else 0,
+        _band.get(r.get("status"), 1),
         -access_ts(r),
     ))
     return out
@@ -246,8 +293,6 @@ def _right_meta(r: dict) -> str:
         stamp = format_when(r.get("last_access") or r.get("last_activity"))
     q = f"{r['query_count']}q" if r.get("query_count") else ""
     extra = f" {q:>4} {stamp:>7}"
-    if live and not r.get("same_window", True):
-        extra += "  other-win"
     return extra
 
 
@@ -290,8 +335,6 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
 
     add_section("RUNNING", live, _fmt_row)
     add_section("HISTORY", here, _fmt_row)
-    if other and not compact:
-        add_section("HISTORY (other projects)", other, _fmt_row)
     return "\n".join(lines).rstrip() + "\n", index
 
 
@@ -301,9 +344,9 @@ def build_for_window(window, cols: int = 0) -> Tuple[str, List[dict]]:
         cwd = window.folders()[0]
     live = collect_live(window)
     live_ids = {r["session_id"] for r in live if r.get("session_id")}
-    here, other = collect_history(live_ids, cwd)
+    here, _other = collect_history(live_ids, cwd)
     starred = load_bookmarks(cwd or None)
-    return render_list(live, here, other, starred, cols=cols)
+    return render_list(live, here, [], starred, cols=cols)
 
 
 def row_at_line(index: List[dict], line: int) -> Optional[dict]:

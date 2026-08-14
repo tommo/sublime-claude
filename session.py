@@ -6189,6 +6189,11 @@ class Session:
 
         # Show permission UI in output view
         self.output.permission_request(pid, tool, tool_input, on_response)
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
     def _handle_question_request(self, params: dict) -> None:
         """Handle AskUserQuestion from Claude - show inline question UI."""
@@ -6204,6 +6209,11 @@ class Session:
                 self.client.send("question_response", {"id": qid, "answers": answers})
 
         self.output.question_request(qid, questions, on_done)
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
     # ─── Plan Mode ─────────────────────────────────────────────────────
 
@@ -6258,6 +6268,11 @@ class Session:
             allowed_prompts=allowed_prompts,
             callback=on_response,
         )
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
 
         # Open plan file if found
         if plan_file and os.path.exists(plan_file):
