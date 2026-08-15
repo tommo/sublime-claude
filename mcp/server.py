@@ -369,7 +369,7 @@ Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
                 },
                 {
                     "name": "send_to_session",
-                    "description": "Send a message by stable agent_id (preferred). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. Prefer reuse over spawn.",
+                    "description": "Send a message by stable agent_id (preferred). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. If the target is mid-turn, the prompt is queued and runs after the current turn — do not wait for signal_complete to retry. Prefer reuse over spawn.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

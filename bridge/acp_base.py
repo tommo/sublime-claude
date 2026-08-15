@@ -434,7 +434,12 @@ class AcpBridge(BaseBridge):
         return meta
 
     def log_path(self) -> str:
-        return self.LOG_PATH
+        """Per-process file. Shared kimi_bridge.log is truncated on every
+        spawn and two sessions interleave — diagnoses hit the wrong tab.
+        """
+        base = self.LOG_PATH
+        root, ext = os.path.splitext(base)
+        return f"{root}.{os.getpid()}{ext or '.log'}"
 
     def file_log(self, msg: str) -> None:
         try:
@@ -489,8 +494,16 @@ class AcpBridge(BaseBridge):
             raise RuntimeError("agent process died; restart the session")
         args = self.agent_argv()
         try:
-            with open(self.log_path(), "w") as f:
-                f.write(f"# {self.BACKEND_NAME}-bridge — {args}, cwd={self.cwd}\n")
+            path = self.log_path()
+            with open(path, "w") as f:
+                f.write(
+                    f"# {self.BACKEND_NAME}-bridge — {args}, "
+                    f"cwd={self.cwd} pid={os.getpid()}\n")
+            shared = getattr(self, "LOG_PATH", None)
+            if shared and shared != path:
+                with open(shared, "a") as f:
+                    f.write(
+                        f"# {self.BACKEND_NAME} pid={os.getpid()} -> {path}\n")
         except Exception:
             pass
         env = self.spawn_env()
@@ -588,7 +601,13 @@ class AcpBridge(BaseBridge):
                     # Host uses this to avoid double-painting synthetic
                     # terminal/* tool rows when Kimi also emits tool_call.
                     self._last_session_tool_ts = time.time()
-                self._forward_update(params)
+                try:
+                    self._forward_update(params)
+                except Exception as e:
+                    # A crash here used to kill the ACP reader — Kimi's
+                    # terminal/create then sat in the pipe and ⚙ never ended.
+                    self.file_log(
+                        f"forward_update failed kind={kind}: {e}")
             elif method and "mcp" in method.lower():
                 # Surface MCP lifecycle (servers_updated, init_progress, …)
                 # Still skip foreign-session MCP chatter if tagged.
@@ -756,6 +775,14 @@ class AcpBridge(BaseBridge):
             if tool_name == "tool" and not tool_input:
                 # Wait for tool_call_update with title/kind/rawInput
                 return
+            # Kimi: title "Bash" then JSON drip. Emitting an empty row here
+            # plus later run_in_background painted two ⚙ with no process.
+            if (self._is_shell_tool_name(tool_name)
+                    and not (isinstance(tool_input, dict)
+                             and tool_input.get("command"))):
+                if tid:
+                    self._note_shell_execute(tid, tool_name)
+                return
             # One open ExitPlanMode at a time — second toolCallId aliases the first
             # (permission + session/update double-open painted two rows).
             if tool_name in ("ExitPlanMode", "EnterPlanMode") and tid:
@@ -778,20 +805,20 @@ class AcpBridge(BaseBridge):
             # Only shell may be ⚙ — TaskOutput/"Reading output…" never.
             if is_bg and not self._is_shell_tool_name(tool_name):
                 is_bg = False
-            if is_bg and tid:
-                self._bg_tool_ids.add(tid)
-                if isinstance(tool_input, dict):
-                    tool_input = {**tool_input, "run_in_background": True}
-                    self._tool_inputs_by_id[tid] = {
-                        **(self._tool_inputs_by_id.get(tid) or {}),
-                        **tool_input,
-                    }
+            # Cache the flag for terminal/create pairing. Do not ⚙ yet —
+            # Kimi spawn is create; ⚙ with no process never ends.
+            if is_bg and tid and isinstance(tool_input, dict):
+                tool_input = {**tool_input, "run_in_background": True}
+                self._tool_inputs_by_id[tid] = {
+                    **(self._tool_inputs_by_id.get(tid) or {}),
+                    **tool_input,
+                }
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
                 "name": tool_name,
                 "input": tool_input,
-                "background": is_bg,
+                "background": False,
             })
         elif kind == "tool_call_update":
             usage = self.usage_from_tool_update(upd)
@@ -865,7 +892,9 @@ class AcpBridge(BaseBridge):
                             "name": enrich_name,
                             "input": enriched or self._tool_inputs_by_id.get(tid) or {},
                         })
-            # Background: Claude host path (⚙ + task_started; notify on exit).
+            # Cache run_in_background for create pairing. Do not ⚙ / do not
+            # drop pending here — that left ⚙ unbound when create arrived
+            # later (or never), so the row never cleared.
             is_bg = bool(
                 tid and self._is_shell_tool_name(tool_name) and (
                     tid in self._bg_tool_ids
@@ -873,18 +902,21 @@ class AcpBridge(BaseBridge):
                 )
             )
             if is_bg and tid:
-                self._register_bg_tool(
-                    tid,
-                    tool_input=enriched or self._tool_inputs_by_id.get(tid),
-                    title=str(upd.get("title") or ""),
-                )
+                cached = dict(self._tool_inputs_by_id.get(tid) or {})
+                if isinstance(enriched, dict):
+                    cached.update(enriched)
+                cached["run_in_background"] = True
+                self._tool_inputs_by_id[tid] = cached
                 for term_id in self._terminal_ids_from_update(upd):
-                    self._bind_terminal_to_bg_tool(term_id, tid)
                     slot = self._terminals.get(term_id)
-                    if slot is not None:
-                        slot["bg"] = True
-                        slot["tool_use_id"] = tid
-                self._drop_pending_execute(tid)
+                    if slot is None:
+                        continue
+                    if tid not in self._bg_tool_ids:
+                        self._register_bg_tool(
+                            tid, cached, str(upd.get("title") or ""))
+                    self._bind_terminal_to_bg_tool(term_id, tid)
+                    slot["bg"] = True
+                    slot["tool_use_id"] = tid
 
             if status in ("completed", "failed"):
                 # No open row for this id → nothing to close (noise already dropped)
@@ -1014,6 +1046,10 @@ class AcpBridge(BaseBridge):
         ):
             self._handle_schedule_lifecycle(upd)
         # turn_completed / session_summary_generated: ignore (result RPC covers end)
+        # elif kind == "turn_completed":
+        #     pf = getattr(self, "_prompt_fut", None)
+        #     if pf is None or pf.done():
+        #         send_notification(...)  # fake result — rejected
 
     def _forward_load_replay(self, params: dict) -> None:
         """Paint session/load history. Kimi replays before load settles.
@@ -1029,22 +1065,31 @@ class AcpBridge(BaseBridge):
         if kind == "available_commands_update":
             self._handle_commands_update(upd)
             return
-        if kind == "user_message_chunk":
-            text = (upd.get("content") or {}).get("text", "")
-            if text:
-                send_notification("message", {
-                    "type": "replay_user", "text": text,
-                })
+        # Do not paint load replay into the view. output.prompt() on each
+        # user_message_chunk dumps the whole transcript, starts working=True,
+        # and exit_input_mode() — ◎ never comes back. Agent already has the
+        # history via session/load; UI uses _paint_resume_preview (last turn).
+        if kind in (
+            "user_message_chunk", "agent_message_chunk",
+            "agent_thought_chunk",
+        ):
             return
-        if kind == "agent_message_chunk":
-            text = (upd.get("content") or {}).get("text", "")
-            if text:
-                send_notification("message", {
-                    "type": "text_delta", "text": text, "replay": True,
-                })
-            return
-        if kind == "agent_thought_chunk":
-            return
+        # if kind == "user_message_chunk":
+        #     text = (upd.get("content") or {}).get("text", "")
+        #     if text:
+        #         send_notification("message", {
+        #             "type": "replay_user", "text": text,
+        #         })
+        #     return
+        # if kind == "agent_message_chunk":
+        #     text = (upd.get("content") or {}).get("text", "")
+        #     if text:
+        #         send_notification("message", {
+        #             "type": "text_delta", "text": text, "replay": True,
+        #         })
+        #     return
+        # if kind == "agent_thought_chunk":
+        #     return
         if kind == "tool_call":
             tool_name = self._normalize_tool_name(upd)
             tool_input = self._tool_input_from_update(upd, tool_name)
@@ -1062,14 +1107,14 @@ class AcpBridge(BaseBridge):
                     prev = self._tool_inputs_by_id.get(tid) or {}
                     self._tool_inputs_by_id[tid] = {**prev, **tool_input}
                 self._tool_ids_emitted.add(tid)
-            send_notification("message", {
-                "type": "tool_use",
-                "id": tid,
-                "name": tool_name,
-                "input": tool_input,
-                "background": False,
-                "replay": True,
-            })
+            # send_notification("message", {
+            #     "type": "tool_use",
+            #     "id": tid,
+            #     "name": tool_name,
+            #     "input": tool_input,
+            #     "background": False,
+            #     "replay": True,
+            # })
             return
         if kind == "tool_call_update":
             status = upd.get("status")
@@ -1089,23 +1134,23 @@ class AcpBridge(BaseBridge):
                     or status in ("completed", "failed")):
                 if not self._should_suppress_tool_row(upd, tool_name):
                     self._tool_ids_emitted.add(tid)
-                    send_notification("message", {
-                        "type": "tool_use",
-                        "id": tid,
-                        "name": tool_name,
-                        "input": enriched or self._tool_inputs_by_id.get(tid) or {},
-                        "background": False,
-                        "replay": True,
-                    })
+                    # send_notification("message", {
+                    #     "type": "tool_use",
+                    #     "id": tid,
+                    #     "name": tool_name,
+                    #     "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                    #     "background": False,
+                    #     "replay": True,
+                    # })
             if status in ("completed", "failed"):
-                text = self._extract_tool_content(upd, tool_name)
-                send_notification("message", {
-                    "type": "tool_result",
-                    "tool_use_id": tid,
-                    "content": text,
-                    "is_error": status == "failed",
-                    "replay": True,
-                })
+                # text = self._extract_tool_content(upd, tool_name)
+                # send_notification("message", {
+                #     "type": "tool_result",
+                #     "tool_use_id": tid,
+                #     "content": text,
+                #     "is_error": status == "failed",
+                #     "replay": True,
+                # })
                 self._tool_ids_emitted.discard(tid)
 
     # ── Scheduler / /loop (Grok native) ────────────────────────────────
@@ -2116,8 +2161,15 @@ class AcpBridge(BaseBridge):
             return False
         if isinstance(ri, dict) and (
                 ri.get("run_in_background") is True
-                or ri.get("detached") is True):
+                or ri.get("detached") is True
+                or ri.get("background") is True):
             return True
+        # Grok: timeout 0 on run_terminal_command = no-timeout / bg
+        # (same session: background:true detaches; timeout:0 still
+        # wait_for_exit — still ⚙ so the row is not a blocking ☐).
+        if isinstance(ri, dict) and ri.get("timeout") in (0, 0.0):
+            if "run_terminal_command" in title or title.startswith("Execute "):
+                return True
         return False
 
     def _note_shell_execute(self, tid: Optional[str], tool_name: str) -> None:
@@ -2161,7 +2213,7 @@ class AcpBridge(BaseBridge):
                 return str(args[i + 1])
         return str(cmd or "")
 
-    @classmethod
+    @staticmethod
     def _terminal_ids_from_update(upd: dict) -> List[str]:
         out = []
         for block in (upd.get("content") or []):
@@ -2470,7 +2522,14 @@ class AcpBridge(BaseBridge):
             self.log(f"session/load failed for {resume_id!r}: {e}")
             return False
         finally:
-            self._loading_session = False
+            # Trailing session/update after the load RPC is still replay.
+            # Clearing immediately lets those adopt as a live ⚙ and steal ◎.
+            def _end_load():
+                self._loading_session = False
+            try:
+                asyncio.get_running_loop().call_later(0.4, _end_load)
+            except Exception:
+                self._loading_session = False
 
     async def _create_session(self, mcp_servers: list, *,
                                system_prompt: str = "",

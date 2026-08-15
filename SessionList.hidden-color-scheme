@@ -5,7 +5,7 @@
         "foreground": "#cbccc6",
         "caret": "#ffcc66",
         "selection": "#33415e",
-        "line_highlight": "#191e2a",
+        "line_highlight": "#2a3348",
         "gutter": "#1f2430"
     },
     "rules": [
@@ -22,6 +22,14 @@
         {
             "scope": "keyword.working.session-list",
             "foreground": "#ffad66"
+        },
+        {
+            "scope": "keyword.input.session-list",
+            "foreground": "#f28779"
+        },
+        {
+            "scope": "keyword.unread.session-list",
+            "foreground": "#ffcc66"
         },
         {
             "scope": "keyword.ready.session-list",

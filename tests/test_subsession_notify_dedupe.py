@@ -22,6 +22,7 @@ from session_registry import (  # noqa: E402
     child_parent_already_notified,
     mark_child_parent_notified,
     fire_subsession_waits,
+    parent_notify_should_inject,
 )
 
 
@@ -70,11 +71,16 @@ class _Child:
 
 
 class TestAlreadyNotified(unittest.TestCase):
-    def test_mark_blocks_second_fire(self):
+    def test_inject_xor_waiter_same_completion_only(self):
+        """Waiter delivered this complete → do not also inject/queue."""
+        self.assertTrue(parent_notify_should_inject(0))
+        self.assertFalse(parent_notify_should_inject(1))
+
+    def test_next_complete_can_inject_again(self):
         c = _Child()
-        self.assertFalse(child_parent_already_notified(c))
         mark_child_parent_notified(c)
-        self.assertTrue(child_parent_already_notified(c))
+        # Lifetime flag must not block a later round.
+        self.assertTrue(parent_notify_should_inject(0, c))
         self.assertEqual(fire_subsession_waits(c, "done"), 0)
 
 

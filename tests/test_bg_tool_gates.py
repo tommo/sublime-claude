@@ -1,4 +1,5 @@
 """Background tool gates: TaskOutput is never ⚙ Read (background)."""
+import json
 import os
 import sys
 import unittest
@@ -70,6 +71,16 @@ class TestNormalizeTaskOutputTitle(unittest.TestCase):
         self.assertTrue(AcpBridge._looks_like_background_tool({
             "title": "Bash",
         }, {"command": "pil test", "run_in_background": True}))
+        self.assertTrue(AcpBridge._looks_like_background_tool({
+            "title": "run_terminal_command",
+        }, {"command": "pil test -t play", "background": True}))
+        self.assertTrue(AcpBridge._looks_like_background_tool({
+            "title": "run_terminal_command",
+        }, {"command": "pil test -t play", "timeout": 0,
+            "description": "Start XR play test in background"}))
+        self.assertFalse(AcpBridge._looks_like_background_tool({
+            "title": "Bash",
+        }, {"command": "echo", "timeout": 0}))
 
     def test_shell_name_gate(self):
         self.assertTrue(AcpBridge._is_shell_tool_name("Bash"))
@@ -141,6 +152,31 @@ class TestMarkTerminalBg(unittest.TestCase):
         self.assertFalse(slot.get("bg"))
         # still consumed so it cannot stain a later execute
         self.assertEqual(b._pending_execute_ids, [])
+
+    def test_streamed_run_in_background_pairs_on_create(self):
+        """⚙ only at terminal/create — streamed flag must stay pending."""
+        b = _TermStub()
+        b._note_shell_execute("tool-rib", "Bash")
+        b._tool_inputs_by_id["tool-rib"] = {
+            "command": "pil test -t ui 2>&1 | tail -40",
+            "run_in_background": True,
+        }
+        self.assertNotIn("tool-rib", b._bg_tool_ids)
+        slot = {"cmd": "cd '/Volumes/prj/pil' && pil test -t ui 2>&1 | tail -40"}
+        b._mark_terminal_bg("term_rib", slot)
+        self.assertTrue(slot.get("bg"))
+        self.assertEqual(slot.get("tool_use_id"), "tool-rib")
+        self.assertIn("tool-rib", b._bg_tool_ids)
+        self.assertEqual(b._pending_execute_ids, [])
+
+    def test_log_path_is_per_pid(self):
+        class _Log(AcpBridge):
+            def __init__(self):
+                self.LOG_PATH = "/tmp/kimi_bridge.log"
+
+        p = _Log().log_path()
+        self.assertIn(str(os.getpid()), p)
+        self.assertNotEqual(p, "/tmp/kimi_bridge.log")
 
     def test_native_detached_meta_marks(self):
         b = _TermStub()
@@ -217,8 +253,93 @@ class _ReplayStub(AcpBridge):
         pass
 
 
+class _FwdStub(AcpBridge):
+    def __init__(self):
+        self.session_id = "session_test"
+        self._loading_session = False
+        self._foreign_session_drops = 0
+        self._tool_names_by_id = {}
+        self._tool_inputs_by_id = {}
+        self._tool_ids_emitted = set()
+        self._tool_id_alias = {}
+        self._bg_tool_ids = set()
+        self._pending_execute_ids = []
+        self._last_execute_id = None
+        self._terminals = {}
+        self._terminal_bg = {}
+        self._tool_titles_by_id = {}
+        self._prompt_fut = None
+        self._prompt_cancelled = False
+        self.TOOL_TO_CANONICAL = dict(AcpBridge.TOOL_TO_CANONICAL)
+
+    def file_log(self, msg):
+        pass
+
+
+class TestForwardNoEarlyGear(unittest.TestCase):
+    def test_empty_bash_then_rib_is_not_gear_until_create(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _FwdStub()
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "19:tool_x",
+                    "title": "Bash",
+                    "kind": "execute",
+                    "status": "pending",
+                    "content": [{"type": "content",
+                                 "content": {"type": "text", "text": ""}}],
+                },
+            })
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "19:tool_x",
+                    "status": "in_progress",
+                    "content": [{"type": "content", "content": {
+                        "type": "text",
+                        "text": json.dumps({
+                            "command": "pil test -t ui 2>&1 | tail -40",
+                            "run_in_background": True,
+                            "description": "Run copilot UI test",
+                        }),
+                    }}],
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        uses = [p for _, p in notes if p.get("type") == "tool_use"]
+        self.assertEqual(len(uses), 1, uses)
+        self.assertFalse(uses[0].get("background"))
+        self.assertNotIn("19:tool_x", b._bg_tool_ids)
+        self.assertTrue(
+            (b._tool_inputs_by_id.get("19:tool_x") or {}).get(
+                "run_in_background"))
+        self.assertIn("19:tool_x", b._pending_execute_ids)
+
+    def test_terminal_ids_from_update_is_static(self):
+        ids = AcpBridge._terminal_ids_from_update({
+            "content": [{"type": "terminal", "terminalId": "term_ab"}],
+        })
+        self.assertEqual(ids, ["term_ab"])
+        b = _FwdStub()
+        ids = b._terminal_ids_from_update({
+            "content": [{"type": "content", "content": {
+                "type": "terminal", "terminalId": "term_cd",
+            }}],
+        })
+        self.assertEqual(ids, ["term_cd"])
+
+
 class TestLoadReplay(unittest.TestCase):
-    def test_load_replay_forwards_user_and_assistant(self):
+    def test_load_replay_does_not_paint_history(self):
+        """session/load replay must not dump turns (kills ◎ via prompt())."""
         import acp_base
         notes = []
         orig = acp_base.send_notification
@@ -240,11 +361,8 @@ class TestLoadReplay(unittest.TestCase):
         finally:
             acp_base.send_notification = orig
         kinds = [p.get("type") for _, p in notes]
-        self.assertIn("replay_user", kinds)
-        self.assertIn("text_delta", kinds)
-        text = next(p for _, p in notes if p.get("type") == "text_delta")
-        self.assertTrue(text.get("replay"))
-        self.assertEqual(text.get("text"), "hi back")
+        self.assertNotIn("replay_user", kinds)
+        self.assertNotIn("text_delta", kinds)
 
 
 if __name__ == "__main__":

@@ -270,7 +270,29 @@ class TestRenderSessionList(unittest.TestCase):
         )
         self.assertEqual(sl._status_of(waiting), "input")
         self.assertEqual(sl._status_of(busy), "working")
-        self.assertEqual(sl._mark("input"), "❓")
+        compacting = types.SimpleNamespace(
+            is_sleeping=False, working=False, _compacting=True,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=None, pending_plan=None,
+            ),
+        )
+        self.assertEqual(sl._status_of(compacting), "working")
+        self.assertEqual(sl._mark("input"), "?")
+        self.assertEqual(sl._mark("unread"), "*")
+        unread = types.SimpleNamespace(
+            is_sleeping=False, working=False, unread=True, _compacting=False,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=None, pending_plan=None,
+            ),
+        )
+        self.assertEqual(sl._status_of(unread), "unread")
+        unread_working = types.SimpleNamespace(
+            is_sleeping=False, working=True, unread=True, _compacting=False,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=None, pending_plan=None,
+            ),
+        )
+        self.assertEqual(sl._status_of(unread_working), "working")
         row = {
             "kind": "live", "session_id": "ask", "view_id": 1,
             "name": "needs a choice", "backend": "kimi", "status": "input",
@@ -278,8 +300,17 @@ class TestRenderSessionList(unittest.TestCase):
             "last_access": 1, "last_activity": 1,
         }
         text, _ = sl.render_list([row], [], [], cols=80)
-        self.assertIn("❓", text)
+        self.assertIn("? ", text)
         self.assertIn("input", text)
+        urow = {
+            "kind": "live", "session_id": "u1", "view_id": 2,
+            "name": "done in background", "backend": "grok", "status": "unread",
+            "query_count": 1, "same_window": True,
+            "last_access": 1, "last_activity": 1,
+        }
+        utext, _ = sl.render_list([urow], [], [], cols=80)
+        self.assertIn("* ", utext)
+        self.assertIn("unread", utext)
         import sublime
         ask = types.SimpleNamespace(
             session_id="ask", name="ask me", backend="kimi",

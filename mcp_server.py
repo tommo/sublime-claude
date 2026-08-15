@@ -1478,11 +1478,18 @@ class MCPSocketServer:
         aid = getattr(session, "agent_id", None)
         name = session.name or "(unnamed)"
 
-        if session.working:
+        if session.working or getattr(session, "_compacting", False):
+            # Mid-turn: queue for _on_done. Returning "busy" made callers
+            # skip send and wait for signal_complete — the brief never landed.
+            session.queue_prompt(prompt)
+            print(f"[MCP send:{aid or rid}] busy → queued ({prompt[:60]!r})")
             return {
-                "error": "Session is busy",
+                "sent": True,
+                "queued": True,
                 "agent_id": aid,
                 "view_id": rid,
+                "name": name,
+                "message": "Target is mid-turn; prompt queued and will run next.",
             }
 
         sleeping = False
@@ -2813,6 +2820,7 @@ class MCPSocketServer:
         }
         session._signal_complete_gen = pending["gen"]
         session._pending_signal_complete = pending
+        # Each signal_complete is a new round. Do not keep a lifetime skip.
 
         print(
             f"[Claude] signal_complete: schedule parent={parent_view_id} "
@@ -2903,20 +2911,12 @@ class MCPSocketServer:
                 return
 
             # 3) Deliver exactly once.
-            # Prefer host wait_for_subsession waiters (custom wake_prompt).
-            # Else direct parent inject. Never both — that double-notified the
-            # parent. wait_for_subsession also best-effort registers notalone2,
-            # so skip daemon when host waiters already fired.
+            # Keep _pending_signal_complete set until we finish so child
+            # _on_done does not also fire_subsession_waits (that raced:
+            # wait notify started a turn, then this path queue_prompt'd
+            # the same completion).
             if getattr(session, "_pending_signal_complete", None) is not cur:
                 return
-            if session_registry.child_parent_already_notified(session):
-                session._pending_signal_complete = None
-                print(
-                    f"[Claude] signal_complete: parent already notified "
-                    f"for {getattr(session, 'agent_id', None)} — skip"
-                )
-                return
-            session._pending_signal_complete = None
             wake_prompt, b, line = _build_wake()
             summary = pending.get("result_summary")
 
@@ -2932,7 +2932,9 @@ class MCPSocketServer:
             except Exception as e:
                 print(f"[Claude] signal_complete: host waits failed: {e}")
 
-            if n_waits > 0:
+            if not session_registry.parent_notify_should_inject(
+                    n_waits, session):
+                session._pending_signal_complete = None
                 return
 
             try:
@@ -2951,9 +2953,9 @@ class MCPSocketServer:
                         wake_prompt, display_prompt="📬 Subsession complete"
                     )
                 session_registry.mark_child_parent_notified(session)
+                session._pending_signal_complete = None
             except Exception as e:
                 print(f"[Claude] signal_complete: inject failed: {e}")
-                session._pending_signal_complete = cur
                 sublime.set_timeout(try_deliver, parent_poll_ms)
                 return
 

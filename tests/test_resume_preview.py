@@ -78,6 +78,42 @@ class TestResumePreview(unittest.TestCase):
         self.assertIn("⚙ read_file", format_turn_body(turns[0]))
         self.assertIn("yo", format_turn_body(turns[0]))
 
+    def test_parse_grok_skips_system_reminder_user(self):
+        recs = [
+            {"type": "user", "content": [{"type": "text", "text": "move the sim hands."}]},
+            {"type": "assistant", "content": "ok",
+             "tool_calls": [{"name": "run_terminal_command"}]},
+            {"type": "user", "content": [{
+                "type": "text",
+                "text": "<system-reminder>\nBackground task \"term_d976b6dc3d\" "
+                        "completed (terminated by signal SIGTERM).\n</system-reminder>",
+            }]},
+            {"type": "assistant", "tool_calls": [
+                {"name": "run_terminal_command"},
+                {"name": "run_terminal_command"},
+            ]},
+        ]
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+            turns = parse_grok_chat(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["prompt"], "move the sim hands.")
+        self.assertEqual(turns[0]["reply"], "ok")
+        self.assertEqual(
+            turns[0]["tools"],
+            ["run_terminal_command", "run_terminal_command", "run_terminal_command"],
+        )
+        body = format_turn_body(turns[0])
+        self.assertIn("⚙ run_terminal_command ×3", body)
+        self.assertNotIn("system-reminder", body)
+        self.assertNotIn("term_d976b6dc3d", body)
+
     def test_parse_kimi_wire(self):
         path = os.path.join(_ROOT, "tests", "fixtures", "kimi_wire_preview.jsonl")
         turns = parse_kimi_wire(path)
@@ -88,6 +124,28 @@ class TestResumePreview(unittest.TestCase):
         self.assertEqual(turns[1]["prompt"], "so richlabel has no cache?")
         self.assertEqual(turns[1]["tools"], ["Grep"])
         self.assertIn("no cache", turns[1]["reply"])
+
+    def test_parse_kimi_wire_drops_cancelled_prompt(self):
+        recs = [
+            {"type": "turn.prompt", "input": "keep me", "origin": {"kind": "user"}},
+            {"type": "context.append_loop_event",
+             "event": {"type": "content.part",
+                       "part": {"type": "text", "text": "ok"}}},
+            {"type": "turn.prompt", "input": "go", "origin": {"kind": "user"}},
+            {"type": "turn.cancel"},
+        ]
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                for r in recs:
+                    f.write(json.dumps(r) + "\n")
+            turns = parse_kimi_wire(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["prompt"], "keep me")
+        self.assertEqual(turns[0]["reply"], "ok")
 
     def test_load_turns_kimi_empty_without_store(self):
         self.assertEqual(load_turns("session_missing", "kimi"), [])

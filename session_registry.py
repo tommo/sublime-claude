@@ -455,6 +455,15 @@ def child_parent_already_notified(child_session: Any) -> bool:
     return bool(getattr(child_session, "_parent_notified", False))
 
 
+def parent_notify_should_inject(n_waits: int, child_session: Any = None) -> bool:
+    """False when this delivery already went through a waiter.
+
+    Only this completion: waiter query/queue XOR default inject — not a
+    lifetime lock. Next signal_complete is a new delivery.
+    """
+    return int(n_waits or 0) <= 0
+
+
 def mark_child_parent_notified(child_session: Any) -> None:
     try:
         child_session._parent_notified = True
@@ -473,9 +482,6 @@ def fire_subsession_waits(
     registered wake_prompt is empty or the stock default, so parents get one
     complete notification instead of a thin stub + a second inject.
     """
-    if child_parent_already_notified(child_session):
-        return 0
-
     aliases = []
     for attr in ("agent_id", "subsession_id"):
         v = getattr(child_session, attr, None)

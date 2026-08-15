@@ -459,6 +459,7 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 return
 
         # Update this session's status and title
+        s._set_unread(False)
         s._update_status_bar()
         s.output.set_name(s.display_name)
 
@@ -716,13 +717,17 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
             # history or crossing → history only (exclude draft)
             return ("claude_select_history", {})
 
-        # Undo: draft → soft; history → no-op (never rewind transcript)
+        # Undo: draft → soft; history → no-op (never rewind transcript).
+        # Only rewrite hard undo/redo. Rewriting soft_* → soft_* loops
+        # ("Error rewriting command soft_redo. Encountered infinite loop").
         if command_name in self._INPUT_UNDO_COMMANDS:
             if not in_draft:
                 return ("noop", {})
-            if command_name in ("redo", "soft_redo"):
+            if command_name == "redo":
                 return ("soft_redo", {})
-            return ("soft_undo", {})
+            if command_name == "undo":
+                return ("soft_undo", {})
+            return None
 
         if command_name.startswith("claude_"):
             return None

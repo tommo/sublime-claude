@@ -122,9 +122,12 @@ def parse_grok_chat(path: str) -> List[dict]:
                 et = rec.get("type")
                 if et == "user":
                     prompt = _flatten(rec.get("content"))
-                    if prompt:
-                        cur = _new_turn(prompt)
-                        turns.append(cur)
+                    if not prompt or _skip_synthetic_prompt(prompt):
+                        # Keep cur so the following assistant tools stay on
+                        # the real user turn, not a fake ◎ system-reminder.
+                        continue
+                    cur = _new_turn(prompt)
+                    turns.append(cur)
                 elif et == "assistant" and cur is not None:
                     cur["reply"] += _flatten(rec.get("content"))
                     for tc in rec.get("tool_calls") or []:
@@ -146,15 +149,26 @@ def _kimi_prompt_text(rec: dict) -> str:
     return ""
 
 
-def _kimi_skip_prompt(text: str, origin: str) -> bool:
+def _skip_synthetic_prompt(text: str, origin: str = "") -> bool:
+    """Host/agent injects, not a real ◎ user turn (Grok stores these as type=user)."""
     if origin == "task":
         return True
     t = (text or "").lstrip()
-    return t.startswith((
+    if t.startswith((
         "<system-reminder>",
         "<task-notification>",
         "<notification",
-    ))
+        "<user_info>",
+    )):
+        return True
+    # Reminder after other wrappers
+    if "<system-reminder>" in t[:200]:
+        return True
+    return False
+
+
+def _kimi_skip_prompt(text: str, origin: str) -> bool:
+    return _skip_synthetic_prompt(text, origin)
 
 
 def parse_kimi_wire(path: str) -> List[dict]:
@@ -172,6 +186,12 @@ def parse_kimi_wire(path: str) -> List[dict]:
                 except json.JSONDecodeError:
                     continue
                 kind = rec.get("type")
+                if kind == "turn.cancel":
+                    # Rejected prompt (agent_busy) — drop the empty turn.
+                    if cur is not None and not cur.get("reply") and not cur.get("tools"):
+                        turns.pop()
+                        cur = turns[-1] if turns else None
+                    continue
                 if kind == "turn.prompt":
                     text = _kimi_prompt_text(rec)
                     origin = str((rec.get("origin") or {}).get("kind") or "")
@@ -258,9 +278,18 @@ def format_turn_body(turn: dict) -> str:
     reply = (turn.get("reply") or "").rstrip()
     parts = []
     if tools:
-        shown = tools[:24]
-        lines = [f"⚙ {n}" for n in shown]
-        extra = len(tools) - len(shown)
+        collapsed = []
+        for n in tools:
+            if collapsed and collapsed[-1][0] == n:
+                collapsed[-1] = (n, collapsed[-1][1] + 1)
+            else:
+                collapsed.append((n, 1))
+        shown = collapsed[:12]
+        lines = [
+            f"⚙ {n}" + (f" ×{c}" if c > 1 else "")
+            for n, c in shown
+        ]
+        extra = len(collapsed) - len(shown)
         if extra > 0:
             lines.append(f"⚙ … +{extra} more")
         parts.append("\n".join(lines))

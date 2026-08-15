@@ -67,8 +67,12 @@ def _status_of(session) -> str:
         return "sleeping"
     if awaiting_input(session):
         return "input"
-    if getattr(session, "working", False):
+    # Kimi /compact: session/prompt returns end_turn immediately while
+    # compaction continues. working can drop; _compacting is the live flag.
+    if getattr(session, "working", False) or getattr(session, "_compacting", False):
         return "working"
+    if getattr(session, "unread", False):
+        return "unread"
     return "ready"
 
 
@@ -91,7 +95,8 @@ def access_ts(obj) -> float:
 
 def _mark(status: str) -> str:
     return {
-        "input": "❓",
+        "input": "?",
+        "unread": "*",
         "working": "●",
         "sleeping": "⏸",
         "ready": "○",
@@ -246,7 +251,7 @@ def collect_live(window) -> List[dict]:
             "last_activity": float(getattr(s, "last_activity", 0) or 0),
         })
     # Input wait first, then awake, then sleeping; access time within each band.
-    _band = {"input": 0, "working": 1, "ready": 1, "sleeping": 2}
+    _band = {"input": 0, "unread": 0, "working": 1, "ready": 1, "sleeping": 2}
     out.sort(key=lambda r: (
         _band.get(r.get("status"), 1),
         -access_ts(r),

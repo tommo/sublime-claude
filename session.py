@@ -228,6 +228,8 @@ class Session:
         # Kimi /compact returns immediately while compaction runs in the
         # background — keep UI busy until we see completion text.
         self._compacting: bool = False
+        # Idle after a turn while the sheet is not focused — Sessions list.
+        self.unread: bool = False
         self.is_looping = False  # agent armed a self-wake/cron → title shows ↻ until manual takeover
         self.next_wake_at: Optional[float] = None  # epoch of the pending self-wake (for the wakeup banner)
         # Quick Agent: lives in a bottom panel (not a doc tab). Lightweight
@@ -306,8 +308,10 @@ class Session:
         # Multiple bg tasks finishing close together → single wake.
         self._pending_bg_notifications: List[str] = []
         self._pending_bg_task_ids: set = set()  # dedupe acp-term + bash-* same job
+        self._pending_bg_tool_ids: set = set()
         self._bg_flush_scheduled: bool = False
         self._bg_notified_task_ids: set = set()  # already woken / delivered this session
+        self._bg_notified_tool_ids: set = set()
         self._bg_poll_timer = None  # sublime.set_timeout handle for between-query bg task polling
         # Bumped to invalidate in-flight set_timeout chains (ST cannot cancel them).
         self._bg_poll_epoch: int = 0
@@ -772,6 +776,9 @@ class Session:
                 print(f"[Claude] resume preview: {e}")
         # Same inline input UX as a normal session
         self._enter_input_with_draft()
+        # Load-replay / preview prompt() can exit ◎ after this returns.
+        if self.resume_id and not self.fork:
+            self._ensure_resume_input()
 
     def _load_env(self, settings) -> dict:
         """Load environment variables from settings and project profile."""
@@ -1367,6 +1374,7 @@ class Session:
             if tag in {
                 "task-notification", "channel", "subsession",
                 "wake", "inject", "timer", "notification", "retain",
+                "system-reminder",
             }:
                 return True
         # Bracketed synthetic markers
@@ -1638,6 +1646,7 @@ class Session:
         if is_compact:
             self._compacting = True
 
+        self._suppress_adopt = False
         self.touch_access()
         self.working = True
         self._awaiting_query_rpc = True  # _on_done owns idle; adopt path does not
@@ -1955,8 +1964,9 @@ class Session:
         # fallback when the child never called it — otherwise we double-queue
         # (custom waiter + stock "✅ Subsession … completed").
         if getattr(self, "parent_agent_id", None) or getattr(self, "parent_view_id", None):
-            if (getattr(self, "_pending_signal_complete", None)
-                    or getattr(self, "_parent_notified", False)):
+            # In-flight signal_complete will deliver. Do not also fire
+            # waiters here — that queued the same body on top of the notify.
+            if getattr(self, "_pending_signal_complete", None):
                 pass
             else:
                 try:
@@ -2657,6 +2667,10 @@ class Session:
             return
 
         self._interrupting = True
+        # Adopt opens ◎ ⚙ task completed ▶ from leftover tool/text after
+        # Esc. That turn has no prompt RPC, so it never ends; Esc again
+        # → *[interrupted]* → more leftovers → adopt again.
+        self._suppress_adopt = True
         if getattr(self, "_compacting", False):
             self._compacting = False
             self.current_tool = None
@@ -3621,6 +3635,36 @@ class Session:
             "plan_todos": self._on_msg_plan_todos,
         }
 
+    def _session_view_focused(self) -> bool:
+        """True when this session's output sheet is the window's active view."""
+        try:
+            v = self.output.view if self.output else None
+            if not v or not v.is_valid():
+                return False
+            w = v.window()
+            if not w:
+                return False
+            av = w.active_view()
+            return bool(av and av.id() == v.id())
+        except Exception:
+            return False
+
+    def _set_unread(self, on: bool) -> None:
+        on = bool(on)
+        if bool(getattr(self, "unread", False)) == on:
+            return
+        self.unread = on
+        try:
+            if self.output:
+                self.output._update_title()
+        except Exception:
+            pass
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
+
     def _set_turn_phase(self, phase: str) -> None:
         """Update busy sub-state (waiting | responding | tool | idle).
 
@@ -3631,6 +3675,11 @@ class Session:
         if getattr(self, "turn_phase", None) == phase:
             return
         self.turn_phase = phase
+        if phase == "idle":
+            if self._session_view_focused():
+                self._set_unread(False)
+            else:
+                self._set_unread(True)
         try:
             if self.output:
                 self.output._update_title()
@@ -3742,14 +3791,33 @@ class Session:
         except Exception as e:
             print(f"[Claude] plan_todos: {e}")
 
+    def _ensure_resume_input(self) -> None:
+        """Re-open ◎ after resume even if a late paint tore it out."""
+        def _again(n=0):
+            if self.working or getattr(self, "_quick_finished", False):
+                return
+            if not self.output:
+                return
+            if self.output.is_input_mode():
+                if n < 8:
+                    sublime.set_timeout(lambda: _again(n + 1), 120)
+                return
+            self._input_mode_entered = False
+            self._enter_input_with_draft()
+            if n < 8:
+                sublime.set_timeout(lambda: _again(n + 1), 120)
+
+        sublime.set_timeout(lambda: _again(), 200)
+
     def _on_msg_replay_user(self, params: dict) -> None:
-        """session/load replay of a prior user turn — no ⚙, no adopt."""
-        text = (params.get("text") or "").strip()
-        if text and self.output:
-            try:
-                self.output.prompt(text)
-            except Exception as e:
-                print(f"[Claude] replay_user: {e}")
+        """session/load user chunk — do not call output.prompt() (kills ◎)."""
+        # text = (params.get("text") or "").strip()
+        # if text and self.output:
+        #     try:
+        #         self.output.prompt(text)
+        #     except Exception as e:
+        #         print(f"[Claude] replay_user: {e}")
+        return
 
     def _on_msg_tool_use(self, params: dict) -> None:
         name = params.get("name", "")
@@ -3931,6 +3999,11 @@ class Session:
         """
         if self.working or not self.output:
             return
+        if getattr(self, "_suppress_adopt", False):
+            return
+        # last = float(getattr(self, "_last_result_at", 0) or 0)
+        # if last and (time.time() - last) < 2.0:
+        #     return
         self.working = True
         self._awaiting_query_rpc = False  # no host query RPC; result ends us
         self._query_start = time.time()
@@ -3951,9 +4024,11 @@ class Session:
             # Drop any host wake buffered for the same bg complete
             self._pending_bg_notifications.clear()
             self._pending_bg_task_ids.clear()
+            getattr(self, "_pending_bg_tool_ids", set()).clear()
             self._bg_flush_scheduled = False
         except Exception as e:
             print(f"[Claude] adopt agent turn: {e}")
+        # self._arm_adopt_idle()
         try:
             sublime.set_timeout(
                 lambda: self._enter_input_with_draft() if self.working else None,
@@ -4063,6 +4138,8 @@ class Session:
             self._update_status_bar()
 
     def _on_msg_result(self, params: dict) -> None:
+        # self._last_result_at = time.time()
+        # self._adopt_idle_gen = int(getattr(self, "_adopt_idle_gen", 0) or 0) + 1
         # Capture session ID for resume
         if params.get("session_id"):
             self.session_id = params["session_id"]
@@ -4116,9 +4193,14 @@ class Session:
             except Exception:
                 pass
         else:
-            self.output.meta(dur, cost, usage=usage)
+            # /compact RPC ends before compaction does — @done here makes
+            # the session look idle while Kimi is still compacting.
+            if not getattr(self, "_compacting", False):
+                self.output.meta(dur, cost, usage=usage)
         self._update_status_bar()
         # Adopted agent-only turn (no host query RPC / _on_done): go idle here.
+        if getattr(self, "_compacting", False):
+            return
         if (
             self.working
             and not getattr(self, "_awaiting_query_rpc", False)
@@ -4294,6 +4376,35 @@ class Session:
         # the notification can still wake the agent.
         self._finalize_bg_tool(tool_use_id, keep=(status == "completed"))
 
+    def _alias_bg_task_ids(self, tool_use_id: str, task_id: str = "") -> set:
+        """All task_ids bound to this tool (acp-term-* and bash-* for one job)."""
+        ids = set()
+        if task_id:
+            ids.add(str(task_id))
+        if tool_use_id:
+            for tid, tuid in (self._task_tool_map or {}).items():
+                if tuid == tool_use_id:
+                    ids.add(str(tid))
+        return ids
+
+    def _bg_notify_already(self, task_id: str = "", tool_use_id: str = "") -> bool:
+        if tool_use_id and tool_use_id in getattr(self, "_bg_notified_tool_ids", ()):
+            return True
+        if tool_use_id and tool_use_id in getattr(self, "_pending_bg_tool_ids", ()):
+            return True
+        for tid in self._alias_bg_task_ids(tool_use_id, task_id):
+            if tid in self._bg_notified_task_ids or tid in self._pending_bg_task_ids:
+                return True
+        return False
+
+    def _mark_bg_notify_ids(self, task_id: str = "", tool_use_id: str = "") -> None:
+        if tool_use_id:
+            self._bg_notified_tool_ids.add(tool_use_id)
+            getattr(self, "_pending_bg_tool_ids", set()).discard(tool_use_id)
+        for tid in self._alias_bg_task_ids(tool_use_id, task_id):
+            self._bg_notified_task_ids.add(tid)
+            self._pending_bg_task_ids.discard(tid)
+
     def _note_task_poll_delivery(self, tool_name: str, content: str) -> None:
         """Mark bash-* tasks the agent already saw via TaskGet/TaskOutput.
 
@@ -4321,9 +4432,8 @@ class Session:
         import re
         for m in re.finditer(r"\b(bash-[\w-]+)\b", text, flags=re.I):
             tid = m.group(1)
-            self._bg_notified_task_ids.add(tid)
-            # Drop a buffered wake for this id if any
-            self._pending_bg_task_ids.discard(tid)
+            tuid = (self._task_tool_map or {}).get(tid) or ""
+            self._mark_bg_notify_ids(tid, tuid)
         # Strip matching blocks from pending buffer
         if self._pending_bg_notifications:
             kept = []
@@ -4351,13 +4461,12 @@ class Session:
         if not status:
             return
         # Dedupe: acp-term exit + bash-*.json complete for the same sidecar
-        if task_id and task_id in self._bg_notified_task_ids:
+        if self._bg_notify_already(task_id, tool_use_id):
             if tool_use_id:
                 self._finalize_bg_tool(tool_use_id, keep=False)
                 self._bg_task_ids.discard(tool_use_id)
                 self._bg_tools.pop(tool_use_id, None)
-            return
-        if task_id and task_id in self._pending_bg_task_ids:
+            self._mark_bg_notify_ids(task_id, tool_use_id)
             return
         if tool_use_id:
             self._bg_task_ids.discard(tool_use_id)
@@ -4383,8 +4492,7 @@ class Session:
             self._finalize_bg_tool(
                 tool_use_id, keep=(status == "completed" and bool(output)))
             self._bg_tools.pop(tool_use_id, None)
-        if task_id:
-            self._bg_notified_task_ids.add(task_id)
+        self._mark_bg_notify_ids(task_id, tool_use_id)
 
         # Mid-turn: only flip ⚙ → ✓ (agent busy / TaskGet path).
         if self.working:
@@ -4410,6 +4518,8 @@ class Session:
             block = f"<task-notification>{header}\n{output}</task-notification>"
         if task_id:
             self._pending_bg_task_ids.add(task_id)
+        if tool_use_id:
+            self._pending_bg_tool_ids.add(tool_use_id)
         self._pending_bg_notifications.append(block)
         if not self._bg_flush_scheduled:
             self._bg_flush_scheduled = True
@@ -4431,10 +4541,12 @@ class Session:
             # Agent already auto-continued (or user typed) — do NOT second-wake.
             self._pending_bg_notifications.clear()
             self._pending_bg_task_ids.clear()
+            getattr(self, "_pending_bg_tool_ids", set()).clear()
             return
         blocks = self._pending_bg_notifications
         self._pending_bg_notifications = []
         self._pending_bg_task_ids.clear()
+        getattr(self, "_pending_bg_tool_ids", set()).clear()
         seen = set()
         uniq = []
         for b in blocks:
@@ -4466,12 +4578,21 @@ class Session:
         self._bg_soft_wake_prompt = joined
         self._bg_soft_wake_display = display
         self._bg_soft_activity = False
+        adopted = False
         try:
             self._adopt_agent_turn(display)
+            adopted = bool(self.working)
         except Exception as e:
             print(f"[Claude] soft bg adopt: {e}")
-        # Fallback hard query only if still no tool/text after 4s
-        sublime.set_timeout(self._bg_soft_fallback_query, 4000)
+        # Adopt already opened the wake turn. A 4s query() of the same
+        # <task-notification> body doubled the report when Kimi also
+        # auto-continued (or continued slower than the timer).
+        if not adopted:
+            sublime.set_timeout(self._bg_soft_fallback_query, 4000)
+
+    # def _arm_adopt_idle(self) -> None:
+    #     """Adopted turns have no session/prompt result — idle after quiet."""
+    #     ... 2s fake result — rejected, left ⚙ looping.
 
     def _note_agent_activity(self) -> None:
         """Mark that auto-continue / soft-wake produced visible work."""
@@ -4942,7 +5063,11 @@ class Session:
                 continue
             # Missed terminal event — synthesize the same wake path as
             # task_notification so the agent actually continues.
-            if task_id not in self._bg_notified_task_ids:
+            if self._bg_notify_already(task_id, tool_use_id):
+                self._finalize_bg_tool(tool_use_id, keep=False)
+                self._bg_task_ids.discard(tool_use_id)
+                self._bg_tools.pop(tool_use_id, None)
+            else:
                 self._on_sys_task_notification({
                     "task_id": task_id,
                     "tool_use_id": tool_use_id,
@@ -4950,10 +5075,6 @@ class Session:
                     "summary": f"{task_id} (completed)",
                     "output_file": "",
                 })
-            else:
-                self._finalize_bg_tool(tool_use_id, keep=False)
-                self._bg_task_ids.discard(tool_use_id)
-                self._bg_tools.pop(tool_use_id, None)
             self._task_tool_map.pop(task_id, None)
             self._seen_running.discard(task_id)
 

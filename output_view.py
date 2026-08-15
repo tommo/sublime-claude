@@ -289,6 +289,7 @@ class OutputView:
         # visible Conversation flip.
         is_working = (
             (session and session.working)
+            or (session and getattr(session, "_compacting", False))
             or (self.current and self.current.working)
         )
         turn_phase = (
@@ -318,6 +319,8 @@ class OutputView:
                 prefix = "◐ " if is_active else "○ "
             else:
                 prefix = "◉ " if is_active else "• "
+        elif session and getattr(session, "unread", False):
+            prefix = "* "
         else:
             # Idle diamond always shown (focused or not) — do not autohide.
             prefix = "◇ "
@@ -2393,7 +2396,14 @@ class OutputView:
                     carry_goal = conv.goal
                     break
 
+        draft = ""
         if self._input_mode:
+            draft = self.get_input_text()
+            try:
+                if _sess is not None:
+                    _sess.draft_prompt = draft
+            except Exception:
+                pass
             self.exit_input_mode(keep_text=False)
         if self.view and self.view.is_valid():
             # Save content for undo
@@ -2439,6 +2449,11 @@ class OutputView:
                 and getattr(_sess, "_composer_allowed", True)
             ):
                 self.enter_input_mode()
+                if draft:
+                    try:
+                        self.set_composer_text(draft)
+                    except Exception:
+                        pass
             return
 
         # Idle case: build a zero-prompt carry-forward conversation so the
@@ -2458,6 +2473,11 @@ class OutputView:
         # lines and the pending-context line via session lookup)
         if was_input_mode:
             self.enter_input_mode()
+            if draft:
+                try:
+                    self.set_composer_text(draft)
+                except Exception:
+                    pass
 
     def clear_keep_last(self) -> None:
         """Clear older log rounds; keep only the last conversation turn.

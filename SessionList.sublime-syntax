@@ -22,6 +22,14 @@ contexts:
       scope: keyword.working.session-list
       push: row_rest
 
+    - match: '^\?'
+      scope: keyword.input.session-list
+      push: row_rest
+
+    - match: '^\*'
+      scope: keyword.unread.session-list
+      push: row_rest
+
     - match: '^○'
       scope: keyword.ready.session-list
       push: row_rest
@@ -47,21 +55,41 @@ contexts:
   row_rest:
     - match: '★'
       scope: keyword.star.session-list
-    - match: '\b([A-Z][A-Z0-9]{1,3}|Pi|CL)\b'
+    # First token is the backend column only — do not scan the title.
+    - match: '(?:claude|grok|kimi|codex|copilot|pi|dsr|deepseek|[A-Z]{2,3})\b'
       scope: storage.type.backend.session-list
-    - match: '\b(working)\b'
-      scope: keyword.working.session-list
-    - match: '\b(ready)\b'
-      scope: keyword.ready.session-list
-    - match: '\b(sleeping)\b'
-      scope: keyword.sleeping.session-list
-    - match: '\b(other-win)\b'
-      scope: comment.line.session-list
-    - match: '\b(\d+q)\b'
-      scope: constant.numeric.session-list
-    - match: '\b(now|\d+[smhdw])\b'
+      set: row_title
+    - match: '$'
+      pop: true
+
+  row_title:
+    - match: '\s+(\d+q)\s+(working)\s*$'
+      captures:
+        1: constant.numeric.session-list
+        2: keyword.working.session-list
+      pop: true
+    - match: '\s+(\d+q)\s+(input)\s*$'
+      captures:
+        1: constant.numeric.session-list
+        2: keyword.input.session-list
+      pop: true
+    - match: '\s+(\d+q)\s+(unread)\s*$'
+      captures:
+        1: constant.numeric.session-list
+        2: keyword.unread.session-list
+      pop: true
+    - match: '\s+(\d+q)\s+(ready)\s*$'
+      captures:
+        1: constant.numeric.session-list
+        2: keyword.ready.session-list
+      pop: true
+    - match: '\s+(\d+q)\s+(sleeping)\s*$'
+      captures:
+        1: constant.numeric.session-list
+        2: keyword.sleeping.session-list
+      pop: true
+    - match: '\s+(now|\d+[smhdw])\s*$'
       scope: comment.line.time.session-list
-    - match: '\b(claude|grok|kimi|codex|copilot|pi|dsr|deepseek)\b'
-      scope: storage.type.backend.session-list
+      pop: true
     - match: '$'
       pop: true
