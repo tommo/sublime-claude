@@ -362,7 +362,7 @@
     },
     {
         "keys": ["r"],
-        "command": "claude_session_list_refresh",
+        "command": "claude_session_list_rename",
         "context": [
             { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
         ]
@@ -838,7 +838,7 @@
 
     { "keys": ["enter"], "command": "claude_session_list_open",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
-    { "keys": ["r"], "command": "claude_session_list_refresh",
+    { "keys": ["r"], "command": "claude_session_list_rename",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["v"], "command": "claude_session_list_reveal",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },

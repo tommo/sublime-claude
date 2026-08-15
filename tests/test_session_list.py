@@ -30,6 +30,7 @@ def _load():
         sess.load_bookmarks = lambda p=None: set()
         sess.remove_saved_session = lambda sid: False
         sess.toggle_bookmark = lambda sid, p=None: True
+        sess.rename_saved_session = lambda sid, name: True
         sys.modules[sess_name] = sess
     be_name = _PKG + ".backends"
     if be_name not in sys.modules:
@@ -67,11 +68,12 @@ class TestRenderSessionList(unittest.TestCase):
         }]
         text, index = sl.render_list(live, here, [], starred={"s2"})
         self.assertIn("STARRED (1)", text)
-        self.assertIn("RUNNING (1)", text)
+        self.assertIn("CURRENT (1)", text)
         self.assertIn("HISTORY (0)", text)
         self.assertIn("Skin editor", text)
-        self.assertIn("★", text)
-        self.assertIn("r refresh", text)
+        self.assertNotIn("★", text)
+        self.assertIn("r rename", text)
+        self.assertNotIn("refresh", text)
         self.assertIn("s star", text)
         self.assertNotIn("c compact", text)
         compact, cidx = sl.render_list(live, here, [], starred={"s2"}, cols=24)
@@ -157,13 +159,15 @@ class TestRenderSessionList(unittest.TestCase):
             "query_count": 0, "same_window": True,
         }]
         narrow, _ = sl.render_list(live, [], [], cols=24)
-        nrow = [ln for ln in narrow.splitlines() if ln.startswith("○")][0]
+        nrow = [ln for ln in narrow.splitlines()
+                if ln.startswith("○") and "CURRENT" not in ln][0]
         self.assertEqual(len(nrow), 24)
         self.assertIn("GR", nrow)
         self.assertNotIn("ready", nrow)
         self.assertTrue(nrow.rstrip().endswith("…"))
         wide, _ = sl.render_list(live, [], [], cols=80)
-        wrow = [ln for ln in wide.splitlines() if ln.startswith("○")][0]
+        wrow = [ln for ln in wide.splitlines()
+                if ln.startswith("○") and "CURRENT" not in ln][0]
         self.assertGreater(len(wrow), len(nrow))
         self.assertIn("grok", wrow)
         self.assertIn("ready", wrow)
@@ -192,7 +196,8 @@ class TestRenderSessionList(unittest.TestCase):
              "last_access": 50, "last_activity": 50},
         ]
         text, _ = sl.render_list(live, [], [], cols=80)
-        rows = [ln for ln in text.splitlines() if ln[:1] in ("○", "●", "⏸")]
+        rows = [ln for ln in text.splitlines()
+                if ln[:1] in ("○", "●", "⏸") and "CURRENT" not in ln]
         self.assertEqual(len(rows), 2)
         self.assertTrue(rows[0].rstrip().endswith("ready"))
         self.assertTrue(rows[1].rstrip().endswith("ready"))
@@ -227,7 +232,8 @@ class TestRenderSessionList(unittest.TestCase):
         }]
         text, _ = sl.render_list(live, here, [], cols=80)
         run = [ln for ln in text.splitlines() if ln.startswith("⏸")][0]
-        hist = [ln for ln in text.splitlines() if ln.startswith("·")][0]
+        hist = [ln for ln in text.splitlines()
+                if ln.startswith("·") and "HISTORY" not in ln][0]
         self.assertNotIn("pil", hist)
         # elapsed field ends at the same column
         self.assertEqual(len(run.rstrip()), len(hist.rstrip()))
@@ -437,15 +443,15 @@ class TestRenderSessionList(unittest.TestCase):
         }]
         text, index = sl.render_list(live, here, [], starred={"pin", "oldpin"}, cols=80)
         self.assertIn("STARRED (2)", text)
-        self.assertIn("RUNNING (1)", text)
+        self.assertIn("CURRENT (1)", text)
         self.assertIn("HISTORY (1)", text)
         ids = [r["session_id"] for r in index]
         self.assertEqual(ids, ["pin", "oldpin", "run", "old"])
-        star_block = text.split("RUNNING")[0]
+        star_block = text.split("CURRENT")[0]
         self.assertIn("pinned live", star_block)
         self.assertIn("pinned hist", star_block)
         self.assertNotIn("plain live", star_block)
-        run_block = text.split("RUNNING")[1].split("HISTORY")[0]
+        run_block = text.split("CURRENT")[1].split("HISTORY")[0]
         self.assertIn("plain live", run_block)
         self.assertNotIn("pinned live", run_block)
 
@@ -457,6 +463,20 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual(pinned, [])
         self.assertEqual(rest_l, live)
         self.assertEqual(rest_h, here)
+
+    def test_rename_row_saved(self):
+        sl = _load()
+        seen = []
+        sl.rename_saved_session = lambda sid, name, s=seen: (
+            s.append((sid, name)) or True)
+        row = {
+            "kind": "saved", "session_id": "s9", "name": "old",
+            "backend": "grok",
+        }
+        self.assertTrue(sl.rename_row(None, row, "  new title  "))
+        self.assertEqual(seen, [("s9", "new title")])
+        self.assertFalse(sl.rename_row(None, row, "   "))
+        self.assertFalse(sl.rename_row(None, None, "x"))
 
     def test_close_row_drops_saved(self):
         sl = _load()

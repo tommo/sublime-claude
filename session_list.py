@@ -10,6 +10,7 @@ import sublime_plugin
 
 from .session import (
     load_saved_sessions, load_bookmarks, remove_saved_session, toggle_bookmark,
+    rename_saved_session,
 )
 
 
@@ -135,7 +136,7 @@ def use_compact(cols: int) -> bool:
 
 def format_header(cols: int = 0) -> str:
     left = "SESSIONS"
-    right = "enter open · v reveal · s star · r refresh · del close"
+    right = "enter open · v reveal · s star · r rename · del close"
     if not cols:
         return f"{left}                  {right}"
     for cand in (
@@ -144,7 +145,7 @@ def format_header(cols: int = 0) -> str:
         "v · s · r · del",
         "s · r · del",
         "r · del",
-        "r refresh",
+        "r rename",
     ):
         if cols >= len(left) + 1 + len(cand):
             right = cand
@@ -312,7 +313,7 @@ def _right_meta(r: dict) -> str:
 
 def pull_starred(live: List[dict], here: List[dict],
                  starred: set) -> Tuple[List[dict], List[dict], List[dict]]:
-    """Starred live+history first; those rows leave RUNNING/HISTORY."""
+    """Starred live+history first; those rows leave CURRENT/HISTORY."""
     ids = set(starred or ())
     if not ids:
         return [], list(live), list(here)
@@ -332,14 +333,13 @@ def pull_starred(live: List[dict], here: List[dict],
 
 def _fmt_row(r: dict, starred: set, compact: bool = False, cols: int = 0) -> str:
     live = r.get("kind") == "live"
-    star = "★ " if r.get("session_id") in starred else ""
     name = one_line_title(r.get("name") or "")
     mark = _mark(r["status"]) if live else "·"
     if compact:
-        pre = f"{mark} {star}{backend_abbrev(r.get('backend'))} "
+        pre = f"{mark} {backend_abbrev(r.get('backend'))} "
         return pre + fit_title(name, _name_budget(pre, "", cols, True))
     extra = _right_meta(r)
-    pre = f"{mark} {star}{r['backend']:<7} "
+    pre = f"{mark} {r['backend']:<7} "
     return pre + fit_title(name, _name_budget(pre, extra, cols, False)) + extra
 
 
@@ -369,7 +369,7 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
 
     pinned, live, here = pull_starred(live, here, starred)
     add_section("STARRED", pinned, _fmt_row)
-    add_section("RUNNING", live, _fmt_row)
+    add_section("CURRENT", live, _fmt_row)
     add_section("HISTORY", here, _fmt_row)
     return "\n".join(lines).rstrip() + "\n", index
 
@@ -677,6 +677,25 @@ def close_row(window, row: dict) -> bool:
     return False
 
 
+def rename_row(window, row: dict, name: str) -> bool:
+    """Rename a live session or a history entry."""
+    name = (name or "").strip()
+    if not row or not name:
+        return False
+    sid = row.get("session_id")
+    if row.get("kind") == "live":
+        session = _live_session_for_row(row)
+        if session is not None:
+            session._set_name(name)
+            return True
+        if sid:
+            return bool(rename_saved_session(sid, name))
+        return False
+    if sid:
+        return bool(rename_saved_session(sid, name))
+    return False
+
+
 class SessionListView:
     def __init__(self, window):
         self.window = window
@@ -795,7 +814,7 @@ class SessionListClickListener(sublime_plugin.EventListener):
             return None
         ch = (args or {}).get("characters") or ""
         if ch == "r":
-            return ("claude_session_list_refresh", {})
+            return ("claude_session_list_rename", {})
         if ch == "v":
             return ("claude_session_list_reveal", {})
         if ch == "s":
@@ -920,6 +939,48 @@ class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
             except Exception:
                 pass
             sublime.status_message("Claude: closed {}".format(name))
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListRenameCommand(sublime_plugin.TextCommand):
+    """Rename the session under the caret."""
+
+    def run(self, edit):
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        current = (row.get("name") or "").strip()
+        if current == "(unnamed)":
+            current = ""
+        list_view = self.view
+
+        def _done(name, _row=row, _win=win, _view=list_view):
+            if not (name or "").strip():
+                return
+            if rename_row(_win, _row, name.strip()):
+                refresh_session_list(_win)
+                try:
+                    if _view and _view.is_valid():
+                        _win.focus_view(_view)
+                except Exception:
+                    pass
+                sublime.status_message("Claude: renamed")
+
+        win.show_input_panel("Session name:", current, _done, None, None)
 
     def is_enabled(self):
         return bool(self.view.settings().get(SETTING))

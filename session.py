@@ -203,6 +203,23 @@ def save_sessions(sessions: List[Dict]) -> None:
         print(f"[Claude] Failed to save sessions: {e}")
 
 
+def rename_saved_session(session_id: str, name: str) -> bool:
+    """Rename a closed/saved session on disk. True if an entry was updated."""
+    name = (name or "").strip()
+    if not session_id or not name:
+        return False
+    sessions = load_saved_sessions()
+    hit = False
+    for s in sessions:
+        if s.get("session_id") == session_id:
+            s["name"] = name
+            hit = True
+            break
+    if hit:
+        save_sessions(sessions)
+    return hit
+
+
 def remove_saved_session(session_id: str) -> bool:
     """Drop a session from the on-disk resume list. True if something was removed."""
     if not session_id:
