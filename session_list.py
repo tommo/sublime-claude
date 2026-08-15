@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import sublime
 import sublime_plugin
 
-from .session import load_saved_sessions, load_bookmarks, remove_saved_session
+from .session import (
+    load_saved_sessions, load_bookmarks, remove_saved_session, toggle_bookmark,
+)
 
 
 SETTING = "claude_session_list"
@@ -133,10 +135,17 @@ def use_compact(cols: int) -> bool:
 
 def format_header(cols: int = 0) -> str:
     left = "SESSIONS"
-    right = "enter open · v reveal · r refresh · del close"
+    right = "enter open · v reveal · s star · r refresh · del close"
     if not cols:
         return f"{left}                  {right}"
-    for cand in (right, "↵ open · v · r · del", "v · r · del", "r · del", "r refresh"):
+    for cand in (
+        right,
+        "↵ open · v · s · r · del",
+        "v · s · r · del",
+        "s · r · del",
+        "r · del",
+        "r refresh",
+    ):
         if cols >= len(left) + 1 + len(cand):
             right = cand
             break
@@ -301,6 +310,26 @@ def _right_meta(r: dict) -> str:
     return extra
 
 
+def pull_starred(live: List[dict], here: List[dict],
+                 starred: set) -> Tuple[List[dict], List[dict], List[dict]]:
+    """Starred live+history first; those rows leave RUNNING/HISTORY."""
+    ids = set(starred or ())
+    if not ids:
+        return [], list(live), list(here)
+    pinned, rest_live, rest_here = [], [], []
+    for r in live:
+        (pinned if r.get("session_id") in ids else rest_live).append(r)
+    for r in here:
+        (pinned if r.get("session_id") in ids else rest_here).append(r)
+    _band = {"input": 0, "unread": 0, "working": 1, "ready": 1, "sleeping": 2}
+    pinned.sort(key=lambda r: (
+        0 if r.get("kind") == "live" else 1,
+        _band.get(r.get("status"), 3),
+        -access_ts(r),
+    ))
+    return pinned, rest_live, rest_here
+
+
 def _fmt_row(r: dict, starred: set, compact: bool = False, cols: int = 0) -> str:
     live = r.get("kind") == "live"
     star = "★ " if r.get("session_id") in starred else ""
@@ -338,6 +367,8 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
             index.append(rec)
         lines.append("")
 
+    pinned, live, here = pull_starred(live, here, starred)
+    add_section("STARRED", pinned, _fmt_row)
     add_section("RUNNING", live, _fmt_row)
     add_section("HISTORY", here, _fmt_row)
     return "\n".join(lines).rstrip() + "\n", index
@@ -351,7 +382,38 @@ def build_for_window(window, cols: int = 0) -> Tuple[str, List[dict]]:
     live_ids = {r["session_id"] for r in live if r.get("session_id")}
     here, _other = collect_history(live_ids, cwd)
     starred = load_bookmarks(cwd or None)
+    here = _include_starred_saved(here, live_ids, cwd, starred)
     return render_list(live, here, [], starred, cols=cols)
+
+
+def _include_starred_saved(here: List[dict], live_ids: set, cwd: str,
+                           starred: set) -> List[dict]:
+    """History cap can drop a starred saved row — put it back for STARRED."""
+    if not starred:
+        return here
+    have = {r.get("session_id") for r in here}
+    extra = []
+    cwd = (cwd or "").rstrip("/")
+    for s in load_saved_sessions():
+        sid = s.get("session_id")
+        if not sid or sid in live_ids or sid in have or sid not in starred:
+            continue
+        proj = (s.get("project") or "").rstrip("/")
+        if cwd and proj and proj != cwd:
+            continue
+        extra.append({
+            "kind": "saved",
+            "session_id": sid,
+            "view_id": None,
+            "name": one_line_title(s.get("name") or "") or "(unnamed)",
+            "backend": s.get("backend") or "claude",
+            "status": s.get("state") or "closed",
+            "query_count": int(s.get("query_count") or 0),
+            "project": s.get("project") or "",
+            "last_activity": s.get("last_activity"),
+            "last_access": access_ts(s),
+        })
+    return here + extra if extra else here
 
 
 def row_at_line(index: List[dict], line: int) -> Optional[dict]:
@@ -736,6 +798,8 @@ class SessionListClickListener(sublime_plugin.EventListener):
             return ("claude_session_list_refresh", {})
         if ch == "v":
             return ("claude_session_list_reveal", {})
+        if ch == "s":
+            return ("claude_session_list_star", {})
         if ch in ("\n", "\r"):
             return ("claude_session_list_open", {})
         return None
@@ -856,6 +920,43 @@ class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
             except Exception:
                 pass
             sublime.status_message("Claude: closed {}".format(name))
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListStarCommand(sublime_plugin.TextCommand):
+    """Toggle bookmark for the session under the caret."""
+
+    def run(self, edit):
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        sid = (row or {}).get("session_id")
+        if not win or not sid:
+            return
+        cwd = ""
+        try:
+            folders = win.folders()
+            if folders:
+                cwd = folders[0]
+        except Exception:
+            cwd = ""
+        now = toggle_bookmark(sid, cwd or None)
+        name = (row.get("name") or "").strip() or sid
+        refresh_session_list(win)
+        sublime.status_message(
+            ("★ Starred: {}" if now else "☆ Unstarred: {}").format(name))
 
     def is_enabled(self):
         return bool(self.view.settings().get(SETTING))

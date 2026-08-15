@@ -1,0 +1,13 @@
+{
+  "session_id": "session_40b7e06e-d8ec-4743-8a73-a55a3743882d",
+  "bridge_log": "kimi_bridge.70945.log",
+  "events": [
+    {"t": "begin_query", "prompt_id": 6},
+    {"t": "end_turn", "prompt_id": 6, "stopReason": "end_turn"},
+    {"t": "terminal_output_poll", "terminalId": "term_1705fbc3a0", "note": "bg pil test still polled after end_turn"},
+    {"t": "terminal_kill", "terminalId": "term_1705fbc3a0"},
+    {"t": "terminal_create", "cmd": "tail -20 /tmp/gitapp_test4.log", "synth_bash": true, "bg": false},
+    {"t": "wait_for_exit", "exitCode": 0},
+    {"t": "bg_notify", "backend": "kimi"}
+  ]
+}

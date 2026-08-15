@@ -369,7 +369,7 @@ Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
                 },
                 {
                     "name": "send_to_session",
-                    "description": "Send a message by stable agent_id (preferred). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. If the target is mid-turn, the prompt is queued and runs after the current turn — do not wait for signal_complete to retry. Prefer reuse over spawn.",
+                    "description": "Send a message by stable agent_id (preferred). The target sees a [from agent <your agent_id>] header (or [from user] if no caller session) so it can tell ◎ user input from inter-agent mail; reply with send_to_session(agent_id=that id). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. If the target is mid-turn, the prompt is queued and runs after the current turn — do not wait for signal_complete to retry. Prefer reuse over spawn.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -935,6 +935,8 @@ Examples:
             # Per-session MCP process: CALLER_VIEW_ID is this sheet. Inject so
             # the agent never has to discover parent/self ids by searching.
             if tool_name == "spawn_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
+                args["_caller_view_id"] = CALLER_VIEW_ID
+            if tool_name == "send_to_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
                 args["_caller_view_id"] = CALLER_VIEW_ID
             if tool_name in ("signal_complete", "signal_subsession_complete"):
                 if CALLER_VIEW_ID is not None and args.get("session_id") is None:

@@ -21,6 +21,56 @@ def new_agent_id() -> str:
     return f"agent-{uuid.uuid4().hex[:12]}"
 
 
+_SENDER_LINE = re.compile(r"^\[from (user|agent)(?: [^\]]*)?\]")
+
+
+def stamp_sender_prompt(
+    prompt: str,
+    *,
+    sender_agent_id: str = "",
+    sender_session_id: str = "",
+    sender_name: str = "",
+    from_user: bool = False,
+) -> str:
+    """Prefix a communication-tool prompt so the receiver sees who sent it.
+
+    User ◎ input is unstamped. send_to_session always goes through here.
+    Idempotent if the body already starts with ``[from user]`` / ``[from agent …]``.
+    """
+    body = (prompt or "").strip()
+    if not body:
+        return body
+    if _SENDER_LINE.match(body):
+        return body
+    if from_user:
+        return f"[from user]\n{body}"
+    aid = (sender_agent_id or "").strip()
+    sid = (sender_session_id or "").strip()
+    name = (sender_name or "").strip()
+    header = f"[from agent {aid}]" if aid else "[from agent]"
+    extra = []
+    if sid and sid != aid:
+        extra.append(f"session_id={sid}")
+    if name:
+        extra.append(f"name={name}")
+    if extra:
+        header = header + " " + " ".join(extra)
+    return f"{header}\n{body}"
+
+
+def sender_display_prompt(stamped: str) -> str:
+    """Short transcript label for a stamped send_to_session body."""
+    first = (stamped or "").split("\n", 1)[0].strip()
+    m = _SENDER_LINE.match(first)
+    if not m:
+        return first[:50] if first else "📬"
+    if m.group(1) == "user":
+        return "📬 from user"
+    rest = first[len("[from agent"):].strip(" ]")
+    token = (rest.split() or ["agent"])[0]
+    return f"📬 from {token}"
+
+
 def ensure_registries() -> None:
     if not hasattr(sublime, "_claude_sessions") or sublime._claude_sessions is None:
         sublime._claude_sessions = {}

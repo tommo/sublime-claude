@@ -375,6 +375,13 @@
         ]
     },
     {
+        "keys": ["s"],
+        "command": "claude_session_list_star",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
         "keys": ["delete"],
         "command": "claude_session_list_close",
         "context": [
@@ -834,6 +841,8 @@
     { "keys": ["r"], "command": "claude_session_list_refresh",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["v"], "command": "claude_session_list_reveal",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
+    { "keys": ["s"], "command": "claude_session_list_star",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["delete"], "command": "claude_session_list_close",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },

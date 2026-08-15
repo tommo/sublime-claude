@@ -10,7 +10,7 @@ contexts:
       scope: markup.heading.session-list
       push: header_rest
 
-    - match: '^(RUNNING|HISTORY)(?: \(other projects\))?\s+\((\d+)\)'
+    - match: '^(STARRED|RUNNING|HISTORY)(?: \(other projects\))?\s+\((\d+)\)'
       captures:
         0: entity.name.section.session-list
         2: constant.numeric.session-list
@@ -43,9 +43,9 @@ contexts:
       push: row_rest
 
   header_rest:
-    - match: '\b(enter|dclick|r)\b'
+    - match: '\b(enter|dclick|r|v|s)\b'
       scope: keyword.operator.session-list
-    - match: '\b(open|refresh)\b'
+    - match: '\b(open|refresh|reveal|star)\b'
       scope: comment.line.session-list
     - match: '·'
       scope: comment.line.session-list

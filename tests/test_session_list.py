@@ -29,6 +29,7 @@ def _load():
         sess.load_saved_sessions = lambda: []
         sess.load_bookmarks = lambda p=None: set()
         sess.remove_saved_session = lambda sid: False
+        sess.toggle_bookmark = lambda sid, p=None: True
         sys.modules[sess_name] = sess
     be_name = _PKG + ".backends"
     if be_name not in sys.modules:
@@ -65,11 +66,13 @@ class TestRenderSessionList(unittest.TestCase):
             "query_count": 1, "project": "/x/pil", "last_activity": 1700000000,
         }]
         text, index = sl.render_list(live, here, [], starred={"s2"})
+        self.assertIn("STARRED (1)", text)
         self.assertIn("RUNNING (1)", text)
-        self.assertIn("HISTORY (1)", text)
+        self.assertIn("HISTORY (0)", text)
         self.assertIn("Skin editor", text)
         self.assertIn("★", text)
         self.assertIn("r refresh", text)
+        self.assertIn("s star", text)
         self.assertNotIn("c compact", text)
         compact, cidx = sl.render_list(live, here, [], starred={"s2"}, cols=24)
         self.assertIn("GR", compact)
@@ -77,8 +80,8 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertNotIn("working", compact.split("Skin editor")[-1][:20])
         self.assertEqual(len(cidx), 2)
         self.assertEqual(len(index), 2)
-        self.assertEqual(sl.row_at_line(index, index[0]["line"])["session_id"], "s1")
-        self.assertEqual(sl.row_at_line(index, index[1]["line"])["session_id"], "s2")
+        self.assertEqual(sl.row_at_line(index, index[0]["line"])["session_id"], "s2")
+        self.assertEqual(sl.row_at_line(index, index[1]["line"])["session_id"], "s1")
         self.assertEqual(sl.format_when(100, now=100), "now")
         self.assertEqual(sl.format_when(100, now=130), "30s")
         self.assertEqual(sl.format_when(100, now=100 + 5 * 60), "5m")
@@ -407,6 +410,53 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertNotIn("elsewhere", text)
         self.assertNotIn("other projects", text)
         self.assertEqual([r["session_id"] for r in index], ["h"])
+
+    def test_starred_section_pulls_from_running_and_history(self):
+        sl = _load()
+        live = [{
+            "kind": "live", "session_id": "pin", "view_id": 1,
+            "name": "pinned live", "backend": "grok", "status": "ready",
+            "query_count": 2, "same_window": True,
+            "last_access": 9, "last_activity": 9,
+        }, {
+            "kind": "live", "session_id": "run", "view_id": 2,
+            "name": "plain live", "backend": "kimi", "status": "working",
+            "query_count": 1, "same_window": True,
+            "last_access": 8, "last_activity": 8,
+        }]
+        here = [{
+            "kind": "saved", "session_id": "oldpin", "view_id": None,
+            "name": "pinned hist", "backend": "grok", "status": "closed",
+            "query_count": 4, "project": "/p",
+            "last_access": 1, "last_activity": 1,
+        }, {
+            "kind": "saved", "session_id": "old", "view_id": None,
+            "name": "plain hist", "backend": "kimi", "status": "closed",
+            "query_count": 0, "project": "/p",
+            "last_access": 2, "last_activity": 2,
+        }]
+        text, index = sl.render_list(live, here, [], starred={"pin", "oldpin"}, cols=80)
+        self.assertIn("STARRED (2)", text)
+        self.assertIn("RUNNING (1)", text)
+        self.assertIn("HISTORY (1)", text)
+        ids = [r["session_id"] for r in index]
+        self.assertEqual(ids, ["pin", "oldpin", "run", "old"])
+        star_block = text.split("RUNNING")[0]
+        self.assertIn("pinned live", star_block)
+        self.assertIn("pinned hist", star_block)
+        self.assertNotIn("plain live", star_block)
+        run_block = text.split("RUNNING")[1].split("HISTORY")[0]
+        self.assertIn("plain live", run_block)
+        self.assertNotIn("pinned live", run_block)
+
+    def test_pull_starred_empty(self):
+        sl = _load()
+        live = [{"session_id": "a", "kind": "live", "status": "ready"}]
+        here = [{"session_id": "b", "kind": "saved", "status": "closed"}]
+        pinned, rest_l, rest_h = sl.pull_starred(live, here, set())
+        self.assertEqual(pinned, [])
+        self.assertEqual(rest_l, live)
+        self.assertEqual(rest_h, here)
 
     def test_close_row_drops_saved(self):
         sl = _load()

@@ -156,6 +156,8 @@ def create_sublime_router() -> ToolRouter:
         + (f", agent_id={args['agent_id']!r}" if args.get('agent_id') else "")
         + (f", view_id={args.get('view_id')}"
            if args.get('view_id') is not None else "")
+        + (f", _caller_view_id={int(args['_caller_view_id'])}"
+           if args.get('_caller_view_id') is not None else "")
         + ")")
 
     router.register("read_session_output", lambda args:

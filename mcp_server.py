@@ -205,6 +205,7 @@ class MCPSocketServer:
             if isinstance(eval_result, dict) and eval_result.get("_wait_for_init"):
                 session = eval_result.pop("_session")
                 prompt = eval_result.pop("_prompt")
+                display_prompt = eval_result.pop("_display_prompt", None)
                 wait_for_completion = eval_result.pop("_wait_for_completion", False)
                 eval_result.pop("_wait_for_init")
                 tag = "wake" if eval_result.get("waking") else "spawn"
@@ -229,7 +230,8 @@ class MCPSocketServer:
                     print(f"[MCP {tag}:{vid}] init OK in {elapsed:.1f}s — scheduling prompt "
                           f"(working={session.working}, client_alive={session.client.is_alive() if session.client else False})")
                     # Send the prompt from main thread
-                    def send_prompt(_vid=vid, _prompt=prompt, _session=session, _tag=tag):
+                    def send_prompt(_vid=vid, _prompt=prompt, _session=session, _tag=tag,
+                                    _display=display_prompt):
                         try:
                             # If still busy after wake (rare), queue instead of drop
                             if _session.working:
@@ -240,7 +242,10 @@ class MCPSocketServer:
                                       f"(working={_session.working}, initialized={_session.initialized}, "
                                       f"client_alive={_session.client.is_alive() if _session.client else False}): "
                                       f"{_prompt[:80]!r}")
-                                _session.query(_prompt)
+                                if _display:
+                                    _session.query(_prompt, display_prompt=_display)
+                                else:
+                                    _session.query(_prompt)
                             print(f"[MCP {_tag}:{_vid}] deliver done (working now={_session.working})")
                         except Exception as e:
                             print(f"[MCP {_tag}:{_vid}] deliver RAISED: {type(e).__name__}: {e}")
@@ -1436,11 +1441,37 @@ class MCPSocketServer:
             "host attaches context_budget for strategy."
         )
 
+    def _stamp_send_prompt(self, prompt: str) -> tuple:
+        """Tag send_to_session body with caller agent/session id (or user)."""
+        from . import session_registry
+
+        caller = None
+        vid = getattr(self, "_caller_view_id", None)
+        if vid is not None:
+            caller = session_registry.get_session_for_view_id(vid)
+        if caller is None:
+            try:
+                window = self._get_window()
+                ev = window.settings().get("claude_executing_view") if window else None
+                if ev is not None:
+                    caller = session_registry.get_session_for_view_id(ev)
+            except Exception:
+                caller = None
+        # send_to_session is always agent mail. User ◎ input is unstamped.
+        stamped = session_registry.stamp_sender_prompt(
+            prompt,
+            sender_agent_id=getattr(caller, "agent_id", None) or "" if caller else "",
+            sender_session_id=getattr(caller, "session_id", None) or "" if caller else "",
+            sender_name=(caller.name or "") if caller else "",
+        )
+        return stamped, session_registry.sender_display_prompt(stamped)
+
     def _send_to_session(
         self,
         prompt: str,
         agent_id: str = None,
         view_id: int = None,
+        _caller_view_id: int = None,
     ) -> dict:
         """Send a message to an existing session by stable agent_id (preferred).
 
@@ -1449,6 +1480,9 @@ class MCPSocketServer:
         """
         from . import session_registry
 
+        if _caller_view_id is not None:
+            self._caller_view_id = _caller_view_id
+
         if not prompt:
             return {"error": "prompt is required"}
         if agent_id is None and view_id is None:
@@ -1456,6 +1490,7 @@ class MCPSocketServer:
                 "error": "Pass agent_id (preferred) or view_id",
                 "hint": "view_id is runtime-only and changes after ST restart",
             }
+        prompt, display = self._stamp_send_prompt(prompt)
 
         session = None
         if agent_id is not None:
@@ -1482,7 +1517,7 @@ class MCPSocketServer:
             # Mid-turn: queue for _on_done. Returning "busy" made callers
             # skip send and wait for signal_complete — the brief never landed.
             session.queue_prompt(prompt)
-            print(f"[MCP send:{aid or rid}] busy → queued ({prompt[:60]!r})")
+            print(f"[MCP send:{aid or rid}] busy → queued ({display!r})")
             return {
                 "sent": True,
                 "queued": True,
@@ -1513,6 +1548,7 @@ class MCPSocketServer:
                 "_wait_for_init": True,
                 "_session": session,
                 "_prompt": prompt,
+                "_display_prompt": display,
                 "_wait_for_completion": False,
                 "sent": True,
                 "waking": True,
@@ -1529,6 +1565,7 @@ class MCPSocketServer:
                     "_wait_for_init": True,
                     "_session": session,
                     "_prompt": prompt,
+                    "_display_prompt": display,
                     "_wait_for_completion": False,
                     "sent": True,
                     "waking": True,
@@ -1542,7 +1579,7 @@ class MCPSocketServer:
                 "view_id": rid,
             }
 
-        session.query(prompt)
+        session.query(prompt, display_prompt=display)
         return {
             "sent": True,
             "agent_id": aid,

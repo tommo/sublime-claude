@@ -13,6 +13,10 @@ from .constants import BACKGROUND_PREFIX
 from . import backends
 from .context_manager import ContextManager, ContextItem  # ContextItem re-exported for back-compat
 from . import cc_launch
+try:
+    from .turn_state import TurnState
+except ImportError:
+    from turn_state import TurnState
 
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
@@ -222,6 +226,7 @@ class Session:
         self.output = OutputView(window)
         self.initialized = False
         self.working = False
+        self._turn = TurnState()
         # Busy sub-state for tab/status honesty (Grok: waiting vs responding)
         # idle | waiting | responding | tool — see constants.TURN_PHASE_*
         self.turn_phase: str = "idle"
@@ -1648,11 +1653,13 @@ class Session:
 
         self._suppress_adopt = False
         self.touch_access()
-        self.working = True
-        self._awaiting_query_rpc = True  # _on_done owns idle; adopt path does not
-        self.query_count += 1
-        self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
+        if getattr(self, "_turn", None) is None:
+            self._turn = TurnState()
+        self._query_gen = self._turn.begin_query()
         query_gen = self._query_gen
+        self.working = True
+        self._awaiting_query_rpc = True
+        self.query_count += 1
         # New turn clears error-halt tab mark
         self._clear_error_halt()
         self._goal_last_update_sig = None  # allow same progress text next turn
@@ -1876,6 +1883,7 @@ class Session:
                 except Exception:
                     pass
             # Host already set working=False + *[interrupted]*; just flush queue.
+            self._turn.settle_interrupt()
             self.working = False
             if self.output and self.output.current:
                 self.output.current.working = False
@@ -2072,6 +2080,7 @@ class Session:
         # continues agent-side. Stay busy (spinner + no idle ◎) until we see
         # "Compaction completed" (or timeout).
         if getattr(self, "_compacting", False) and completion == "success":
+            self._turn.enter_compacting()
             self._awaiting_query_rpc = False
             self.working = True
             self._set_turn_phase("waiting")
@@ -2101,6 +2110,7 @@ class Session:
             return
 
         # 7. Now set working=False and enter input mode
+        self._turn.end_live(_expected_gen)
         self.working = False
         self._set_turn_phase("idle")
         now = time.time()
@@ -2667,9 +2677,10 @@ class Session:
             return
 
         self._interrupting = True
-        # Adopt opens ◎ ⚙ task completed ▶ from leftover tool/text after
-        # Esc. That turn has no prompt RPC, so it never ends; Esc again
-        # → *[interrupted]* → more leftovers → adopt again.
+        try:
+            self._turn.begin_interrupt()
+        except Exception:
+            pass
         self._suppress_adopt = True
         if getattr(self, "_compacting", False):
             self._compacting = False
@@ -3837,40 +3848,33 @@ class Session:
         _shell_bg = (
             "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
         )
-        # Kimi auto-continues on task.completed while host is idle (Read report
-        # log, then text). Without adopt, tools are dropped and the report is
-        # swallowed — then host wake says "already reported".
-        # Also: bridge synthesizes Bash from terminal/* when Kimi skips
-        # session/update tool_call — those must paint too.
-        if not self.working and not background:
-            self._adopt_agent_turn("⚙ task completed")
+        # Idle leftover (synth Bash after end_turn): paint, do not own busy.
         if not background:
             self._note_agent_activity()
-        # Late shell ⚙ (bridge race after end_turn): still arm wake gate + row.
-        # Other late tools stay dropped only if still idle after adopt.
         if not self.working:
-            if background and name in _shell_bg and tool_id:
-                try:
-                    if self.output and self.output.current:
-                        self.output.tool(
-                            name, tool_input, tool_id=tool_id, background=True)
+            try:
+                if self.output:
+                    self.output.tool(
+                        name, tool_input, tool_id=tool_id,
+                        background=bool(background))
+                    if background and tool_id:
                         tc = self.output.find_tool_by_id(tool_id)
                         if tc is not None:
                             self._bg_tools[tool_id] = tc
-                    self._bg_task_ids.add(tool_id)
-                    tid = ""
-                    if isinstance(tool_input, dict):
-                        tid = str(
-                            tool_input.get("task_id")
-                            or tool_input.get("taskId")
-                            or "")
-                    if tid:
-                        self._task_tool_map[tid] = tool_id
-                    self._schedule_bg_poll()
-                    if self.output and self.output.is_input_mode():
-                        self.output.refresh_background_hints()
-                except Exception as e:
-                    print(f"[Claude] late bg tool_use: {e}")
+                        self._bg_task_ids.add(tool_id)
+                        tid = ""
+                        if isinstance(tool_input, dict):
+                            tid = str(
+                                tool_input.get("task_id")
+                                or tool_input.get("taskId")
+                                or "")
+                        if tid:
+                            self._task_tool_map[tid] = tool_id
+                        self._schedule_bg_poll()
+                        if self.output.is_input_mode():
+                            self.output.refresh_background_hints()
+            except Exception as e:
+                print(f"[Claude] idle tool_use paint: {e}")
             return
         # A real content event arrived → the retry hint no longer applies.
         self._clear_api_retry_hint()
@@ -3991,56 +3995,26 @@ class Session:
         self._update_status_bar()
 
     def _adopt_agent_turn(self, label: str = "⚙ task completed") -> None:
-        """Agent continued without host query (Kimi automatic_notification).
+        """Leftover inbound must not become a host-owned turn.
 
-        Without this, the report streams while host is idle: no turn chrome,
-        sticky ◎ still open, then host task_notification fires a *second* wake
-        that says "already reported" and the real report looks swallowed.
+        Old path set working=True with no session/prompt. After @done, synth
+        Bash / notify opened ◎ ⚙ task completed and the session never idled.
+        Callers paint; this stays a no-op so busy only comes from query().
         """
-        if self.working or not self.output:
-            return
-        if getattr(self, "_suppress_adopt", False):
-            return
-        # last = float(getattr(self, "_last_result_at", 0) or 0)
-        # if last and (time.time() - last) < 2.0:
+        # if self.working or not self.output:
         #     return
-        self.working = True
-        self._awaiting_query_rpc = False  # no host query RPC; result ends us
-        self._query_start = time.time()
-        self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
-        self._input_mode_entered = False
-        self._clear_error_halt()
-        try:
-            if self.output.is_input_mode():
-                self.draft_prompt = self.output.get_input_text()
-                self.output.exit_input_mode(keep_text=False)
-            self.output.show(focus=False)
-            self.output.prompt(label)
-            if self.output.current is not None:
-                self.output.current.working = True
-            self._set_turn_phase("responding")
-            self.output._update_title()
-            self._animate()
-            # Drop any host wake buffered for the same bg complete
-            self._pending_bg_notifications.clear()
-            self._pending_bg_task_ids.clear()
-            getattr(self, "_pending_bg_tool_ids", set()).clear()
-            self._bg_flush_scheduled = False
-        except Exception as e:
-            print(f"[Claude] adopt agent turn: {e}")
-        # self._arm_adopt_idle()
-        try:
-            sublime.set_timeout(
-                lambda: self._enter_input_with_draft() if self.working else None,
-                40)
-        except Exception:
-            pass
+        # if getattr(self, "_suppress_adopt", False):
+        #     return
+        # self.working = True
+        # self._awaiting_query_rpc = False
+        return
 
     def _finish_compact(self, timeout: bool = False) -> None:
         """End host compact-busy state and drain queued prompts."""
         if not getattr(self, "_compacting", False) and not timeout:
             return
         self._compacting = False
+        self._turn.finish_compact()
         self.current_tool = None
         self._awaiting_query_rpc = False
         self.working = False
@@ -4109,10 +4083,6 @@ class Session:
             self._compacting = True
             self.current_tool = "compact…"
             self._status("compacting…")
-        # Kimi auto-continues on task.completed while host is idle — claim the turn
-        # (but not for compact-complete which we handled above)
-        if not self.working and not getattr(self, "_compacting", False):
-            self._adopt_agent_turn("⚙ task completed")
         self._note_agent_activity()
         if self.working:
             self._set_turn_phase("responding")
@@ -4124,8 +4094,6 @@ class Session:
     def _on_msg_thinking(self, params: dict) -> None:
         """ACP agent_thought_chunk — count as responding (model is active)."""
         self._clear_api_retry_hint()
-        if not self.working:
-            self._adopt_agent_turn("⚙ task completed")
         self._note_agent_activity()
         if self.working:
             self._set_turn_phase("responding")
@@ -4523,22 +4491,17 @@ class Session:
         self._pending_bg_notifications.append(block)
         if not self._bg_flush_scheduled:
             self._bg_flush_scheduled = True
-            # ≥1s so Kimi auto-continue + adopt can win the race
             sublime.set_timeout(self._flush_bg_notifications, 1200)
 
     def _flush_bg_notifications(self) -> None:
-        """Surface completed bg tasks without killing Kimi auto-continue.
-
-        Hard host query() while the agent already auto-continued causes
-        turn.agent_busy → cancel → empty view while kimi keeps working.
-        Soft path: open ⚙ chrome via adopt and let terminal/* synth + streams
-        paint. Only hard-query if still silent after a few seconds.
-        """
+        """Apply TurnState.notify_action — never fake-adopt a turn."""
         self._bg_flush_scheduled = False
         if not self._pending_bg_notifications:
             return
-        if self.working:
-            # Agent already auto-continued (or user typed) — do NOT second-wake.
+        if getattr(self, "_turn", None) is None:
+            self._turn = TurnState()
+        action = self._turn.notify_action(self.backend)
+        if action == "hold":
             self._pending_bg_notifications.clear()
             self._pending_bg_task_ids.clear()
             getattr(self, "_pending_bg_tool_ids", set()).clear()
@@ -4559,13 +4522,11 @@ class Session:
             return
         n = len(blocks)
         display = f"{BACKGROUND_PREFIX}{n} task notification{'s' if n != 1 else ''}"
-        # Compaction complete is host-tracked via _compacting + text, not ⚙ wake
         joined = "\n".join(blocks)
         if self._looks_like_compact_done(joined) or (
                 getattr(self, "_compacting", False)
                 and "compaction" in joined.lower()):
             if self.output and "compaction" in joined.lower():
-                # Prefer plain text under the /compact turn
                 body = joined
                 if "<task-notification>" in body:
                     body = body.replace("<task-notification>", "").replace(
@@ -4573,22 +4534,20 @@ class Session:
                 self.output.text("\n" + body.strip() + "\n")
             self._finish_compact()
             return
-        # Soft adopt: claim the turn UI without session/prompt (Kimi already
-        # injected the notify agent-side). Bridge synth terminal/* → Bash rows.
-        self._bg_soft_wake_prompt = joined
-        self._bg_soft_wake_display = display
-        self._bg_soft_activity = False
-        adopted = False
-        try:
-            self._adopt_agent_turn(display)
-            adopted = bool(self.working)
-        except Exception as e:
-            print(f"[Claude] soft bg adopt: {e}")
-        # Adopt already opened the wake turn. A 4s query() of the same
-        # <task-notification> body doubled the report when Kimi also
-        # auto-continued (or continued slower than the timer).
-        if not adopted:
-            sublime.set_timeout(self._bg_soft_fallback_query, 4000)
+        if action == "surface":
+            try:
+                if self.output and self.output.is_input_mode():
+                    self.output.refresh_background_hints()
+                if not self._session_view_focused():
+                    self._set_unread(True)
+            except Exception as e:
+                print(f"[Claude] bg notify surface: {e}")
+            return
+        if action == "query":
+            try:
+                self.query(joined, display_prompt=display, silent=False)
+            except Exception as e:
+                print(f"[Claude] bg notify query: {e}")
 
     # def _arm_adopt_idle(self) -> None:
     #     """Adopted turns have no session/prompt result — idle after quiet."""
