@@ -250,6 +250,7 @@ class TestOutputViewBgDemote(unittest.TestCase):
         def apply(name, background, existing=None):
             _SHELL_BG = (
                 "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
+                "Task", "Subagent",
             )
             if background and name not in _SHELL_BG:
                 background = False
@@ -268,6 +269,8 @@ class TestOutputViewBgDemote(unittest.TestCase):
         self.assertEqual(tc.name, "Read")
 
         tc = apply("Bash", True)
+        self.assertEqual(tc.status, BACKGROUND)
+        tc = apply("Task", True)
         self.assertEqual(tc.status, BACKGROUND)
         tc = apply("Read", False, existing=tc)
         self.assertEqual(tc.status, PENDING)
@@ -302,6 +305,11 @@ class _FwdStub(AcpBridge):
         self._last_execute_id = None
         self._terminals = {}
         self._terminal_bg = {}
+        self._released_terminals = set()
+        self._child_sessions = {}
+        self._bg_notified_tasks = set()
+        self._bg_notified_tools = set()
+        self._bg_tool_ids = set()
         self._tool_titles_by_id = {}
         self._prompt_fut = None
         self._prompt_cancelled = False
@@ -457,6 +465,104 @@ class TestMarkAgentDead(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].get("is_error"))
         self.assertEqual(results[0].get("stop_reason"), "error")
+
+
+class TestSubagentTerminalOutput(unittest.TestCase):
+    """Grok polls spawn_subagent ids via terminal/output — not SIGTERM."""
+
+    def setUp(self):
+        self.b = _FwdStub()
+
+    def test_spawn_text_registers_child(self):
+        self.b._note_spawned_child(
+            "Subagent started in background.\n"
+            "subagent_id: 01a00fc4-b4e1-7692-bb0e-e806eba02589\n")
+        self.assertIn(
+            "01a00fc4-b4e1-7692-bb0e-e806eba02589",
+            self.b._child_sessions)
+
+    def test_output_on_live_child_is_not_sigterm(self):
+        sid = "01child"
+        self.b._register_child_session(sid)
+        self.b._ingest_child_session({
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "still going"},
+            },
+        })
+
+        async def _go():
+            return await self.b._acp_terminal_output({"terminalId": sid})
+
+        result = asyncio.run(_go())
+        self.assertEqual(result.get("output"), "still going")
+        self.assertNotIn("exitStatus", result)
+
+    def test_output_after_child_turn_completed_has_exit(self):
+        sid = "01done"
+        self.b._ingest_child_session({
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ok"},
+            },
+        })
+        self.b._ingest_child_session({
+            "sessionId": sid,
+            "update": {
+                "sessionUpdate": "turn_completed",
+                "stop_reason": "end_turn",
+            },
+        })
+
+        async def _go():
+            return await self.b._acp_terminal_output({"terminalId": sid})
+
+        result = asyncio.run(_go())
+        self.assertEqual(result.get("output"), "ok")
+        self.assertEqual(result.get("exitStatus"),
+                         {"exitCode": 0, "signal": None})
+
+    def test_unknown_term_id_still_cancelled(self):
+        async def _go():
+            return await self.b._acp_terminal_output(
+                {"terminalId": "term_deadbeef"})
+
+        result = asyncio.run(_go())
+        self.assertEqual(
+            (result.get("exitStatus") or {}).get("signal"), "SIGTERM")
+
+    def test_spawn_is_background_not_poll(self):
+        upd = {
+            "title": "spawn_subagent",
+            "rawInput": {
+                "description": "Simple working check",
+                "prompt": "say hi",
+            },
+        }
+        self.assertTrue(AcpBridge._is_subagent_spawn("Task", upd, upd["rawInput"]))
+        self.assertTrue(AcpBridge._looks_like_background_tool(upd, upd["rawInput"]))
+        poll = {
+            "title": "Get task output: 01a00fd8-1258-7413-a3ec-50862ba62a91",
+            "rawInput": {
+                "task_ids": ["01a00fd8-1258-7413-a3ec-50862ba62a91"],
+                "timeout_ms": 30000,
+            },
+        }
+        self.assertFalse(
+            AcpBridge._is_subagent_spawn("TaskGet", poll, poll["rawInput"]))
+        self.assertTrue(self.b._is_subagent_output_poll(poll, "TaskGet"))
+        self.assertTrue(self.b._should_suppress_tool_row(poll, "TaskGet"))
+
+    def test_unknown_subagent_id_is_still_running(self):
+        async def _go():
+            return await self.b._acp_terminal_output(
+                {"terminalId": "01a00never-seen"})
+
+        result = asyncio.run(_go())
+        self.assertNotIn("exitStatus", result)
+        self.assertIn("01a00never-seen", self.b._child_sessions)
 
 
 if __name__ == "__main__":

@@ -59,7 +59,7 @@ class DsrBridge(AcpBridge):
         "submit_plan": "ExitPlanMode",
         "mark_step_complete": "TaskUpdate",
         "revise_plan": "TaskUpdate",
-        "spawn_subagent": "Task",
+        "spawn_subagent": "Subagent",
         "run_skill": "Skill",
         "sublime_eval": "sublime_eval",
         "find_file": "find_file",

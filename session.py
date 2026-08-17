@@ -4033,6 +4033,7 @@ class Session:
             return
         _shell_bg = (
             "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
+            "Task", "Subagent",
         )
         # Idle leftover (synth Bash after end_turn): paint, do not own busy.
         # After Esc, leftover *is* the cancelled turn still streaming — re-busy.
@@ -4098,7 +4099,7 @@ class Session:
             self.output._update_title()
             self._update_wakeup_banner(show=True)
         if background:
-            # Only shell tools may be ⚙ — never Read / TaskOutput / etc.
+            # Only shell / Task spawn may be ⚙ — never Read / TaskOutput.
             if name not in _shell_bg:
                 background = False
                 # Drop a prior bad ⚙ registration for this id (e.g. TaskOutput

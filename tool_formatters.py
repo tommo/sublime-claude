@@ -589,6 +589,13 @@ def _task_list(view: "OutputView", tool: "ToolCall") -> str:
     return ""
 
 
+def _looks_like_session_id(tid: str) -> bool:
+    tid = str(tid or "")
+    if not tid or tid.startswith(("term_", "bash-")):
+        return False
+    return tid.count("-") >= 4 and len(tid) >= 20
+
+
 def _task_get(view: "OutputView", tool: "ToolCall") -> str:
     inp = tool.tool_input or {}
     tid = (
@@ -600,10 +607,24 @@ def _task_get(view: "OutputView", tool: "ToolCall") -> str:
         ids = inp.get("task_ids") or inp.get("taskIds") or []
         if isinstance(ids, list) and ids:
             tid = ids[0]
+    desc = (inp.get("description") or inp.get("title") or "").strip()
+    if desc:
+        desc = desc.split("\n", 1)[0].strip()
+        if len(desc) > 80:
+            desc = desc[:77] + "…"
+    # Child session ids are not human labels — never print #01a00fd8-…
+    if _looks_like_session_id(str(tid)):
+        if desc:
+            return f": {desc}"
+        if tool.status in ("pending", "running", "in_progress", "background"):
+            return ": waiting…"
+        return ""
     block = inp.get("block")
     bits = []
     if tid:
         bits.append(f"#{tid}")
+    if desc:
+        bits.append(desc)
     if block:
         bits.append("wait")
     if bits:
@@ -679,6 +700,7 @@ TOOL_FORMATTERS: Dict[str, Callable] = {
     "goal_verdict": _goal_verdict,
     "WebFetch": _webfetch,
     "Task": _task,
+    "Subagent": _task,
     "Agent": _task,
     "AgentSwarm": _task,
     "NotebookEdit": _notebook_edit,

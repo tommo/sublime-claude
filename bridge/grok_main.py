@@ -116,7 +116,7 @@ class GrokBridge(AcpBridge):
         "open_page": "WebFetch",
         "todo_write": "TodoWrite",
         "TodoWrite": "TodoWrite",
-        "spawn_subagent": "Task",
+        "spawn_subagent": "Subagent",
         "Task": "Task",
         "get_command_or_subagent_output": "TaskGet",
         "TaskOutput": "TaskGet",

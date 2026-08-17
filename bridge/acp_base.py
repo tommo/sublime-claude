@@ -194,6 +194,10 @@ class AcpBridge(BaseBridge):
         # Grok multiplexes subagent session/update on the parent ACP pipe with
         # a different sessionId. Count drops so we can log without spam.
         self._foreign_session_drops: int = 0
+        # child sessionId → {text, done, exit, event}. Grok polls these via
+        # terminal/output (same RPC as shells).
+        self._child_sessions: Dict[str, Dict[str, Any]] = {}
+        self._released_terminals: set = set()
         # Serialize writes to agent stdin — concurrent create_task handlers
         # (permission + terminal + fs) would otherwise interleave JSON lines.
         self._acp_write_lock: Optional[asyncio.Lock] = None
@@ -610,6 +614,7 @@ class AcpBridge(BaseBridge):
                 # Drop child/subagent streams before logging noise (Grok fans
                 # subagent tool_call + agent_message onto this same stdio).
                 if self._is_foreign_session(params):
+                    self._ingest_child_session(params)
                     self._note_foreign_session_drop(
                         kind or "session/update", params)
                     continue
@@ -635,6 +640,7 @@ class AcpBridge(BaseBridge):
                 # Surface MCP lifecycle (servers_updated, init_progress, …)
                 # Still skip foreign-session MCP chatter if tagged.
                 if self._is_foreign_session(params):
+                    self._ingest_child_session(params)
                     self._note_foreign_session_drop(method, params)
                     continue
                 self.file_log(
@@ -644,6 +650,7 @@ class AcpBridge(BaseBridge):
             ):
                 # Grok may nest schedule lifecycle under x.ai/session/update.
                 if self._is_foreign_session(params):
+                    self._ingest_child_session(params)
                     self._note_foreign_session_drop(method, params)
                     continue
                 self.file_log(
@@ -651,7 +658,10 @@ class AcpBridge(BaseBridge):
                 upd = params.get("update") or params
                 if isinstance(upd, dict):
                     self._handle_schedule_lifecycle(upd)
-            # Other notifications (_x.ai/*, etc.) are intentionally ignored.
+            elif method and self._is_foreign_session(params):
+                self._ingest_child_session(params)
+                self._note_foreign_session_drop(method, params)
+            # Other parent notifications (_x.ai/*, etc.) are intentionally ignored.
 
     def _acp_id(self) -> int:
         self.next_acp_id += 1
@@ -719,6 +729,103 @@ class AcpBridge(BaseBridge):
             return False
         return str(sid) != str(self.session_id)
 
+    _SUBAGENT_ID_RE = re.compile(r"subagent_id:\s*([0-9A-Za-z._-]+)", re.I)
+    _CHILD_TEXT_CAP = 80_000
+
+    def _register_child_session(self, sid: str) -> dict:
+        sid = str(sid or "").strip()
+        if not sid:
+            return {}
+        slot = self._child_sessions.get(sid)
+        if slot is None:
+            slot = {
+                "text": "",
+                "done": False,
+                "exit": None,
+                "event": asyncio.Event(),
+            }
+            self._child_sessions[sid] = slot
+        return slot
+
+    def _note_spawned_child(self, text: Optional[str]) -> None:
+        if not text:
+            return
+        for m in self._SUBAGENT_ID_RE.finditer(str(text)):
+            self._register_child_session(m.group(1))
+
+    def _bind_child_to_tool(self, text: Optional[str], tool_use_id: str) -> None:
+        if not text or not tool_use_id:
+            return
+        for m in self._SUBAGENT_ID_RE.finditer(str(text)):
+            sid = m.group(1)
+            slot = self._register_child_session(sid)
+            if not slot:
+                continue
+            slot["tool_use_id"] = tool_use_id
+            inp = self._tool_inputs_by_id.get(tool_use_id) or {}
+            desc = inp.get("description") or inp.get("title") or ""
+            if desc:
+                slot["description"] = desc
+            task_id = f"acp-child-{sid}"
+            if task_id not in self._bg_notified_tasks:
+                self._emit_system("task_started", {
+                    "task_id": task_id,
+                    "tool_use_id": tool_use_id,
+                })
+
+    def _emit_bg_child_complete(self, sid: str, slot: dict) -> None:
+        tuid = slot.get("tool_use_id") or ""
+        task_id = f"acp-child-{sid}"
+        if self._should_skip_bg_notify(task_id, tuid):
+            return
+        out = slot.get("text") or ""
+        path = self._write_bg_output_file("acp-child-", out)
+        line = out.strip().split("\n", 1)[0] if out.strip() else sid
+        es = slot.get("exit") or {}
+        code = es.get("exitCode")
+        status = "completed" if code in (0, None) else "failed"
+        self._emit_bg_finished(
+            task_id, tuid, status, self._clip_bg_summary(line, code), path)
+
+    def _ingest_child_session(self, params: dict) -> None:
+        sid = params.get("sessionId") or params.get("session_id")
+        if not sid:
+            return
+        slot = self._register_child_session(str(sid))
+        if not slot or slot.get("done"):
+            return
+        upd = params.get("update") or {}
+        if not isinstance(upd, dict):
+            return
+        kind = upd.get("sessionUpdate")
+        if kind == "agent_message_chunk":
+            text = ((upd.get("content") or {}) or {}).get("text") or ""
+            if text:
+                buf = (slot.get("text") or "") + str(text)
+                slot["text"] = buf[-self._CHILD_TEXT_CAP:]
+        elif kind == "turn_completed":
+            stop = (
+                upd.get("stop_reason") or upd.get("stopReason") or "end_turn")
+            ok = str(stop) in ("end_turn", "max_tokens", "stop")
+            slot["done"] = True
+            slot["exit"] = {
+                "exitCode": 0 if ok else 1,
+                "signal": None,
+            }
+            ev = slot.get("event")
+            if ev is not None and not ev.is_set():
+                ev.set()
+            self._emit_bg_child_complete(str(sid), slot)
+
+    def _child_output_payload(self, slot: dict) -> dict:
+        out = {
+            "output": slot.get("text") or "",
+            "truncated": False,
+        }
+        if slot.get("done") and slot.get("exit") is not None:
+            out["exitStatus"] = slot["exit"]
+        return out
+
     def _note_foreign_session_drop(self, kind: str, params: dict) -> None:
         self._foreign_session_drops += 1
         n = self._foreign_session_drops
@@ -735,6 +842,7 @@ class AcpBridge(BaseBridge):
         # filter here if anything calls this path directly.
         if self._is_foreign_session(params):
             kind = (params.get("update") or {}).get("sessionUpdate")
+            self._ingest_child_session(params)
             self._note_foreign_session_drop(kind or "forward", params)
             return
 
@@ -826,24 +934,29 @@ class AcpBridge(BaseBridge):
                         return
             self._tool_ids_emitted.add(tid)
             self._note_shell_execute(tid, tool_name)
-            is_bg = self._looks_like_background_tool(upd, tool_input)
-            # Only shell may be ⚙ — TaskOutput/"Reading output…" never.
-            if is_bg and not self._is_shell_tool_name(tool_name):
+            is_spawn = self._is_subagent_spawn(tool_name, upd, tool_input)
+            is_bg = is_spawn or self._looks_like_background_tool(
+                upd, tool_input)
+            # Shell ⚙ waits for terminal/create. Task spawn is ⚙ immediately.
+            if is_bg and not (
+                    self._is_shell_tool_name(tool_name)
+                    or self._is_subagent_tool_name(tool_name)):
                 is_bg = False
-            # Cache the flag for terminal/create pairing. Do not ⚙ yet —
-            # Kimi spawn is create; ⚙ with no process never ends.
+                is_spawn = False
             if is_bg and tid and isinstance(tool_input, dict):
                 tool_input = {**tool_input, "run_in_background": True}
                 self._tool_inputs_by_id[tid] = {
                     **(self._tool_inputs_by_id.get(tid) or {}),
                     **tool_input,
                 }
+            if is_spawn and tid:
+                self._bg_tool_ids.add(tid)
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
                 "name": tool_name,
                 "input": tool_input,
-                "background": False,
+                "background": bool(is_spawn),
             })
         elif kind == "tool_call_update":
             usage = self.usage_from_tool_update(upd)
@@ -974,6 +1087,9 @@ class AcpBridge(BaseBridge):
                         self._bind_terminal_to_bg_tool(term_id, tid)
 
                 text = self._extract_tool_content(upd, tool_name)
+                self._note_spawned_child(text)
+                if tid:
+                    self._bind_child_to_tool(text, tid)
                 is_error = status == "failed"
                 # Grok read_file marks images failed ("Cannot read binary file")
                 # even after a successful fs/read — pixels need read_image, not
@@ -986,27 +1102,32 @@ class AcpBridge(BaseBridge):
 
                 # TaskOutput / "Reading output of task …" only *polls* a
                 # bash-* job — never register it as a new ⚙ background tool.
+                # spawn_subagent is Task (launch), not a poll.
                 _title_l = str(upd.get("title") or "").lower()
                 _inp = enriched if isinstance(enriched, dict) else {}
                 is_task_poll = (
-                    tool_name in ("TaskGet", "TaskOutput", "Task")
+                    tool_name in ("TaskGet", "TaskOutput")
                     or "reading output of task" in _title_l
-                    or bool(_inp.get("task_id") or _inp.get("taskId"))
-                    or (tool_name == "Read" and bool(
-                        _inp.get("task_id") or _inp.get("taskId")))
-                )
+                    or "get task output" in _title_l
+                    or bool(_inp.get("task_ids")
+                            or _inp.get("task_id")
+                            or _inp.get("taskId"))
+                ) and not self._is_subagent_spawn(tool_name, upd, _inp)
                 if self._kimi_handle_tool_result(
                         tid, tool_name, text, enriched, is_task_poll,
                         status, upd):
                     return
 
-                # ACP-terminal background: tool_result is only an ack (host keeps
-                # ⚙ until task_notification). Same as Claude run_in_background.
+                # ACP-terminal / subagent background: tool_result is only an
+                # ack (host keeps ⚙ until task_notification).
                 if (
                     tid
                     and tid in self._bg_tool_ids
                     and status == "completed"
-                    and self._is_shell_tool_name(tool_name)
+                    and (
+                        self._is_shell_tool_name(tool_name)
+                        or self._is_subagent_tool_name(tool_name)
+                    )
                     and not is_task_poll
                 ):
                     send_notification("message", {
@@ -1015,10 +1136,12 @@ class AcpBridge(BaseBridge):
                         "content": text or "background",
                         "is_error": False,
                     })
-                    # Keep name/input maps until process exit notification
+                    # Keep name/input maps until process / child exit
                     return
                 if tid and tid in self._bg_tool_ids and (
-                        is_task_poll or not self._is_shell_tool_name(tool_name)):
+                        is_task_poll or not (
+                            self._is_shell_tool_name(tool_name)
+                            or self._is_subagent_tool_name(tool_name))):
                     # Drop mistaken bg mark so normal tool_result can close the row
                     self._bg_tool_ids.discard(tid)
 
@@ -1483,7 +1606,7 @@ class AcpBridge(BaseBridge):
     # prose like "Smoke-test subagent harness" as a tool id).
     _CANONICAL_NAMES = frozenset({
         "Read", "Write", "Edit", "Bash", "Glob", "Grep",
-        "WebSearch", "WebFetch", "TodoWrite", "Task", "TaskGet",
+        "WebSearch", "WebFetch", "TodoWrite", "Task", "TaskGet", "Subagent",
         "TaskCreate", "TaskUpdate", "TaskList", "NotebookEdit",
         "Skill", "EnterPlanMode", "ExitPlanMode", "ask_user",
         "Thinking",
@@ -1597,6 +1720,8 @@ class AcpBridge(BaseBridge):
 
     def _should_suppress_tool_row(self, upd: dict, tool_name: str) -> bool:
         """Drop Kimi lifecycle tool_call noise (✔ Starting)."""
+        if self._is_subagent_output_poll(upd, tool_name):
+            return True
         title = (upd.get("title") or "").strip()
         name = (tool_name or "").strip()
         # Real mapped / mcp tools always keep
@@ -1717,7 +1842,7 @@ class AcpBridge(BaseBridge):
                 if low.startswith("running:") or len(t.split()) > 1:
                     return "Bash"
             if low.startswith("launching ") and "agent" in low:
-                return "Task"
+                return "Subagent"
             if (
                 low.startswith("asking ")
                 or low.startswith("ask:")
@@ -2205,10 +2330,73 @@ class AcpBridge(BaseBridge):
     _SHELL_BG_NAMES = frozenset({
         "Bash", "Shell", "execute", "run_terminal_command", "tool",
     })
+    _SUBAGENT_BG_NAMES = frozenset({"Task", "Subagent", "spawn_subagent"})
 
     @classmethod
     def _is_shell_tool_name(cls, name: str) -> bool:
         return (name or "") in cls._SHELL_BG_NAMES or (name or "") == "Workflow"
+
+    @classmethod
+    def _is_subagent_tool_name(cls, name: str) -> bool:
+        return (name or "") in cls._SUBAGENT_BG_NAMES
+
+    @classmethod
+    def _is_subagent_spawn(cls, tool_name: str, upd: Optional[dict] = None,
+                           tool_input: Optional[dict] = None) -> bool:
+        """True for spawn_subagent / Task launch — not TaskGet polls."""
+        name = (tool_name or "")
+        title = str((upd or {}).get("title") or "").lower()
+        if "spawn_subagent" in title or name in cls._SUBAGENT_BG_NAMES:
+            ri = tool_input if isinstance(tool_input, dict) else {}
+            if not ri:
+                raw = (upd or {}).get("rawInput")
+                ri = raw if isinstance(raw, dict) else {}
+            if ri.get("task_ids") or ri.get("task_id") or ri.get("taskId"):
+                return False
+            if "get task output" in title or "reading output of task" in title:
+                return False
+            if name in ("Task", "Subagent") or "spawn_subagent" in title:
+                return True
+        return False
+
+    def _poll_task_ids(self, upd: Optional[dict] = None,
+                       tool_input: Optional[dict] = None) -> list:
+        ri = tool_input if isinstance(tool_input, dict) else {}
+        if not ri:
+            raw = (upd or {}).get("rawInput")
+            ri = raw if isinstance(raw, dict) else {}
+        ids = []
+        for key in ("task_ids", "taskIds"):
+            v = ri.get(key)
+            if isinstance(v, list):
+                ids.extend(str(x) for x in v if x)
+        for key in ("task_id", "taskId"):
+            v = ri.get(key)
+            if v:
+                ids.append(str(v))
+        return ids
+
+    def _is_child_session_id(self, tid: str) -> bool:
+        tid = str(tid or "")
+        if not tid:
+            return False
+        if tid in getattr(self, "_child_sessions", {}):
+            return True
+        if tid.startswith(("term_", "bash-")):
+            return False
+        return tid.count("-") >= 4 and len(tid) >= 20
+
+    def _is_subagent_output_poll(self, upd: Optional[dict],
+                                 tool_name: str) -> bool:
+        """get_command_or_subagent_output on a child session — not a new row."""
+        name = tool_name or ""
+        title = str((upd or {}).get("title") or "").lower()
+        if name not in ("TaskGet", "TaskOutput") and (
+                "get task output" not in title
+                and "reading output of task" not in title):
+            return False
+        return any(self._is_child_session_id(i)
+                   for i in self._poll_task_ids(upd))
 
     @staticmethod
     def _looks_like_background_tool(upd: dict, tool_input: Optional[dict] = None) -> bool:
@@ -2223,6 +2411,8 @@ class AcpBridge(BaseBridge):
         # Poll tools are foreground — never ⚙
         if "reading output of task" in low or low.startswith("taskoutput"):
             return False
+        if "spawn_subagent" in low:
+            return True
         if low.startswith("starting background"):
             return True
         if low.startswith("running in background") or low.startswith("background task"):
@@ -2351,16 +2541,18 @@ class AcpBridge(BaseBridge):
         if "reading output of task" in tlow or tlow.startswith("taskoutput"):
             return
         name = self._tool_names_by_id.get(tool_use_id) or "Bash"
+        is_sub = self._is_subagent_tool_name(name)
         # Never promote Read / TaskOutput / etc. to ⚙ background
-        if not self._is_shell_tool_name(name):
+        if not self._is_shell_tool_name(name) and not is_sub:
             return
         if name == "tool":
             name = "Bash"
+        emit_name = "Subagent" if is_sub else "Bash"
         already = tool_use_id in self._bg_tool_ids
         self._bg_tool_ids.add(tool_use_id)
         self._last_bg_tool_id = tool_use_id
         inp = dict(tool_input or self._tool_inputs_by_id.get(tool_use_id) or {})
-        if title and not inp.get("command"):
+        if title and not inp.get("command") and not is_sub:
             cmd = title
             for prefix in (
                 "Starting background:", "Starting background",
@@ -2376,14 +2568,14 @@ class AcpBridge(BaseBridge):
             **(self._tool_inputs_by_id.get(tool_use_id) or {}),
             **inp,
         }
-        self._tool_names_by_id[tool_use_id] = "Bash"
+        self._tool_names_by_id[tool_use_id] = emit_name
         self._tool_ids_emitted.add(tool_use_id)
         if already:
             return
         send_notification("message", {
             "type": "tool_use",
             "id": tool_use_id,
-            "name": "Bash",
+            "name": emit_name,
             "input": self._tool_inputs_by_id[tool_use_id],
             "background": True,
         })
@@ -2458,6 +2650,13 @@ class AcpBridge(BaseBridge):
         self._resume_fallback = False
         self._loading_session = False
         self._in_plan_mode = False
+        for slot in list(self._child_sessions.values()):
+            ev = slot.get("event")
+            slot["done"] = True
+            if ev is not None and not ev.is_set():
+                ev.set()
+        self._child_sessions.clear()
+        self._released_terminals.clear()
         keys = list(self._client_schedule_tasks.keys())
         for key in keys:
             self._cancel_client_schedule(key)
@@ -5469,9 +5668,18 @@ class AcpBridge(BaseBridge):
     async def _acp_terminal_output(self, params: dict) -> dict:
         tid = params.get("terminalId") or ""
         slot = self._terminals.get(tid)
-        if not slot:
-            # Already released/killed (e.g. on interrupt) — empty output,
-            # cancelled exit. Matches terminal/wait_for_exit soft handling.
+        if slot:
+            out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
+            return {"output": out, "truncated": bool(slot["truncated"]),
+                    "exitStatus": slot.get("exit_status")}
+        child = self._child_sessions.get(tid)
+        if child:
+            self.file_log(
+                f"terminal/output {tid} child session "
+                f"done={bool(child.get('done'))} n={len(child.get('text') or '')}")
+            return self._child_output_payload(child)
+        if tid in self._released_terminals or str(tid).startswith("term_"):
+            # Host shell we created (or already released).
             self.file_log(
                 f"terminal/output {tid} unknown (released); return cancelled")
             return {
@@ -5479,9 +5687,10 @@ class AcpBridge(BaseBridge):
                 "truncated": False,
                 "exitStatus": {"exitCode": None, "signal": "SIGTERM"},
             }
-        out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
-        return {"output": out, "truncated": bool(slot["truncated"]),
-                "exitStatus": slot.get("exit_status")}
+        # Grok polls spawn_subagent ids here before the first child update.
+        self.file_log(f"terminal/output {tid} unknown child; still running")
+        self._register_child_session(tid)
+        return {"output": "", "truncated": False}
 
     def _mark_terminal_bg(self, tid: str, slot: dict) -> None:
         """⚙ only for this execute's explicit detach or native kimi detached."""
@@ -5525,6 +5734,17 @@ class AcpBridge(BaseBridge):
         tid = params.get("terminalId") or ""
         slot = self._terminals.get(tid)
         if not slot:
+            child = self._child_sessions.get(tid)
+            if child is None and tid not in self._released_terminals \
+                    and not str(tid).startswith("term_"):
+                child = self._register_child_session(tid)
+            if child:
+                ev = child.get("event")
+                if ev is not None and not child.get("done"):
+                    await ev.wait()
+                es = child.get("exit") or {"exitCode": 0, "signal": None}
+                return {"exitCode": es.get("exitCode"),
+                        "signal": es.get("signal")}
             # Already released/killed (e.g. on interrupt) — report cancelled.
             return {"exitCode": None, "signal": "SIGTERM"}
         # kimi-code AcpTerminalProcess: exitCode ?? -1. A null exit is
@@ -5597,6 +5817,9 @@ class AcpBridge(BaseBridge):
 
     async def _acp_terminal_kill(self, params: dict) -> dict:
         tid = params.get("terminalId") or ""
+        if tid in self._child_sessions:
+            self.file_log(f"terminal/kill {tid} is subagent session; ignore")
+            return {}
         slot = self._terminals.get(tid)
         if slot:
             self._kill_terminal_proc(slot.get("proc"))
@@ -5605,6 +5828,10 @@ class AcpBridge(BaseBridge):
 
     async def _acp_terminal_release(self, params: dict) -> dict:
         tid = params.get("terminalId") or ""
+        if tid in self._child_sessions:
+            # Detach the poll handle; the child session keeps running.
+            self.file_log(f"terminal/release {tid} is subagent session; ignore")
+            return {}
         await self._terminal_close(tid)
         return {}
 
@@ -5612,6 +5839,7 @@ class AcpBridge(BaseBridge):
         slot = self._terminals.pop(tid, None)
         if not slot:
             return
+        self._released_terminals.add(tid)
         self._kill_terminal_proc(slot.get("proc"))
         reader = slot.get("reader")
         if reader and not reader.done():

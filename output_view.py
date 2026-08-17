@@ -1785,6 +1785,7 @@ class OutputView:
         # (Kimi TaskOutput was misnamed "Read" and stuck as "⚙ Read (background)".)
         _SHELL_BG = (
             "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
+            "Task", "Subagent",
         )
         if background and name not in _SHELL_BG:
             background = False
