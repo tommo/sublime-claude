@@ -12,6 +12,7 @@ if _ROOT not in sys.path:
 from resume_preview import (
     display_prompt, select_preview, parse_claude_jsonl, parse_grok_chat,
     parse_kimi_wire, load_turns, format_turn_body,
+    find_session_jsonl, find_claude_jsonl,
 )
 
 
@@ -149,6 +150,12 @@ class TestResumePreview(unittest.TestCase):
 
     def test_load_turns_kimi_empty_without_store(self):
         self.assertEqual(load_turns("session_missing", "kimi"), [])
+
+
+    def test_find_session_jsonl_missing(self):
+        self.assertIsNone(find_session_jsonl("", "grok"))
+        self.assertIsNone(find_session_jsonl("no-such-session", "kimi"))
+        self.assertIsNone(find_claude_jsonl(""))
 
 
 if __name__ == "__main__":

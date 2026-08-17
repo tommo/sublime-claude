@@ -203,6 +203,18 @@ def save_sessions(sessions: List[Dict]) -> None:
         print(f"[Claude] Failed to save sessions: {e}")
 
 
+def fork_session_title(name: str) -> str:
+    """Tab / list title for a forked session: '(fork) <name>'."""
+    base = (name or "session").strip() or "session"
+    if base.lower().startswith("(fork)"):
+        return base
+    if base.endswith(" (fork)"):
+        base = base[:-7].rstrip() or "session"
+    if base.lower().startswith("fork:"):
+        base = base[5:].strip() or "session"
+    return f"(fork) {base}"
+
+
 def rename_saved_session(session_id: str, name: str) -> bool:
     """Rename a closed/saved session on disk. True if an entry was updated."""
     name = (name or "").strip()
@@ -326,6 +338,8 @@ class Session:
         self._queued_prompts: List[str] = []
         # Track if inject was sent (to skip "done" status until inject query completes)
         self._inject_pending: bool = False
+        self._interrupting: bool = False
+        self._interrupt_stream: bool = False
         # Buffer for coalescing background-task notifications (idle only).
         # Multiple bg tasks finishing close together → single wake.
         self._pending_bg_notifications: List[str] = []
@@ -428,7 +442,25 @@ class Session:
         # Resolve virtual model ID (e.g. @400k suffix) → real model + context limit
         default_models = settings.get("default_models", {})
         default_model = default_models.get(self.backend) or spec.fallback_model or settings.get("default_model")
-        model_for_env = (self.profile.get("model") if self.profile else None) or default_model
+        saved_entry = None
+        if self.resume_id:
+            for saved in load_saved_sessions():
+                if saved.get("session_id") == self.resume_id:
+                    saved_entry = saved
+                    break
+        view_model = None
+        if self.resume_id and self.output and self.output.view:
+            view_model = self.output.view.settings().get("claude_model")
+        from .session_registry import resolve_init_model
+        chosen_raw = resolve_init_model(
+            profile_model=(self.profile.get("model") if self.profile else None),
+            session_model=self.model,
+            view_model=view_model,
+            saved_model=(saved_entry or {}).get("model"),
+            default_model=default_model,
+            resume=bool(self.resume_id),
+        )
+        model_for_env = chosen_raw
         if model_for_env:
             _, ctx = _resolve_model_id(model_for_env)
             if ctx:
@@ -452,6 +484,7 @@ class Session:
 
         # Diagnostic: log resolved spawn config (subsession-vs-standalone matters here)
         _is_subsession = bool(getattr(self, "subsession_id", None))
+        print(f"[Claude] start {spec.label or self.backend}/{model_for_env or '?'}")
         print(f"[Claude session] backend={self.backend} bridge={spec.bridge_script} "
               f"subsession={'yes' if _is_subsession else 'no'} "
               f"resume={self.resume_id!r} fork={self.fork} "
@@ -550,27 +583,24 @@ class Session:
                 init_params["fork_session"] = True
             # Use saved session's project dir as cwd (session may belong to different project)
             # Also restore lightweight UI state (context_usage, plan_file) so it survives sleep
-            for saved in load_saved_sessions():
-                if saved.get("session_id") == self.resume_id:
-                    saved_project = saved.get("project", "")
-                    if saved_project and saved_project != init_params["cwd"]:
-                        print(f"[Claude] resume: using saved project {saved_project}")
-                        init_params["cwd"] = saved_project
-                    # Restore optional state — best-effort, ignore parse errors
-                    try:
-                        if saved.get("context_usage"):
-                            self.context_usage = saved.get("context_usage")
-                        if saved.get("plan_file"):
-                            self.plan_file = saved.get("plan_file")
-                        if saved.get("last_activity"):
-                            self.last_activity = float(saved.get("last_activity"))
-                        if saved.get("last_access") or saved.get("last_activity"):
-                            self.last_access = float(
-                                saved.get("last_access")
-                                or saved.get("last_activity"))
-                    except Exception:
-                        pass  # benign: restored state is purely cosmetic
-                    break
+            if saved_entry:
+                saved_project = saved_entry.get("project", "")
+                if saved_project and saved_project != init_params["cwd"]:
+                    print(f"[Claude] resume: using saved project {saved_project}")
+                    init_params["cwd"] = saved_project
+                try:
+                    if saved_entry.get("context_usage"):
+                        self.context_usage = saved_entry.get("context_usage")
+                    if saved_entry.get("plan_file"):
+                        self.plan_file = saved_entry.get("plan_file")
+                    if saved_entry.get("last_activity"):
+                        self.last_activity = float(saved_entry.get("last_activity"))
+                    if saved_entry.get("last_access") or saved_entry.get("last_activity"):
+                        self.last_access = float(
+                            saved_entry.get("last_access")
+                            or saved_entry.get("last_activity"))
+                except Exception:
+                    pass  # benign: restored state is purely cosmetic
             if resume_session_at:
                 init_params["resume_session_at"] = resume_session_at
         # Pass subsession identity if this is a subsession (host holds parent;
@@ -594,11 +624,9 @@ class Session:
         if self.output and self.output.view and effort:
             self.output.view.settings().set("claude_effort", effort)
 
-        # Apply profile config or default model
+        # Apply profile extras (model is resolved above — never clobber a
+        # session DeepSeek id with default_models.grok on restart).
         if self.profile:
-            if self.profile.get("model"):
-                real_model, _ = _resolve_model_id(self.profile["model"])
-                init_params["model"] = real_model
             if self.profile.get("betas"):
                 init_params["betas"] = self.profile["betas"]
             if self.profile.get("pre_compact_prompt"):
@@ -617,11 +645,9 @@ class Session:
                 init_params["append_system_prompt"] = append_system
             if getattr(self, "quick_mode", False):
                 init_params["quick_mode"] = True
-        else:
-            # No profile - use default_model setting if available
-            if default_model:
-                real_model, _ = _resolve_model_id(default_model)
-                init_params["model"] = real_model
+        if chosen_raw:
+            real_model, _ = _resolve_model_id(chosen_raw)
+            init_params["model"] = real_model
         # Track model; drop reasoning effort for Grok BYOK chat models (DeepSeek).
         if init_params.get("model"):
             self.model = init_params["model"]
@@ -745,6 +771,13 @@ class Session:
             self.model = str(mid)
             if self.output and self.output.view:
                 self.output.view.settings().set("claude_model", self.model)
+        try:
+            _plabel = backends.get(self.backend).label or self.backend
+        except Exception:
+            _plabel = self.backend
+        print(f"[Claude] {_plabel}/{self.model or '?'}")
+        if self.model:
+            parts.insert(0, str(self.model))
         if self.effort and self.backend in ("claude", "grok"):
             show_effort = True
             if self.backend == "grok":
@@ -1604,23 +1637,17 @@ class Session:
 
     def _find_jsonl_path(self) -> Optional[str]:
         """Find the JSONL file for this session."""
-        if not self.session_id:
-            return None
-        fname = f"{self.session_id}.jsonl"
-        projects_dir = os.path.expanduser("~/.claude/projects")
-        # Try exact cwd match first
-        cwd = self._cwd()
-        project_key = cwd.replace("/", "-").lstrip("-")
-        exact = os.path.join(projects_dir, project_key, fname)
-        if os.path.exists(exact):
-            return exact
-        # Search all project directories
-        if os.path.isdir(projects_dir):
-            for d in os.listdir(projects_dir):
-                candidate = os.path.join(projects_dir, d, fname)
-                if os.path.exists(candidate):
-                    return candidate
-        return None
+        try:
+            from .resume_preview import find_session_jsonl
+        except ImportError:
+            from resume_preview import find_session_jsonl
+        cwd = ""
+        try:
+            cwd = self._cwd() or ""
+        except Exception:
+            cwd = ""
+        return find_session_jsonl(
+            self.session_id, self.backend or "claude", cwd)
 
     def query(self, prompt: str, display_prompt: str = None, silent: bool = False,
               _auto_retry: bool = False) -> None:
@@ -1669,6 +1696,7 @@ class Session:
             self._compacting = True
 
         self._suppress_adopt = False
+        self._interrupt_stream = False
         self.touch_access()
         if getattr(self, "_turn", None) is None:
             self._turn = TurnState()
@@ -1878,16 +1906,15 @@ class Session:
         else:
             completion = "success"
 
-        # Interrupt already restored idle UI in interrupt(). Late bridge ack
-        # only settles flags + flushes queue — never paints *[interrupted]* again
-        # and never clobbers a newer live turn (queue/send_now may already run).
+        # Interrupt ACK. A newer user query already live must not be idled.
+        # Otherwise keep busy if the agent is still streaming after cancel
+        # (Grok + background terminals keep sending tools).
         if completion == "interrupted":
-            # Critical: if settle timers / send_now already started the next
-            # turn, working=True while _interrupting may still be True. The
-            # old check required "working and not interrupting" so it missed
-            # that case, forced working=False, and re-fired the queue —
-            # superseding the turn we just started (Grok looks "weird").
-            if self.working:
+            newer = (
+                self._turn.kind == "live"
+                and not getattr(self, "_interrupt_stream", False)
+            )
+            if newer:
                 print("[Claude] ignore interrupt done — newer turn already live")
                 self._interrupting = False
                 return
@@ -1899,8 +1926,12 @@ class Session:
                     cb("")
                 except Exception:
                     pass
-            # Host already set working=False + *[interrupted]*; just flush queue.
             self._turn.settle_interrupt()
+            if getattr(self, "_interrupt_stream", False) and (
+                    getattr(self, "_bg_task_ids", None)
+                    or getattr(self, "_bg_tools", None)):
+                self._resume_interrupt_stream()
+                return
             self.working = False
             if self.output and self.output.current:
                 self.output.current.working = False
@@ -2093,38 +2124,47 @@ class Session:
         # 6. Clear inject_pending - Claude mid-stream inject / bridge queued_inject
         self._inject_pending = False
 
-        # 6b. Kimi /compact: session/prompt returns immediately while compaction
-        # continues agent-side. Stay busy (spinner + no idle ◎) until we see
-        # "Compaction completed" (or timeout).
+        # 6b. Compact turn finished.
+        # Kimi: session/prompt returns immediately; compaction continues
+        # agent-side until "Compaction completed". Stay busy until then.
+        # Grok (and others): /compact is a slash — the same RPC *is* the
+        # command (end_turn, often no text). Waiting for Kimi's phrase
+        # locks the session for 3 minutes then prints a false timeout.
         if getattr(self, "_compacting", False) and completion == "success":
-            self._turn.enter_compacting()
-            self._awaiting_query_rpc = False
-            self.working = True
-            self._set_turn_phase("waiting")
-            self.current_tool = "compact…"
-            if self.output and self.output.current is not None:
-                self.output.current.working = True
-            try:
-                self.output._update_title()
-            except Exception:
-                pass
-            self._animate()
-            self._status("compacting…")
-            # Safety: if complete text never arrives, unstick after 3 min
-            gen = int(getattr(self, "_query_gen", 0) or 0)
+            if self.backend == "kimi":
+                self._turn.enter_compacting()
+                self._awaiting_query_rpc = False
+                self.working = True
+                self._set_turn_phase("waiting")
+                self.current_tool = "compact…"
+                if self.output and self.output.current is not None:
+                    self.output.current.working = True
+                try:
+                    self.output._update_title()
+                except Exception:
+                    pass
+                self._animate()
+                self._status("compacting…")
+                gen = int(getattr(self, "_query_gen", 0) or 0)
 
-            def _compact_timeout(g=gen):
-                if (getattr(self, "_compacting", False)
-                        and g == getattr(self, "_query_gen", None)):
-                    print("[Claude] compact timeout — forcing idle")
-                    self._finish_compact(timeout=True)
+                def _compact_timeout(g=gen):
+                    if (getattr(self, "_compacting", False)
+                            and g == getattr(self, "_query_gen", None)):
+                        print("[Claude] compact timeout — forcing idle")
+                        self._finish_compact(timeout=True)
 
-            sublime.set_timeout(_compact_timeout, 180000)
-            # Sticky composer still allowed so user can queue messages
-            sublime.set_timeout(
-                lambda: self._enter_input_with_draft() if self.working else None,
-                100)
+                sublime.set_timeout(_compact_timeout, 180000)
+                sublime.set_timeout(
+                    lambda: self._enter_input_with_draft()
+                    if self.working else None,
+                    100)
+                return
+            if self.output:
+                self.output.text("\n*Compacted.*\n")
+            self._finish_compact()
             return
+        if getattr(self, "_compacting", False):
+            self._finish_compact()
 
         # 7. Now set working=False and enter input mode
         self._turn.end_live(_expected_gen)
@@ -2685,6 +2725,22 @@ class Session:
         # Debounce Esc spam — multiple cancels after the turn ends kill Grok
         # (session/cancel on a dead prompt → ChatStateActor dead).
         if getattr(self, "_interrupting", False):
+            # Second Esc while cancel is in flight: force idle (hung cancel).
+            self._interrupting = False
+            self._interrupt_stream = False
+            try:
+                self._turn.settle_interrupt()
+            except Exception:
+                pass
+            self.working = False
+            self._set_turn_phase("idle")
+            try:
+                if self.output and self.output.current:
+                    self.output.current.working = False
+                self.output._update_title()
+            except Exception:
+                pass
+            self._ensure_idle_input(reason="second interrupt")
             return
         if not self.working and not getattr(self, "_inject_pending", False):
             # Idle: only clear input is handled by the command; nothing to cancel.
@@ -2694,11 +2750,12 @@ class Session:
             return
 
         self._interrupting = True
+        self._interrupt_stream = True
         try:
             self._turn.begin_interrupt()
         except Exception:
             pass
-        self._suppress_adopt = True
+        self._suppress_adopt = False
         if getattr(self, "_compacting", False):
             self._compacting = False
             self.current_tool = None
@@ -2722,11 +2779,11 @@ class Session:
         except Exception as e:
             print(f"[Claude] goal interrupt pause: {e}")
 
-        # Immediate UI: idle. Do NOT leave session.working=True with
-        # conversation.working=False (dead UI after a hung cancel).
+        # Stay busy until cancel ACK. Dropping working here is why Esc +
+        # bg task looked idle while Grok kept streaming tools.
         send_now = bool(getattr(self, "_send_now_pending", False))
         self._send_now_pending = False
-        self.working = False
+        self.working = True
         self.current_tool = None
         self._clear_deferred_state(clear_queue=False)
         try:
@@ -3283,6 +3340,110 @@ class Session:
     def _show_connecting_phantom(self) -> None:
         self._show_overlay_phantom("◎ Connecting...")
 
+    def clear_conversation(self) -> None:
+        """Harness /clear: new agent conversation, same process and view.
+
+        Does not kill the bridge. session/new (ACP) or a fresh SDK session.
+        Falls back to a full respawn only if the client is already dead.
+        """
+        if getattr(self, "quick_mode", False):
+            from . import quick_agent
+            win = self.window
+            quick_agent.stop_quick_session(win)
+            quick_agent.ensure_quick_session(win, force_new=True)
+            sublime.status_message("Quick Agent cleared")
+            return
+        if not self.client or not self.client.is_alive() or not self.initialized:
+            from .commands.session_cmds import restart_session_new
+            restart_session_new(self.window, self)
+            return
+
+        if self.working:
+            try:
+                self.interrupt()
+            except Exception:
+                pass
+        # Invalidate in-flight turn done so interrupt result cannot clobber.
+        self._query_gen = int(getattr(self, "_query_gen", 0) or 0) + 1
+        self.working = False
+
+        def _on_clear(result, sess=self):
+            if not result or result.get("error"):
+                err = (result or {}).get("error") or {}
+                msg = err.get("message") if isinstance(err, dict) else str(err)
+                print(f"[Claude] clear failed: {msg}")
+                sublime.status_message(f"Clear failed: {msg or 'unknown'}")
+                return
+            old_sid = sess.session_id
+            sid = result.get("session_id") or result.get("sessionId")
+            if old_sid and old_sid != sid:
+                try:
+                    sess._persist_state("closed")
+                except Exception:
+                    pass
+            if sid:
+                sess.session_id = str(sid)
+                sess.resume_id = None
+                sess.fork = False
+            mid = result.get("model") or result.get("modelId")
+            if mid:
+                sess.model = str(mid)
+                if sess.output and sess.output.view:
+                    sess.output.view.settings().set("claude_model", sess.model)
+            sess.query_count = 0
+            sess.total_cost = 0.0
+            sess.name = None
+            sess.working = False
+            sess._compacting = False
+            sess._turn = TurnState()
+            sess._queued_prompts.clear()
+            sess._task_tool_map.clear()
+            sess._bg_tools.clear()
+            sess._bg_task_ids.clear()
+            sess._seen_running.clear()
+            sess._pending_resume_at = None
+            sess.context.clear()
+            sess._clear_error_halt()
+            sess._composer_allowed = True
+            sess._input_mode_entered = False
+            gt = getattr(sess, "goal_tracker", None)
+            if gt is not None:
+                try:
+                    gt.clear()
+                except Exception:
+                    sess.goal_tracker = None
+            if sess.output:
+                sess.output.clear(keep_supportive=False)
+            try:
+                sess._persist_view_identity()
+            except Exception:
+                pass
+            if not getattr(sess, "quick_mode", False):
+                sess._save_session()
+            try:
+                sess._enter_input_with_draft()
+            except Exception:
+                pass
+            try:
+                label = backends.get(sess.backend).label or sess.backend
+            except Exception:
+                label = sess.backend
+            print(f"[Claude] /clear {label}/{sess.model or '?'} "
+                  f"{old_sid} → {sess.session_id}")
+            sublime.status_message(f"Cleared — {label}/{sess.model or '?'}")
+            try:
+                sess.output.set_name(sess.display_name)
+            except Exception:
+                pass
+            sess._update_status_bar()
+
+        sent = self.client.send("clear", {}, _on_clear)
+        if not sent:
+            from .commands.session_cmds import restart_session_new
+            restart_session_new(self.window, self)
+            return
+        sublime.status_message("Clearing conversation…")
+
     def restart(self) -> None:
         """Restart session — sleep then immediately wake.
 
@@ -3591,6 +3752,14 @@ class Session:
         for i, s in enumerate(sessions):
             if s.get("session_id") == self.session_id:
                 sessions[i]["state"] = state
+                mid = getattr(self, "model", None)
+                if not mid and self.output and self.output.view:
+                    try:
+                        mid = self.output.view.settings().get("claude_model")
+                    except Exception:
+                        mid = None
+                if mid:
+                    sessions[i]["model"] = mid
                 save_sessions(sessions)
                 return
         # Entry doesn't exist yet — create it
@@ -3866,8 +4035,15 @@ class Session:
             "Bash", "Shell", "execute", "run_terminal_command", "Workflow",
         )
         # Idle leftover (synth Bash after end_turn): paint, do not own busy.
+        # After Esc, leftover *is* the cancelled turn still streaming — re-busy.
         if not background:
             self._note_agent_activity()
+        if (
+            not self.working
+            and getattr(self, "_interrupt_stream", False)
+            and not params.get("replay")
+        ):
+            self._resume_interrupt_stream()
         if not self.working:
             try:
                 if self.output:
@@ -4011,6 +4187,20 @@ class Session:
             self._set_turn_phase("waiting")
         self._update_status_bar()
 
+    def _resume_interrupt_stream(self) -> None:
+        """Grok kept streaming after Esc. Own busy until result / next query / Esc."""
+        self._turn.resume_stream()
+        self.working = True
+        self._awaiting_query_rpc = False
+        self._set_turn_phase("responding")
+        if self.output and self.output.current:
+            self.output.current.working = True
+        try:
+            self.output._update_title()
+        except Exception:
+            pass
+        self._animate()
+
     def _adopt_agent_turn(self, label: str = "⚙ task completed") -> None:
         """Leftover inbound must not become a host-owned turn.
 
@@ -4063,6 +4253,8 @@ class Session:
         return (
             "compaction completed" in low
             or "context compaction completed" in low
+            or "compacted." in low
+            or low.strip() == "compacted"
             or (
                 "messages compacted" in low
                 and "tokens after" in low
@@ -4088,6 +4280,12 @@ class Session:
                 self.output.text(text)
             return
         # Compaction finished — paint into compact turn, not a new ⚙ wake
+        if (
+            not self.working
+            and getattr(self, "_interrupt_stream", False)
+            and not params.get("replay")
+        ):
+            self._resume_interrupt_stream()
         if getattr(self, "_compacting", False) and self._looks_like_compact_done(text):
             self._note_agent_activity()
             if self.working:
@@ -4148,9 +4346,13 @@ class Session:
         if usage:
             print(f"[Claude] usage: {usage}")
         stop = params.get("stop_reason") or params.get("stopReason") or ""
+        leftover_end = bool(params.get("leftover_end"))
         if (
-            params.get("status") == "interrupted"
-            or stop in ("interrupted", "cancelled", "canceled")
+            not leftover_end
+            and (
+                params.get("status") == "interrupted"
+                or stop in ("interrupted", "cancelled", "canceled")
+            )
         ):
             # Manual interrupt — _on_done renders *[interrupted]*. Skip @done
             # and "turn failed" (and auto-retry). ACP sends stop_reason without
@@ -4192,6 +4394,11 @@ class Session:
             and params.get("status") != "interrupted"
             and not params.get("is_error")
         ):
+            self._interrupt_stream = False
+            try:
+                self._turn.end_live()
+            except Exception:
+                pass
             self.working = False
             self._set_turn_phase("idle")
             if self.output and self.output.current:
@@ -5089,6 +5296,9 @@ class Session:
                 view.settings().set("claude_session_id", sid)
             if self.backend:
                 view.settings().set("claude_backend", self.backend)
+            mid = getattr(self, "model", None)
+            if mid:
+                view.settings().set("claude_model", mid)
         except Exception:
             pass
 
@@ -5127,6 +5337,14 @@ class Session:
             entry["parent_agent_id"] = self.parent_agent_id
         else:
             entry.pop("parent_agent_id", None)
+        mid = getattr(self, "model", None)
+        if not mid and self.output and self.output.view:
+            try:
+                mid = self.output.view.settings().get("claude_model")
+            except Exception:
+                mid = None
+        if mid:
+            entry["model"] = mid
         # Derive state from current session state
         if self.client is not None and self.initialized:
             entry["state"] = "open"

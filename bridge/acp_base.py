@@ -134,6 +134,9 @@ class AcpBridge(BaseBridge):
         self.pending: Dict[int, asyncio.Future] = {}
         self.reader_task: Optional[asyncio.Task] = None
         self.model: str = self.DEFAULT_MODEL
+        # True only when the host sent initialize.model. DEFAULT_MODEL is a
+        # spawn placeholder — do not force it onto a resumed session.
+        self._host_model: bool = False
         self.effort: str = ""  # reasoning effort (low/medium/high/…); empty = agent default
         self.cwd: str = os.getcwd()
         self.agent_mode: str = ""
@@ -151,6 +154,8 @@ class AcpBridge(BaseBridge):
         self._bg_notified_tools: set = set()
         # toolCallIds already shown as tool_use (avoid duplicate ☐ rows).
         self._tool_ids_emitted: set = set()
+        # toolCallIds already closed with tool_result (avoid a second ✔ row).
+        self._tool_results_sent: set = set()
         # Secondary ExitPlanMode/… toolCallId → primary open id (one UI row).
         self._tool_id_alias: Dict[str, str] = {}
         self._loading_session: bool = False
@@ -159,6 +164,8 @@ class AcpBridge(BaseBridge):
         self._available_models: List[dict] = []
         self._resumed: bool = False
         self._resume_fallback: bool = False
+        self._additional_dirs: List[str] = []
+        self._system_prompt: str = ""
         self._auth_methods: List[dict] = []
         self._init_meta: Dict[str, Any] = {}
         # Plugin permission surface (mirrors Claude can_use_tool / settings).
@@ -310,10 +317,19 @@ class AcpBridge(BaseBridge):
             "modelId": self.model,
         }
 
+    def resolve_applied_model(self, requested: Optional[str],
+                              current: Optional[str]) -> str:
+        """Prefer the id the agent actually bound."""
+        cur = str(current).strip() if current else ""
+        if cur:
+            return cur
+        return (requested or "").strip()
+
     async def apply_model(self) -> None:
         """Push self.model (and effort, if any) to the live session."""
         if not self.session_id or not self.model:
             return
+        requested = self.model
         try:
             result = await self._send_acp(
                 "session/set_model", self.set_model_params()) or {}
@@ -324,8 +340,9 @@ class AcpBridge(BaseBridge):
                 model_meta = meta.get("model") or {}
                 if isinstance(model_meta, dict):
                     current = model_meta.get("Ok") or model_meta.get("ok")
-            if current:
-                self.model = current
+            nxt = self.resolve_applied_model(requested, current)
+            if nxt:
+                self.model = nxt
         except Exception as e:
             self.log(f"session/set_model({self.model}) failed: {e}")
 
@@ -469,6 +486,12 @@ class AcpBridge(BaseBridge):
             except Exception:
                 pass
         self.file_log(f"agent dead: {reason}")
+        pf = getattr(self, "_prompt_fut", None)
+        in_flight = pf is not None and not pf.done()
+        if not in_flight:
+            # Prompt already returned end_turn — Grok often closes stdio
+            # after a long turn. Do not paint ⚠ turn failed on a finished @done.
+            return
         try:
             send_notification("message", {
                 "type": "result",
@@ -785,9 +808,11 @@ class AcpBridge(BaseBridge):
                 return
             # One open ExitPlanMode at a time — second toolCallId aliases the first
             # (permission + session/update double-open painted two rows).
-            if tool_name in ("ExitPlanMode", "EnterPlanMode") and tid:
+            if tool_name in (
+                "ExitPlanMode", "EnterPlanMode", "ask_user", "AskUserQuestion",
+            ) and tid:
                 for oid, oname in list(self._tool_names_by_id.items()):
-                    if (oname == tool_name and oid != tid
+                    if (self._same_modal_tool(oname, tool_name) and oid != tid
                             and oid in self._tool_ids_emitted):
                         if not hasattr(self, "_tool_id_alias"):
                             self._tool_id_alias = {}
@@ -919,6 +944,8 @@ class AcpBridge(BaseBridge):
                     slot["tool_use_id"] = tid
 
             if status in ("completed", "failed"):
+                if tid and tid in getattr(self, "_tool_results_sent", set()):
+                    return
                 # No open row for this id → nothing to close (noise already dropped)
                 if tid not in self._tool_ids_emitted and not self._tool_update_has_substance(upd):
                     # may have been suppressed at open
@@ -1001,6 +1028,8 @@ class AcpBridge(BaseBridge):
                     "content": text,
                     "is_error": is_error,
                 })
+                if tid:
+                    self._tool_results_sent.add(tid)
                 self._tool_ids_emitted.discard(tid)
                 # Drop aliases that pointed at this primary
                 for alias, primary in list(
@@ -1045,11 +1074,9 @@ class AcpBridge(BaseBridge):
             "scheduled_task_deleted",
         ):
             self._handle_schedule_lifecycle(upd)
-        # turn_completed / session_summary_generated: ignore (result RPC covers end)
-        # elif kind == "turn_completed":
-        #     pf = getattr(self, "_prompt_fut", None)
-        #     if pf is None or pf.done():
-        #         send_notification(...)  # fake result — rejected
+        # turn_completed after a finished prompt is not a second result.
+        # Firing leftover_end here double-closed every Grok turn (@done +
+        # ⚠ turn failed when stdout then dropped).
 
     def _forward_load_replay(self, params: dict) -> None:
         """Paint session/load history. Kimi replays before load settles.
@@ -1526,6 +1553,20 @@ class AcpBridge(BaseBridge):
                 return True
         return False
 
+    @staticmethod
+    def _same_modal_tool(a: str, b: str) -> bool:
+        """ask_user / ExitPlanMode aliases that must share one UI row."""
+        def _n(x: str) -> str:
+            s = (x or "").strip()
+            if s in ("ask_user", "AskUserQuestion", "ask_user_question", "AskUser"):
+                return "ask_user"
+            if s in ("ExitPlanMode", "exit_plan_mode", "exitPlanMode"):
+                return "ExitPlanMode"
+            if s in ("EnterPlanMode", "enter_plan_mode", "enterPlanMode"):
+                return "EnterPlanMode"
+            return s
+        return bool(a and b and _n(a) == _n(b))
+
     def _resolve_tool_id(self, tid: Optional[str]) -> Optional[str]:
         """Map aliased secondary toolCallId → primary open row id."""
         if not tid:
@@ -1580,21 +1621,54 @@ class AcpBridge(BaseBridge):
             return True
         return False
 
+    _USE_TOOL_WRAPPERS = frozenset({
+        "use_tool", "UseTool", "CallMcpTool", "call_mcp_tool",
+    })
+
+    def _peel_use_tool_name(self, upd: dict) -> Optional[str]:
+        """Grok MCP is use_tool{tool_name, tool_input}. Do not keep the wrapper."""
+        raw = upd.get("rawInput") if isinstance(upd.get("rawInput"), dict) else {}
+        inner = raw.get("tool_name") or raw.get("toolName")
+        if not isinstance(inner, str) or not inner.strip():
+            return None
+        inner = inner.strip()
+        if inner in self._USE_TOOL_WRAPPERS:
+            return None
+        mapped = self._map_agent_tool_id(inner)
+        if mapped:
+            return mapped
+        if inner.startswith("sublime__"):
+            short = inner[len("sublime__"):]
+            return self._map_agent_tool_id(short) or short
+        if inner.startswith("mcp__"):
+            return inner
+        return inner
+
     def _normalize_tool_name(self, upd: dict) -> str:
+        peeled = self._peel_use_tool_name(upd)
+        if peeled:
+            return peeled
+
         # 1) Grok advertises the real tool id on _meta.x.ai/tool.name — prefer it.
+        # Skip when that name is the use_tool wrapper (inner is in rawInput).
         meta = upd.get("_meta") or {}
         if isinstance(meta, dict):
             xai = meta.get("x.ai/tool") or meta.get("xai_tool") or {}
             if isinstance(xai, dict):
-                mapped = self._map_agent_tool_id(xai.get("name") or "")
-                if mapped:
-                    return mapped
+                xn = xai.get("name") or ""
+                if xn not in self._USE_TOOL_WRAPPERS:
+                    mapped = self._map_agent_tool_id(xn)
+                    if mapped:
+                        return mapped
 
         # 2) rawInput tool / name / toolName / variant (e.g. variant=Task, ReadFile)
         raw = upd.get("rawInput") or {}
         if isinstance(raw, dict):
             for key in ("tool", "name", "toolName", "variant"):
-                mapped = self._map_agent_tool_id(raw.get(key) or "")
+                val = raw.get(key) or ""
+                if val in self._USE_TOOL_WRAPPERS:
+                    continue
+                mapped = self._map_agent_tool_id(val)
                 if mapped:
                     return mapped
 
@@ -1644,8 +1718,13 @@ class AcpBridge(BaseBridge):
                     return "Bash"
             if low.startswith("launching ") and "agent" in low:
                 return "Task"
-            if low.startswith("asking ") or "question" in low:
-                return "AskUserQuestion"
+            if (
+                low.startswith("asking ")
+                or low.startswith("ask:")
+                or low.startswith("ask ")
+                or "question" in low
+            ):
+                return "ask_user"
             if low.startswith("todo") or "todolist" in low.replace(" ", ""):
                 return "TodoWrite"
             first = t.split()[0].strip("`'\"*")
@@ -1653,7 +1732,7 @@ class AcpBridge(BaseBridge):
             if mapped:
                 return mapped
             # PascalCase / CamelCase / snake_case only when it looks like a tool id
-            if first and self._title_looks_like_tool_id(first):
+            if first and first not in self._USE_TOOL_WRAPPERS and self._title_looks_like_tool_id(first):
                 mapped = self._map_agent_tool_id(first)
                 if mapped:
                     return mapped
@@ -1664,6 +1743,7 @@ class AcpBridge(BaseBridge):
             # snake_case / lowercase machine id without map entry
             if (first and first.isascii() and first.replace("_", "").isalnum()
                     and ("_" in first or first.islower())
+                    and first not in self._USE_TOOL_WRAPPERS
                     and not self._is_lifecycle_tool_noise(first)):
                 return first
 
@@ -2043,6 +2123,8 @@ class AcpBridge(BaseBridge):
             "cancel_loop": self.handle_cancel_loop,
             # Same RPC as Claude SDK bridge — host polls when idle with ⚙ tasks.
             "poll_bg_tasks": self.handle_poll_bg_tasks,
+            # Harness /clear: new conversation, same agent process.
+            "clear": self.handle_clear,
         }
 
     async def handle_poll_bg_tasks(self, req_id: Optional[int],
@@ -2358,6 +2440,62 @@ class AcpBridge(BaseBridge):
         self._emit_bg_finished(
             task_id, tool_use_id, status, summary, output_file)
 
+    def _reset_conversation_local(self) -> None:
+        """Drop turn-local maps that belong to the conversation being cleared."""
+        self._bg_tool_ids.clear()
+        self._terminal_bg.clear()
+        self._bg_notified_tasks.clear()
+        self._bg_notified_tools.clear()
+        self._tool_ids_emitted.clear()
+        self._tool_results_sent.clear()
+        self._tool_id_alias.clear()
+        self._tool_inputs_by_id.clear()
+        self._tool_names_by_id.clear()
+        self._pending_execute_ids.clear()
+        self._last_execute_id = None
+        self._last_bg_tool_id = None
+        self._resumed = False
+        self._resume_fallback = False
+        self._loading_session = False
+        self._in_plan_mode = False
+        keys = list(self._client_schedule_tasks.keys())
+        for key in keys:
+            self._cancel_client_schedule(key)
+
+    async def handle_clear(self, req_id: Optional[int],
+                            params: dict) -> None:
+        """Harness /clear: session/new on the live agent, keep the process."""
+        if self.session_id is None:
+            send_error(req_id, -32000, "session not initialized")
+            return
+        if (
+            self._query_req_id is not None
+            or (self._prompt_fut is not None and not self._prompt_fut.done())
+            or self._cancel_in_flight
+        ):
+            await self._cancel_agent_turn(
+                reason="clear", wait_s=2.0, settle_s=0.3,
+                force_local=True, orphan_ok=True)
+        self._reset_conversation_local()
+        old = self.session_id
+        mcp_servers = self._collect_mcp_servers()
+        await self._create_session(
+            mcp_servers,
+            system_prompt=getattr(self, "_system_prompt", "") or "",
+            additional_dirs=getattr(self, "_additional_dirs", None),
+        )
+        await self.apply_mode()
+        if self.model:
+            await self.apply_model()
+        self.file_log(
+            f"clear: {old} → {self.session_id} model={self.model}")
+        send_result(req_id, {
+            "ok": True,
+            "session_id": self.session_id,
+            "sessionId": self.session_id,
+            "model": self.model,
+        })
+
     async def handle_cancel_loop(self, req_id: Optional[int],
                                   params: dict) -> None:
         """Cancel all client-side schedule backups and clear the loop banner."""
@@ -2370,7 +2508,10 @@ class AcpBridge(BaseBridge):
 
     async def handle_initialize(self, req_id: Optional[int],
                                  params: dict) -> None:
-        self.model = self.normalize_model(params.get("model") or self.model)
+        raw_model = params.get("model")
+        self._host_model = bool(raw_model)
+        if raw_model:
+            self.model = self.normalize_model(raw_model)
         # Capture effort before first agent spawn (Grok CLI flag is spawn-time).
         self.effort = self.normalize_effort(params.get("effort"))
         self._agent_exited = False
@@ -2407,6 +2548,8 @@ class AcpBridge(BaseBridge):
         fork_session = bool(params.get("fork_session", False))
         system_prompt = params.get("system_prompt") or ""
         additional_dirs = params.get("additional_dirs") or []
+        self._additional_dirs = list(additional_dirs)
+        self._system_prompt = system_prompt
 
         try:
             # kimi-code 0.36: AskUser Q1+ only via elicitation/create.
@@ -2461,7 +2604,8 @@ class AcpBridge(BaseBridge):
                              f"opened new session {self.session_id}")
 
             await self.apply_mode()
-            await self.apply_model()
+            if self.model:
+                await self.apply_model()
 
             send_result(req_id, {
                 "status": "initialized",
@@ -2572,7 +2716,7 @@ class AcpBridge(BaseBridge):
         models = result.get("models") or {}
         if models.get("availableModels"):
             self._available_models = models["availableModels"]
-        if models.get("currentModelId") and not self.model:
+        if models.get("currentModelId") and not self._host_model:
             self.model = models["currentModelId"]
 
     def _collect_mcp_servers(self) -> list:
@@ -4472,14 +4616,17 @@ class AcpBridge(BaseBridge):
                 "partial_answers": {},
             }
 
-        # Emit a tool_use so the transcript shows the ask (Claude parity).
+        # session/update already opened this id — do not paint a second ☐.
         tool_call_id = params.get("toolCallId") or f"ask_{self.permission_id + 1}"
-        send_notification("message", {
-            "type": "tool_use",
-            "id": tool_call_id,
-            "name": "ask_user",
-            "input": {"questions": questions},
-        })
+        if tool_call_id not in self._tool_ids_emitted:
+            self._tool_ids_emitted.add(tool_call_id)
+            self._tool_names_by_id[tool_call_id] = "ask_user"
+            send_notification("message", {
+                "type": "tool_use",
+                "id": tool_call_id,
+                "name": "ask_user",
+                "input": {"questions": questions},
+            })
 
         self.question_id += 1
         qid = self.question_id
@@ -4500,12 +4647,14 @@ class AcpBridge(BaseBridge):
 
         if answers is None:
             # User cancelled / interrupted the question UI.
-            send_notification("message", {
-                "type": "tool_result",
-                "tool_use_id": tool_call_id,
-                "content": "User cancelled",
-                "is_error": True,
-            })
+            if tool_call_id not in self._tool_results_sent:
+                self._tool_results_sent.add(tool_call_id)
+                send_notification("message", {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": "User cancelled",
+                    "is_error": True,
+                })
             return {"outcome": "cancelled"}
 
         # Plugin returns {question_text: answer_label_or_list}.
@@ -4513,12 +4662,14 @@ class AcpBridge(BaseBridge):
 
         summary = "; ".join(
             f"{k}: {', '.join(v)}" for k, v in norm.items())
-        send_notification("message", {
-            "type": "tool_result",
-            "tool_use_id": tool_call_id,
-            "content": summary or "answered",
-            "is_error": False,
-        })
+        if tool_call_id not in self._tool_results_sent:
+            self._tool_results_sent.add(tool_call_id)
+            send_notification("message", {
+                "type": "tool_result",
+                "tool_use_id": tool_call_id,
+                "content": summary or "answered",
+                "is_error": False,
+            })
         self.file_log(f"ask_user_question answers: {json.dumps(norm)[:400]}")
         return {
             "outcome": "accepted",
@@ -4867,7 +5018,8 @@ class AcpBridge(BaseBridge):
             )
         else:
             summary = "Continue planning"
-        if tool_call_id:
+        if tool_call_id and tool_call_id not in self._tool_results_sent:
+            self._tool_results_sent.add(tool_call_id)
             send_notification("message", {
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,

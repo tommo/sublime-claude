@@ -51,6 +51,19 @@ class OutputView:
         low = n.lower()
         return low.endswith("quick_done") or "quick_done" in low
 
+    @staticmethod
+    def _same_modal_tool(a: str, b: str) -> bool:
+        def _n(x: str) -> str:
+            s = (x or "").strip()
+            if s in ("ask_user", "AskUserQuestion", "ask_user_question", "AskUser"):
+                return "ask_user"
+            if s in ("ExitPlanMode", "exit_plan_mode", "exitPlanMode"):
+                return "ExitPlanMode"
+            if s in ("EnterPlanMode", "enter_plan_mode", "enterPlanMode"):
+                return "EnterPlanMode"
+            return s
+        return bool(a and b and _n(a) == _n(b))
+
     def __init__(self, window: sublime.Window):
         self.window = window
         self.view: Optional[sublime.View] = None
@@ -403,6 +416,18 @@ class OutputView:
             self.view.set_read_only(False)
         else:
             self.view.set_read_only(True)
+        # Full-conversation replace on every stream tick fills ST's undo
+        # stack (main process, not plugin_host). Scratch views don't need it.
+        view = self.view
+
+        def _drop_undo(v=view):
+            try:
+                if v and v.is_valid():
+                    v.clear_undo_stack()
+            except Exception:
+                pass
+
+        sublime.set_timeout(_drop_undo, 0)
 
     def _write(self, text: str, pos: Optional[int] = None) -> int:
         """Write text at position (or end). Returns end position."""
@@ -1771,10 +1796,12 @@ class OutputView:
         # ExitPlanMode / EnterPlanMode: agent or ACP often opens twice with
         # different toolCallIds (tool_call + permission / ext method) →
         # "✔ ExitPlanMode: awaiting approval..." twice. Collapse to one open row.
-        if existing is None and name in ("ExitPlanMode", "EnterPlanMode"):
+        if existing is None and name in (
+            "ExitPlanMode", "EnterPlanMode", "ask_user", "AskUserQuestion",
+        ):
             for event in reversed(self.current.events):
                 if (isinstance(event, ToolCall)
-                        and event.name == name
+                        and self._same_modal_tool(event.name, name)
                         and event.status in (PENDING, BACKGROUND)):
                     existing = event
                     if tool_id:
@@ -2060,6 +2087,18 @@ class OutputView:
             if target is not None:
                 targets = [target]
         if not targets:
+            # Second close of ask_user / ExitPlanMode after the first ✔ —
+            # do not append a blank duplicate row.
+            if self.current:
+                for event in reversed(self.current.events):
+                    if not isinstance(event, ToolCall):
+                        continue
+                    if event.status != DONE:
+                        continue
+                    if tool_id and event.id == tool_id:
+                        return
+                    if self._same_modal_tool(event.name, name):
+                        return
             # Don't surface host-control tools as a late-arriving ✔ row
             if self.current and not self.is_host_control_tool(name):
                 self.current.events.append(ToolCall(
@@ -2356,13 +2395,15 @@ class OutputView:
             self.current.events.append("\n\n*[interrupted]*\n")
         self._render_current()
 
-    def clear(self) -> None:
+    def clear(self, keep_supportive: bool = True) -> None:
         """Clear all output (can undo with Cmd+Z).
 
         Preserves and re-displays "supportive" UI elements that reflect current
         state rather than chat history: active background tools and the open
         todo list. Pending permission/plan/question UIs are turn-modal and
         intentionally cleared.
+
+        keep_supportive=False: harness /clear — wipe todos/goal/bg rows too.
         """
         # Remember if we were in input mode
         was_input_mode = self._input_mode
@@ -2395,6 +2436,10 @@ class OutputView:
                 if _goal_is_open(conv.goal):
                     carry_goal = conv.goal
                     break
+        if not keep_supportive:
+            carry_bg_tools = []
+            carry_todos = []
+            carry_goal = None
 
         draft = ""
         if self._input_mode:

@@ -23,7 +23,9 @@ class CommandParser:
     """Parses input for /command patterns."""
 
     BUILTIN_COMMANDS = {
-        "clear": "Clear conversation history (local)",
+        "clear": "Harness /clear — new conversation, same process",
+        "restart": "Same as /clear — new conversation in this view",
+        "restart-new": "Same as /clear — new conversation in this view",
         "compact": "Summarize conversation to reduce context",
         "context": "Show pending context items",
         "goal": "Goal mode: /goal <obj> [--budget N] | status|pause|resume|clear",

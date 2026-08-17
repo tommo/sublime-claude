@@ -259,6 +259,39 @@ def find_grok_chat(session_id: str, cwd: str = "") -> Optional[str]:
     return None
 
 
+def find_claude_jsonl(session_id: str, cwd: str = "") -> Optional[str]:
+    if not session_id:
+        return None
+    fname = f"{session_id}.jsonl"
+    projects_dir = os.path.expanduser("~/.claude/projects")
+    if cwd:
+        key = cwd.replace("/", "-").lstrip("-")
+        exact = os.path.join(projects_dir, key, fname)
+        if os.path.isfile(exact):
+            return exact
+    if not os.path.isdir(projects_dir):
+        return None
+    try:
+        for d in os.listdir(projects_dir):
+            cand = os.path.join(projects_dir, d, fname)
+            if os.path.isfile(cand):
+                return cand
+    except OSError:
+        return None
+    return None
+
+
+def find_session_jsonl(session_id: str, backend: str = "",
+                       cwd: str = "") -> Optional[str]:
+    """Backend transcript: grok chat_history, kimi wire, claude projects jsonl."""
+    backend = (backend or "claude").lower()
+    if backend == "grok":
+        return find_grok_chat(session_id, cwd)
+    if backend == "kimi":
+        return find_kimi_wire(session_id, cwd)
+    return find_claude_jsonl(session_id, cwd)
+
+
 def load_turns(session_id: str, backend: str, cwd: str = "",
                claude_jsonl: str = "") -> List[dict]:
     backend = (backend or "claude").lower()

@@ -98,6 +98,13 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
 
         text = s.output.get_input_text().strip()
 
+        # Composer command: RESTART NEW (also /restart, /restart new)
+        if text.upper() == "RESTART NEW":
+            s.output.exit_input_mode(keep_text=False)
+            s.draft_prompt = ""
+            s.window.run_command("claude_code_restart_new")
+            return
+
         # Empty composer + send now: force-send top of queue (cancel current).
         if not text:
             if send_now and s.working and s._queued_prompts:
@@ -203,6 +210,8 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         """Handle a slash command."""
         if cmd.name == "clear":
             self._cmd_clear(session)
+        elif cmd.name in ("restart", "restart-new", "restart_new"):
+            self._cmd_restart_new(session, cmd)
         elif cmd.name == "compact":
             self._cmd_compact(session)
         elif cmd.name == "context":
@@ -219,16 +228,19 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             session.query(cmd.raw)
 
     def _cmd_clear(self, session):
-        """Clear conversation history."""
-        session.output.clear()
-        sublime.status_message("Claude: conversation cleared")
+        """Harness /clear — new conversation, same process."""
+        session.clear_conversation()
+
+    def _cmd_restart_new(self, session, cmd=None):
+        """RESTART NEW: same as harness /clear."""
+        args = (getattr(cmd, "args", None) or "").strip().lower()
+        if cmd and cmd.name == "restart" and args and args not in ("new",):
+            session.query(cmd.raw)
+            return
+        session.clear_conversation()
 
     def _cmd_compact(self, session):
-        """Send /compact to Claude for context summarization.
-
-        Kimi returns immediately while compaction runs agent-side — Session
-        keeps busy (_compacting) until 'Compaction completed' text arrives.
-        """
+        """Send /compact. Kimi stays busy until agent text; Grok ends with the RPC."""
         session._compacting = True
         session.current_tool = "compact…"
         try:

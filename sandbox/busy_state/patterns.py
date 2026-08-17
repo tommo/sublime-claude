@@ -123,17 +123,28 @@ class TestCompact(unittest.TestCase):
 
 
 class TestInterrupt(unittest.TestCase):
-    def test_interrupt_clears_busy_leftover_does_not_rearm(self):
+    def test_interrupt_stays_busy_until_settle(self):
         t = TurnState()
         t.begin_query()
         self.assertTrue(t.begin_interrupt())
-        self.assertFalse(t.working)
-        self.assertEqual(t.inbound_action("text"), "paint")
-        self.assertEqual(t.inbound_action("synth_bash"), "paint")
+        self.assertTrue(t.working)
         self.assertEqual(t.kind, "interrupting")
+        self.assertEqual(t.inbound_action("text"), "paint")
         t.settle_interrupt()
         self.assertEqual(t.kind, "idle")
+        self.assertFalse(t.working)
         self.assertEqual(t.inbound_action("synth_bash"), "paint_bg")
+
+    def test_resume_stream_after_interrupt_is_busy(self):
+        t = TurnState()
+        t.begin_query()
+        t.begin_interrupt()
+        t.settle_interrupt()
+        t.resume_stream()
+        self.assertEqual(t.kind, "live")
+        self.assertTrue(t.working)
+        self.assertFalse(t.awaiting_rpc)
+        self.assertTrue(t.end_live())
         self.assertFalse(t.working)
 
     def test_idle_interrupt_is_noop(self):

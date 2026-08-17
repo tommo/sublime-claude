@@ -43,9 +43,9 @@ contexts:
       push: row_rest
 
   header_rest:
-    - match: '\b(enter|dclick|r|v|s)\b'
+    - match: '\b(enter|dclick|r|v|s|f)\b'
       scope: keyword.operator.session-list
-    - match: '\b(open|rename|reveal|star)\b'
+    - match: '\b(open|rename|reveal|star|fork)\b'
       scope: comment.line.session-list
     - match: '·'
       scope: comment.line.session-list
@@ -63,30 +63,19 @@ contexts:
       pop: true
 
   row_title:
-    - match: '\s+(\d+q)\s+(working)\s*$'
-      captures:
-        1: constant.numeric.session-list
-        2: keyword.working.session-list
+    - match: '\s+\d+q\b'
+      scope: comment.nq.session-list
+    - match: '\s+(busy)\s*$'
+      scope: keyword.working.session-list
       pop: true
-    - match: '\s+(\d+q)\s+(input)\s*$'
-      captures:
-        1: constant.numeric.session-list
-        2: keyword.input.session-list
+    - match: '\s+(wait)\s*$'
+      scope: keyword.input.session-list
       pop: true
-    - match: '\s+(\d+q)\s+(unread)\s*$'
-      captures:
-        1: constant.numeric.session-list
-        2: keyword.unread.session-list
+    - match: '\s+(new)\s*$'
+      scope: keyword.unread.session-list
       pop: true
-    - match: '\s+(\d+q)\s+(ready)\s*$'
-      captures:
-        1: constant.numeric.session-list
-        2: keyword.ready.session-list
-      pop: true
-    - match: '\s+(\d+q)\s+(sleeping)\s*$'
-      captures:
-        1: constant.numeric.session-list
-        2: keyword.sleeping.session-list
+    - match: '\s+(idle)\s*$'
+      scope: keyword.ready.session-list
       pop: true
     - match: '\s+(now|\d+[smhdw])\s*$'
       scope: comment.line.time.session-list

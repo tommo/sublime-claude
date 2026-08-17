@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,7 +12,7 @@ import sublime_plugin
 
 from .session import (
     load_saved_sessions, load_bookmarks, remove_saved_session, toggle_bookmark,
-    rename_saved_session,
+    rename_saved_session, fork_session_title,
 )
 
 
@@ -112,7 +114,7 @@ def backend_abbrev(backend: str) -> str:
 
 
 def view_cols(view, fallback: int = 80) -> int:
-    """Visible columns for the Sessions scratch (viewport / em, minus slack)."""
+    """Columns in the text box (viewport minus ST's own left/right margin)."""
     if not view:
         return fallback
     try:
@@ -125,7 +127,7 @@ def view_cols(view, fallback: int = 80) -> int:
         except Exception:
             margin = 0
         usable = max(em, vw - 2 * margin)
-        return max(24, int(usable / em) - 1)
+        return max(24, int(usable / em))
     except Exception:
         return fallback
 
@@ -136,13 +138,14 @@ def use_compact(cols: int) -> bool:
 
 def format_header(cols: int = 0) -> str:
     left = "SESSIONS"
-    right = "enter open · v reveal · s star · r rename · del close"
+    right = "enter open · v reveal · f fork · s star · r rename · del close"
     if not cols:
         return f"{left}                  {right}"
     for cand in (
         right,
-        "↵ open · v · s · r · del",
-        "v · s · r · del",
+        "↵ open · v · f · s · r · del",
+        "v · f · s · r · del",
+        "f · s · r · del",
         "s · r · del",
         "r · del",
         "r rename",
@@ -192,8 +195,9 @@ def format_when(ts, now=None) -> str:
     sec = max(0, int(now_t - t))
     if sec < 5:
         return "now"
+    # No per-second stamp — a 900ms poll + undo stack was leaking GBs.
     if sec < 60:
-        return f"{sec}s"
+        return "<1m"
     if sec < 3600:
         return f"{sec // 60}m"
     if sec < 86400:
@@ -298,17 +302,41 @@ def collect_history(live_ids: set, cwd: str) -> Tuple[List[dict], List[dict]]:
     return here[:HISTORY_CAP], other[:HISTORY_CAP]
 
 
-def _right_meta(r: dict) -> str:
-    """One stamp column: ready/working if awake, elapsed if sleeping/history."""
+# 4 letters so the state column is a fixed width.
+_STAMP = {
+    "working": "busy",
+    "ready": "idle",
+    "input": "wait",
+    "unread": "new",
+}
+_GAP = 2   # after Nq, before state — must be > 1 (the space before Nq)
+_STAMP_W = 4
+
+
+def _stamp_of(r: dict) -> str:
     live = r.get("kind") == "live"
     status = r.get("status") or ""
-    if live and status not in ("", "sleeping"):
-        stamp = status
-    else:
-        stamp = format_when(r.get("last_access") or r.get("last_activity"))
-    q = f"{r['query_count']}q" if r.get("query_count") else ""
-    extra = f" {q:>4} {stamp:>7}"
-    return extra
+    if live and status in _STAMP:
+        return _STAMP[status]
+    return format_when(r.get("last_access") or r.get("last_activity"))
+
+
+def _q_col(r: dict) -> str:
+    try:
+        n = int(r.get("query_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return f" {n}q" if n else ""
+
+
+def _right_meta(r: dict) -> str:
+    """` 12q` (if any) + 2 spaces + state. No blank Nq column — that
+    stole title width and left a hole (the Libr... 1q        1h shot).
+    """
+    stamp = _stamp_of(r) or ""
+    if len(stamp) < _STAMP_W:
+        stamp = f"{stamp:>{_STAMP_W}}"
+    return _q_col(r) + (" " * _GAP) + stamp
 
 
 def pull_starred(live: List[dict], here: List[dict],
@@ -338,8 +366,8 @@ def _fmt_row(r: dict, starred: set, compact: bool = False, cols: int = 0) -> str
     if compact:
         pre = f"{mark} {backend_abbrev(r.get('backend'))} "
         return pre + fit_title(name, _name_budget(pre, "", cols, True))
-    extra = _right_meta(r)
     pre = f"{mark} {r['backend']:<7} "
+    extra = _right_meta(r)
     return pre + fit_title(name, _name_budget(pre, extra, cols, False)) + extra
 
 
@@ -677,6 +705,92 @@ def close_row(window, row: dict) -> bool:
     return False
 
 
+def jsonl_path_for_row(window, row: dict) -> Optional[str]:
+    if not row:
+        return None
+    sid = row.get("session_id")
+    backend = row.get("backend") or "claude"
+    cwd = row.get("project") or ""
+    if not cwd and window:
+        try:
+            folders = window.folders()
+            if folders:
+                cwd = folders[0]
+        except Exception:
+            cwd = ""
+    live = _live_session_for_row(row)
+    if live is not None:
+        try:
+            p = live._find_jsonl_path()
+            if p:
+                return p
+        except Exception:
+            pass
+        try:
+            cwd = live._cwd() or cwd
+        except Exception:
+            pass
+        backend = getattr(live, "backend", None) or backend
+        sid = getattr(live, "session_id", None) or sid
+    try:
+        from .resume_preview import find_session_jsonl
+    except ImportError:
+        from resume_preview import find_session_jsonl
+    return find_session_jsonl(sid, backend, cwd)
+
+
+def open_row_jsonl(window, row: dict, reveal: bool = False) -> bool:
+    """Open the session transcript in ST, or reveal it in the file manager."""
+    path = jsonl_path_for_row(window, row)
+    if not path:
+        sublime.status_message("Claude: no jsonl for this session")
+        return False
+    if reveal:
+        return _reveal_in_file_manager(path)
+    if window:
+        window.open_file(path)
+    return True
+
+
+def _reveal_in_file_manager(path: str) -> bool:
+    import subprocess
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", "/select,", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        return True
+    except Exception as e:
+        print(f"[Claude] reveal jsonl: {e}")
+        return False
+
+
+def fork_row(window, row: dict) -> bool:
+    """Fork the row's session into a new sheet. True if a session was created."""
+    sid = (row or {}).get("session_id")
+    if not window or not sid:
+        return False
+    backend = (row or {}).get("backend") or "claude"
+    name = ((row or {}).get("name") or "").strip() or "session"
+    try:
+        from .core import create_session
+    except Exception:
+        from core import create_session
+    forked = create_session(window, resume_id=sid, fork=True, backend=backend)
+    if not forked:
+        return False
+    forked_name = fork_session_title(name)
+    forked.name = forked_name
+    try:
+        forked.output.set_name(forked_name)
+    except Exception:
+        pass
+    sublime.status_message(f"Forked session: {forked_name}")
+    return True
+
+
 def rename_row(window, row: dict, name: str) -> bool:
     """Rename a live session or a history entry."""
     name = (name or "").strip()
@@ -696,6 +810,32 @@ def rename_row(window, row: dict, name: str) -> bool:
     return False
 
 
+class ClaudeSessionJsonlCommand(sublime_plugin.WindowCommand):
+    """Open the active session's transcript jsonl (or reveal in Finder)."""
+
+    def run(self, reveal: bool = False):
+        from .core import get_active_session
+        s = get_active_session(self.window)
+        if not s or not getattr(s, "session_id", None):
+            sublime.status_message("Claude: no session")
+            return
+        view = None
+        try:
+            view = s.output.view if s.output else None
+        except Exception:
+            view = None
+        row = {
+            "kind": "live",
+            "session_id": s.session_id,
+            "backend": getattr(s, "backend", None) or "claude",
+            "view_id": view.id() if view and view.is_valid() else None,
+            "project": "",
+        }
+        if open_row_jsonl(self.window, row, reveal=bool(reveal)):
+            sublime.status_message(
+                "Claude: revealed jsonl" if reveal else "Claude: opened jsonl")
+
+
 class SessionListView:
     def __init__(self, window):
         self.window = window
@@ -709,10 +849,11 @@ class SessionListView:
         st.set("word_wrap", False)
         st.set("gutter", False)
         st.set("line_numbers", False)
-        st.set("margin", 12)
+        st.set("margin", 6)
         st.set("scroll_past_end", False)
         st.set("highlight_line", True)
         st.set("font_size", 10)
+        st.set("font_face", "Menlo")
         st.set("color_scheme",
                "Packages/ClaudeCode/SessionList.hidden-color-scheme")
         self.view.assign_syntax(
@@ -725,16 +866,21 @@ class SessionListView:
                 break
         if not self.view:
             self.view = self.window.new_file()
-            self.view.set_name("Sessions")
             self.view.set_scratch(True)
             self.view.set_read_only(True)
+        # Symbol so the list tab is findable among session sheets.
+        self.view.set_name("☰ Sessions")
         self._apply_chrome()
-        self.refresh()
+        self.refresh(follow=True)
         self.window.focus_view(self.view)
 
-    def refresh(self):
+    def refresh(self, follow: bool = False):
         if not self.view or not self.view.is_valid():
             return
+        try:
+            vx, vy = self.view.viewport_position()
+        except Exception:
+            vx, vy = 0.0, 0.0
         cols = view_cols(self.view)
         text, index = build_for_window(self.window, cols=cols)
         cur = self.view.substr(sublime.Region(0, self.view.size()))
@@ -750,14 +896,29 @@ class SessionListView:
             if hit:
                 keep_sid = hit.get("session_id")
                 keep_kind = hit.get("kind")
-        self.view.settings().set(ROWS_KEY, json.dumps(index))
-        if text == cur:
+        rows_json = json.dumps(index)
+        if self.view.settings().get(ROWS_KEY) != rows_json:
+            self.view.settings().set(ROWS_KEY, rows_json)
+        wrote = False
+        if text != cur:
+            self._write_list_text(text)
+            wrote = True
+        # Wide glyphs (⏸/…) can exceed em; only then drop a column.
+        for _ in range(3):
+            try:
+                if self.view.layout_extent()[0] <= self.view.viewport_extent()[0] + 1:
+                    break
+            except Exception:
+                break
+            cols = max(24, cols - 1)
+            text, index = build_for_window(self.window, cols=cols)
+            rows_json = json.dumps(index)
+            if self.view.settings().get(ROWS_KEY) != rows_json:
+                self.view.settings().set(ROWS_KEY, rows_json)
+            self._write_list_text(text)
+            wrote = True
+        if not wrote and not follow:
             return
-        self.view.set_read_only(False)
-        self.view.run_command("select_all")
-        self.view.run_command("left_delete")
-        self.view.run_command("append", {"characters": text})
-        self.view.set_read_only(True)
         target = None
         if keep_sid:
             for rec in index:
@@ -771,7 +932,27 @@ class SessionListView:
             pt = self.view.text_point(max(0, int(target["line"]) - 1), 0)
             self.view.sel().clear()
             self.view.sel().add(sublime.Region(pt))
-            self.view.show(pt)
+            if follow:
+                self.view.show(pt)
+        if not follow:
+            try:
+                self.view.set_viewport_position((float(vx), float(vy)), False)
+            except Exception:
+                pass
+
+    def _write_list_text(self, text: str) -> None:
+        view = self.view
+        view.set_read_only(False)
+        view.run_command("claude_session_list_set_text", {"text": text})
+        view.set_read_only(True)
+        # select_all+delete+append left an undo snapshot every poll (~1Hz).
+        def _drop_undo(v=view):
+            try:
+                if v and v.is_valid():
+                    v.clear_undo_stack()
+            except Exception:
+                pass
+        sublime.set_timeout(_drop_undo, 0)
 
 
 def show_session_list(window) -> Optional[SessionListView]:
@@ -819,6 +1000,8 @@ class SessionListClickListener(sublime_plugin.EventListener):
             return ("claude_session_list_reveal", {})
         if ch == "s":
             return ("claude_session_list_star", {})
+        if ch == "f":
+            return ("claude_session_list_fork", {})
         if ch in ("\n", "\r"):
             return ("claude_session_list_open", {})
         return None
@@ -909,6 +1092,15 @@ def _session_list_poll() -> None:
     sublime.set_timeout(_session_list_poll, 900)
 
 
+class ClaudeSessionListSetTextCommand(sublime_plugin.TextCommand):
+    """Replace the list buffer in one edit (no select_all/delete undo pair)."""
+
+    def run(self, edit, text=""):
+        if not self.view.settings().get(SETTING):
+            return
+        self.view.replace(edit, sublime.Region(0, self.view.size()), text)
+
+
 class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
     """Delete/close the session under the caret in the Sessions list."""
 
@@ -981,6 +1173,63 @@ class ClaudeSessionListRenameCommand(sublime_plugin.TextCommand):
                 sublime.status_message("Claude: renamed")
 
         win.show_input_panel("Session name:", current, _done, None, None)
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListForkCommand(sublime_plugin.TextCommand):
+    """Fork the session under the caret (f)."""
+
+    def run(self, edit):
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        if not row.get("session_id"):
+            sublime.status_message("Claude: no session to fork")
+            return
+        fork_row(win, row)
+
+    def is_enabled(self):
+        return bool(self.view.settings().get(SETTING))
+
+
+class ClaudeSessionListJsonlCommand(sublime_plugin.TextCommand):
+    """Open or Finder-reveal the session transcript jsonl (palette)."""
+
+    def run(self, edit, reveal: bool = False):
+        if not self.view.settings().get(SETTING):
+            return
+        raw = self.view.settings().get(ROWS_KEY) or "[]"
+        try:
+            index = json.loads(raw)
+        except Exception:
+            index = []
+        sel = self.view.sel()
+        if not sel:
+            return
+        line = self.view.rowcol(sel[0].begin())[0] + 1
+        row = row_at_line(index, line)
+        win = self.view.window()
+        if not win or not row:
+            return
+        if open_row_jsonl(win, row, reveal=bool(reveal)):
+            if reveal:
+                sublime.status_message("Claude: revealed jsonl")
+            else:
+                sublime.status_message("Claude: opened jsonl")
 
     def is_enabled(self):
         return bool(self.view.settings().get(SETTING))

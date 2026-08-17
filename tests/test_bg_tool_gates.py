@@ -1,4 +1,5 @@
 """Background tool gates: TaskOutput is never ⚙ Read (background)."""
+import asyncio
 import json
 import os
 import sys
@@ -18,6 +19,40 @@ class _NameOnly(AcpBridge):
 
     def __init__(self):
         self.TOOL_TO_CANONICAL = dict(AcpBridge.TOOL_TO_CANONICAL)
+
+
+class TestPeelUseTool(unittest.TestCase):
+    def setUp(self):
+        self.b = _NameOnly()
+
+    def test_use_tool_peels_jar_kanban(self):
+        name = self.b._normalize_tool_name({
+            "title": "use_tool",
+            "rawInput": {
+                "tool_name": "jar-kanban__read",
+                "tool_input": {"cmd": "projects"},
+            },
+            "_meta": {"x.ai/tool": {"name": "use_tool", "kind": "use_tool"}},
+        })
+        self.assertEqual(name, "jar-kanban__read")
+
+    def test_use_tool_peels_sublime_read_image(self):
+        name = self.b._normalize_tool_name({
+            "title": "use_tool",
+            "rawInput": {
+                "tool_name": "sublime__read_image",
+                "tool_input": {"path": "/tmp/a.png"},
+            },
+        })
+        self.assertEqual(name, "read_image")
+
+    def test_title_use_tool_without_inner_stays_tool(self):
+        name = self.b._normalize_tool_name({
+            "title": "use_tool",
+            "rawInput": {},
+            "kind": "other",
+        })
+        self.assertNotEqual(name, "use_tool")
 
 
 class TestNormalizeTaskOutputTitle(unittest.TestCase):
@@ -363,6 +398,65 @@ class TestLoadReplay(unittest.TestCase):
         kinds = [p.get("type") for _, p in notes]
         self.assertNotIn("replay_user", kinds)
         self.assertNotIn("text_delta", kinds)
+
+
+class TestModalToolDedupe(unittest.TestCase):
+    def test_ask_user_aliases(self):
+        self.assertTrue(AcpBridge._same_modal_tool("ask_user", "AskUserQuestion"))
+        self.assertTrue(AcpBridge._same_modal_tool("ask_user_question", "ask_user"))
+        self.assertTrue(AcpBridge._same_modal_tool("ExitPlanMode", "exit_plan_mode"))
+        self.assertFalse(AcpBridge._same_modal_tool("ask_user", "ExitPlanMode"))
+
+    def test_ask_title_normalizes_to_ask_user(self):
+        b = _NameOnly()
+        name = b._normalize_tool_name({
+            "title": "Ask: How do you want to handle the box3d swap?",
+        })
+        self.assertEqual(name, "ask_user")
+
+
+class TestMarkAgentDead(unittest.TestCase):
+    """Grok closes stdout after a successful end_turn — that is not ⚠."""
+
+    def _dead(self, fut):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _FwdStub()
+            b._agent_exited = False
+            b.proc = None
+            b.session_id = "s"
+            b._prompt_fut = fut
+            b._mark_agent_dead("agent stdout closed (returncode=None)")
+        finally:
+            acp_base.send_notification = orig
+        return [p for _, p in notes if p.get("type") == "result"]
+
+    def test_stdio_close_after_end_turn_is_not_failed_turn(self):
+        loop = asyncio.new_event_loop()
+        try:
+            fut = loop.create_future()
+            fut.set_result({"stopReason": "end_turn"})
+            results = self._dead(fut)
+        finally:
+            loop.close()
+        self.assertEqual(results, [])
+
+    def test_stdio_close_with_no_prompt_is_not_failed_turn(self):
+        self.assertEqual(self._dead(None), [])
+
+    def test_stdio_close_mid_prompt_is_failed_turn(self):
+        loop = asyncio.new_event_loop()
+        try:
+            fut = loop.create_future()
+            results = self._dead(fut)
+        finally:
+            loop.close()
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].get("is_error"))
+        self.assertEqual(results[0].get("stop_reason"), "error")
 
 
 if __name__ == "__main__":

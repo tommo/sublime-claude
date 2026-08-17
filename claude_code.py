@@ -24,6 +24,7 @@ from .commands import (
     ClaudeRevealCliScreenCommand,
     ClaudeCodeQueryCommand,
     ClaudeCodeRestartCommand,
+    ClaudeCodeRestartNewCommand,
     ClaudeCodeQuerySelectionCommand,
     ClaudeCodeQueryFileCommand,
     ClaudeCodeAddFileCommand,

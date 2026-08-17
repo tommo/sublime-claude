@@ -382,6 +382,13 @@
         ]
     },
     {
+        "keys": ["f"],
+        "command": "claude_session_list_fork",
+        "context": [
+            { "key": "setting.claude_session_list", "operator": "equal", "operand": true }
+        ]
+    },
+    {
         "keys": ["delete"],
         "command": "claude_session_list_close",
         "context": [
@@ -843,6 +850,8 @@
     { "keys": ["v"], "command": "claude_session_list_reveal",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["s"], "command": "claude_session_list_star",
+      "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
+    { "keys": ["f"], "command": "claude_session_list_fork",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },
     { "keys": ["delete"], "command": "claude_session_list_close",
       "context": [{ "key": "setting.claude_session_list", "operator": "equal", "operand": true }] },

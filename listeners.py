@@ -532,6 +532,13 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
 
             session = Session(window, resume_id=resume_id, backend=saved_backend)
             session.name = session_name
+            saved_model = (
+                (matched or {}).get("model")
+                or view.settings().get("claude_model")
+            )
+            if saved_model:
+                session.model = saved_model
+                view.settings().set("claude_model", saved_model)
             if matched:
                 try:
                     session.last_activity = float(

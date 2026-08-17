@@ -10,6 +10,7 @@ from .session_cmds import (  # noqa: F401
     KimiStartCommand,
     ClaudeCodeQueryCommand,
     ClaudeCodeRestartCommand,
+    ClaudeCodeRestartNewCommand,
     ClaudeCodeCopySessionIdCommand,
     ClaudeCodeQueuePromptCommand,
     ClaudeCodeInterruptCommand,

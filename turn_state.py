@@ -29,7 +29,9 @@ class TurnState:
 
     @property
     def busy(self) -> bool:
-        return self.kind in ("live", "compacting", "rewinding")
+        # interrupting stays busy until cancel ACK — otherwise Esc + bg
+        # task looks idle while the agent is still streaming.
+        return self.kind in ("live", "compacting", "rewinding", "interrupting")
 
     @property
     def working(self) -> bool:
@@ -81,6 +83,13 @@ class TurnState:
         if self.kind == "interrupting":
             self.kind = "idle"
             self.awaiting_rpc = False
+
+    def resume_stream(self) -> None:
+        """Agent kept outputting after cancel ACK. Own busy until a closer."""
+        if self.kind in ("live", "compacting", "rewinding"):
+            return
+        self.kind = "live"
+        self.awaiting_rpc = False
 
     def inbound_action(self, event: str) -> Inbound:
         """What leftover/stream events may do. Never begins a turn."""

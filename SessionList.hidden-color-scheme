@@ -60,6 +60,10 @@
             "foreground": "#5c6773"
         },
         {
+            "scope": "comment.nq.session-list",
+            "foreground": "#5c6773"
+        },
+        {
             "scope": "comment.line.time.session-list",
             "foreground": "#707a8c"
         },

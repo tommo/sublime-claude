@@ -731,6 +731,17 @@ class ClaudeSelectEffortCommand(sublime_plugin.WindowCommand):
         return s is not None and s.backend == "claude"
 
 
+def _apply_session_model(session, real_model: str) -> None:
+    """Pin model on this session only. Never writes default_models."""
+    session.model = real_model
+    try:
+        if session.output and session.output.view:
+            session.output.view.settings().set("claude_model", real_model)
+        session._save_session()
+    except Exception:
+        pass
+
+
 class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
     """Quick panel to select model for current session."""
     def run(self) -> None:
@@ -769,11 +780,7 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
                     f"Context limit ({ctx // 1000}K) requires session restart.\n\nRestart session with {mid}?",
                     "Restart"
                 ):
-                    settings = sublime.load_settings("ClaudeCode.sublime-settings")
-                    default_models = settings.get("default_models", {})
-                    default_models[s.backend] = mid
-                    settings.set("default_models", default_models)
-                    sublime.save_settings("ClaudeCode.sublime-settings")
+                    _apply_session_model(s, real_model)
                     s.restart()
                 return
             # Grok: vision MCP is bound at session start. Switching to/from
@@ -794,24 +801,14 @@ class ClaudeSelectModelCommand(sublime_plugin.WindowCommand):
                             f"(avoids broken image tool calls)?",
                             "Restart",
                         ):
-                            settings = sublime.load_settings(
-                                "ClaudeCode.sublime-settings")
-                            default_models = settings.get("default_models", {})
-                            default_models[s.backend] = mid
-                            settings.set("default_models", default_models)
-                            sublime.save_settings("ClaudeCode.sublime-settings")
+                            _apply_session_model(s, real_model)
                             s.restart()
                         return
                 except Exception as e:
                     print(f"[Claude] vision check on set_model: {e}")
             if s.client:
                 s.client.send("set_model", {"model": real_model})
-            s.model = real_model
-            try:
-                if s.output and s.output.view:
-                    s.output.view.settings().set("claude_model", real_model)
-            except Exception:
-                pass
+            _apply_session_model(s, real_model)
             sublime.status_message(f"Model: {mid}")
 
         self.window.show_quick_panel(items, on_select)

@@ -222,13 +222,17 @@ class ClaudeSearchSessionsCommand(sublime_plugin.WindowCommand):
                     if idx < 0:
                         return
                     sid = results[idx][0]
+                    title = results[idx][1]
                     # Look up backend from saved sessions
                     saved_backend = "claude"
                     for saved in load_saved_sessions():
                         if saved.get("session_id") == sid:
                             saved_backend = saved.get("backend", "claude")
                             break
-                    create_session(self.window, resume_id=sid, fork=True, backend=saved_backend)
+                    s = create_session(self.window, resume_id=sid, fork=True, backend=saved_backend)
+                    from ..session import fork_session_title
+                    s.name = fork_session_title(title)
+                    s.output.set_name(s.name)
 
                 self.window.show_quick_panel(items, on_select)
 
@@ -477,7 +481,8 @@ class ClaudeGarageSearchCommand(sublime_plugin.WindowCommand):
             if idx == 0:
                 # Fork
                 s = create_session(self.window, resume_id=session_id, fork=True, backend=src_backend)
-                s.name = f"fork:{short_id}"
+                from ..session import fork_session_title
+                s.name = fork_session_title(short_id)
                 s.output.set_name(s.name)
                 sublime.status_message(f"Forked session {short_id}")
             elif idx == 1:

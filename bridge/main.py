@@ -233,6 +233,8 @@ class Bridge:
                 await self.poll_bg_tasks(id)
             elif method == "cancel_loop":
                 await self.cancel_loop(id, params)
+            elif method == "clear":
+                await self.clear(id, params)
             else:
                 send_error(id, -32601, f"Method not found: {method}")
         except Exception as e:
@@ -1273,6 +1275,52 @@ View ID: {view_id_info}
                 with open(os.path.join(os.environ.get("TMPDIR") or os.environ.get("TEMP") or os.environ.get("TMP") or "/tmp", "claude_bridge.log"), "a") as f:
                     f.write(f"interrupt: drain error: {e}\n")
         send_result(id, {"status": "interrupted"})
+
+    async def clear(self, id: int, params: dict) -> None:
+        """Harness /clear: new SDK session, same process and options."""
+        if self.current_task and not self.current_task.done():
+            self.interrupted = True
+            try:
+                if self.client:
+                    await self.client.interrupt()
+            except Exception as e:
+                _logger.info(f"clear: interrupt before new session: {e}")
+            try:
+                self.current_task.cancel()
+                await asyncio.wait_for(self.current_task, timeout=2.0)
+            except Exception:
+                pass
+        old = getattr(self, "_session_id", None)
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception as e:
+                _logger.info(f"clear: disconnect: {e}")
+            self.client = None
+        session_id = str(uuid.uuid4())
+        self._session_id = session_id
+        if self.options is None:
+            send_error(id, -32000, "session not initialized")
+            return
+        opts = dict(getattr(self.options, "__dict__", {}) or {})
+        opts["resume"] = None
+        extra = dict(opts.get("extra_args") or {})
+        extra.pop("resume-session-at", None)
+        extra["session-id"] = session_id
+        opts["extra_args"] = extra
+        opts["fork_session"] = False
+        fields = getattr(ClaudeAgentOptions, "__dataclass_fields__", None)
+        if fields:
+            opts = {k: v for k, v in opts.items() if k in fields}
+        self.options = ClaudeAgentOptions(**opts)
+        self.client = ClaudeSDKClient(options=self.options)
+        await self.client.connect()
+        _logger.info(f"clear: {old} → {session_id}")
+        send_result(id, {
+            "ok": True,
+            "session_id": session_id,
+            "sessionId": session_id,
+        })
 
     async def cancel_pending(self, id: int) -> None:
         """Cancel all pending permission/question requests."""

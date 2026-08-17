@@ -323,55 +323,100 @@ class ClaudeCodeQueryCommand(sublime_plugin.WindowCommand):
         s._enter_input_with_draft()
 
 
-class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
-    """Restart session, keeping the output view."""
-    def run(self) -> None:
+def restart_session_new(window, session=None):
+    """Harness /clear in the current view. Live bridge: session/new.
+    Dead bridge: respawn a new Session on the same sheet.
+    """
+    old_session = session or get_active_session(window)
+    if (
+        old_session
+        and old_session.client
+        and old_session.client.is_alive()
+        and old_session.initialized
+        and not getattr(old_session, "quick_mode", False)
+    ):
+        old_session.clear_conversation()
+        return
+    if old_session and getattr(old_session, "quick_mode", False):
+        from .. import quick_agent
+        quick_agent.stop_quick_session(window)
+        quick_agent.ensure_quick_session(window, force_new=True)
+        sublime.status_message("Quick Agent restarted")
+        return
+    old_view = None
+    backend = None
+    profile = None
+    model = None
 
-        old_session = get_active_session(self.window)
-        # Quick Agent has its own lifecycle (panel) — restart via ensure.
-        if old_session and getattr(old_session, "quick_mode", False):
-            from .. import quick_agent
-            quick_agent.stop_quick_session(self.window)
-            quick_agent.ensure_quick_session(self.window, force_new=True)
-            sublime.status_message("Quick Agent restarted")
-            return
-        old_view = None
-        backend = None
-        profile = None
-
-        if old_session:
-            old_view = old_session.output.view
-            backend = old_session.backend
-            profile = old_session.profile
-            old_session.stop()
-            if old_view and old_view.id() in sublime._claude_sessions:
-                del sublime._claude_sessions[old_view.id()]
-
-        # Create new session
-        if backend is None:
-            backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
-        new_session = Session(self.window, profile=profile, backend=backend)
-
-        # Reuse existing view if available
+    if old_session:
+        old_view = old_session.output.view if old_session.output else None
+        backend = old_session.backend
+        profile = old_session.profile
+        model = getattr(old_session, "model", None)
+        if not model and old_view:
+            try:
+                model = old_view.settings().get("claude_model")
+            except Exception:
+                model = None
+        old_session.stop()
         if old_view and old_view.is_valid():
-            new_session.output.view = old_view
-            new_session.output.clear()
-            sublime._claude_sessions[old_view.id()] = new_session
+            from .. import session_registry
+            session_registry.unregister_view(old_view.id())
 
-        new_session.start()
-        if new_session.output.view:
-            if backend != "claude":
-                spec = backends.get(backend)
-                new_session.output.view.settings().set("claude_backend", backend)
-                new_session.output.set_name(spec.label)
-                if spec.theme:
-                    new_session.output.view.settings().set("color_scheme", spec.theme)
-            else:
-                new_session.output.view.set_name("Claude")
-            if new_session.output.view.id() not in sublime._claude_sessions:
-                sublime._claude_sessions[new_session.output.view.id()] = new_session
-        new_session.output.show()
-        sublime.status_message("Session restarted")
+    if backend is None:
+        backend = sublime.load_settings("ClaudeCode.sublime-settings").get(
+            "default_backend", "claude")
+    new_session = Session(window, profile=profile, backend=backend)
+    if model:
+        new_session.model = model
+
+    if old_view and old_view.is_valid():
+        new_session.output.view = old_view
+        try:
+            old_view.settings().erase("claude_session_id")
+        except Exception:
+            pass
+        if model:
+            old_view.settings().set("claude_model", model)
+        new_session.output.clear()
+
+    if new_session.output.view:
+        from .. import session_registry
+        try:
+            new_session._persist_view_identity()
+        except Exception:
+            pass
+        session_registry.register_session(new_session)
+        if backend != "claude":
+            spec = backends.get(backend)
+            new_session.output.view.settings().set("claude_backend", backend)
+            new_session.output.set_name(spec.label)
+            if spec.theme:
+                new_session.output.view.settings().set("color_scheme", spec.theme)
+        else:
+            new_session.output.set_name("Claude")
+
+    new_session.start()
+    new_session.output.show()
+    mid = getattr(new_session, "model", None) or "?"
+    try:
+        label = backends.get(new_session.backend).label or new_session.backend
+    except Exception:
+        label = new_session.backend
+    print(f"[Claude] RESTART NEW {label}/{mid}")
+    sublime.status_message(f"RESTART NEW — {label}/{mid}")
+
+
+class ClaudeCodeRestartCommand(sublime_plugin.WindowCommand):
+    """Restart as a new session in the current view (RESTART NEW)."""
+    def run(self) -> None:
+        restart_session_new(self.window)
+
+
+class ClaudeCodeRestartNewCommand(sublime_plugin.WindowCommand):
+    """Alias: RESTART NEW in the current session view."""
+    def run(self) -> None:
+        restart_session_new(self.window)
 
 
 class ClaudeCodeCopySessionIdCommand(sublime_plugin.WindowCommand):
@@ -755,7 +800,9 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if active_session and not active_session.is_sleeping:
                 items.append(["○ Sleep Session", "Put session to sleep, free resources"])
                 actions.append(("sleep", active_session))
-            items.append(["🔄 Restart Session", "Restart current session, keep output"])
+            items.append(["RESTART NEW", "Fresh session in this view — same provider/model"])
+            actions.append(("restart_new", active_session))
+            items.append(["🔄 Restart Session…", "Restart with a profile or checkpoint"])
             actions.append(("restart", active_session))
 
             # PTY-engine sessions can hot-swap between the native view and the
@@ -933,6 +980,8 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                             _s._apply_undo(rewind_id, draft_prompt)
                     self.window.show_quick_panel(
                         labels, _on_undo, placeholder="Rewind to…")
+                elif action == "restart_new" and data:
+                    restart_session_new(self.window, data)
                 elif action == "restart" and data:
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)
@@ -1103,6 +1152,10 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 return
 
             action, data = actions[idx]
+            if action not in ("checkpoint", "profile"):
+                restart_session_new(self.window, session)
+                return
+
             old_view = session.output.view
 
             # Stop old session
@@ -1114,14 +1167,14 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if action == "checkpoint":
                 session_id = data.get("session_id")
                 new_session = Session(self.window, resume_id=session_id, fork=True, backend=session.backend)
-            elif action == "profile":
-                new_session = Session(self.window, profile=data, backend=session.backend)
             else:
-                new_session = Session(self.window, backend=session.backend)
+                new_session = Session(self.window, profile=data, backend=session.backend)
 
             # Reuse existing view
             if old_view and old_view.is_valid():
                 new_session.output.view = old_view
+                if getattr(new_session, "model", None):
+                    old_view.settings().set("claude_model", new_session.model)
                 new_session.output.clear()
                 sublime._claude_sessions[old_view.id()] = new_session
 
@@ -1145,7 +1198,8 @@ class ClaudeCodeForkCommand(sublime_plugin.WindowCommand):
 
         # Create forked session
         forked = create_session(self.window, resume_id=s.session_id, fork=True, backend=s.backend)
-        forked_name = f"{s.name or 'session'} (fork)"
+        from ..session import fork_session_title
+        forked_name = fork_session_title(s.name or "session")
         forked.name = forked_name
         forked.output.set_name(forked_name)
         sublime.status_message(f"Forked session: {forked_name}")
@@ -1190,7 +1244,8 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
             if idx >= 0:
                 source_type, view_id, session_id, name, src_backend = sources[idx]
                 forked = create_session(self.window, resume_id=session_id, fork=True, backend=src_backend)
-                forked_name = f"{name} (fork)"
+                from ..session import fork_session_title
+                forked_name = fork_session_title(name)
                 forked.name = forked_name
                 forked.output.set_name(forked_name)
                 sublime.status_message(f"Forked session: {forked_name}")

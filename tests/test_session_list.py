@@ -31,6 +31,9 @@ def _load():
         sess.remove_saved_session = lambda sid: False
         sess.toggle_bookmark = lambda sid, p=None: True
         sess.rename_saved_session = lambda sid, name: True
+        sess.fork_session_title = lambda name: (
+            name if (name or "").lower().startswith("(fork)")
+            else "(fork) %s" % ((name or "session").strip() or "session"))
         sys.modules[sess_name] = sess
     be_name = _PKG + ".backends"
     if be_name not in sys.modules:
@@ -43,8 +46,10 @@ def _load():
             (name or "claude"), (name or "??")[:2].upper())
         sys.modules[be_name] = be
     name = _PKG + ".session_list"
-    if name in sys.modules:
-        return sys.modules[name]
+    cached = sys.modules.get(name)
+    if cached is not None and hasattr(cached, "format_when"):
+        return cached
+    sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(
         name, os.path.join(_ROOT, "session_list.py"))
     mod = importlib.util.module_from_spec(spec)
@@ -75,6 +80,8 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertIn("r rename", text)
         self.assertNotIn("refresh", text)
         self.assertIn("s star", text)
+        self.assertIn("f fork", text)
+        self.assertNotIn("jsonl", text)
         self.assertNotIn("c compact", text)
         compact, cidx = sl.render_list(live, here, [], starred={"s2"}, cols=24)
         self.assertIn("GR", compact)
@@ -85,7 +92,8 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual(sl.row_at_line(index, index[0]["line"])["session_id"], "s2")
         self.assertEqual(sl.row_at_line(index, index[1]["line"])["session_id"], "s1")
         self.assertEqual(sl.format_when(100, now=100), "now")
-        self.assertEqual(sl.format_when(100, now=130), "30s")
+        self.assertEqual(sl.format_when(100, now=130), "<1m")
+        self.assertEqual(sl.format_when(100, now=159), "<1m")
         self.assertEqual(sl.format_when(100, now=100 + 5 * 60), "5m")
         self.assertEqual(sl.format_when(100, now=100 + 3 * 3600), "3h")
         self.assertEqual(sl.format_when(100, now=100 + 2 * 86400), "2d")
@@ -135,6 +143,80 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual(sl.backend_abbrev("claude"), "CL")
         self.assertEqual(sl.backend_abbrev("codex"), "CX")
 
+    def test_long_title_not_cut_while_space_remains(self):
+        sl = _load()
+        name = "=== PIL UNCAUGHT EXCEPTION === type: Library"
+        live = [{
+            "kind": "live", "session_id": "s1", "view_id": 1,
+            "name": name, "backend": "grok", "status": "ready",
+            "query_count": 1, "same_window": True,
+        }]
+        text, _ = sl.render_list(live, [], [], cols=80)
+        row = [ln for ln in text.splitlines()
+               if ln.startswith("○") and "CURRENT" not in ln][0]
+        self.assertIn("Library", row)
+        self.assertNotIn("…", row)
+        self.assertIn(" 1q", row)
+        self.assertTrue(row.rstrip().endswith("idle"))
+        i_q = row.index("1q")
+        i_st = row.rindex("idle")
+        self.assertGreater(i_st - (i_q + 2), 1)
+
+    def test_nq_closer_to_title_than_state(self):
+        sl = _load()
+        live = [{
+            "kind": "live", "session_id": "s1", "view_id": 1,
+            "name": "GUEST", "backend": "kimi", "status": "ready",
+            "query_count": 10, "same_window": True,
+        }]
+        text, _ = sl.render_list(live, [], [], cols=80)
+        row = [ln for ln in text.splitlines()
+               if ln.startswith("○") and "CURRENT" not in ln][0]
+        i_q = row.rfind("10q")
+        i_st = row.rfind("idle")
+        self.assertGreater(i_q, 0)
+        self.assertGreater(i_st, i_q)
+        # one space before Nq; more spaces between Nq and state
+        self.assertEqual(row[i_q - 1], " ")
+        self.assertGreater(i_st - (i_q + 3), 1)
+
+    def test_title_uses_full_leftover(self):
+        sl = _load()
+        pre = "○ grok    "
+        extra = sl._right_meta({
+            "kind": "live", "status": "ready", "query_count": 1,
+        })
+        self.assertEqual(
+            sl._name_budget(pre, extra, 80, False),
+            80 - len(pre) - len(extra))
+        live = [{
+            "kind": "live", "session_id": "s1", "view_id": 1,
+            "name": "GUEST", "backend": "kimi", "status": "ready",
+            "query_count": 0, "same_window": True,
+        }]
+        text, _ = sl.render_list(live, [], [], cols=80)
+        row = [ln for ln in text.splitlines()
+               if ln.startswith("○") and "CURRENT" not in ln][0]
+        self.assertEqual(len(row.rstrip()), 80)
+        self.assertTrue(row.rstrip().endswith("idle"))
+
+    def test_view_cols_no_double_margin(self):
+        sl = _load()
+
+        class _V:
+            def viewport_extent(self):
+                return (700.0, 400.0)
+
+            def em_width(self):
+                return 7.0
+
+            def settings(self):
+                return types.SimpleNamespace(get=lambda k, d=None: 6 if k == "margin" else d)
+
+        cols = sl.view_cols(_V())
+        # (700 - 12) / 7 = 98 — text box only, no extra -2 slack
+        self.assertEqual(cols, 98)
+
     def test_header_fits_view_cols(self):
         sl = _load()
         wide = sl.format_header(72)
@@ -170,7 +252,8 @@ class TestRenderSessionList(unittest.TestCase):
                 if ln.startswith("○") and "CURRENT" not in ln][0]
         self.assertGreater(len(wrow), len(nrow))
         self.assertIn("grok", wrow)
-        self.assertIn("ready", wrow)
+        self.assertIn("idle", wrow)
+        self.assertEqual(len(wrow.rstrip()), 80)
         self.assertEqual(sl.fit_title("short", 10), "short     ")
         self.assertEqual(sl.fit_title("abcdefghij", 6), "abcde…")
         asleep = [{
@@ -199,8 +282,8 @@ class TestRenderSessionList(unittest.TestCase):
         rows = [ln for ln in text.splitlines()
                 if ln[:1] in ("○", "●", "⏸") and "CURRENT" not in ln]
         self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[0].rstrip().endswith("ready"))
-        self.assertTrue(rows[1].rstrip().endswith("ready"))
+        self.assertTrue(rows[0].rstrip().endswith("idle"))
+        self.assertTrue(rows[1].rstrip().endswith("idle"))
         self.assertEqual(len(rows[0].rstrip()), len(rows[1].rstrip()))
         for row in rows:
             self.assertNotRegex(row, r"\b\d+[smhdw]\b")
@@ -213,7 +296,7 @@ class TestRenderSessionList(unittest.TestCase):
         mixed, _ = sl.render_list(live + [asleep], [], [], cols=80)
         srow = [ln for ln in mixed.splitlines() if ln.startswith("⏸")][0]
         self.assertRegex(srow, r"\b(\d+[smhdw]|now)\b")
-        self.assertNotIn("ready", srow)
+        self.assertNotIn("idle", srow)
         self.assertEqual(len(srow.rstrip()), len(rows[0].rstrip()))
 
     def test_history_matches_running_cols(self):
@@ -310,7 +393,7 @@ class TestRenderSessionList(unittest.TestCase):
         }
         text, _ = sl.render_list([row], [], [], cols=80)
         self.assertIn("? ", text)
-        self.assertIn("input", text)
+        self.assertIn("wait", text)
         urow = {
             "kind": "live", "session_id": "u1", "view_id": 2,
             "name": "done in background", "backend": "grok", "status": "unread",
@@ -319,7 +402,7 @@ class TestRenderSessionList(unittest.TestCase):
         }
         utext, _ = sl.render_list([urow], [], [], cols=80)
         self.assertIn("* ", utext)
-        self.assertIn("unread", utext)
+        self.assertIn("new", utext)
         import sublime
         ask = types.SimpleNamespace(
             session_id="ask", name="ask me", backend="kimi",

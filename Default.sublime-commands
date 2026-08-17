@@ -133,6 +133,15 @@
         "command": "claude_session_list_reveal"
     },
     {
+        "caption": "Claude: Open Session JSONL",
+        "command": "claude_session_jsonl"
+    },
+    {
+        "caption": "Claude: Reveal Session JSONL in Finder",
+        "command": "claude_session_jsonl",
+        "args": {"reveal": true}
+    },
+    {
         "caption": "Claude: Hide Session (keep running)",
         "command": "claude_hide_session"
     },
@@ -163,6 +172,10 @@
     {
         "caption": "Claude: Restart Session",
         "command": "claude_code_restart"
+    },
+    {
+        "caption": "Claude: Restart New",
+        "command": "claude_code_restart_new"
     },
     {
         "caption": "Claude: Change Provider for Current Session…",

@@ -614,8 +614,17 @@ def _task_get(view: "OutputView", tool: "ToolCall") -> str:
 
 
 def _ask_user(view: "OutputView", tool: "ToolCall") -> str:
-    question = tool.tool_input.get("question", "")
-    out = f": {question}"
+    inp = tool.tool_input or {}
+    question = inp.get("question") or ""
+    if not question:
+        qs = inp.get("questions") or []
+        if isinstance(qs, list) and qs:
+            first = qs[0]
+            if isinstance(first, dict):
+                question = first.get("question") or first.get("header") or ""
+            elif first:
+                question = str(first)
+    out = f": {question}" if question else ""
     if tool.result and tool.status == "done":
         out += view._format_ask_user_result(tool.result, question)
     return out

@@ -21,6 +21,34 @@ def new_agent_id() -> str:
     return f"agent-{uuid.uuid4().hex[:12]}"
 
 
+def resolve_init_model(
+    *,
+    profile_model: Optional[str] = None,
+    session_model: Optional[str] = None,
+    view_model: Optional[str] = None,
+    saved_model: Optional[str] = None,
+    default_model: Optional[str] = None,
+    resume: bool = False,
+) -> Optional[str]:
+    """Model to send on initialize.
+
+    One chain: profile pin → this session → saved entry → view stamp
+    (resume only) → backend default. Always pick a model when a default
+    exists. New sessions ignore a leftover view stamp so DeepSeek does
+    not leak onto the next Grok sheet.
+    """
+    chain = [profile_model, session_model, saved_model]
+    if resume:
+        chain.append(view_model)
+    chain.append(default_model)
+    for raw in chain:
+        if raw:
+            text = str(raw).strip()
+            if text:
+                return text
+    return None
+
+
 _SENDER_LINE = re.compile(r"^\[from (user|agent)(?: [^\]]*)?\]")
 
 
