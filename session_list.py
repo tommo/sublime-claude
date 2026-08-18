@@ -18,7 +18,7 @@ from .session import (
 
 SETTING = "claude_session_list"
 ROWS_KEY = "claude_session_list_rows"
-HISTORY_CAP = 40
+HISTORY_CAP = 200  # default; override with session_list_history_limit
 # Full row needs ~backend(7) + title(16+) + status/time. Below this, abbrev.
 COMPACT_COLS = 56
 
@@ -101,7 +101,7 @@ def access_ts(obj) -> float:
 def _mark(status: str) -> str:
     return {
         "input": "?",
-        "unread": "*",
+        "unread": "!",
         "working": "●",
         "sleeping": "⏸",
         "ready": "○",
@@ -299,7 +299,20 @@ def collect_history(live_ids: set, cwd: str) -> Tuple[List[dict], List[dict]]:
             other.append(row)
     here.sort(key=access_ts, reverse=True)
     other.sort(key=access_ts, reverse=True)
-    return here[:HISTORY_CAP], other[:HISTORY_CAP]
+    cap = history_cap()
+    return here[:cap], other[:cap]
+
+
+def history_cap() -> int:
+    try:
+        n = sublime.load_settings("ClaudeCode.sublime-settings").get(
+            "session_list_history_limit", HISTORY_CAP)
+        n = int(n)
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return HISTORY_CAP
 
 
 # 4 letters so the state column is a fixed width.
@@ -319,6 +332,24 @@ def _stamp_of(r: dict) -> str:
     if live and status in _STAMP:
         return _STAMP[status]
     return format_when(r.get("last_access") or r.get("last_activity"))
+
+
+def is_empty_session_row(r: dict) -> bool:
+    """Unused: never sent a turn. Don't keep these in the list."""
+    try:
+        return int((r or {}).get("query_count") or 0) <= 0
+    except (TypeError, ValueError):
+        return True
+
+
+def drop_empty_sessions(rows: List[dict], starred: Optional[set] = None) -> List[dict]:
+    ids = set(starred or ())
+    out = []
+    for r in rows or []:
+        if is_empty_session_row(r) and r.get("session_id") not in ids:
+            continue
+        out.append(r)
+    return out
 
 
 def _q_col(r: dict) -> str:
@@ -396,7 +427,8 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
         lines.append("")
 
     pinned, live, here = pull_starred(live, here, starred)
-    add_section("STARRED", pinned, _fmt_row)
+    if pinned:
+        add_section("STARRED", pinned, _fmt_row)
     add_section("CURRENT", live, _fmt_row)
     add_section("HISTORY", here, _fmt_row)
     return "\n".join(lines).rstrip() + "\n", index
@@ -411,6 +443,7 @@ def build_for_window(window, cols: int = 0) -> Tuple[str, List[dict]]:
     here, _other = collect_history(live_ids, cwd)
     starred = load_bookmarks(cwd or None)
     here = _include_starred_saved(here, live_ids, cwd, starred)
+    here = drop_empty_sessions(here, starred)
     return render_list(live, here, [], starred, cols=cols)
 
 
@@ -1122,14 +1155,26 @@ class ClaudeSessionListCloseCommand(sublime_plugin.TextCommand):
         if not win or not row:
             return
         name = (row.get("name") or "").strip() or "session"
+        list_view = self.view
         if close_row(win, row):
             refresh_session_list(win)
-            try:
-                pt = self.view.text_point(max(0, line - 1), 0)
-                self.view.sel().clear()
-                self.view.sel().add(pt)
-            except Exception:
-                pass
+
+            def _stay(_v=list_view, _win=win, _line=line):
+                if not _v or not _v.is_valid():
+                    return
+                w = _v.window() or _win
+                if not w:
+                    return
+                w.focus_view(_v)
+                try:
+                    pt = _v.text_point(max(0, _line - 1), 0)
+                    _v.sel().clear()
+                    _v.sel().add(pt)
+                except Exception:
+                    pass
+
+            _stay()
+            sublime.set_timeout(_stay, 0)
             sublime.status_message("Claude: closed {}".format(name))
 
     def is_enabled(self):

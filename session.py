@@ -448,6 +448,13 @@ class Session:
                 if saved.get("session_id") == self.resume_id:
                     saved_entry = saved
                     break
+            if saved_entry:
+                try:
+                    saved_q = int(saved_entry.get("query_count") or 0)
+                except (TypeError, ValueError):
+                    saved_q = 0
+                if saved_q > int(getattr(self, "query_count", 0) or 0):
+                    self.query_count = saved_q
         view_model = None
         if self.resume_id and self.output and self.output.view:
             view_model = self.output.view.settings().get("claude_model")
@@ -2647,6 +2654,16 @@ class Session:
                     f'text-decoration:none;" title="remove">×</a>'
                     f'</div>'
                 )
+            hint = (
+                "⌘↵ send now"
+                if sublime.platform() == "osx"
+                else "Ctrl+↵ send now"
+            )
+            rows.append(
+                '<div style="margin:2px 0 1px 0;font-size:10px;'
+                'color:color(var(--foreground) alpha(0.35));">'
+                f'{hint}</div>'
+            )
         # Hairline flush above ◎ — no bottom margin (avoids empty-line gap)
         rows.append(
             '<div style="margin:1px 0 0 0;padding:0;line-height:1;'
@@ -5319,12 +5336,23 @@ class Session:
             if s.get("session_id") == self.session_id:
                 entry = sessions.pop(i)
                 break
+        live_q = int(getattr(self, "query_count", 0) or 0)
+        saved_q = 0
+        if entry:
+            try:
+                saved_q = int(entry.get("query_count") or 0)
+            except (TypeError, ValueError):
+                saved_q = 0
+        # New unused sheet: do not create a history row. Never delete an
+        # existing resume entry just because this process has not queried yet.
+        if live_q <= 0 and entry is None:
+            return
         if not entry:
             entry = {"session_id": self.session_id}
         entry["name"] = self.name
         entry["project"] = self._cwd()
         entry["total_cost"] = self.total_cost
-        entry["query_count"] = self.query_count
+        entry["query_count"] = max(live_q, saved_q)
         entry["backend"] = self.backend
         entry["last_activity"] = self.last_activity
         entry["last_access"] = float(getattr(self, "last_access", 0) or 0) or float(

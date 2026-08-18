@@ -21,6 +21,9 @@
     // Options: "default", "acceptEdits", "plan", "bypassPermissions"
     "permission_mode": "acceptEdits",
 
+    // Session list HISTORY rows (this project). Default 200.
+    "session_list_history_limit": 200,
+
     // Auto-sleep idle sessions after N minutes (0 = disabled). Timer starts
     // when a turn *ends* (not when sticky ◎ opens mid-stream).
     // "auto_sleep_minutes": 60,

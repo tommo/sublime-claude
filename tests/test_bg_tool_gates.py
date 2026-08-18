@@ -299,6 +299,7 @@ class _FwdStub(AcpBridge):
         self._tool_names_by_id = {}
         self._tool_inputs_by_id = {}
         self._tool_ids_emitted = set()
+        self._tool_results_sent = set()
         self._tool_id_alias = {}
         self._bg_tool_ids = set()
         self._pending_execute_ids = []
@@ -306,6 +307,8 @@ class _FwdStub(AcpBridge):
         self._terminals = {}
         self._terminal_bg = {}
         self._released_terminals = set()
+        self._detached_snaps = {}
+        self._detached_procs = {}
         self._child_sessions = {}
         self._bg_notified_tasks = set()
         self._bg_notified_tools = set()
@@ -421,6 +424,36 @@ class TestModalToolDedupe(unittest.TestCase):
             "title": "Ask: How do you want to handle the box3d swap?",
         })
         self.assertEqual(name, "ask_user")
+
+    def test_completed_update_after_result_does_not_reopen(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        tid = "call-ask-1"
+        try:
+            b = _FwdStub()
+            b._tool_ids_emitted.add(tid)
+            b._tool_names_by_id[tid] = "ask_user"
+            b._tool_results_sent.add(tid)
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tid,
+                    "status": "completed",
+                    "title": "Ask: How far should Polite adopt?",
+                    "content": [{"type": "content", "content": {
+                        "type": "text",
+                        "text": "User has answered your questions",
+                    }}],
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        kinds = [p.get("type") for _, p in notes]
+        self.assertNotIn("tool_use", kinds)
+        self.assertNotIn("tool_result", kinds)
 
 
 class TestMarkAgentDead(unittest.TestCase):
@@ -554,6 +587,34 @@ class TestSubagentTerminalOutput(unittest.TestCase):
             AcpBridge._is_subagent_spawn("TaskGet", poll, poll["rawInput"]))
         self.assertTrue(self.b._is_subagent_output_poll(poll, "TaskGet"))
         self.assertTrue(self.b._should_suppress_tool_row(poll, "TaskGet"))
+
+    def test_bg_release_detaches_not_sigterm(self):
+        class _P:
+            returncode = None
+            pid = 1
+
+        self.b._terminals["term_bg1"] = {
+            "proc": _P(),
+            "stdout": "starting editor\n",
+            "stderr": "",
+            "truncated": False,
+            "exit_status": None,
+            "bg": True,
+            "reader": None,
+        }
+
+        async def _go():
+            await self.b._acp_terminal_release({"terminalId": "term_bg1"})
+            return await self.b._acp_terminal_output(
+                {"terminalId": "term_bg1"})
+
+        result = asyncio.run(_go())
+        self.assertNotIn("term_bg1", self.b._terminals)
+        self.assertEqual(result.get("output"), "starting editor\n")
+        self.assertEqual(
+            (result.get("exitStatus") or {}).get("exitCode"), 0)
+        self.assertNotEqual(
+            (result.get("exitStatus") or {}).get("signal"), "SIGTERM")
 
     def test_unknown_subagent_id_is_still_running(self):
         async def _go():

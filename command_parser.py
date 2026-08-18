@@ -28,6 +28,7 @@ class CommandParser:
         "restart-new": "Same as /clear — new conversation in this view",
         "compact": "Summarize conversation to reduce context",
         "context": "Show pending context items",
+        "rename": "Rename this session: /rename <title>",
         "goal": "Goal mode: /goal <obj> [--budget N] | status|pause|resume|clear",
     }
 

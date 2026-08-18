@@ -198,6 +198,10 @@ class AcpBridge(BaseBridge):
         # terminal/output (same RPC as shells).
         self._child_sessions: Dict[str, Dict[str, Any]] = {}
         self._released_terminals: set = set()
+        # timeout:0 / run_in_background: Grok release()s while the process
+        # must keep running. Snap last output; do not SIGTERM.
+        self._detached_snaps: Dict[str, dict] = {}
+        self._detached_procs: Dict[str, Any] = {}
         # Serialize writes to agent stdin — concurrent create_task handlers
         # (permission + terminal + fs) would otherwise interleave JSON lines.
         self._acp_write_lock: Optional[asyncio.Lock] = None
@@ -981,6 +985,11 @@ class AcpBridge(BaseBridge):
                     f"suppress tool_call_update noise: "
                     f"title={upd.get('title')!r} name={tool_name!r} "
                     f"status={status!r}")
+                return
+            # Ext method already closed this id (ask_user / ExitPlanMode).
+            # Re-emitting tool_use after ✔ opens a second ☐ (plugin only
+            # upserts PENDING rows).
+            if tid and tid in getattr(self, "_tool_results_sent", set()):
                 return
             # Grok: bare tool_call then richer update. Emit tool_use at most
             # once per id (plugin upserts); re-emitting created a second ☐
@@ -3854,6 +3863,9 @@ class AcpBridge(BaseBridge):
                 await self._terminal_close(tid)
             except Exception:
                 pass
+        for tid, proc in list(self._detached_procs.items()):
+            self._kill_terminal_proc(proc)
+        self._detached_procs.clear()
         if self.proc is not None:
             try:
                 self.proc.terminate()
@@ -5622,6 +5634,11 @@ class AcpBridge(BaseBridge):
                 code = await proc.wait()
                 slot["exit_status"] = self._exit_status_from_code(code)
             except asyncio.CancelledError:
+                if slot.get("detached"):
+                    if slot.get("exit_status") is None:
+                        slot["exit_status"] = {
+                            "exitCode": 0, "signal": None}
+                    raise
                 self._kill_terminal_proc(proc)
                 code = None
                 try:
@@ -5656,6 +5673,8 @@ class AcpBridge(BaseBridge):
                             hid, out or f"exit {code}", is_error=is_err)
                     except Exception as e:
                         self.file_log(f"synth tool_result {tid}: {e}")
+                if slot.get("detached"):
+                    return
                 # Claude-compatible wake when host is already idle after end_turn
                 try:
                     self._emit_bg_terminal_complete(tid)
@@ -5678,6 +5697,13 @@ class AcpBridge(BaseBridge):
                 f"terminal/output {tid} child session "
                 f"done={bool(child.get('done'))} n={len(child.get('text') or '')}")
             return self._child_output_payload(child)
+        snap = self._detached_snaps.get(tid)
+        if snap:
+            return {
+                "output": snap.get("output") or "",
+                "truncated": bool(snap.get("truncated")),
+                "exitStatus": snap.get("exitStatus"),
+            }
         if tid in self._released_terminals or str(tid).startswith("term_"):
             # Host shell we created (or already released).
             self.file_log(
@@ -5743,6 +5769,11 @@ class AcpBridge(BaseBridge):
                 if ev is not None and not child.get("done"):
                     await ev.wait()
                 es = child.get("exit") or {"exitCode": 0, "signal": None}
+                return {"exitCode": es.get("exitCode"),
+                        "signal": es.get("signal")}
+            snap = self._detached_snaps.get(tid)
+            if snap:
+                es = snap.get("exitStatus") or {"exitCode": 0, "signal": None}
                 return {"exitCode": es.get("exitCode"),
                         "signal": es.get("signal")}
             # Already released/killed (e.g. on interrupt) — report cancelled.
@@ -5832,8 +5863,63 @@ class AcpBridge(BaseBridge):
             # Detach the poll handle; the child session keeps running.
             self.file_log(f"terminal/release {tid} is subagent session; ignore")
             return {}
+        slot = self._terminals.get(tid)
+        # Grok timeout:0 / run_in_background: release is detach, not kill.
+        if slot and slot.get("bg"):
+            await self._detach_terminal(tid)
+            return {}
         await self._terminal_close(tid)
         return {}
+
+    async def _detach_terminal(self, tid: str) -> None:
+        """Drop the ACP handle; leave a timeout:0 / bg process running."""
+        slot = self._terminals.get(tid)
+        if not slot:
+            return
+        slot["detached"] = True
+        if slot.get("exit_status") is None:
+            slot["exit_status"] = {"exitCode": 0, "signal": None}
+        out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
+        self._detached_snaps[tid] = {
+            "output": out,
+            "truncated": bool(slot.get("truncated")),
+            "exitStatus": slot["exit_status"],
+        }
+        extra = list(self._detached_snaps)[:-32]
+        for old in extra:
+            self._detached_snaps.pop(old, None)
+        reader = slot.get("reader")
+        if reader and not reader.done():
+            reader.cancel()
+            try:
+                await asyncio.wait_for(reader, timeout=0.5)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+        self._terminals.pop(tid, None)
+        proc = slot.get("proc")
+        if proc is not None and proc.returncode is None:
+            self._detached_procs[tid] = proc
+            asyncio.create_task(self._watch_detached(tid, proc, slot))
+        self.file_log(
+            f"terminal/release {tid} detach (bg keep pid="
+            f"{getattr(proc, 'pid', None)})")
+
+    async def _watch_detached(self, tid: str, proc, slot: dict) -> None:
+        try:
+            code = await proc.wait()
+            es = self._exit_status_from_code(code)
+            slot["exit_status"] = es
+            snap = self._detached_snaps.get(tid)
+            if snap is not None:
+                snap["exitStatus"] = es
+            self._detached_procs.pop(tid, None)
+            try:
+                self._emit_bg_terminal_complete(tid)
+            except Exception as e:
+                self.file_log(f"detached complete {tid}: {e}")
+        except Exception as e:
+            self.file_log(f"detached watch {tid}: {e}")
+            self._detached_procs.pop(tid, None)
 
     async def _terminal_close(self, tid: str) -> None:
         slot = self._terminals.pop(tid, None)

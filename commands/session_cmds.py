@@ -800,8 +800,6 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
             if active_session and not active_session.is_sleeping:
                 items.append(["○ Sleep Session", "Put session to sleep, free resources"])
                 actions.append(("sleep", active_session))
-            items.append(["RESTART NEW", "Fresh session in this view — same provider/model"])
-            actions.append(("restart_new", active_session))
             items.append(["🔄 Restart Session…", "Restart with a profile or checkpoint"])
             actions.append(("restart", active_session))
 
@@ -980,8 +978,6 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                             _s._apply_undo(rewind_id, draft_prompt)
                     self.window.show_quick_panel(
                         labels, _on_undo, placeholder="Rewind to…")
-                elif action == "restart_new" and data:
-                    restart_session_new(self.window, data)
                 elif action == "restart" and data:
                     # Show profile picker for restart
                     self._show_restart_picker(data, profiles, checkpoints)

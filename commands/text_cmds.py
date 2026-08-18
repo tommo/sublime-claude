@@ -76,6 +76,21 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         if s.output.submit_question_input():
             return
 
+        # Cmd+Enter with a queue: send now even if ◎ is closed or caret is
+        # in history (the phantom hint). Draft in ◎ is handled below.
+        if (
+            send_now
+            and s.working
+            and getattr(s, "_queued_prompts", None)
+        ):
+            in_composer = (
+                s.output.is_input_mode()
+                and not _caret_outside_composer(self.view, s.output)
+            )
+            if not in_composer:
+                s.send_now("")
+                return
+
         if not s.output.is_input_mode():
             # Sticky ◎ not open yet — open it (idle) rather than no-op
             if not s.working and getattr(s, "_composer_allowed", True) and not s.is_sleeping:
@@ -216,6 +231,8 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
             self._cmd_compact(session)
         elif cmd.name == "context":
             self._cmd_context(session)
+        elif cmd.name == "rename":
+            self._cmd_rename(session, cmd)
         elif cmd.name == "goal":
             # Plugin-owned goal harness — do not forward raw /goal to agent
             # (would double-drive Grok's native harness).
@@ -248,6 +265,19 @@ class ClaudeSubmitInputCommand(sublime_plugin.TextCommand):
         except Exception:
             pass
         session.query("/compact", display_prompt="/compact")
+
+    def _cmd_rename(self, session, cmd):
+        """Rename this session. Host-only — do not forward /rename to the agent."""
+        name = (getattr(cmd, "args", None) or "").strip()
+        if not name:
+            cur = (getattr(session, "name", None) or "").strip() or "(unnamed)"
+            session.output.text(
+                "\n*Usage: /rename <title> — current: {}*\n".format(cur))
+            session.output.enter_input_mode()
+            return
+        session._set_name(name)
+        sublime.status_message("Claude: renamed")
+        session.output.enter_input_mode()
 
     def _cmd_context(self, session):
         """Show pending context items."""

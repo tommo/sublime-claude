@@ -370,7 +370,7 @@ class TestRenderSessionList(unittest.TestCase):
         )
         self.assertEqual(sl._status_of(compacting), "working")
         self.assertEqual(sl._mark("input"), "?")
-        self.assertEqual(sl._mark("unread"), "*")
+        self.assertEqual(sl._mark("unread"), "!")
         unread = types.SimpleNamespace(
             is_sleeping=False, working=False, unread=True, _compacting=False,
             output=types.SimpleNamespace(
@@ -401,7 +401,7 @@ class TestRenderSessionList(unittest.TestCase):
             "last_access": 1, "last_activity": 1,
         }
         utext, _ = sl.render_list([urow], [], [], cols=80)
-        self.assertIn("* ", utext)
+        self.assertIn("! ", utext)
         self.assertIn("new", utext)
         import sublime
         ask = types.SimpleNamespace(
@@ -447,6 +447,8 @@ class TestRenderSessionList(unittest.TestCase):
             sl.load_saved_sessions = prev
         self.assertEqual([r["session_id"] for r in here], ["b", "a"])
         self.assertEqual(other, [])
+        self.assertEqual(sl.history_cap(), sl.HISTORY_CAP)
+        self.assertEqual(sl.HISTORY_CAP, 200)
 
     def test_live_filters_to_window_project(self):
         sl = _load()
@@ -538,6 +540,17 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertIn("plain live", run_block)
         self.assertNotIn("pinned live", run_block)
 
+    def test_drop_empty_sessions(self):
+        sl = _load()
+        rows = [
+            {"session_id": "a", "query_count": 0, "name": "unused"},
+            {"session_id": "b", "query_count": 2, "name": "used"},
+            {"session_id": "c", "query_count": 0, "name": "pinned empty"},
+        ]
+        kept = sl.drop_empty_sessions(rows, starred={"c"})
+        self.assertEqual([r["session_id"] for r in kept], ["b", "c"])
+        # Live / open sheets are not filtered — only unused history.
+
     def test_pull_starred_empty(self):
         sl = _load()
         live = [{"session_id": "a", "kind": "live", "status": "ready"}]
@@ -546,6 +559,13 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual(pinned, [])
         self.assertEqual(rest_l, live)
         self.assertEqual(rest_h, here)
+        rows = [{
+            "kind": "live", "session_id": "a", "view_id": 1,
+            "name": "x", "backend": "grok", "status": "ready",
+            "query_count": 0, "same_window": True,
+        }]
+        text, _ = sl.render_list(rows, [], [], starred=set())
+        self.assertNotIn("STARRED", text)
 
     def test_rename_row_saved(self):
         sl = _load()

@@ -37,6 +37,13 @@ class TestRestartNewParse(unittest.TestCase):
     def test_plain_prompt_is_not_slash(self):
         self.assertIsNone(CommandParser.parse("RESTART NEW"))
 
+    def test_slash_rename(self):
+        self.assertTrue(CommandParser.is_builtin("rename"))
+        cmd = CommandParser.parse("/rename (fork) polite host")
+        self.assertIsNotNone(cmd)
+        self.assertEqual(cmd.name, "rename")
+        self.assertEqual(cmd.args, "(fork) polite host")
+
 
 if __name__ == "__main__":
     unittest.main()
