@@ -24,6 +24,10 @@
         "command": "dsr_start"
     },
     {
+        "caption": "opencode: New Session",
+        "command": "opencode_start"
+    },
+    {
         "caption": "Grok: New Session",
         "command": "grok_start"
     },

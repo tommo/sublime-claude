@@ -279,6 +279,112 @@ def _grok_available() -> bool:
     return bool(os.environ.get("GROK_BIN") or shutil.which("grok"))
 
 
+def resolve_opencode_bin() -> str:
+    """opencode CLI path: OPENCODE_BIN → PATH → default install dir."""
+    cand = (os.environ.get("OPENCODE_BIN") or "").strip()
+    if cand:
+        return cand
+    found = shutil.which("opencode")
+    if found:
+        return found
+    home = os.path.expanduser("~/.local/bin/opencode")
+    return home if os.path.isfile(home) else ""
+
+
+def _opencode_available() -> bool:
+    """Native opencode ACP: `opencode acp` (OPENCODE_BIN / PATH / ~/.local/bin)."""
+    return bool(resolve_opencode_bin())
+
+
+# Shown until `opencode models` lands (see _opencode_refresh_models). The live
+# per-session catalog also arrives via ACP configOptions → session.available_models.
+OPENCODE_FALLBACK_MODELS: List[Tuple[str, str]] = [
+    ("opencode/big-pickle", "Zen / Big Pickle"),
+    ("opencode/deepseek-v4-flash-free", "Zen / DeepSeek V4 Flash (free)"),
+    ("opencode/nemotron-3-ultra-free", "Zen / Nemotron 3 Ultra (free)"),
+    ("opencode/north-mini-code-free", "Zen / North Mini Code (free)"),
+    ("opencode/mimo-v2.5-free", "Zen / MiMo V2.5 (free)"),
+    ("opencode/longcat-2.0-free", "Zen / LongCat 2.0 (free)"),
+    ("opencode/laguna-s-2.1-free", "Zen / Laguna S 2.1 (free)"),
+    ("opencode/ling-3.0-tiny-free", "Zen / Ling 3.0 Tiny (free)"),
+]
+
+# Populated off-thread by _opencode_refresh_models(); None = not fetched yet.
+_opencode_models_cache: Optional[List[Tuple[str, str]]] = None
+_opencode_fetch_started = False
+
+
+def _opencode_fetch_models() -> None:
+    """Run `opencode models` once and cache the result (worker thread)."""
+    global _opencode_models_cache
+    import subprocess
+    binpath = resolve_opencode_bin()
+    if not binpath:
+        return
+    try:
+        out = subprocess.run(
+            [binpath, "models"], capture_output=True, text=True, timeout=20,
+        ).stdout
+    except Exception as e:
+        print(f"[Claude] opencode models failed: {e}")
+        return
+    models: List[Tuple[str, str]] = []
+    for line in out.splitlines():
+        mid = line.strip()
+        # ids are "provider/model"; skip banner/ANSI noise
+        if not mid or "/" not in mid or " " in mid or "\x1b" in mid:
+            continue
+        models.append((mid, mid))
+    if models:
+        _opencode_models_cache = models
+
+
+def merge_model_catalog(*sources) -> List[Tuple[str, str]]:
+    """Merge model lists into ordered unique ``(id, label)`` pairs.
+
+    Accepts ACP ``availableModels`` dicts ({modelId, name}), ``(id, label)``
+    pairs and bare id strings, in any mix. Earlier sources win on duplicates,
+    so callers pass the freshest catalog first (live session → registry →
+    on-disk cache).
+    """
+    merged: List[Tuple[str, str]] = []
+    seen = set()
+    for src in sources:
+        for item in src or []:
+            if isinstance(item, dict):
+                mid = (item.get("modelId") or item.get("model_id")
+                       or item.get("id"))
+                label = item.get("name") or item.get("label") or mid
+            elif isinstance(item, (list, tuple)) and item:
+                mid = item[0]
+                label = item[1] if len(item) > 1 else item[0]
+            else:
+                mid = label = item
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            merged.append((str(mid), str(label or mid)))
+    return merged
+
+
+def opencode_picker_models() -> List[Tuple[str, str]]:
+    """Model catalog for the picker; kicks off the CLI fetch on first call."""
+    global _opencode_fetch_started
+    if _opencode_models_cache is not None:
+        return list(_opencode_models_cache)
+    if not _opencode_fetch_started and _opencode_available():
+        _opencode_fetch_started = True
+        try:
+            import threading
+            threading.Thread(
+                target=_opencode_fetch_models, daemon=True).start()
+        except Exception:
+            _opencode_fetch_models()
+            if _opencode_models_cache is not None:
+                return list(_opencode_models_cache)
+    return list(OPENCODE_FALLBACK_MODELS)
+
+
 def _kimi_available() -> bool:
     """Native Kimi Code ACP: `kimi` / KIMI_BIN / ~/.kimi-code/bin/kimi."""
     try:
@@ -338,6 +444,21 @@ BACKENDS: Dict[str, BackendSpec] = {
             ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
         ],
         available=_kimi_available,
+        pinned=True,
+    ),
+    # Native opencode via ACP (`opencode acp`). Model ids are provider/model
+    # ("opencode/big-pickle", "anthropic/claude-…") — catalog refreshed in
+    # all_backends() via opencode_picker_models().
+    "opencode": BackendSpec(
+        name="opencode",
+        label="opencode",
+        abbrev="OC",
+        bridge_script="opencode_main.py",
+        # Must stay a real opencode id: an empty fallback makes session.py fall
+        # through to the global `default_model` (a Claude id like "opus").
+        fallback_model="opencode/big-pickle",
+        default_models=list(OPENCODE_FALLBACK_MODELS),
+        available=_opencode_available,
         pinned=True,
     ),
     # xAI via Anthropic-compat proxy + Claude Code bridge (legacy path).
@@ -449,6 +570,16 @@ def all_backends() -> Dict[str, "BackendSpec"]:
             )
     except Exception as e:
         print(f"[Claude] grok model catalog refresh failed: {e}")
+    # Refresh opencode catalog (cached `opencode models`, fetched off-thread).
+    try:
+        from dataclasses import replace as _replace
+        if "opencode" in merged and _opencode_available():
+            merged["opencode"] = _replace(
+                merged["opencode"],
+                default_models=list(opencode_picker_models()),
+            )
+    except Exception as e:
+        print(f"[Claude] opencode model catalog refresh failed: {e}")
     try:
         custom = _load_custom_providers()
     except Exception as e:
