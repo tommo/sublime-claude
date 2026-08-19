@@ -856,26 +856,31 @@ class AcpBridge(BaseBridge):
 
         upd = params.get("update", {})
         kind = upd.get("sessionUpdate")
-        # Only suppress streams while *our* host prompt is being cancelled.
-        # When idle / auto-continue after end_turn, _prompt_cancelled must not
-        # black-hole agent activity (that left the view empty while kimi worked).
+        # After Esc, Grok often returns cancelled then keeps sending tools.
+        # Hold the lid until the next handle_query actually starts.
+        # Do not clear that lid just because the prompt future settled —
+        # that re-opened leftover as a live turn.
         host_prompt_live = (
             self._prompt_fut is not None and not self._prompt_fut.done())
-        if self._prompt_cancelled and not host_prompt_live:
-            # Stale cancel flag after prompt ended — clear so auto-continue paints
+        if (
+            self._prompt_cancelled
+            and not host_prompt_live
+            and not self._cancel_in_flight
+        ):
             self._prompt_cancelled = False
-        suppress = bool(self._prompt_cancelled and host_prompt_live)
-        # After user interrupt: drop *new* tool starts so ☐ rows don't appear
-        # post-[interrupted]. Still accept tool_call_update completions so
-        # already-open rows can settle.
-        if suppress and kind == "tool_call":
-            self.file_log(
-                f"drop tool_call after cancel: "
-                f"{(upd.get('title') or upd.get('toolCallId') or '')!r}")
+        suppress = bool(self._cancel_in_flight or (
+            self._prompt_cancelled and host_prompt_live))
+        # After user interrupt: drop *new* tool starts / leftover prose.
+        # Still accept tool_call_update completions so already-open rows settle.
+        if suppress and kind in (
+            "tool_call", "agent_message_chunk", "agent_thought_chunk",
+        ):
+            if kind == "tool_call":
+                self.file_log(
+                    f"drop tool_call after cancel: "
+                    f"{(upd.get('title') or upd.get('toolCallId') or '')!r}")
             return
         if kind == "agent_message_chunk":
-            if suppress:
-                return
             text = (upd.get("content") or {}).get("text", "")
             if text:
                 send_notification("message",
@@ -3422,14 +3427,20 @@ class AcpBridge(BaseBridge):
         fut = self._prompt_fut
         active = fut is not None and not fut.done()
         has_query = self._query_req_id is not None
-        # Idle — nothing to cancel (don't poke Grok).
-        if not active and not has_query:
-            self.file_log("interrupt: idle (no in-flight prompt)")
-            send_result(req_id, {"status": "interrupted"})
-            return
-        # Cancel already in progress / done for this turn — no second notify.
-        if self._cancel_in_flight and not active:
-            self.file_log("interrupt: already cancelled; skip session/cancel")
+        # Idle / already cancelled: do not re-send session/cancel (Grok
+        # ChatStateActor dies). Still kill leftover shells Grok keeps using.
+        if (not active and not has_query) or (
+                self._cancel_in_flight and not active):
+            n = 0
+            for tid in list(self._terminals):
+                try:
+                    await self._terminal_close(tid)
+                    n += 1
+                except Exception:
+                    pass
+            self.file_log(
+                f"interrupt: idle leftover_killed={n} "
+                f"cancel_in_flight={self._cancel_in_flight}")
             send_result(req_id, {"status": "interrupted"})
             return
 
@@ -5396,6 +5407,8 @@ class AcpBridge(BaseBridge):
         return note
 
     async def _acp_fs_write(self, params: dict) -> dict:
+        if self._cancel_in_flight:
+            raise ValueError("fs/write_text_file rejected: turn cancelled")
         path = params.get("path") or ""
         if not path or not os.path.isabs(path):
             raise ValueError(
@@ -5523,7 +5536,8 @@ class AcpBridge(BaseBridge):
         # work while the prompt is winding down — only while host prompt lives.
         host_prompt_live = (
             self._prompt_fut is not None and not self._prompt_fut.done())
-        if self._prompt_cancelled and host_prompt_live:
+        if self._cancel_in_flight or (
+                self._prompt_cancelled and host_prompt_live):
             raise ValueError("terminal/create rejected: turn cancelled")
         cmd = params.get("command")
         if not cmd:

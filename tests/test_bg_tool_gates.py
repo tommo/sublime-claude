@@ -316,6 +316,7 @@ class _FwdStub(AcpBridge):
         self._tool_titles_by_id = {}
         self._prompt_fut = None
         self._prompt_cancelled = False
+        self._cancel_in_flight = False
         self.TOOL_TO_CANONICAL = dict(AcpBridge.TOOL_TO_CANONICAL)
 
     def file_log(self, msg):
@@ -424,6 +425,30 @@ class TestModalToolDedupe(unittest.TestCase):
             "title": "Ask: How do you want to handle the box3d swap?",
         })
         self.assertEqual(name, "ask_user")
+
+    def test_cancel_in_flight_drops_new_tool_call(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _FwdStub()
+            b._cancel_in_flight = True
+            b._prompt_cancelled = True
+            b._prompt_fut = None
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-after-esc",
+                    "title": "run_terminal_command",
+                    "rawInput": {"command": "echo no"},
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        self.assertEqual(
+            [p.get("type") for _, p in notes], [])
 
     def test_completed_update_after_result_does_not_reopen(self):
         import acp_base

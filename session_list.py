@@ -423,6 +423,7 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
             lines.append(fmt(r, starred, compact, cols))
             rec = dict(r)
             rec["line"] = len(lines)  # 1-based
+            rec["section"] = title
             index.append(rec)
         lines.append("")
 
@@ -692,10 +693,16 @@ def _live_session_for_row(row: dict):
     return None
 
 
-def close_row(window, row: dict) -> bool:
-    """Stop a live session or drop a history entry. Removes it from the list."""
+def close_row(window, row: dict, remove: Optional[bool] = None) -> bool:
+    """Del a list row. Only HISTORY removes the saved resume entry.
+
+    CURRENT/STARRED: stop the live sheet and close its view; keep the save.
+    HISTORY: drop the saved row (resume list).
+    """
     if not row:
         return False
+    if remove is None:
+        remove = row.get("section") == "HISTORY"
     sid = row.get("session_id")
     if row.get("kind") == "live":
         session = _live_session_for_row(row)
@@ -727,13 +734,13 @@ def close_row(window, row: dict) -> bool:
                         view.close()
                 except Exception:
                     pass
-        if sid:
+        if remove and sid:
             try:
                 remove_saved_session(sid)
             except Exception:
                 pass
         return True
-    if sid:
+    if remove and sid:
         return bool(remove_saved_session(sid))
     return False
 

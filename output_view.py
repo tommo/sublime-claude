@@ -2388,6 +2388,63 @@ class OutputView:
         self._render_pending = False
         self._do_render()
 
+    def clear_asking_state(self) -> None:
+        """Drop leftover question / permission / plan UI.
+
+        Resume after interrupt must not restore asking. Does not fire
+        callbacks — the old turn's waiters are gone.
+        """
+        if self.pending_question:
+            try:
+                self._clear_question()
+            except Exception:
+                pass
+            self.pending_question = None
+        if self.pending_permission:
+            try:
+                self._remove_permission_block()
+            except Exception:
+                pass
+            self.pending_permission = None
+        self._permission_queue.clear()
+        if self.pending_plan:
+            try:
+                self._clear_plan_approval()
+            except Exception:
+                pass
+            self.pending_plan = None
+        self._question_input_mode = False
+        view = self.view
+        if not view or not view.is_valid():
+            return
+        try:
+            view.settings().set("claude_question_input_mode", False)
+        except Exception:
+            pass
+        try:
+            from .output_pending import clear_pending_block
+            for key in (
+                "claude_question_block",
+                "claude_permission_block",
+                "claude_plan_block",
+            ):
+                regs = view.get_regions(key) if hasattr(view, "get_regions") else []
+                if regs:
+                    clear_pending_block(
+                        view,
+                        block_region_key=key,
+                        button_prefix="",
+                        button_keys={},
+                        extra_region_keys=(
+                            "claude_question_keys",
+                            "claude_question_input_marker",
+                        ),
+                    )
+            view.erase_regions("claude_question_keys")
+            view.erase_regions("claude_question_input_marker")
+        except Exception:
+            pass
+
     def interrupted(self, show_banner: bool = True) -> None:
         """End the live turn UI (optional *[interrupted]* banner).
 
@@ -2395,6 +2452,7 @@ class OutputView:
         sit under a misleading interrupted marker.
         """
         if not self.current:
+            self.clear_asking_state()
             return
         self.current.working = False
         # Mark any pending/background tools as error
@@ -2666,15 +2724,15 @@ class OutputView:
         # Reset input mode state (view settings may persist across restart)
         self.reset_input_mode()
 
-        # Clear permission state (memory only when soft)
-        if self.pending_permission:
-            if not soft:
-                self._remove_permission_block()
-            self.pending_permission = None
-        self._permission_queue.clear()
-
         if soft:
+            self.pending_permission = None
+            self._permission_queue.clear()
+            self.pending_plan = None
+            self.pending_question = None
+            self._question_input_mode = False
             return
+
+        self.clear_asking_state()
 
         # Mark any pending tools in current conversation as error
         if self.current:

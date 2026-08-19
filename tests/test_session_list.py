@@ -581,18 +581,68 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertFalse(sl.rename_row(None, row, "   "))
         self.assertFalse(sl.rename_row(None, None, "x"))
 
-    def test_close_row_drops_saved(self):
+    def test_close_row_history_removes_saved(self):
         sl = _load()
         gone = []
         sl.remove_saved_session = lambda sid, g=gone: (g.append(sid) or True)
         row = {
             "kind": "saved", "session_id": "dead", "name": "old",
-            "backend": "grok",
+            "backend": "grok", "section": "HISTORY",
         }
         self.assertTrue(sl.close_row(None, row))
         self.assertEqual(gone, ["dead"])
         self.assertFalse(sl.close_row(None, None))
         self.assertFalse(sl.close_row(None, {"kind": "saved"}))
+        self.assertFalse(sl.close_row(None, {
+            "kind": "saved", "session_id": "keep", "section": "STARRED",
+        }))
+        self.assertEqual(gone, ["dead"])
+
+    def test_close_row_current_keeps_saved(self):
+        sl = _load()
+        gone = []
+        sl.remove_saved_session = lambda sid, g=gone: (g.append(sid) or True)
+
+        class _Sess:
+            output = None
+            agent_id = None
+            stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        sess = _Sess()
+        sl._live_session_for_row = lambda row, s=sess: s
+        row = {
+            "kind": "live", "session_id": "live1", "name": "x",
+            "backend": "grok", "section": "CURRENT",
+        }
+        self.assertTrue(sl.close_row(None, row))
+        self.assertTrue(sess.stopped)
+        self.assertEqual(gone, [])
+        starred_live = dict(row)
+        starred_live["section"] = "STARRED"
+        sess.stopped = False
+        self.assertTrue(sl.close_row(None, starred_live))
+        self.assertTrue(sess.stopped)
+        self.assertEqual(gone, [])
+
+    def test_render_stamps_section(self):
+        sl = _load()
+        live = [{
+            "kind": "live", "session_id": "cur", "view_id": 1,
+            "name": "now", "backend": "grok", "status": "ready",
+            "query_count": 1, "same_window": True,
+        }]
+        here = [{
+            "kind": "saved", "session_id": "old", "name": "then",
+            "backend": "grok", "query_count": 3, "project": "/p",
+            "last_activity": 1.0,
+        }]
+        _, index = sl.render_list(live, here, [], starred=set())
+        by_id = {r["session_id"]: r.get("section") for r in index}
+        self.assertEqual(by_id["cur"], "CURRENT")
+        self.assertEqual(by_id["old"], "HISTORY")
 
 
 if __name__ == "__main__":

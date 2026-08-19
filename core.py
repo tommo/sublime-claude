@@ -288,6 +288,48 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
     return s
 
 
+def auto_sleep_due(session, now: float, timeout_min: float):
+    """True when an idle live session has been quiet longer than timeout.
+
+    Returns (due, effective_idle_ts). Interrupt/cancel must not look idle
+    since the turn *started* — last_activity is the floor.
+    """
+    if not timeout_min or timeout_min <= 0:
+        return False, 0.0
+    if getattr(session, "sleep_disabled", False):
+        return False, 0.0
+    if getattr(session, "quick_mode", False):
+        return False, 0.0
+    if getattr(session, "_interrupting", False):
+        return False, 0.0
+    try:
+        gt = getattr(session, "goal_tracker", None)
+        if gt is not None and gt.is_open() and gt.status in (
+                "active", "infra_paused"):
+            return False, 0.0
+    except Exception:
+        pass
+    sleeping = getattr(session, "is_sleeping", False)
+    if callable(sleeping):
+        try:
+            sleeping = bool(sleeping())
+        except Exception:
+            sleeping = False
+    if not (getattr(session, "initialized", False)
+            and not getattr(session, "working", False)
+            and not sleeping):
+        return False, 0.0
+    idle_at = float(getattr(session, "last_idle_at", 0) or 0)
+    last_act = float(getattr(session, "last_activity", 0) or 0)
+    # Idle clock cannot predate last work — long ACP turns used to leave
+    # last_idle_at at pre-run sticky-◎ open time → instant sleep on done.
+    effective_idle = max(idle_at, last_act)
+    threshold = now - (timeout_min * 60)
+    if effective_idle <= 0 or effective_idle >= threshold:
+        return False, effective_idle
+    return True, effective_idle
+
+
 def _check_auto_sleep():
     global _auto_sleep_timer
     _auto_sleep_timer = None
@@ -298,7 +340,6 @@ def _check_auto_sleep():
         return
 
     now = time.time()
-    threshold = now - (timeout_min * 60)
     force_threshold = now - (timeout_min * 60 * 2)
 
     try:
@@ -307,31 +348,8 @@ def _check_auto_sleep():
     except Exception:
         live = list((getattr(sublime, "_claude_sessions", None) or {}).values())
     for session in live:
-        if getattr(session, 'sleep_disabled', False):
-            continue
-        if getattr(session, 'quick_mode', False):
-            continue
-        # Host goal harness: don't auto-sleep while a goal is open/active.
-        try:
-            gt = getattr(session, "goal_tracker", None)
-            if gt is not None and gt.is_open() and gt.status in (
-                    "active", "infra_paused"):
-                continue
-        except Exception:
-            pass
-        if not (session.initialized
-                and not session.working
-                and not session.is_sleeping):
-            continue
-        # Prefer last_idle_at (true idle). Fall back to last_activity so a
-        # session that never stamped idle (or stamped it mid-turn long ago)
-        # still needs a full timeout of *quiet* time after the last work.
-        idle_at = float(getattr(session, "last_idle_at", 0) or 0)
-        last_act = float(getattr(session, "last_activity", 0) or 0)
-        # Idle clock cannot predate last work — long ACP turns used to leave
-        # last_idle_at at pre-run sticky-◎ open time → instant sleep on done.
-        effective_idle = max(idle_at, last_act)
-        if effective_idle <= 0 or effective_idle >= threshold:
+        due, effective_idle = auto_sleep_due(session, now, timeout_min)
+        if not due:
             continue
         force = effective_idle < force_threshold
         idle_m = int((now - effective_idle) / 60)

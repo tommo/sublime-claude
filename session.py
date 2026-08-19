@@ -417,6 +417,10 @@ class Session:
         # Composer allowed only after live init/wake — never during restore/sleep.
         # Prevents enter_input_mode from flashing ◎ on package load / ST restart.
         self._composer_allowed: bool = True
+        # Resume after interrupt-in-asking: drop leftover question/permission/plan
+        # until the user starts a new query.
+        self._resume_drop_asking: bool = bool(resume_id) and not fork
+        self._resume_asking_interrupt_sent: bool = False
 
         # Pending retain content (set by compact_boundary, sent after interrupt)
         self._pending_retain: Optional[str] = None
@@ -424,6 +428,14 @@ class Session:
     def start(self, resume_session_at: str = None) -> None:
         # Live bridge starting — still no ◎ until _on_init succeeds
         self._composer_allowed = False
+        if self.resume_id and not self.fork:
+            self._resume_drop_asking = True
+            self._resume_asking_interrupt_sent = False
+            try:
+                if self.output:
+                    self.output.clear_asking_state()
+            except Exception:
+                pass
         self._show_connecting_phantom()
 
         settings = sublime.load_settings("ClaudeCode.sublime-settings")
@@ -831,6 +843,11 @@ class Session:
         self._composer_allowed = True
         if self.output and self.output.view:
             self.output.view.settings().erase("claude_sleeping")
+        if getattr(self, "_resume_drop_asking", False) and self.output:
+            try:
+                self.output.clear_asking_state()
+            except Exception:
+                pass
         if self.resume_id and not self.fork and not getattr(self, "quick_mode", False):
             try:
                 self._paint_resume_preview()
@@ -1669,6 +1686,7 @@ class Session:
         if not self.client or not self.initialized:
             sublime.error_message("Claude not initialized")
             return
+        self._resume_drop_asking = False
 
         # A user-initiated query (or any non-auto-retry) cancels any pending
         # auto-retry and resets the retry budget. Auto-retry calls pass
@@ -1934,12 +1952,11 @@ class Session:
                 except Exception:
                     pass
             self._turn.settle_interrupt()
-            if getattr(self, "_interrupt_stream", False) and (
-                    getattr(self, "_bg_task_ids", None)
-                    or getattr(self, "_bg_tools", None)):
-                self._resume_interrupt_stream()
-                return
+            self._interrupt_stream = False
             self.working = False
+            # Interrupt ACK used to skip the idle stamp below. A long Kimi
+            # turn then looked idle since it *started*, and auto-sleep fired.
+            self._note_activity(idle=True)
             if self.output and self.output.current:
                 self.output.current.working = False
             self._clear_deferred_state(clear_queue=False)
@@ -2751,6 +2768,7 @@ class Session:
                 pass
             self.working = False
             self._set_turn_phase("idle")
+            self._note_activity(idle=True)
             try:
                 if self.output and self.output.current:
                     self.output.current.working = False
@@ -2760,7 +2778,11 @@ class Session:
             self._ensure_idle_input(reason="second interrupt")
             return
         if not self.working and not getattr(self, "_inject_pending", False):
-            # Idle: only clear input is handled by the command; nothing to cancel.
+            # Idle UI: still tell the bridge to reap leftover Grok shells.
+            # User is here — do not treat the long agent-side run as idle.
+            self._note_activity()
+            if self.client:
+                self.client.send("interrupt", {})
             if break_channel and self.output and self.output.view:
                 from . import notalone
                 notalone.interrupt_channel(self.output.view.id())
@@ -2768,6 +2790,7 @@ class Session:
 
         self._interrupting = True
         self._interrupt_stream = True
+        self._note_activity()
         try:
             self._turn.begin_interrupt()
         except Exception:
@@ -3473,6 +3496,13 @@ class Session:
         if self.sleep(force=True):
             sublime.set_timeout(do_wake, 600)
 
+    def _note_activity(self, idle: bool = False) -> None:
+        """Stamp auto-sleep clocks. idle=True also starts the idle timeout."""
+        now = time.time()
+        self.last_activity = now
+        if idle:
+            self.last_idle_at = now
+
     def touch_access(self) -> None:
         """Session-list access: wake, inbound prompt, or completed reply. Not focus."""
         self.last_access = time.time()
@@ -3510,6 +3540,13 @@ class Session:
         self.terminal_mode = False
         self._terminal_poll_active = False
         self._terminal_tag = None
+        self._resume_drop_asking = True
+        self._resume_asking_interrupt_sent = False
+        try:
+            if self.output:
+                self.output.clear_asking_state()
+        except Exception:
+            pass
         self._clear_overlay_phantom()
         if self.output and self.output.view:
             view = self.output.view
@@ -3811,6 +3848,8 @@ class Session:
 
     def _on_notification(self, method: str, params: dict) -> None:
         # Pre-built handler set for top-level methods (one-time lookup is fine)
+        if method in ("permission_request", "question_request"):
+            self._note_activity()
         method_handler = self._notification_method_handlers().get(method)
         if method_handler is not None:
             method_handler(params)
@@ -3818,6 +3857,14 @@ class Session:
         if method != "message":
             return
         t = params.get("type")
+        if t in (
+            "tool_use", "tool_result", "text_delta", "text",
+            "thinking", "plan_todos",
+        ):
+            # Long Kimi agent-side work can run after host @done with
+            # working=False. Keep last_activity fresh so auto-sleep does not
+            # treat that as idle.
+            self._note_activity()
         msg_handler = self._notification_message_handlers().get(t)
         if msg_handler is not None:
             msg_handler(params)
@@ -4039,6 +4086,8 @@ class Session:
         background = params.get("background", False)
         tool_id = params.get("id")
         if not name or not name.strip():
+            return
+        if getattr(self, "_resume_drop_asking", False) and self._is_asking_tool(name):
             return
         if params.get("replay"):
             try:
@@ -6572,6 +6621,46 @@ class Session:
             self.output.advance_spinner()
         sublime.set_timeout(self._animate, interval)
 
+    @staticmethod
+    def _is_asking_tool(name: str) -> bool:
+        n = (name or "").strip()
+        if not n:
+            return False
+        if n in (
+            "ask_user", "AskUserQuestion", "ask_user_question", "AskUser",
+            "ExitPlanMode", "EnterPlanMode",
+        ):
+            return True
+        return n.lower() in ("ask_user", "askuserquestion", "ask_user_question")
+
+    def _drop_resume_asking_if_needed(self, send_fn) -> bool:
+        """True if leftover asking from resume was cancelled (no UI)."""
+        if not getattr(self, "_resume_drop_asking", False):
+            return False
+        try:
+            send_fn()
+        except Exception as e:
+            print(f"[Claude] resume drop asking send: {e}")
+        if not getattr(self, "_resume_asking_interrupt_sent", False):
+            self._resume_asking_interrupt_sent = True
+            if self.client:
+                try:
+                    self.client.send("interrupt", {})
+                except Exception:
+                    pass
+        try:
+            if self.output:
+                self.output.clear_asking_state()
+        except Exception:
+            pass
+        print("[Claude] resume: dropped leftover asking state")
+        try:
+            from .session_list import schedule_session_list_refresh
+            schedule_session_list_refresh()
+        except Exception:
+            pass
+        return True
+
     def _handle_permission_request(self, params: dict) -> None:
         """Handle permission request from bridge - show in output view."""
         from .output import PERM_ALLOW, PERM_ALLOW_ALL, PERM_ALLOW_SESSION
@@ -6579,6 +6668,15 @@ class Session:
         pid = params.get("id")
         tool = params.get("tool", "Unknown")
         tool_input = params.get("input", {})
+        if self._drop_resume_asking_if_needed(lambda: self.client and self.client.send(
+                "permission_response", {
+                    "id": pid,
+                    "allow": False,
+                    "always": False,
+                    "input": None,
+                    "message": "User denied permission",
+                })):
+            return
         def on_response(response: str) -> None:
             if self.client:
                 # ALLOW_ALL / ALLOW_SESSION are normalized to allow in output.py
@@ -6610,6 +6708,9 @@ class Session:
         """Handle AskUserQuestion from Claude - show inline question UI."""
         qid = params.get("id")
         questions = params.get("questions", [])
+        if self._drop_resume_asking_if_needed(lambda: self.client and self.client.send(
+                "question_response", {"id": qid, "answers": None})):
+            return
         if not questions:
             if self.client:
                 self.client.send("question_response", {"id": qid, "answers": {}})
@@ -6638,6 +6739,14 @@ class Session:
         from .output import PLAN_APPROVE
         plan_id = params.get("id")
         tool_input = params.get("tool_input", {}) or {}
+        if self._drop_resume_asking_if_needed(lambda: self.client and self.client.send(
+                "plan_response", {
+                    "id": plan_id,
+                    "approved": False,
+                    "plan": "",
+                    "planFilePath": "",
+                })):
+            return
 
         # Prefer path from bridge; else scan disk (Kimi/Claude/Grok plans).
         plan_file = (
