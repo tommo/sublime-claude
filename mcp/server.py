@@ -37,6 +37,9 @@ _READ_IMAGE_MAX_EDGE = 1600  # long edge for resize
 #   enables it — other backends rarely need multi-MB base64 image blocks).
 CALLER_VIEW_ID = None
 ENABLE_READ_IMAGE = False
+_env_vid = (os.environ.get("SUBLIME_CLAUDE_VIEW_ID") or "").strip()
+if _env_vid.isdigit():
+    CALLER_VIEW_ID = int(_env_vid)
 for arg in sys.argv[1:]:
     if arg.startswith("--view-id="):
         try:

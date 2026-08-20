@@ -25,6 +25,32 @@ class TestPeelUseTool(unittest.TestCase):
     def setUp(self):
         self.b = _NameOnly()
 
+    def test_format_acp_error_includes_kimi_details(self):
+        self.assertEqual(
+            self.b._format_acp_error({
+                "code": -32603,
+                "message": "Internal error",
+                "data": {
+                    "details":
+                    "ACP stdio MCP server sublime does not declare a runtime identity",
+                },
+            }),
+            "Internal error: ACP stdio MCP server sublime does not declare "
+            "a runtime identity",
+        )
+        self.assertTrue(self.b._is_mcp_runtime_identity_error(RuntimeError(
+            "Internal error: ACP stdio MCP server sublime does not "
+            "declare a runtime identity")))
+
+    def test_agent_busy_error_matches_kimi_invalid_request(self):
+        self.assertTrue(self.b._is_agent_busy_error(
+            RuntimeError(
+                "Invalid request: another turn is already in progress")))
+        self.assertTrue(self.b._is_agent_busy_error(
+            RuntimeError("turn.agent_busy")))
+        self.assertFalse(self.b._is_agent_busy_error(
+            RuntimeError("session not initialized")))
+
     def test_use_tool_peels_jar_kanban(self):
         name = self.b._normalize_tool_name({
             "title": "use_tool",

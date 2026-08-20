@@ -139,8 +139,47 @@ class KimiBridge(KimiBgMixin, AcpBridge):
     }
 
     def agent_argv(self) -> List[str]:
-        # Always ACP stdio — never Claude SDK main.py
+        # Official: `kimi acp` (https://moonshotai.github.io/kimi-code/zh/reference/kimi-acp.html)
         return list(_kimi_agent_argv(self.model))
+
+    def _collect_mcp_servers(self) -> list:
+        """ACP session/new mcpServers. Docs: http/stdio/sse.
+
+        0.37.2 throws on stdio relay (runtime identity). Sandbox: type=http
+        session/new succeeds. Wrap our stdio MCP as localhost HTTP.
+        """
+        cached = getattr(self, "_kimi_http_mcp_servers", None)
+        if cached is not None:
+            return cached
+        stdio = AcpBridge._collect_mcp_servers(self)
+        try:
+            from stdio_http_mcp import start_stdio_http_mcp, acp_stdio_env
+        except ImportError:
+            from .stdio_http_mcp import start_stdio_http_mcp, acp_stdio_env
+        out = []
+        held = []
+        for s in stdio:
+            if not isinstance(s, dict) or not s.get("command"):
+                continue
+            name = s.get("name") or "mcp"
+            try:
+                url, httpd = start_stdio_http_mcp(
+                    s["command"], list(s.get("args") or []),
+                    acp_stdio_env(s),
+                )
+                held.append(httpd)
+                out.append({
+                    "name": name,
+                    "type": "http",
+                    "url": url,
+                    "headers": [],
+                })
+                self.file_log(f"kimi MCP http wrap {name} → {url}")
+            except Exception as e:
+                self.file_log(f"kimi MCP http wrap {name}: {e}")
+        self._http_mcp_httpd = held
+        self._kimi_http_mcp_servers = out
+        return out
 
     def normalize_model(self, model: Optional[str]) -> str:
         return _kimi_normalize_model(model, default=self.DEFAULT_MODEL)

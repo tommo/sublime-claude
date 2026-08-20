@@ -599,8 +599,10 @@ class AcpBridge(BaseBridge):
                 fut = self.pending.pop(msg["id"], None)
                 if fut is not None and not fut.done():
                     if "error" in msg:
-                        fut.set_exception(RuntimeError(
-                            msg["error"].get("message", "acp error")))
+                        err_txt = self._format_acp_error(msg.get("error") or {})
+                        self.file_log(
+                            f"← acp id={msg.get('id')} error: {err_txt}")
+                        fut.set_exception(RuntimeError(err_txt))
                     else:
                         fut.set_result(msg.get("result"))
                 continue
@@ -670,6 +672,34 @@ class AcpBridge(BaseBridge):
     def _acp_id(self) -> int:
         self.next_acp_id += 1
         return self.next_acp_id
+
+    @staticmethod
+    def _format_acp_error(err: Any) -> str:
+        """JSON-RPC error → 'message: details' (Kimi Internal error hides data)."""
+        if not isinstance(err, dict):
+            return str(err) or "acp error"
+        msg = str(err.get("message") or "acp error")
+        data = err.get("data")
+        if isinstance(data, dict):
+            details = data.get("details")
+            if details:
+                return f"{msg}: {details}"
+            nested = data.get("_errors") or data.get("mcpServers")
+            if nested:
+                try:
+                    return f"{msg}: {json.dumps(data)[:400]}"
+                except Exception:
+                    return f"{msg}: {data}"
+        if data:
+            return f"{msg}: {data}"
+        return msg
+
+    @staticmethod
+    def _is_mcp_runtime_identity_error(e: BaseException) -> bool:
+        t = str(e).lower()
+        return "runtime identity" in t or (
+            "internal error" in t and "mcp" in t
+        )
 
     async def _send_acp(self, method: str, params: dict,
                          *, timeout: Optional[float] = None) -> Any:
@@ -2861,11 +2891,20 @@ class AcpBridge(BaseBridge):
             "sessionId": resume_id,
             "cwd": self.cwd,
         }
-        if mcp_servers:
-            load_params["mcpServers"] = mcp_servers
+        load_params["mcpServers"] = list(mcp_servers or [])
         self._loading_session = True
         try:
-            result = await self._send_acp("session/load", load_params) or {}
+            try:
+                result = await self._send_acp("session/load", load_params) or {}
+            except Exception as e:
+                if mcp_servers and self._is_mcp_runtime_identity_error(e):
+                    self.file_log(
+                        f"session/load MCP rejected ({e}); retry mcpServers=[]")
+                    load_params = dict(load_params)
+                    load_params["mcpServers"] = []
+                    result = await self._send_acp("session/load", load_params) or {}
+                else:
+                    raise
             self.session_id = (
                 result.get("sessionId")
                 or result.get("session_id")
@@ -2893,8 +2932,8 @@ class AcpBridge(BaseBridge):
                                additional_dirs: Optional[list] = None,
                                resume_failed: bool = False) -> None:
         new_params: Dict[str, Any] = {"cwd": self.cwd}
-        if mcp_servers:
-            new_params["mcpServers"] = mcp_servers
+        # Kimi 0.37: mcpServers is required (missing → Invalid params).
+        new_params["mcpServers"] = list(mcp_servers or [])
         if additional_dirs:
             new_params["additionalDirectories"] = list(additional_dirs)
         meta = self.build_session_meta(
@@ -2902,7 +2941,19 @@ class AcpBridge(BaseBridge):
         if meta:
             new_params["_meta"] = meta
 
-        new_result = await self._send_acp("session/new", new_params) or {}
+        try:
+            new_result = await self._send_acp("session/new", new_params) or {}
+        except Exception as e:
+            # Kimi 0.37.2: type:stdio MCP is stripped then rejected
+            # ("does not declare a runtime identity"). Empty mcpServers works.
+            if mcp_servers and self._is_mcp_runtime_identity_error(e):
+                self.file_log(
+                    f"session/new MCP rejected ({e}); retry mcpServers=[]")
+                new_params = dict(new_params)
+                new_params["mcpServers"] = []
+                new_result = await self._send_acp("session/new", new_params) or {}
+            else:
+                raise
         self.session_id = (
             new_result.get("sessionId") or new_result.get("session_id")
         )
@@ -3067,6 +3118,7 @@ class AcpBridge(BaseBridge):
             or "another turn" in msg
             or "turn is active" in msg
             or "cannot launch a new turn" in msg
+            or "already in progress" in msg
         )
 
     async def _cancel_agent_turn(
@@ -3128,20 +3180,30 @@ class AcpBridge(BaseBridge):
             send_error(req_id, -32000, "session not initialized")
             return
         # A new query must not overlap an agent turn (Kimi: turn.agent_busy).
-        if self._query_req_id is not None and self._query_req_id != req_id:
+        # Tool ✔ is not end_turn — wait the live prompt out. Cancel only after
+        # user Esc (cancel_in_flight) or when the live prompt is stuck.
+        if self._cancel_in_flight:
+            await self._cancel_agent_turn(
+                reason="post_interrupt", wait_s=2.0, settle_s=0.8,
+                force_local=True, orphan_ok=True)
+        elif self._prompt_fut is not None and not self._prompt_fut.done():
+            self.file_log("query: waiting for in-flight session/prompt")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._prompt_fut), timeout=120.0)
+            except (asyncio.TimeoutError, Exception):
+                await self._cancel_agent_turn(
+                    reason="stale_prompt", wait_s=2.0, settle_s=0.5)
+            else:
+                try:
+                    await asyncio.sleep(0.35)
+                except Exception:
+                    pass
+        elif self._query_req_id is not None and self._query_req_id != req_id:
             self.file_log(
                 f"query: superseding in-flight req {self._query_req_id}")
             await self._cancel_agent_turn(
                 reason="supersede", wait_s=2.0, settle_s=0.5)
-        elif self._prompt_fut is not None and not self._prompt_fut.done():
-            await self._cancel_agent_turn(
-                reason="stale_prompt", wait_s=2.0, settle_s=0.5)
-        elif self._cancel_in_flight:
-            # Just interrupted — one more cancel for orphan agent turn + settle.
-            # Do not kill the process; session/cancel only.
-            await self._cancel_agent_turn(
-                reason="post_interrupt", wait_s=2.0, settle_s=0.8,
-                force_local=True, orphan_ok=True)
         prompt = params.get("prompt") or params.get("text") or ""
         images = params.get("images") or []
         if not isinstance(images, list):
@@ -3154,8 +3216,9 @@ class AcpBridge(BaseBridge):
         try:
             result = None
             last_err: Optional[BaseException] = None
-            # Busy retry: cancel leaves agent laggy; up to 3 attempts
-            for attempt in range(3):
+            # Busy: wait the current agent turn out. Do not cancel a healthy
+            # in-progress turn (Bash already HANDLED) on the first hits.
+            for attempt in range(8):
                 try:
                     result = await self._send_prompt(prompt_blocks) or {}
                     last_err = None
@@ -3165,19 +3228,25 @@ class AcpBridge(BaseBridge):
                     if (not self._is_agent_busy_error(e)
                             or self._prompt_cancelled):
                         raise
-                    settle = 0.6 + attempt * 0.8
+                    settle = min(8.0, 0.7 * (2 ** attempt))
                     self.file_log(
-                        f"query: agent_busy attempt {attempt + 1}/3 "
+                        f"query: agent_busy attempt {attempt + 1}/8 "
                         f"settle={settle:.1f}s: {e}")
-                    await self._cancel_agent_turn(
-                        reason=f"busy_retry_{attempt + 1}",
-                        wait_s=2.0 + attempt,
-                        settle_s=settle,
-                        force_local=True,
-                        orphan_ok=True,
-                    )
-                    self._prompt_cancelled = False
-                    self._cancel_in_flight = False
+                    if attempt >= 3:
+                        await self._cancel_agent_turn(
+                            reason=f"busy_retry_{attempt + 1}",
+                            wait_s=2.0 + attempt,
+                            settle_s=settle,
+                            force_local=True,
+                            orphan_ok=True,
+                        )
+                        self._prompt_cancelled = False
+                        self._cancel_in_flight = False
+                    else:
+                        try:
+                            await asyncio.sleep(settle)
+                        except Exception:
+                            pass
             if last_err is not None and result is None:
                 raise last_err
             result = result or {}

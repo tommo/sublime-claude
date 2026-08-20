@@ -27,6 +27,9 @@ if "self.working = True" in adopt:
 flush = _live_body(src, "_flush_bg_notifications")
 if "self._adopt_agent_turn(" in flush:
     bad.append("_flush_bg_notifications still soft-adopts")
+query = _live_body(src, "query")
+if "should_queue_prompt" not in query or "queue_prompt" not in query:
+    bad.append("query() does not queue while a turn is live")
 if bad:
     print("FAIL:", "; ".join(bad))
     sys.exit(1)

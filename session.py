@@ -1697,6 +1697,21 @@ class Session:
 
         raw = (prompt or "").strip()
         is_compact = raw in ("/compact", "compact") or raw.startswith("/compact ")
+        # Live session/prompt still owns the agent (Kimi: tool ✔ is not
+        # end_turn). A second query RPC is "another turn is already in
+        # progress". Queue until _on_done; drain via _fire_next_queued.
+        firing_queue = bool(getattr(self, "_firing_queue", False))
+        if raw and not firing_queue and not _auto_retry and not is_compact:
+            busy = bool(self.working) or bool(
+                getattr(self, "_awaiting_query_rpc", False))
+            try:
+                if getattr(self, "_turn", None) is not None:
+                    busy = busy or self._turn.should_queue_prompt()
+            except Exception:
+                pass
+            if busy:
+                self.queue_prompt(prompt)
+                return
         # While Kimi bg-compacts, new prompts race and return empty end_turn.
         # Queue them until compaction finishes.
         if (
@@ -4859,12 +4874,8 @@ class Session:
         prompt = self._bg_soft_wake_prompt
         display = getattr(self, "_bg_soft_wake_display", None) or "⚙ task notification"
         self._bg_soft_wake_prompt = None
-        if self.working and not getattr(self, "_awaiting_query_rpc", False):
-            # Soft adopt left us working without an RPC — reset to send query
-            self.working = False
-            self._set_turn_phase("idle")
-        if self.working:
-            return  # real query already in flight
+        if self.working or getattr(self, "_awaiting_query_rpc", False):
+            return
         try:
             self.query(prompt, display_prompt=display, silent=False)
         except Exception as e:

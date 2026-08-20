@@ -76,7 +76,10 @@ class TestKimiStaticWiring(unittest.TestCase):
         self.assertIn("AcpBridge", src)
         self.assertIn("agent_argv", src)
         self.assertIn("acp", src)
+        self.assertIn("stdio_http_mcp", src)
+        self.assertIn('"type": "http"', src)
         self.assertNotIn('bridge_script="main.py"', src)
+        self.assertNotIn("install_kimi_stdio_mcp", src)
 
     def test_backends_registry_source(self):
         """Assert BACKENDS registry wires kimi without importing sublime package."""

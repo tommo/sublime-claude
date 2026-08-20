@@ -44,6 +44,11 @@ class TestHostDoesNotAdoptWorking(unittest.TestCase):
         self.assertNotIn("self._adopt_agent_turn(", body)
         self.assertNotIn("_bg_soft_fallback_query", body)
 
+    def test_query_queues_while_busy(self):
+        body = self._live("query")
+        self.assertIn("should_queue_prompt", body)
+        self.assertIn("queue_prompt", body)
+
 
 if __name__ == "__main__":
     unittest.main()
