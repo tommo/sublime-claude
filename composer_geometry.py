@@ -162,6 +162,20 @@ def stream_treat_as_composing(
     return False
 
 
+def should_pin_view_state(following: bool, owner: str) -> bool:
+    """Whether a stream rewrite must snapshot/restore caret+viewport.
+
+    Following the tail with a draft caret: no pin (chase the stream).
+    History caret: always pin. A full-region replace remaps any caret
+    inside the live turn to the new region end (◎ / spinner line).
+    Short sessions fit in the viewport so following is always true —
+    skipping the pin is what locks the caret at line end while busy.
+    """
+    if owner == OWNER_HISTORY:
+        return True
+    return not bool(following)
+
+
 def stream_tick_actions(
         owner: str,
         following_tail: bool,

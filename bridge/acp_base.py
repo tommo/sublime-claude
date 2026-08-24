@@ -32,7 +32,7 @@ import uuid as uuidlib
 from typing import Any, Dict, List, Optional
 
 from base import BaseBridge
-from rpc_helpers import send_notification, send_result, send_error
+from rpc_helpers import process_cwd, send_notification, send_result, send_error
 
 
 # CSI / OSC sequences leftover when tools ignore NO_COLOR.
@@ -138,7 +138,7 @@ class AcpBridge(BaseBridge):
         # spawn placeholder — do not force it onto a resumed session.
         self._host_model: bool = False
         self.effort: str = ""  # reasoning effort (low/medium/high/…); empty = agent default
-        self.cwd: str = os.getcwd()
+        self.cwd: str = process_cwd()
         self.agent_mode: str = ""
         self._view_id: Optional[Any] = None
         self._mcp_enable_read_image: bool = bool(
@@ -178,6 +178,9 @@ class AcpBridge(BaseBridge):
         # True from first cancel notify until query fully settles — blocks
         # spam session/cancel (Grok ChatStateActor dies on cancel-after-done).
         self._cancel_in_flight: bool = False
+        # AskUser Q1+/Other: inject after the elicitation/permission RPC
+        # reply is on the wire (kimi 0.37.2 drops non-enum answers).
+        self._pending_ask_followup: Optional[str] = None
         # Grok scheduler: track next fire for loop banner / wakes.
         self._schedule_next_fire: Optional[float] = None
         # toolCallId → last known input (completed updates often omit rawInput).
@@ -988,14 +991,14 @@ class AcpBridge(BaseBridge):
                     **(self._tool_inputs_by_id.get(tid) or {}),
                     **tool_input,
                 }
-            if is_spawn and tid:
+            if is_bg and tid:
                 self._bg_tool_ids.add(tid)
             send_notification("message", {
                 "type": "tool_use",
                 "id": tid,
                 "name": tool_name,
                 "input": tool_input,
-                "background": bool(is_spawn),
+                "background": bool(is_bg),
             })
         elif kind == "tool_call_update":
             usage = self.usage_from_tool_update(upd)
@@ -1052,11 +1055,18 @@ class AcpBridge(BaseBridge):
                     if self._should_suppress_tool_row(upd, tool_name):
                         return
                     self._tool_ids_emitted.add(tid)
+                    bg = bool(
+                        tid in self._bg_tool_ids
+                        or self._looks_like_background_tool(upd, enriched)
+                    )
+                    if bg and tid:
+                        self._bg_tool_ids.add(tid)
                     send_notification("message", {
                         "type": "tool_use",
                         "id": tid,
                         "name": tool_name,
                         "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                        "background": bg,
                     })
             elif tool_name != "tool" or (enriched and status not in ("completed", "failed")):
                 # Enrich open row (same id → output.tool upserts). Prefer real name.
@@ -1068,11 +1078,18 @@ class AcpBridge(BaseBridge):
                 if not self._should_suppress_tool_row(upd, enrich_name):
                     if status in ("completed", "failed") or self._should_repaint_tool(
                             tid, upd, enriched):
+                        bg = bool(
+                            tid in self._bg_tool_ids
+                            or self._looks_like_background_tool(upd, enriched)
+                        )
+                        if bg and tid:
+                            self._bg_tool_ids.add(tid)
                         send_notification("message", {
                             "type": "tool_use",
                             "id": tid,
                             "name": enrich_name,
                             "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                            "background": bg,
                         })
             # Cache run_in_background for create pairing. Do not ⚙ / do not
             # drop pending here — that left ⚙ unbound when create arrived
@@ -3091,7 +3108,7 @@ class AcpBridge(BaseBridge):
 
     def _irr_db_near_cwd(self) -> str:
         """Walk cwd→parents for a .irr index directory."""
-        start = (self.cwd or os.getcwd() or "").strip() or os.getcwd()
+        start = (self.cwd or process_cwd() or "").strip() or process_cwd()
         try:
             cur = os.path.abspath(start)
         except Exception:
@@ -3157,6 +3174,11 @@ class AcpBridge(BaseBridge):
                     f"{'' if active or has_query else ' [orphan agent turn]'}")
             except Exception as e:
                 self.log(f"session/cancel failed ({reason}): {e}")
+        # Release elicitation/permission waiters AFTER session/cancel is on
+        # the wire. Answering elicitation with cancel first lets Kimi
+        # continue ("dismissed"); cancel-while-outstanding actually stops
+        # the turn (sandbox interrupt_during).
+        self._unblock_interaction_waiters()
         fut = self._prompt_fut
         if fut is not None and not fut.done():
             try:
@@ -3523,23 +3545,21 @@ class AcpBridge(BaseBridge):
         # Cancel + wait (longer than old 0.35s force — Kimi turn teardown).
         await self._cancel_agent_turn(
             reason="interrupt", wait_s=1.5, settle_s=0.2, force_local=True)
+        send_result(req_id, {"status": "interrupted"})
 
-        # Unblock any permission waiters so they don't keep the turn alive.
+    def _unblock_interaction_waiters(self) -> None:
         for pid, pfut in list(self.pending_permissions.items()):
             if pfut and not pfut.done():
                 pfut.set_result({"kind": "denied-interactively-by-user"})
             self.pending_permissions.pop(pid, None)
-        # Unblock ask_user waiters (None → outcome "cancelled").
         for qid, qfut in list(self.pending_questions.items()):
             if qfut and not qfut.done():
                 qfut.set_result(None)
             self.pending_questions.pop(qid, None)
-        # Unblock plan approval (None → rejected / stay in plan).
         for pid, pfut in list(self.pending_plan_approvals.items()):
             if pfut and not pfut.done():
                 pfut.set_result(None)
             self.pending_plan_approvals.pop(pid, None)
-        send_result(req_id, {"status": "interrupted"})
 
     async def handle_set_model(self, req_id: Optional[int],
                                 params: dict) -> None:
@@ -3989,10 +4009,13 @@ class AcpBridge(BaseBridge):
         except FileNotFoundError as e:
             await self._send_acp_response(rid, error={
                 "code": -32000, "message": str(e)})
+            return
         except Exception as e:
             self.log(f"ACP {method} error: {e}")
             await self._send_acp_response(rid, error={
                 "code": -32000, "message": str(e)})
+            return
+        self._flush_ask_followup()
 
     async def _send_acp_response(self, rid: int, *, result: Any = None,
                                   error: Optional[dict] = None) -> None:
@@ -4394,8 +4417,14 @@ class AcpBridge(BaseBridge):
             questions, keys, answers)
         if not content:
             return {"action": "cancel"}
+        extra = self._kimi_followup_answers(questions, answers)
+        if extra and self._kimi_answers_dropped(questions, answers, content, keys):
+            # Other / extra questions are not in the enum schema; kimi
+            # drops them. Followup after this RPC reply (cancel+reprompt).
+            self._pending_ask_followup = extra
         self.file_log(
-            f"elicitation/create accept keys={list(content.keys())}")
+            f"elicitation/create accept keys={list(content.keys())}"
+            f" dropped={bool(self._pending_ask_followup)}")
         return {"action": "accept", "content": content}
 
     @staticmethod
@@ -4583,9 +4612,11 @@ class AcpBridge(BaseBridge):
         oid = self._kimi_q0_option_id(options, questions, label)
         extra = self._kimi_followup_answers(questions, answers)
         if extra:
-            # After this permission RPC returns, Kimi resumes with Q0 only.
-            # Inject on the next tick so we don't cancel before optionId lands.
-            loop.call_later(0.08, lambda t=extra: self._inject_ask_user_followup(t))
+            # handleQuestion is q0-only. Flush after this RPC is written
+            # (see _dispatch_acp_request) — do not cancel before optionId lands.
+            # loop.call_later(0.08, ...) raced the continuation; kimi already
+            # sampled "Q1 unanswered" before the followup.
+            self._pending_ask_followup = extra
         if oid:
             self.file_log(
                 f"ask_user permission selected label={label!r} optionId={oid!r}")
@@ -4598,7 +4629,7 @@ class AcpBridge(BaseBridge):
             self.file_log(
                 f"ask_user unmatched label={label!r} → fallback {fallback}")
             if not extra:
-                self._inject_ask_user_followup(
+                self._pending_ask_followup = (
                     self._kimi_followup_answers(questions, answers)
                     or self._kimi_other_followup(questions, answers, label))
             return {"outcome": {"outcome": "selected", "optionId": fallback}}
@@ -4737,6 +4768,45 @@ class AcpBridge(BaseBridge):
             f"(not a listed option){': ' + q0 if q0 else ''}: {label}. "
             "Do NOT treat this as dismissed."
         )
+
+    def _flush_ask_followup(self) -> None:
+        text = getattr(self, "_pending_ask_followup", None)
+        self._pending_ask_followup = None
+        if text:
+            self._inject_ask_user_followup(text)
+
+    @staticmethod
+    def _kimi_answers_dropped(
+            questions: list, answers: dict, content: dict, keys: list) -> bool:
+        """True when the UI answered something elicitation content omitted.
+
+        Kimi elicitationResponseToQuestionAnswers keeps only values that
+        match a declared option label. Other/freeform is dropped.
+        """
+        if not isinstance(answers, dict) or not answers:
+            return False
+        content = content or {}
+        for i, q in enumerate(questions or []):
+            if not isinstance(q, dict):
+                continue
+            val = ""
+            for key in (q.get("question") or "", q.get("header") or ""):
+                if key and key in answers:
+                    val = AcpBridge._answer_as_label(answers[key])
+                    if val:
+                        break
+            if not val:
+                continue
+            ck = keys[i] if i < len(keys) else f"q{i}"
+            got = content.get(ck)
+            if got is None:
+                return True
+            if isinstance(got, list):
+                if val not in [str(x) for x in got]:
+                    return True
+            elif str(got) != val:
+                return True
+        return False
 
     def _inject_ask_user_followup(self, text: str) -> None:
         if not text or not str(text).strip():
@@ -5114,7 +5184,7 @@ class AcpBridge(BaseBridge):
                 return plan_path
             except Exception as e:
                 self.file_log(f"exit_plan_mode: plan file write failed: {e}")
-        fallback = os.path.join(self.cwd or os.getcwd(), ".grok-plan.md")
+        fallback = os.path.join(self.cwd or process_cwd(), ".grok-plan.md")
         try:
             with open(fallback, "w", encoding="utf-8") as f:
                 f.write(plan_content)

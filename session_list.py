@@ -370,36 +370,33 @@ def _right_meta(r: dict) -> str:
     return _q_col(r) + (" " * _GAP) + stamp
 
 
-def pull_starred(live: List[dict], here: List[dict],
-                 starred: set) -> Tuple[List[dict], List[dict], List[dict]]:
-    """Starred live+history first; those rows leave CURRENT/HISTORY."""
+def pin_starred(rows: List[dict], starred: set) -> List[dict]:
+    """Starred rows first within a group; relative order otherwise."""
     ids = set(starred or ())
     if not ids:
-        return [], list(live), list(here)
-    pinned, rest_live, rest_here = [], [], []
-    for r in live:
-        (pinned if r.get("session_id") in ids else rest_live).append(r)
-    for r in here:
-        (pinned if r.get("session_id") in ids else rest_here).append(r)
-    _band = {"input": 0, "unread": 0, "working": 1, "ready": 1, "sleeping": 2}
-    pinned.sort(key=lambda r: (
-        0 if r.get("kind") == "live" else 1,
-        _band.get(r.get("status"), 3),
-        -access_ts(r),
-    ))
-    return pinned, rest_live, rest_here
+        return list(rows or [])
+    pinned, rest = [], []
+    for r in rows or []:
+        (pinned if r.get("session_id") in ids else rest).append(r)
+    return pinned + rest
 
 
 def _fmt_row(r: dict, starred: set, compact: bool = False, cols: int = 0) -> str:
     live = r.get("kind") == "live"
     name = one_line_title(r.get("name") or "")
     mark = _mark(r["status"]) if live else "·"
+    star = "✨ " if r.get("session_id") in (starred or ()) else ""
     if compact:
         pre = f"{mark} {backend_abbrev(r.get('backend'))} "
-        return pre + fit_title(name, _name_budget(pre, "", cols, True))
+        return pre + star + fit_title(
+            name, _name_budget(pre + star, "", cols, True))
     pre = f"{mark} {r['backend']:<7} "
     extra = _right_meta(r)
-    return pre + fit_title(name, _name_budget(pre, extra, cols, False)) + extra
+    return (
+        pre + star
+        + fit_title(name, _name_budget(pre + star, extra, cols, False))
+        + extra
+    )
 
 
 def render_list(live: List[dict], here: List[dict], other: List[dict],
@@ -427,11 +424,8 @@ def render_list(live: List[dict], here: List[dict], other: List[dict],
             index.append(rec)
         lines.append("")
 
-    pinned, live, here = pull_starred(live, here, starred)
-    if pinned:
-        add_section("STARRED", pinned, _fmt_row)
-    add_section("CURRENT", live, _fmt_row)
-    add_section("HISTORY", here, _fmt_row)
+    add_section("CURRENT", pin_starred(live, starred), _fmt_row)
+    add_section("HISTORY", pin_starred(here, starred), _fmt_row)
     return "\n".join(lines).rstrip() + "\n", index
 
 
@@ -450,7 +444,7 @@ def build_for_window(window, cols: int = 0) -> Tuple[str, List[dict]]:
 
 def _include_starred_saved(here: List[dict], live_ids: set, cwd: str,
                            starred: set) -> List[dict]:
-    """History cap can drop a starred saved row — put it back for STARRED."""
+    """History cap can drop a starred saved row — put it back, pinned in HISTORY."""
     if not starred:
         return here
     have = {r.get("session_id") for r in here}
@@ -696,8 +690,9 @@ def _live_session_for_row(row: dict):
 def close_row(window, row: dict, remove: Optional[bool] = None) -> bool:
     """Del a list row. Only HISTORY removes the saved resume entry.
 
-    CURRENT/STARRED: stop the live sheet and close its view; keep the save.
-    HISTORY: drop the saved row (resume list).
+    CURRENT (including starred live): stop the live sheet and close its view;
+    keep the save.
+    HISTORY (including starred saved): drop the saved row (resume list).
     """
     if not row:
         return False

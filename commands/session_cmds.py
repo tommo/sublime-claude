@@ -453,7 +453,14 @@ class ClaudeCodeInterruptCommand(sublime_plugin.WindowCommand):
         if not s or not s.output:
             return
         # Non-empty composer always clears first — never interrupt while typing.
-        if s.output.is_input_mode() and s.output.get_input_text().strip():
+        # Exception: AskUser Other reuses input mode; Esc/Ctrl+C must still
+        # cancel the question turn, not just wipe the Other line.
+        modal = False
+        try:
+            modal = bool(s.output.has_turn_modal_ui())
+        except Exception:
+            modal = bool(getattr(s.output, "pending_question", None))
+        if (not modal) and s.output.is_input_mode() and s.output.get_input_text().strip():
             view = s.output.view
             if not view or not view.is_valid():
                 return

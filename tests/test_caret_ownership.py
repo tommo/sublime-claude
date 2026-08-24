@@ -14,6 +14,7 @@ from composer_geometry import (  # noqa: E402
     OWNER_DRAFT,
     OWNER_HISTORY,
     owner_from_geometry,
+    should_pin_view_state,
     stream_may_move_caret,
     stream_may_force_bottom,
     stream_treat_as_composing,
@@ -85,6 +86,14 @@ class TestCaretOwnership(unittest.TestCase):
             has_saved_draft_off=True)
         self.assertTrue(force)
         self.assertTrue(reapply)
+
+    def test_pin_history_even_when_following(self):
+        # Whole buffer visible ⇒ following. History click must still pin or
+        # ST remaps the caret to the live-turn replace end.
+        self.assertTrue(should_pin_view_state(True, OWNER_HISTORY))
+        self.assertTrue(should_pin_view_state(False, OWNER_HISTORY))
+        self.assertFalse(should_pin_view_state(True, OWNER_DRAFT))
+        self.assertTrue(should_pin_view_state(False, OWNER_DRAFT))
 
     def test_stream_tick_empty_sel_stale_offset_history(self):
         force, reapply = stream_tick_actions(

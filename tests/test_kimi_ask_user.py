@@ -149,6 +149,37 @@ class TestKimiElicitationForm(unittest.TestCase):
         content = AcpBridge._elicitation_content_from_answers(
             qs, keys, {"Pick one": "B", "Pick many": ["Z", "X"]})
         self.assertEqual(content, {"q0": "B", "q1": ["X", "Z"]})
+        self.assertFalse(AcpBridge._kimi_answers_dropped(
+            qs, {"Pick one": "B", "Pick many": ["Z", "X"]}, content, keys))
+
+    def test_other_freeform_is_dropped_and_needs_followup(self):
+        qs = [
+            {"question": "What should the new procedural animation package be named?",
+             "header": "Pkg name",
+             "options": [{"label": "procanim"}, {"label": "procmotion"},
+                         {"label": "panim"}],
+             "multiSelect": False},
+            {"question": "Confirm Phase 1 scope (pure math modules, no ECS coupling yet)?",
+             "header": "Phase 1",
+             "options": [
+                 {"label": "dynamics + noise_motion (Recommended)"},
+                 {"label": "dynamics only"},
+                 {"label": "dynamics + verlet"},
+             ],
+             "multiSelect": False},
+        ]
+        answers = {
+            qs[0]["question"]: "procmotion",
+            qs[1]["question"]: "all",
+        }
+        content = AcpBridge._elicitation_content_from_answers(
+            qs, ["q0", "q1"], answers)
+        self.assertEqual(content, {"q0": "procmotion"})
+        self.assertTrue(AcpBridge._kimi_answers_dropped(
+            qs, answers, content, ["q0", "q1"]))
+        extra = AcpBridge._kimi_followup_answers(qs, answers)
+        self.assertIn("all", extra)
+        self.assertIn("Phase 1", extra)
 
     def test_cancel_when_no_answers(self):
         self.assertEqual(

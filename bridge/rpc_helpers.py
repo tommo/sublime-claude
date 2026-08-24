@@ -17,6 +17,34 @@ import threading
 from typing import Any, Optional
 
 # Max NDJSON line we will enqueue toward the plugin (bytes of UTF-8).
+def process_cwd() -> str:
+    """Directory this process can stand in.
+
+    Sublime's *launch* cwd is not the project. The plugin spawns the bridge
+    with the project folder; this only covers getcwd() when that inherited
+    path is already gone so __init__ does not crash before initialize.cwd.
+    """
+    try:
+        cur = os.getcwd()
+        if cur and os.path.isdir(cur):
+            return cur
+    except OSError:
+        pass
+    for cand in (
+        os.path.expanduser("~"),
+        os.environ.get("TMPDIR") or os.environ.get("TEMP") or "/tmp",
+        "/",
+    ):
+        if not cand or not os.path.isdir(cand):
+            continue
+        try:
+            os.chdir(cand)
+        except OSError:
+            continue
+        return cand
+    return os.path.expanduser("~") or "/"
+
+
 _PLUGIN_MSG_MAX = int(
     os.environ.get("SUBLIME_CLAUDE_PLUGIN_MSG_MAX", str(4 * 1024 * 1024)))
 # Bound backlog so a stuck Sublime cannot grow RAM forever.

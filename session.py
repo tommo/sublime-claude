@@ -538,7 +538,8 @@ class Session:
 
         bridge_script = os.path.join(os.path.dirname(__file__), "bridge", spec.bridge_script)
         self.client = JsonRpcClient(self._on_notification)
-        self.client.start([python_path, bridge_script], env=env)
+        self.client.start(
+            [python_path, bridge_script], env=env, cwd=self._cwd())
         self._status("connecting...")
 
         # Quick Agent may pin permission / tools; otherwise same as normal session.
@@ -691,11 +692,14 @@ class Session:
             )
 
     def _cwd(self) -> str:
-        if self.window.folders():
-            return self.window.folders()[0]
+        for folder in self.window.folders() or []:
+            if folder and os.path.isdir(folder):
+                return folder
         view = self.window.active_view()
         if view and view.file_name():
-            return os.path.dirname(view.file_name())
+            parent = os.path.dirname(view.file_name())
+            if parent and os.path.isdir(parent):
+                return parent
         # Fallback: use ~/.claude/scratch for sessions without a project
         # This ensures consistent cwd for session resume
         scratch_dir = os.path.expanduser("~/.claude/scratch")
@@ -2796,6 +2800,11 @@ class Session:
             # Idle UI: still tell the bridge to reap leftover Grok shells.
             # User is here — do not treat the long agent-side run as idle.
             self._note_activity()
+            try:
+                if self.output and self.output.has_turn_modal_ui():
+                    self.output.interrupted()
+            except Exception:
+                pass
             if self.client:
                 self.client.send("interrupt", {})
             if break_channel and self.output and self.output.view:
@@ -4772,10 +4781,11 @@ class Session:
         if self.working:
             return
 
-        # Idle: Kimi often auto-continues via its own task.completed inject
-        # *before* our host wake. Debounce — if agent is already streaming the
-        # report, drop the host wake (that was the "结果已在上条汇报" lie when
-        # the previous report never painted as its own turn).
+        # Idle: wait_for_exit often completes after session/prompt already
+        # returned. Kimi self-wakes but does not emit session/update without
+        # a live prompt (sandbox/kimi_bg/check_recovery.py after vs wake).
+        # Buffer; flush uses notify_action (kimi=query) so the continuation
+        # has a closer. Grok stays surface.
         summary = (data.get("summary") or task_id or "background task").strip()
         if "\n" in summary:
             summary = " ⏎ ".join(

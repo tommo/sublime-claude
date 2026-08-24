@@ -122,6 +122,30 @@ class TestResumeDropAsking(unittest.TestCase):
         self.assertFalse(ov._question_input_mode)
         self.assertEqual(ov._permission_queue, [])
 
+    def test_interrupted_does_not_dismiss_question_rpc(self):
+        # callback(None) is "user dismissed" — Kimi continues. Interrupt must
+        # session/cancel while elicitation is still outstanding.
+        path = os.path.join(_ROOT, "output_view.py")
+        with open(path) as f:
+            src = f.read()
+        start = src.find("    def interrupted")
+        end = src.find("\n    def clear(", start)
+        body = src[start:end]
+        self.assertNotIn("if callback:", body)
+        self.assertIn("session/cancel", body)
+
+    def test_cancel_unblocks_waiters_after_session_cancel(self):
+        path = os.path.join(_ROOT, "bridge", "acp_base.py")
+        with open(path) as f:
+            src = f.read()
+        start = src.find("    async def _cancel_agent_turn")
+        end = src.find("    async def handle_interrupt", start)
+        body = src[start:end]
+        cancel_at = body.find('session/cancel"')
+        unblock_at = body.find("_unblock_interaction_waiters")
+        self.assertGreater(cancel_at, 0)
+        self.assertGreater(unblock_at, cancel_at)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,10 +72,11 @@ class TestRenderSessionList(unittest.TestCase):
             "query_count": 1, "project": "/x/pil", "last_activity": 1700000000,
         }]
         text, index = sl.render_list(live, here, [], starred={"s2"})
-        self.assertIn("STARRED (1)", text)
+        self.assertNotIn("STARRED", text)
         self.assertIn("CURRENT (1)", text)
-        self.assertIn("HISTORY (0)", text)
+        self.assertIn("HISTORY (1)", text)
         self.assertIn("Skin editor", text)
+        self.assertIn("△ old plan", text)
         self.assertNotIn("★", text)
         self.assertIn("r rename", text)
         self.assertNotIn("refresh", text)
@@ -89,8 +90,8 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertNotIn("working", compact.split("Skin editor")[-1][:20])
         self.assertEqual(len(cidx), 2)
         self.assertEqual(len(index), 2)
-        self.assertEqual(sl.row_at_line(index, index[0]["line"])["session_id"], "s2")
-        self.assertEqual(sl.row_at_line(index, index[1]["line"])["session_id"], "s1")
+        self.assertEqual(sl.row_at_line(index, index[0]["line"])["session_id"], "s1")
+        self.assertEqual(sl.row_at_line(index, index[1]["line"])["session_id"], "s2")
         self.assertEqual(sl.format_when(100, now=100), "now")
         self.assertEqual(sl.format_when(100, now=130), "<1m")
         self.assertEqual(sl.format_when(100, now=159), "<1m")
@@ -502,7 +503,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertNotIn("other projects", text)
         self.assertEqual([r["session_id"] for r in index], ["h"])
 
-    def test_starred_section_pulls_from_running_and_history(self):
+    def test_starred_pins_within_current_and_history(self):
         sl = _load()
         live = [{
             "kind": "live", "session_id": "pin", "view_id": 1,
@@ -527,18 +528,19 @@ class TestRenderSessionList(unittest.TestCase):
             "last_access": 2, "last_activity": 2,
         }]
         text, index = sl.render_list(live, here, [], starred={"pin", "oldpin"}, cols=80)
-        self.assertIn("STARRED (2)", text)
-        self.assertIn("CURRENT (1)", text)
-        self.assertIn("HISTORY (1)", text)
+        self.assertNotIn("STARRED", text)
+        self.assertIn("CURRENT (2)", text)
+        self.assertIn("HISTORY (2)", text)
         ids = [r["session_id"] for r in index]
-        self.assertEqual(ids, ["pin", "oldpin", "run", "old"])
-        star_block = text.split("CURRENT")[0]
-        self.assertIn("pinned live", star_block)
-        self.assertIn("pinned hist", star_block)
-        self.assertNotIn("plain live", star_block)
-        run_block = text.split("CURRENT")[1].split("HISTORY")[0]
-        self.assertIn("plain live", run_block)
-        self.assertNotIn("pinned live", run_block)
+        self.assertEqual(ids, ["pin", "run", "oldpin", "old"])
+        self.assertIn("△ pinned live", text)
+        self.assertIn("△ pinned hist", text)
+        self.assertNotIn("△ plain live", text)
+        self.assertNotIn("△ plain hist", text)
+        cur = text.split("CURRENT")[1].split("HISTORY")[0]
+        self.assertLess(cur.find("pinned live"), cur.find("plain live"))
+        hist = text.split("HISTORY")[1]
+        self.assertLess(hist.find("pinned hist"), hist.find("plain hist"))
 
     def test_drop_empty_sessions(self):
         sl = _load()
@@ -551,14 +553,12 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual([r["session_id"] for r in kept], ["b", "c"])
         # Live / open sheets are not filtered — only unused history.
 
-    def test_pull_starred_empty(self):
+    def test_pin_starred_empty(self):
         sl = _load()
         live = [{"session_id": "a", "kind": "live", "status": "ready"}]
         here = [{"session_id": "b", "kind": "saved", "status": "closed"}]
-        pinned, rest_l, rest_h = sl.pull_starred(live, here, set())
-        self.assertEqual(pinned, [])
-        self.assertEqual(rest_l, live)
-        self.assertEqual(rest_h, here)
+        self.assertEqual(sl.pin_starred(live, set()), live)
+        self.assertEqual(sl.pin_starred(here, set()), here)
         rows = [{
             "kind": "live", "session_id": "a", "view_id": 1,
             "name": "x", "backend": "grok", "status": "ready",
@@ -594,7 +594,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertFalse(sl.close_row(None, None))
         self.assertFalse(sl.close_row(None, {"kind": "saved"}))
         self.assertFalse(sl.close_row(None, {
-            "kind": "saved", "session_id": "keep", "section": "STARRED",
+            "kind": "saved", "session_id": "keep", "section": "CURRENT",
         }))
         self.assertEqual(gone, ["dead"])
 
@@ -621,7 +621,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertTrue(sess.stopped)
         self.assertEqual(gone, [])
         starred_live = dict(row)
-        starred_live["section"] = "STARRED"
+        starred_live["section"] = "CURRENT"
         sess.stopped = False
         self.assertTrue(sl.close_row(None, starred_live))
         self.assertTrue(sess.stopped)

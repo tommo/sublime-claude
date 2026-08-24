@@ -64,11 +64,12 @@ class TestGitappAfterDone(unittest.TestCase):
         self.assertEqual(t.inbound_action("synth_bash"), "paint_bg")
         self.assertEqual(t.kind, "idle")
 
-    def test_kimi_notify_after_end_is_surface_not_query(self):
+    def test_kimi_notify_after_end_is_query(self):
         t = TurnState()
         t.begin_query()
         t.end_live()
-        self.assertEqual(t.notify_action("kimi"), "surface")
+        # Kimi self-wake does not paint without a live prompt (check_recovery).
+        self.assertEqual(t.notify_action("kimi"), "query")
         self.assertEqual(t.notify_action("grok"), "surface")
         self.assertEqual(t.notify_action("claude"), "query")
         self.assertFalse(t.working)

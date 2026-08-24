@@ -66,6 +66,33 @@ class TestFindMatchingKimiTask(unittest.TestCase):
         self.assertEqual(p["task_id"], "bash-abc")
         self.assertTrue(p["auto"])
 
+    def test_parse_live_pid_zero_result(self):
+        # Live ACP AcpTerminalProcess.pid is always 0.
+        text = (
+            "task_id: bash-6rusyl45\n"
+            "pid: 0\n"
+            "description: grok research: engine baking-group precedents\n"
+            "status: running\n"
+            "automatic_notification: true\n"
+            "next_step: The completion arrives automatically\n"
+        )
+        p = KimiBgMixin.parse_kimi_bg_result_text(text)
+        self.assertEqual(p["task_id"], "bash-6rusyl45")
+        self.assertEqual(p["status"], "running")
+        self.assertTrue(p["auto"])
+
+    def test_run_in_background_gate(self):
+        from acp_base import AcpBridge
+        self.assertTrue(AcpBridge._looks_like_background_tool(
+            {"title": "Bash"},
+            {"command": "grok -p x", "run_in_background": True,
+             "timeout": 2400},
+        ))
+        self.assertFalse(AcpBridge._looks_like_background_tool(
+            {"title": "Running: grok -p x"},
+            {"command": "grok -p x"},
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

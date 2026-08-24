@@ -34,4 +34,6 @@ thinking/text after `end_turn`, parent `signal_complete` paint.
    `_awaiting_query_rpc=False` → no prompt result ever → session stuck
 
 Correct: step 4 is `inbound_action("synth_bash") == paint_bg`, stay `idle`.
-Kimi notify is `notify_action("kimi") == surface` (⚙ strip), not `query`.
+Kimi notify is `notify_action("kimi") == query` — self-wake after
+`wait_for_exit` does not emit `session/update` without a live prompt
+(`sandbox/kimi_bg/check_recovery.py`). Grok stays `surface`.

@@ -103,12 +103,50 @@ def main() -> int:
     if "Full suite" not in extra:
         fails.append("followup should recap Q0 too")
 
+    # Live 2-question Other: Kimi elicitationResponseToQuestionAnswers
+    # drops values not in declared option labels.
+    live_qs = [
+        {"question": "What should the new procedural animation package be named?",
+         "header": "Pkg name",
+         "options": [{"label": "procanim"}, {"label": "procmotion"},
+                     {"label": "panim"}]},
+        {"question": "Confirm Phase 1 scope (pure math modules, no ECS coupling yet)?",
+         "header": "Phase 1",
+         "options": [
+             {"label": "dynamics + noise_motion (Recommended)"},
+             {"label": "dynamics only"},
+             {"label": "dynamics + verlet"},
+         ]},
+    ]
+    live_answers = {
+        live_qs[0]["question"]: "procmotion",
+        live_qs[1]["question"]: "all",
+    }
+    content = AcpBridge._elicitation_content_from_answers(
+        live_qs, ["q0", "q1"], live_answers)
+    kimi_kept = {}
+    for i, q in enumerate(live_qs):
+        val = content.get(f"q{i}")
+        labels = [o["label"] for o in q["options"]]
+        if isinstance(val, str) and val in labels:
+            kimi_kept[q["question"]] = val
+    print("live Other elicitation content", content)
+    print("kimi_kept after enum filter", kimi_kept)
+    if "q1" in content and content["q1"] == "all":
+        fails.append("host must not put Other 'all' in q1 — Kimi drops it")
+    if live_qs[1]["question"] in kimi_kept:
+        fails.append("Kimi enum filter should drop Other 'all'")
+    extra2 = AcpBridge._kimi_followup_answers(live_qs, live_answers)
+    if "all" not in extra2:
+        fails.append("followup must carry Other Phase 1 = all")
+
     if fails:
         print("FAIL")
         for f in fails:
             print(" -", f)
         return 1
     print("host maps Q0; Kimi drops Q1+; followup is the only channel")
+    print("live Other 'all' is dropped by elicitation enum filter")
     return 0
 
 

@@ -269,22 +269,11 @@ class KimiBridge(KimiBgMixin, AcpBridge):
 
         # Prefer waiting for real cancelled stopReason; force_local only after
         # a long wait so UI unsticks without tearing down ACP.
+        # Waiters are released inside _cancel_agent_turn after session/cancel
+        # is written — not before, and not after the wait.
         await self._cancel_agent_turn(
             reason="interrupt", wait_s=5.0, settle_s=0.5,
             force_local=True, orphan_ok=True)
-
-        for pid, pfut in list(self.pending_permissions.items()):
-            if pfut and not pfut.done():
-                pfut.set_result({"kind": "denied-interactively-by-user"})
-            self.pending_permissions.pop(pid, None)
-        for qid, qfut in list(self.pending_questions.items()):
-            if qfut and not qfut.done():
-                qfut.set_result(None)
-            self.pending_questions.pop(qid, None)
-        for pid, pfut in list(self.pending_plan_approvals.items()):
-            if pfut and not pfut.done():
-                pfut.set_result(None)
-            self.pending_plan_approvals.pop(pid, None)
 
         # Mark so next query does a short post-interrupt settle (not kill)
         self._cancel_in_flight = True

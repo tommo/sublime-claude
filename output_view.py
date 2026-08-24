@@ -107,6 +107,7 @@ class OutputView:
         self._caret_owner: str = "draft"
         # Coalesce deferred draft re-pins (stream ticks must not stack).
         self._pending_caret_token: int = 0
+        self._sel_guard: bool = False
         self._spinner_frame: int = 0  # Current spinner animation frame
         self._media_phantom_set = None  # inline image previews (minihtml data: URIs)
         self._media_uri_cache: Dict[str, tuple] = {}  # path|edge -> (mtime, uri, w, h)
@@ -698,7 +699,9 @@ class OutputView:
         # In input mode, scroll to true bottom (◎ + pad hline), not only caret.
         # force only when caller wants a hard follow; stream ticks use soft.
         if self._input_mode:
-            self._scroll_layout_to_bottom(force=bool(force))
+            hist = self.caret_owner() == "history"
+            self._scroll_layout_to_bottom(
+                force=bool(force), reapply_caret=not hist)
             return
 
         if not force and not self._is_following_tail():
@@ -2467,13 +2470,12 @@ class OutputView:
         if self.pending_plan:
             self._clear_plan_approval()
             self.pending_plan = None
-        # Clear any pending question
+        # Clear question UI without resolving the RPC. Resolving it as
+        # dismissed lets Kimi continue; session/cancel while the ask is
+        # still outstanding actually stops the turn (sandbox interrupt_during).
         if self.pending_question:
-            callback = self.pending_question.callback
             self._clear_question()
             self.pending_question = None
-            if callback:
-                callback(None)
         if show_banner:
             self.current.events.append("\n\n*[interrupted]*\n")
         self._render_current()
@@ -4383,7 +4385,12 @@ class OutputView:
         at_tail = self._is_following_tail()
         typing_at_tail = was_input and caret_in_composer and at_tail
         following = (want_scroll and at_tail) or typing_at_tail
-        pin = None if following else self._pin_view_state()
+        from .composer_geometry import should_pin_view_state
+        pin = (
+            self._pin_view_state()
+            if should_pin_view_state(following, self.caret_owner())
+            else None
+        )
 
         # Queue hairline sits at peel-1 (inside the replace range). Clearing it
         # every frame then re-adding after a timeout makes ◎ jump one row while
@@ -4403,6 +4410,10 @@ class OutputView:
             pass
 
         old_end = end
+        # ST remaps carets inside the replaced span to the new end. Hold the
+        # guard until this frame's pin restore so on_selection_modified does
+        # not flip history → draft (later ticks would lock caret at line end).
+        self._sel_guard = True
         new_end = self._replace(start, end, text)
         delta = new_end - old_end
         self.current.region = (start, new_end)
@@ -4599,6 +4610,7 @@ class OutputView:
                     _sess._clear_queue_phantom()
         except Exception:
             pass
+        self._sel_guard = False
 
     def _format_tool_detail(self, tool: ToolCall) -> str:
         """Format tool detail string. Dispatches via TOOL_FORMATTERS registry."""

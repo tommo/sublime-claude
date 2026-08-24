@@ -21,11 +21,25 @@ class JsonRpcClient:
         self.running = False
         self.stderr_thread: Optional[threading.Thread] = None
 
-    def start(self, cmd: list, env: Dict[str, str] = None) -> None:
+    def start(self, cmd: list, env: Dict[str, str] = None,
+              cwd: str = None) -> None:
         # Merge custom env with current environment
         proc_env = os.environ.copy()
         if env:
             proc_env.update(env)
+        # Child cwd is the Sublime project (caller). Process getcwd() is
+        # Sublime's launch dir and may already be deleted — never use ~ when
+        # the project folder is live.
+        spawn_cwd = cwd if cwd and os.path.isdir(cwd) else None
+        if not spawn_cwd:
+            try:
+                cur = os.getcwd()
+                if cur and os.path.isdir(cur):
+                    spawn_cwd = cur
+            except OSError:
+                pass
+        if not spawn_cwd:
+            spawn_cwd = os.path.expanduser("~")
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -33,6 +47,7 @@ class JsonRpcClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=proc_env,
+            cwd=spawn_cwd,
         )
         self.running = True
         self.reader_thread = threading.Thread(target=self._read_loop, daemon=True)
