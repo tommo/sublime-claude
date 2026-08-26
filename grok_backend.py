@@ -28,6 +28,7 @@ GROK_MODELS = [
     ("grok-composer-2.5-fast", "Composer 2.5"),
     ("deepseek-v4-pro", "DeepSeek V4 Pro"),
     ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+    ("deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision"),
 ]
 
 # Never show these in the picker (legacy / noise from ACP availableModels).
@@ -48,10 +49,14 @@ GROK_MODEL_ALIASES = {
     "composer-2.5": "grok-composer-2.5-fast",
     "deepseek-v4-pro": "deepseek-v4-pro",
     "deepseek-v4-flash": "deepseek-v4-flash",
+    "deepseek-v4-flash-vision-exp": "deepseek-v4-flash-vision-exp",
     "deepseek-pro": "deepseek-v4-pro",
     "deepseek-flash": "deepseek-v4-flash",
+    "deepseek-flash-vision": "deepseek-v4-flash-vision-exp",
     "ds-pro": "deepseek-v4-pro",
     "ds-flash": "deepseek-v4-flash",
+    "ds-flash-vision": "deepseek-v4-flash-vision-exp",
+    "ds-vision": "deepseek-v4-flash-vision-exp",
     "ds": "deepseek-v4-pro",
 }
 
@@ -80,10 +85,17 @@ def model_supports_reasoning_effort(model_id: str) -> bool:
 
 
 def model_supports_vision(model_id: str) -> bool:
-    """DeepSeek via Grok has no image/vision — read_image would error the turn."""
+    """Most DeepSeek BYOK has no image/vision — read_image would error the turn.
+
+    `deepseek-v4-flash-vision-exp` is the exception (multimodal).
+    """
     if not (model_id or "").strip():
         return True  # unknown → keep Grok default vision
-    return not _is_deepseek_model(model_id)
+    wire = normalize_grok_model(model_id, default="")
+    low = (wire or model_id).strip().lower()
+    if "vision" in low:
+        return True
+    return not _is_deepseek_model(wire or model_id)
 
 
 def normalize_grok_model(model_id: str, default: str = "grok-4.6") -> str:

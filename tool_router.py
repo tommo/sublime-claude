@@ -144,6 +144,7 @@ def create_sublime_router() -> ToolRouter:
         f"{args.get('fork_current', False)}, "
         f"{args.get('wait_for_completion', False)}"
         + (f", backend={args['backend']!r}" if args.get('backend') else "")
+        + (f", model={args['model']!r}" if args.get('model') else "")
         + (f", fork_from_view_id={int(args['fork_from_view_id'])}"
            if args.get('fork_from_view_id') is not None else "")
         + (f", fork_from_agent_id={args['fork_from_agent_id']!r}"

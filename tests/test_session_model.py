@@ -34,6 +34,40 @@ class TestResolveInitModel(unittest.TestCase):
             "deepseek-v4-pro",
         )
 
+    def test_requested_beats_profile(self):
+        self.assertEqual(
+            self.resolve(
+                requested_model="deepseek-v4-flash-vision-exp",
+                profile_model="deepseek-v4-pro",
+                default_model="grok-4.6",
+            ),
+            "deepseek-v4-flash-vision-exp",
+        )
+
+    def test_spawn_fork_inherits_source_model(self):
+        import session_registry as sr
+        self.assertEqual(
+            sr.resolve_spawn_model(
+                source_model="deepseek-v4-flash",
+                forking=True,
+            ),
+            "deepseek-v4-flash",
+        )
+        self.assertEqual(
+            sr.resolve_spawn_model(
+                requested="deepseek-v4-pro",
+                source_model="deepseek-v4-flash",
+                forking=True,
+            ),
+            "deepseek-v4-pro",
+        )
+        self.assertIsNone(
+            sr.resolve_spawn_model(
+                source_model="deepseek-v4-flash",
+                forking=False,
+            ),
+        )
+
     def test_live_session_beats_default(self):
         self.assertEqual(
             self.resolve(

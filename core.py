@@ -215,7 +215,7 @@ def get_active_session(window: sublime.Window) -> Optional[Session]:
     return None
 
 
-def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: Optional[str] = None, focus: bool = True) -> Session:
+def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[dict] = None, initial_context: Optional[dict] = None, backend: Optional[str] = None, focus: bool = True, model: Optional[str] = None) -> Session:
     """Create a new session (always creates new, doesn't reuse).
 
     focus=True (default): intentional New Session UX — sheet is focused.
@@ -242,7 +242,7 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
         old_session = sublime._claude_sessions[old_active]
         old_session.output.set_name(old_session.name or "Claude")
 
-    s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend)
+    s = Session(window, resume_id=resume_id, fork=fork, profile=profile, initial_context=initial_context, backend=backend, model=model)
     # New session: composer allowed after init (start sets False until then)
     s._composer_allowed = True
     # new_file() fires on_activated before we can register — suppress orphan

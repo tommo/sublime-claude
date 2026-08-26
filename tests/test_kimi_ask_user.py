@@ -71,15 +71,18 @@ class TestKimiAskUserMapping(unittest.TestCase):
             AcpBridge._first_answer_label(answers, [Q0, Q1]),
             "Reuse pui.node_graph")
 
-    def test_followup_includes_dropped_questions(self):
+    def test_elicitation_sends_every_listed_label(self):
         answers = {
             "How should the FSM view be rebuilt?": "Reuse pui.node_graph",
             "How should blend trees be shown?":
                 "Tree + visual diagrams (Recommended)",
         }
-        text = AcpBridge._kimi_followup_answers([Q0, Q1], answers)
-        self.assertIn("do NOT treat this as dismissed", text)
-        self.assertIn("blend trees", text.lower())
+        content = AcpBridge._elicitation_content_from_answers(
+            [Q0, Q1], ["q0", "q1"], answers)
+        self.assertEqual(content, {
+            "q0": "Reuse pui.node_graph",
+            "q1": "Tree + visual diagrams (Recommended)",
+        })
 
     def test_real_colorgrading_three_answers(self):
         import os
@@ -104,10 +107,12 @@ class TestKimiAskUserMapping(unittest.TestCase):
         ]
         oid = AcpBridge._kimi_q0_option_id(
             opts, qs, AcpBridge._first_answer_label(answers, qs))
-        extra = AcpBridge._kimi_followup_answers(qs, answers)
         self.assertEqual(oid, "q0_opt_0")
-        self.assertIn("Bake to 3D LUT", extra)
-        self.assertIn("API space only", extra)
+        content = AcpBridge._elicitation_content_from_answers(
+            qs, ["q0", "q1", "q2"], answers)
+        self.assertEqual(content.get("q0"), "Full suite (Recommended)")
+        self.assertEqual(content.get("q1"), "Bake to 3D LUT (Recommended)")
+        self.assertEqual(content.get("q2"), "API space only (Recommended)")
 
 
 class TestKimiElicitationForm(unittest.TestCase):
@@ -152,7 +157,7 @@ class TestKimiElicitationForm(unittest.TestCase):
         self.assertFalse(AcpBridge._kimi_answers_dropped(
             qs, {"Pick one": "B", "Pick many": ["Z", "X"]}, content, keys))
 
-    def test_other_freeform_is_dropped_and_needs_followup(self):
+    def test_other_freeform_is_omitted_from_elicitation(self):
         qs = [
             {"question": "What should the new procedural animation package be named?",
              "header": "Pkg name",
@@ -179,7 +184,44 @@ class TestKimiElicitationForm(unittest.TestCase):
             qs, answers, content, ["q0", "q1"]))
         extra = AcpBridge._kimi_followup_answers(qs, answers)
         self.assertIn("all", extra)
-        self.assertIn("Phase 1", extra)
+
+    def test_inject_followup_is_dead(self):
+        path = os.path.join(_ROOT, "bridge", "acp_base.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        start = src.find("    def _inject_ask_user_followup")
+        end = src.find("    def _match_option_id_for_label", start)
+        live = []
+        for line in src[start:end].splitlines():
+            s = line.lstrip()
+            if s.startswith("#"):
+                continue
+            live.append(line)
+        body = "\n".join(live)
+        self.assertNotIn("notification_wake", body)
+        self.assertNotIn("interrupt", body)
+        idx = src.find("self._flush_ask_followup()")
+        line = src[src.rfind("\n", 0, idx) + 1:src.find("\n", idx)]
+        self.assertTrue(line.lstrip().startswith("#"), line)
+
+    def test_freetext_followup_chains_after_end_turn(self):
+        path = os.path.join(_ROOT, "bridge", "acp_base.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        start = src.find("    async def handle_query")
+        end = src.find("    def _build_prompt_blocks", start)
+        live = []
+        for line in src[start:end].splitlines():
+            s = line.lstrip()
+            if s.startswith("#"):
+                continue
+            live.append(line)
+        body = "\n".join(live)
+        self.assertIn("_pending_ask_followup", body)
+        self.assertIn("_send_prompt(extra_blocks)", body)
+        chunk = body.split("_pending_ask_followup")[-1][:1200]
+        self.assertNotIn("session/cancel", chunk)
+        self.assertNotIn("interrupt: True", chunk)
 
     def test_cancel_when_no_answers(self):
         self.assertEqual(

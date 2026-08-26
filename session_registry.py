@@ -21,8 +21,31 @@ def new_agent_id() -> str:
     return f"agent-{uuid.uuid4().hex[:12]}"
 
 
+def resolve_spawn_model(
+    *,
+    requested: Optional[str] = None,
+    source_model: Optional[str] = None,
+    forking: bool = False,
+) -> Optional[str]:
+    """Submodel to pin on spawn_session / UI fork.
+
+    Explicit ``model=`` wins. Forking inherits the source session's
+    submodel when none is passed. Fresh spawn with no model uses the
+    backend default later in resolve_init_model.
+    """
+    req = (requested or "").strip()
+    if req:
+        return req
+    if forking:
+        src = (source_model or "").strip()
+        if src:
+            return src
+    return None
+
+
 def resolve_init_model(
     *,
+    requested_model: Optional[str] = None,
     profile_model: Optional[str] = None,
     session_model: Optional[str] = None,
     view_model: Optional[str] = None,
@@ -32,12 +55,12 @@ def resolve_init_model(
 ) -> Optional[str]:
     """Model to send on initialize.
 
-    One chain: profile pin → this session → saved entry → view stamp
-    (resume only) → backend default. Always pick a model when a default
-    exists. New sessions ignore a leftover view stamp so DeepSeek does
-    not leak onto the next Grok sheet.
+    One chain: spawn/fork pin → profile pin → this session → saved entry
+    → view stamp (resume only) → backend default. Always pick a model
+    when a default exists. New sessions ignore a leftover view stamp so
+    DeepSeek does not leak onto the next Grok sheet.
     """
-    chain = [profile_model, session_model, saved_model]
+    chain = [requested_model, profile_model, session_model, saved_model]
     if resume:
         chain.append(view_model)
     chain.append(default_model)

@@ -343,8 +343,8 @@ def handle_request(request: dict) -> dict:
 
 ALWAYS address workers by agent_id — view_id changes after Sublime restart.
 Workflow for base context then workers:
-  1) spawn_session(prompt=…, name="explorer", backend=X)  # returns agent_id
-  2) spawn workers with fork_from_agent_id=<explorer agent_id>
+  1) spawn_session(prompt=…, name="explorer", backend=X, model=Y)  # returns agent_id
+  2) spawn workers with fork_from_agent_id=<explorer agent_id>  # keeps X/Y unless model= set
 
 Fork rules:
   - fork_current: fork THIS (caller) session
@@ -352,7 +352,8 @@ Fork rules:
   - fork_from_view_id: legacy only
   - Prefer list_sessions + send_to_session(agent_id=…) over re-spawning.
 
-Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
+Host appends signal_complete reminder. Parent linkage uses parent_agent_id.
+Child reports done via signal_complete only — not send_to_session(parent).""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -362,6 +363,7 @@ Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
                             "checkpoint": {"type": "string", "description": "Optional: checkpoint name to fork from"},
                             "persona_id": {"type": "integer", "description": "Optional: persona ID from list_personas to acquire and use"},
                             "backend": {"type": "string", "description": "Optional: backend (claude, codex, grok, …). When forking, defaults to source."},
+                            "model": {"type": "string", "description": "Optional: submodel id from list_backends models (e.g. deepseek-v4-flash-vision-exp). Forking without this keeps the source session's model."},
                             "fork_current": {"type": "boolean", "description": "Fork caller's history into the child (default false)."},
                             "fork_from_agent_id": {"type": "string", "description": "Fork that session by stable agent_id (preferred over view_id)."},
                             "fork_from_view_id": {"type": "integer", "description": "Legacy: fork by runtime view_id (breaks after ST restart)."},
@@ -372,7 +374,11 @@ Host appends signal_complete reminder. Parent linkage uses parent_agent_id.""",
                 },
                 {
                     "name": "send_to_session",
-                    "description": "Send a message by stable agent_id (preferred). The target sees a [from agent <your agent_id>] header (or [from user] if no caller session) so it can tell ◎ user input from inter-agent mail; reply with send_to_session(agent_id=that id). view_id is runtime-only and invalid after ST restart — always list_sessions first if unsure. Sleeping workers auto-wake. If the target is mid-turn, the prompt is queued and runs after the current turn — do not wait for signal_complete to retry. Prefer reuse over spawn.",
+                    "description": """Send a message by stable agent_id (preferred). Direct mail only — mid-task steer, questions, follow-ups.
+
+Do NOT use this to tell a parent that a spawned child is done. That is signal_complete (parent wait_for_subsession / host inject). Mailing the same summary AND signaling completion duplicates the parent's turn.
+
+The target sees a [from agent <your agent_id>] header (or [from user] if no caller session). Reply with send_to_session(agent_id=that id). view_id is runtime-only — list_sessions if unsure. Sleeping workers auto-wake. Mid-turn: queued (sent=true); do not retry the same prompt. Prefer reuse over spawn.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -662,14 +668,16 @@ Parent routing for signal_complete is automatic.""",
                 },
                 {
                     "name": "signal_complete",
-                    "description": """Signal that this subsession has completed.
+                    "description": """Signal that this spawned subsession has completed.
 
-ONLY for sessions spawned via spawn_session. Host looks up parent_view_id from
-this sheet — do NOT search for parent ids. session_id defaults to this MCP
-session (omit it). Host attaches context_budget and notifies the parent only
-after *this* turn is fully idle (so parallel toolcalls with your final message
-do not wake the parent early). Prefer: finish your final summary text, then
-call signal_complete alone — not in the same parallel batch as other tools.
+This IS the parent notification (wait_for_subsession / host inject). Do NOT
+also send_to_session the parent with the same result_summary — that doubles
+the parent's next turn.
+
+ONLY for spawn_session children. Host looks up parent from this sheet — do
+NOT search for parent ids. Omit session_id. Host attaches context_budget and
+notifies the parent only after *this* turn is idle. Finish your summary
+text, then call signal_complete alone — not in parallel with other tools.
 
 Example:
   signal_complete(result_summary="Task done. Files: … Findings: …")""",
@@ -690,16 +698,18 @@ Example:
                 },
                 {
                     "name": "wait_for_subsession",
-                    "description": """Wait for a child agent to complete (host-local; fires on signal_complete).
+                    "description": """Wait for a child agent to complete (host-local; fires on child's signal_complete).
 
-Prefer agent_id from spawn_session (stable). subsession_id is the same value for
-new spawns. Do NOT use runtime view_id.
+This is the subscribe path. Do NOT also send_to_session yourself the same
+wake_prompt — you will run that text twice.
+
+Prefer agent_id from spawn_session (stable). Do NOT use runtime view_id.
 
 Example:
   r = spawn_session(prompt="Design solution", name="architect")
   wait_for_subsession(agent_id=r['agent_id'], wake_prompt="Architect done — review.")
 
-Child must call signal_complete when finished. Returns wait_id / notification_id.""",
+Child must signal_complete when finished (not send_to_session you). Returns wait_id.""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -774,7 +784,10 @@ Example:
                 },
                 {
                     "name": "subscribe",
-                    "description": """Subscribe to a notification service discovered via discover_services().
+                    "description": """Subscribe to an external notification service from discover_services()
+(kanban, timer, …). Not for parent/child session completion — that is
+wait_for_subsession + child's signal_complete. Do not subscribe and
+send_to_session the same wake_prompt.
 
 Example:
   services = discover_services()

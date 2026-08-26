@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Live kimi acp e2e: 2-question AskUser — does Q1 reach the first continuation?
+"""Live kimi acp e2e: 2-question AskUser via elicitation/create.
+
+kimi 0.38 `packages/acp-server/src/question.ts` (from the binary):
+  if elicitationForm: createElicitation(ALL questions)
+  elicitationResponseToQuestionAnswers keeps only exact option labels
+  Other/otherLabel is unsupported (no extra text field)
+  request_permission fallback degrades to q0_opt_N only
 
 Does not write ~/.kimi-code/mcp.json. Spawns `kimi acp` like the host.
+No session/cancel + followup prompt (that is the anti-pattern).
 
-Strategies (argv, default all):
-  q0            permission q0_opt only
-  inject_during session/prompt with Q1 while permission is outstanding
-  inject_after  return q0, immediately session/prompt (no cancel)
-  cancel_then   return q0, session/cancel, wait prompt settle, then followup
+Strategies (argv, default listed other):
+  listed  elicitation accept q0+q1 declared labels — Q1 must be in tool result
+  other   elicitation accept q1='all' (not in enum) — Kimi must drop it
+  interrupt_during  session/cancel while elicitation outstanding
 """
 from __future__ import annotations
 
@@ -31,8 +37,9 @@ from acp_base import AcpBridge  # noqa: E402
 
 KIMI = os.path.expanduser("~/.kimi-code/bin/kimi")
 Q0_LABEL = "procmotion"
-# Live failure: user typed Other "all" — not a listed Phase 1 label.
-Q1_LABEL = "all"
+Q1_LISTED = "dynamics only"
+# Other is not a declared option — Kimi drops it (elicitationResponseToQuestionAnswers).
+Q1_OTHER = "all"
 
 QUESTIONS = [
     {
@@ -65,10 +72,48 @@ QUESTIONS = [
     },
 ]
 
-ANSWERS = {
+ANSWERS_LISTED = {
     QUESTIONS[0]["question"]: Q0_LABEL,
-    QUESTIONS[1]["question"]: Q1_LABEL,
+    QUESTIONS[1]["question"]: Q1_LISTED,
 }
+ANSWERS_OTHER = {
+    QUESTIONS[0]["question"]: Q0_LABEL,
+    QUESTIONS[1]["question"]: Q1_OTHER,
+}
+
+Q0_Q = QUESTIONS[0]["question"]
+Q1_Q = QUESTIONS[1]["question"]
+
+
+def _freetext_content(strategy: str, qs, keys) -> dict:
+    """Payloads to try for Other. Engine TUI uses {kind: other, text}."""
+    k0 = keys[0] if keys else "q0"
+    k1 = keys[1] if len(keys) > 1 else "q1"
+    listed = AcpBridge._elicitation_content_from_answers(
+        qs, keys, ANSWERS_LISTED)
+    if strategy in ("other", "after_prompt"):
+        return {k0: Q0_LABEL, k1: Q1_OTHER}
+    if strategy == "extra":
+        return {
+            k0: Q0_LABEL,
+            k1: Q1_OTHER,
+            f"{k1}_other": Q1_OTHER,
+            "other": Q1_OTHER,
+            "q1_other": Q1_OTHER,
+        }
+    if strategy == "qtext":
+        return {Q0_Q: Q0_LABEL, Q1_Q: Q1_OTHER, k0: Q0_LABEL, k1: Q1_OTHER}
+    if strategy == "kind":
+        return {k0: Q0_LABEL, k1: {"kind": "other", "text": Q1_OTHER}}
+    if strategy == "hold_prompt":
+        return {k0: Q0_LABEL, k1: Q1_OTHER}
+    if strategy == "meta":
+        return {
+            k0: Q0_LABEL,
+            k1: Q1_OTHER,
+            "_meta": {"q1_other": Q1_OTHER, "kind": "other", "text": Q1_OTHER},
+        }
+    return listed
 
 PROMPT = """Do not explore the filesystem. Do not call Bash, Read, Write, Edit, Grep, Glob, EnterPlanMode, ExitPlanMode, or any tool except AskUserQuestion.
 
@@ -90,8 +135,9 @@ Use MISSING for any answer the tool result did not contain. Do not guess. Do not
 
 
 class Acp:
-    def __init__(self, proc):
+    def __init__(self, proc, strategy: str = "listed"):
         self.proc = proc
+        self.strategy = strategy
         self._n = 0
         self._lock = threading.Lock()
         self._pending = {}
@@ -108,6 +154,7 @@ class Acp:
         self._after_ask = None
         self._hold_elicitation = False
         self._held_elicit = None
+        self._content_override = None
         self._dead = False
         t = threading.Thread(target=self._read, daemon=True)
         t.start()
@@ -260,8 +307,13 @@ class Acp:
         params = msg.get("params") or {}
         self.elicitation.append(params)
         qs, keys = AcpBridge._questions_from_elicitation(params)
-        content = AcpBridge._elicitation_content_from_answers(
-            qs, keys, ANSWERS)
+        if self.strategy == "listed":
+            content = AcpBridge._elicitation_content_from_answers(
+                qs, keys, ANSWERS_LISTED)
+        else:
+            content = _freetext_content(self.strategy, qs, keys)
+        if self._content_override is not None:
+            content = self._content_override(qs, keys, content)
         self.elicitation_io.append({
             "keys": keys,
             "content": content,
@@ -282,10 +334,9 @@ class Acp:
                 "action": "accept", "content": content,
             })
         else:
-            # Still accept q0 so we observe Kimi dropping Other, not dismiss.
             self._reply(msg.get("id"), {
                 "action": "accept",
-                "content": content or {keys[0]: Q0_LABEL} if keys else {},
+                "content": {keys[0]: Q0_LABEL} if keys else {},
             })
         if self._after_ask:
             self._after_ask(msg, "elicitation")
@@ -358,7 +409,8 @@ def _first_q0(opts):
 
 
 def _followup():
-    return AcpBridge._kimi_followup_answers(QUESTIONS, ANSWERS)
+    # leftover helper — not used by listed/other. Keep for interrupt tests.
+    return AcpBridge._kimi_followup_answers(QUESTIONS, ANSWERS_OTHER)
 
 
 def spawn(cwd):
@@ -398,7 +450,7 @@ def handshake(acp, cwd):
     return sid, None
 
 
-def _verdict(text: str, tool_results: list) -> dict:
+def _verdict(text: str, tool_results: list, q1_expect: str) -> dict:
     joined = text
     q1_missing = (
         "PHASE 1 UNANSWERED" in joined.upper()
@@ -406,12 +458,11 @@ def _verdict(text: str, tool_results: list) -> dict:
         or "Q1=<MISSING" in joined.upper()
     )
     q1_got = (
-        f"Q1={Q1_LABEL}" in joined
-        or f"Q1={Q1_LABEL}".lower() in joined.lower()
-        or (Q1_LABEL in joined and "Phase 1" in joined)
+        f"Q1={q1_expect}" in joined
+        or (q1_expect and q1_expect in joined and "Phase 1" in joined)
     )
     q0_got = Q0_LABEL in joined
-    tr_q1 = any(Q1_LABEL in t for t in tool_results)
+    tr_q1 = any(q1_expect in t for t in tool_results) if q1_expect else False
     tr_q0 = any(Q0_LABEL in t for t in tool_results)
     return {
         "agent_text": joined[:800],
@@ -432,57 +483,71 @@ def run_strategy(name: str, timeout=180) -> dict:
         return {"ok": False, "stage": "spawn", "err": "no kimi"}
     cwd = tempfile.mkdtemp(prefix="kimi-ask-e2e-")
     proc = spawn(cwd)
-    acp = Acp(proc)
+    acp = Acp(proc, strategy=name)
     sid, err = handshake(acp, cwd)
     if err:
         proc.kill()
         return {"ok": False, "strategy": name, "stage": "handshake", "err": err}
 
     extra_rpc = {"error": {"message": "not sent"}}
-    follow_box = []
-    follow = _followup()
-    follow_params = {
-        "sessionId": sid,
-        "prompt": [{"type": "text", "text": follow}],
-    }
-
-    def send_follow(tag):
-        rid = acp._next_id()
-        with acp._lock:
-            acp._pending[rid] = follow_box
-        acp._write({
-            "jsonrpc": "2.0", "id": rid,
-            "method": "session/prompt",
-            "params": follow_params,
-        })
-        acp.events.append((tag, rid))
-
-    if name == "interrupt_during":
+    if name in ("interrupt_during", "hold_prompt"):
         acp._hold_elicitation = True
 
     def on_ask(_msg, oid):
         acp.events.append(("ask_oid", oid))
-        if name == "inject_during":
-            send_follow("inject_during")
-        elif name == "interrupt_during":
-            acp.notify("session/cancel", {"sessionId": sid})
-            acp.events.append(("cancel", True))
-
-    def after_ask(_msg, oid):
-        if name == "inject_after":
-            send_follow("inject_after")
-        elif name == "cancel_then":
+        if name == "interrupt_during":
             acp.notify("session/cancel", {"sessionId": sid})
             acp.events.append(("cancel", True))
 
     acp._on_ask = on_ask
-    acp._after_ask = after_ask
     first_timeout = 12 if name == "interrupt_during" else timeout
+    if name == "hold_prompt":
+        first_timeout = 8
     first = acp.call(
         "session/prompt",
         {"sessionId": sid, "prompt": [{"type": "text", "text": PROMPT}]},
         timeout=first_timeout,
     )
+    follow = {
+        "sessionId": sid,
+        "prompt": [{
+            "type": "text",
+            "text": (
+                "The user typed Other for Phase 1: all. "
+                "Honor Q0=procmotion Q1=all. "
+                "Reply SANDBOX_RESULT Q0=procmotion Q1=all"
+            ),
+        }],
+    }
+    if name == "hold_prompt":
+        extra_rpc = acp.call("session/prompt", follow, timeout=15)
+        held = acp._held_elicit
+        if held:
+            qs, keys = AcpBridge._questions_from_elicitation(
+                (held.get("params") or {}))
+            content = _freetext_content("other", qs, keys)
+            acp._reply(held.get("id"), {
+                "action": "accept", "content": content,
+            })
+            acp.events.append(("elicit_accept_after_hold_prompt", content))
+        # original prompt may still be open
+        if not first.get("result") and not (
+                isinstance(first.get("error"), dict)
+                and "timeout" in str(first["error"])):
+            pass
+        else:
+            first = first
+        # wait remaining original prompt
+        if isinstance(first.get("error"), dict) and str(
+                first["error"].get("message") or "").startswith("timeout"):
+            t2 = time.time() + timeout
+            while time.time() < t2 and not acp._dead:
+                # original call already timed out; drain via new wait on agent_text
+                if "SANDBOX_RESULT" in "".join(acp.agent_text):
+                    break
+                time.sleep(0.1)
+    if name == "after_prompt":
+        extra_rpc = acp.call("session/prompt", follow, timeout=30)
     if name == "interrupt_during":
         err = first.get("error") if isinstance(first.get("error"), dict) else {}
         timed_out = str(err.get("message") or "").startswith("timeout")
@@ -494,19 +559,10 @@ def run_strategy(name: str, timeout=180) -> dict:
             extra_rpc = {
                 "error": {"message": "needed elicitation cancel to unstick"},
             }
-    if name == "cancel_then":
-        extra_rpc = acp.call(
-            "session/prompt", follow_params, timeout=timeout)
-    elif name in ("inject_during", "inject_after"):
-        end = time.time() + timeout
-        while time.time() < end and not follow_box and not acp._dead:
-            time.sleep(0.05)
-        extra_rpc = follow_box[0] if follow_box else {
-            "error": {"message": f"{name} no response"},
-        }
 
     text = "".join(acp.agent_text)
-    v = _verdict(text, acp.tool_results)
+    q1_expect = Q1_LISTED if name == "listed" else Q1_OTHER
+    v = _verdict(text, acp.tool_results, q1_expect)
     asked = any(e[0] == "ask_oid" for e in acp.events)
     if not asked and not acp.elicitation:
         ok = False
@@ -520,15 +576,38 @@ def run_strategy(name: str, timeout=180) -> dict:
         ok = (not hung) and ("cancel" in stop.lower() or "interrupt" in stop.lower())
         why = ("session/cancel unblocked ask" if ok
                else "session/cancel ignored while elicitation outstanding")
-    elif name == "q0":
-        # Live Other="all" is not a listed option. Kimi must drop it from
-        # the tool result (permission q0-only, or elicitation enum filter).
+    elif name == "listed":
+        ok = bool(v["tool_q0"] and v["tool_q1"])
+        why = ("elicitation q0+q1 in tool_result" if ok
+               else "listed Q1 missing from tool_result — elicitation failed")
+    elif name in ("other", "extra", "qtext", "kind", "meta"):
+        # PASS if freetext reached the tool result (the actual goal).
+        if v["tool_q1"]:
+            ok = True
+            why = f"{name}: Other reached tool_result"
+        else:
+            ok = False
+            why = f"{name}: Other still dropped from tool_result"
+    elif name in ("hold_prompt", "after_prompt"):
+        err = extra_rpc.get("error") if isinstance(extra_rpc, dict) else None
+        busy = bool(err) and "busy" in str(err).lower()
+        last = ""
+        for ln in reversed(text.splitlines()):
+            if "SANDBOX_RESULT" in ln:
+                last = ln
+                break
+        if not last and "SANDBOX_RESULT" in text:
+            last = text[text.rfind("SANDBOX_RESULT"):]
+        ok = (not busy) and f"Q1={Q1_OTHER}" in last
+        why = (f"{name}: last={last!r} extra={_short(extra_rpc)}" if not ok
+               else f"{name}: followup end_turn Q1={Q1_OTHER}")
+    elif name == "other_drop":
         ok = bool(v["tool_q0"]) and not v["tool_q1"]
-        why = ("Other Q1 dropped from tool_result" if ok
-               else "expected Q1 Other to be absent from tool_result")
+        why = ("Other dropped from tool_result" if ok
+               else "expected Other absent from tool_result")
     else:
-        ok = bool(v["q1_in_text"]) and not v["q1_declared_missing"]
-        why = "Q1 reached first continuation" if ok else "Q1 still missing"
+        ok = False
+        why = f"unknown strategy {name}"
     proc.kill()
     return {
         "ok": ok,
@@ -556,9 +635,9 @@ def run_strategy(name: str, timeout=180) -> dict:
 def main(argv) -> int:
     names = [a for a in argv[1:] if not a.startswith("-")]
     if not names:
-        names = ["q0", "inject_during"]
+        names = ["listed", "other"]
     failed = 0
-    print("followup:\n", _followup())
+    print("kimi", KIMI)
     print("q0_oid preview", _q0_oid([
         {"optionId": "q0_opt_0", "name": "procanim", "kind": "allow_once"},
         {"optionId": "q0_opt_1", "name": "procmotion", "kind": "allow_once"},

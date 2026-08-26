@@ -1022,7 +1022,9 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                 elif action == "fork" and data:
                     # Fork the current session
                     if data.session_id:
-                        create_session(self.window, resume_id=data.session_id, fork=True, backend=data.backend)
+                        create_session(
+                            self.window, resume_id=data.session_id, fork=True,
+                            backend=data.backend, model=getattr(data, "model", None))
                 elif action == "persona" and data:
                     # Show persona picker
                     self._show_persona_picker(data, backend=backend)
@@ -1200,7 +1202,9 @@ class ClaudeCodeForkCommand(sublime_plugin.WindowCommand):
             return
 
         # Create forked session
-        forked = create_session(self.window, resume_id=s.session_id, fork=True, backend=s.backend)
+        forked = create_session(
+            self.window, resume_id=s.session_id, fork=True,
+            backend=s.backend, model=getattr(s, "model", None))
         from ..session import fork_session_title
         forked_name = fork_session_title(s.name or "session")
         forked.name = forked_name
@@ -1222,7 +1226,7 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
                 name = session.name or "(unnamed)"
                 cost = f"${session.total_cost:.4f}" if session.total_cost > 0 else ""
                 items.append([f"● {name}", f"active  {cost}  {session.query_count}q"])
-                sources.append(("active", view_id, session.session_id, name, session.backend))
+                sources.append(("active", view_id, session.session_id, name, session.backend, getattr(session, "model", None)))
 
         # Saved sessions
         saved = load_saved_sessions()
@@ -1237,7 +1241,7 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
             cost = s.get("total_cost", 0)
             cost_str = f"${cost:.4f}" if cost else ""
             items.append([name, f"saved  {project}  {cost_str}"])
-            sources.append(("saved", None, session_id, name, s.get("backend", "claude")))
+            sources.append(("saved", None, session_id, name, s.get("backend", "claude"), s.get("model")))
 
         if not items:
             sublime.status_message("No sessions to fork from")
@@ -1245,8 +1249,10 @@ class ClaudeCodeForkFromCommand(sublime_plugin.WindowCommand):
 
         def on_select(idx):
             if idx >= 0:
-                source_type, view_id, session_id, name, src_backend = sources[idx]
-                forked = create_session(self.window, resume_id=session_id, fork=True, backend=src_backend)
+                source_type, view_id, session_id, name, src_backend, src_model = sources[idx]
+                forked = create_session(
+                    self.window, resume_id=session_id, fork=True,
+                    backend=src_backend, model=src_model)
                 from ..session import fork_session_title
                 forked_name = fork_session_title(name)
                 forked.name = forked_name

@@ -51,6 +51,25 @@ class TestPeelUseTool(unittest.TestCase):
         self.assertFalse(self.b._is_agent_busy_error(
             RuntimeError("session not initialized")))
 
+    def test_query_serializes_and_does_not_cancel_on_busy(self):
+        # sandbox/kimi_busy: overlap → agent_busy; wait for end_turn then
+        # retry without session/cancel → second prompt lands.
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "bridge", "acp_base.py")
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
+        start = src.find("    async def handle_query")
+        end = src.find("    def _prompt_caps", start)
+        body = src[start:end]
+        live = "\n".join(
+            ln for ln in body.splitlines()
+            if not ln.lstrip().startswith("#")
+        )
+        self.assertIn("_query_lock", live)
+        self.assertNotIn("busy_retry_", live)
+        self.assertIn("no cancel", live)
+
     def test_use_tool_peels_jar_kanban(self):
         name = self.b._normalize_tool_name({
             "title": "use_tool",
@@ -249,18 +268,48 @@ class TestMarkTerminalBg(unittest.TestCase):
         b._mark_terminal_bg("term_d", slot)
         self.assertTrue(slot.get("bg"))
 
-    def test_wait_for_exit_has_no_fake_success(self):
+    def test_wait_for_exit_kimi_has_no_unconditional_fake_success(self):
         import inspect
         src = inspect.getsource(AcpBridge._acp_terminal_wait)
-        # kimi-code: exitCode ?? -1. Must not return 0 or null while running.
-        self.assertNotIn('return {"exitCode": 0, "signal": None}', src)
+        # Grok timeout:0 may ack 0; Kimi must still wait on the reader.
+        self.assertIn('BACKEND_NAME', src)
+        self.assertIn('"grok"', src)
         live = [
             ln for ln in src.splitlines()
-            if "return" in ln and "exitCode" in ln and not ln.lstrip().startswith("#")
+            if not ln.lstrip().startswith("#")
         ]
-        self.assertTrue(any("es.get(" in ln for ln in live))
-        self.assertFalse(any(
-            'None, "signal": None' in ln for ln in live))
+        body = "\n".join(live)
+        grok_idx = body.find('"grok"')
+        self.assertGreater(grok_idx, 0)
+        grok_return = body.find(
+            'return {"exitCode": 0, "signal": None}', grok_idx)
+        self.assertGreater(grok_return, grok_idx)
+        before = body[:grok_idx]
+        self.assertNotIn(
+            'return {"exitCode": 0, "signal": None}', before)
+        self.assertNotIn(
+            'return {"exitCode": None, "signal": None}', body)
+
+    def test_grok_timeout_0_marks_bg(self):
+        b = _TermStub()
+        b.BACKEND_NAME = "grok"
+        b._note_shell_execute("tool-g", "Bash")
+        b._tool_inputs_by_id["tool-g"] = {
+            "command": "pil test -t visual", "timeout": 0}
+        slot = {"cmd": "pil test -t visual"}
+        b._mark_terminal_bg("term_g", slot)
+        self.assertTrue(slot.get("bg"))
+        self.assertEqual(slot.get("tool_use_id"), "tool-g")
+
+    def test_kimi_timeout_0_does_not_mark_bg(self):
+        b = _TermStub()
+        b.BACKEND_NAME = "kimi"
+        b._note_shell_execute("tool-k", "Bash")
+        b._tool_inputs_by_id["tool-k"] = {
+            "command": "echo ok", "timeout": 0}
+        slot = {"cmd": "echo ok"}
+        b._mark_terminal_bg("term_k", slot)
+        self.assertFalse(slot.get("bg"))
 
 
 class TestOutputViewBgDemote(unittest.TestCase):
@@ -675,6 +724,101 @@ class TestSubagentTerminalOutput(unittest.TestCase):
         result = asyncio.run(_go())
         self.assertNotIn("exitStatus", result)
         self.assertIn("01a00never-seen", self.b._child_sessions)
+
+
+class _WaitStub(AcpBridge):
+    def __init__(self, backend="grok"):
+        self.BACKEND_NAME = backend
+        self._terminals = {}
+        self._child_sessions = {}
+        self._released_terminals = set()
+        self._detached_snaps = {}
+        self._detached_procs = {}
+        self.terminal_wait_timeout_s = 0
+        self._bg_tool_ids = set()
+        self._pending_execute_ids = []
+        self._tool_ids_emitted = set()
+        self._last_session_tool_ts = 0
+        self._logs = []
+
+    def file_log(self, msg):
+        self._logs.append(msg)
+
+    def _emit_bg_terminal_complete(self, *a, **k):
+        pass
+
+
+class TestGrokBgWaitAck(unittest.TestCase):
+    def _hanging_slot(self):
+        fut = asyncio.get_running_loop().create_future()
+        return {
+            "proc": None,
+            "stdout": "",
+            "stderr": "",
+            "truncated": False,
+            "exit_status": None,
+            "bg": True,
+            "cmd": "sleep 30",
+            "reader": fut,
+        }, fut
+
+    def test_grok_bg_wait_returns_immediately_without_finishing(self):
+        b = _WaitStub("grok")
+
+        async def _go():
+            slot, fut = self._hanging_slot()
+            b._terminals["term_g"] = slot
+            t0 = asyncio.get_running_loop().time()
+            result = await b._acp_terminal_wait({"terminalId": "term_g"})
+            elapsed = asyncio.get_running_loop().time() - t0
+            return result, elapsed, slot, fut
+
+        result, elapsed, slot, fut = asyncio.run(_go())
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(result, {"exitCode": 0, "signal": None})
+        self.assertIsNone(slot.get("exit_status"))
+        self.assertFalse(fut.done())
+        fut.cancel()
+
+    def test_kimi_bg_wait_stays_pending(self):
+        b = _WaitStub("kimi")
+
+        async def _go():
+            slot, fut = self._hanging_slot()
+            b._terminals["term_k"] = slot
+            # wait_for cancels the inner coro; wait swallows CancelledError
+            # as SIGTERM. Probe with a sibling task instead.
+            task = asyncio.create_task(
+                b._acp_terminal_wait({"terminalId": "term_k"}))
+            await asyncio.sleep(0.15)
+            still = not task.done()
+            if not still:
+                result = task.result()
+            else:
+                result = None
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self.assertTrue(still, f"kimi wait returned {result}")
+            self.assertIsNone(slot.get("exit_status"))
+            self.assertFalse(fut.done())
+            fut.cancel()
+
+        asyncio.run(_go())
+
+    def test_grok_synth_disabled(self):
+        b = _WaitStub("grok")
+        b._last_session_tool_ts = 0
+        self.assertFalse(b._should_synth_terminal_ui())
+
+    def test_kimi_synth_when_stale_and_unpaired(self):
+        b = _WaitStub("kimi")
+        b._last_session_tool_ts = 0
+        self.assertTrue(b._should_synth_terminal_ui())
+        b._pending_execute_ids = ["tool-1"]
+        self.assertFalse(b._should_synth_terminal_ui())
 
 
 if __name__ == "__main__":

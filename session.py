@@ -248,7 +248,7 @@ def remove_saved_session(session_id: str) -> bool:
 
 
 class Session:
-    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[Dict] = None, initial_context: Optional[Dict] = None, backend: str = "claude"):
+    def __init__(self, window: sublime.Window, resume_id: Optional[str] = None, fork: bool = False, profile: Optional[Dict] = None, initial_context: Optional[Dict] = None, backend: str = "claude", model: Optional[str] = None):
         self.window = window
         self.backend = backend
         self.client: Optional[JsonRpcClient] = None
@@ -282,7 +282,7 @@ class Session:
         self.effort: Optional[str] = None  # Resolved reasoning effort for this session
         # Live ACP model catalog (Grok availableModels incl. DeepSeek BYOK)
         self.available_models: list = []
-        self.model: Optional[str] = None  # last known model id for this session
+        self.model: Optional[str] = (str(model).strip() if model else None)  # last known / spawn pin
         self.name: Optional[str] = None
         self.total_cost: float = 0.0
         self.query_count: int = 0
@@ -472,6 +472,7 @@ class Session:
             view_model = self.output.view.settings().get("claude_model")
         from .session_registry import resolve_init_model
         chosen_raw = resolve_init_model(
+            requested_model=self.model,
             profile_model=(self.profile.get("model") if self.profile else None),
             session_model=self.model,
             view_model=view_model,
@@ -4357,8 +4358,11 @@ class Session:
         if not text:
             return False
         low = text.lower()
+        # kimi acp auto-compact: "Compacting conversation context"
+        # (not "compaction started" — that phrase is TUI/slash only).
         return (
-            "compaction started" in low
+            "compacting conversation context" in low
+            or "compaction started" in low
             or "context compaction started" in low
             or "compacting context" in low
         )
@@ -4382,13 +4386,24 @@ class Session:
             if self.working:
                 self._set_turn_phase("responding")
             if self.output:
-                self.output.text(text)
+                self.output.text("\n*Compaction completed.*\n")
             self._finish_compact()
             return
         if self._looks_like_compact_start(text):
-            self._compacting = True
-            self.current_tool = "compact…"
-            self._status("compacting…")
+            if self.working:
+                self._compacting = True
+                self.current_tool = "compact…"
+                self._status("compacting…")
+                self._set_turn_phase("waiting")
+            if self.output:
+                self.output.text("\n*Compacting conversation context…*\n")
+            return
+        if self._looks_like_compact_done(text):
+            if self.output:
+                self.output.text("\n*Compaction completed.*\n")
+            if getattr(self, "_compacting", False):
+                self._finish_compact()
+            return
         self._note_agent_activity()
         if self.working:
             self._set_turn_phase("responding")

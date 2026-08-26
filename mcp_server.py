@@ -1107,9 +1107,10 @@ class MCPSocketServer:
         summary.append("")
         summary.append(f"default backend: {default}")
         summary.append(
-            "Spawn via spawn_session(backend=<name>). "
+            "Spawn via spawn_session(backend=<name>, model=<id from models>). "
+            "Forking without model= keeps the source session's submodel. "
             "fork_current / fork_from_view_id only work within the same bridge "
-            "family (same bridge_script). Prefer fork_from_view_id to branch "
+            "family (same bridge_script). Prefer fork_from_agent_id to branch "
             "workers off a base explorer session."
         )
         return {"summary": "\n".join(summary), "default": default, "backends": rows}
@@ -1199,12 +1200,15 @@ class MCPSocketServer:
         fork_current: bool = False,
         wait_for_completion: bool = False,
         backend: str = None,
+        model: str = None,
         fork_from_view_id: int = None,
         fork_from_agent_id: str = None,
         _caller_view_id: int = None,
     ) -> dict:
         """Spawn a new session. Public id is agent_id; view_id is runtime only.
 
+        model: submodel id from list_backends (e.g. deepseek-v4-flash).
+        Forking without model keeps the source session's submodel.
         Fork sources (pick one; checkpoint wins if set):
           - fork_current: fork the caller's transcript
           - fork_from_agent_id: fork any open session (preferred; stable)
@@ -1239,6 +1243,7 @@ class MCPSocketServer:
         fork = False
         fork_source_view_id = None
         fork_source_backend = None
+        fork_source_model = None
 
         # Load profile config if specified
         if profile:
@@ -1264,7 +1269,7 @@ class MCPSocketServer:
                 name = persona.get("alias", f"persona-{persona_id}")
 
         def _resolve_fork_source(source_session, label: str):
-            nonlocal resume_id, fork, fork_source_view_id, fork_source_backend, backend
+            nonlocal resume_id, fork, fork_source_view_id, fork_source_backend, fork_source_model, backend
             if not source_session:
                 return {"error": f"Cannot fork: {label} not found"}
             sid = getattr(source_session, "session_id", None)
@@ -1274,6 +1279,7 @@ class MCPSocketServer:
                              f"(still starting?)"
                 }
             src_backend = getattr(source_session, "backend", None) or "claude"
+            fork_source_model = getattr(source_session, "model", None)
             # Inherit source backend when agent omits backend (avoid default→claude
             # clobbering a grok/codex explorer base).
             if not backend:
@@ -1374,7 +1380,19 @@ class MCPSocketServer:
         }
 
         # Create new session with initial context
-        print(f"[MCP spawn] backend={backend} fork_current={fork_current} "
+        spawn_model = session_registry.resolve_spawn_model(
+            requested=model,
+            source_model=fork_source_model,
+            forking=fork,
+        )
+        if (backend or "") == "grok" and spawn_model:
+            try:
+                from . import grok_backend
+                spawn_model = grok_backend.normalize_grok_model(spawn_model)
+            except Exception:
+                pass
+        print(f"[MCP spawn] backend={backend} model={spawn_model!r} "
+              f"fork_current={fork_current} "
               f"fork_from_agent_id={fork_from_agent_id!r} "
               f"fork_from_view_id={fork_from_view_id!r} "
               f"resume_id={resume_id!r} fork={fork} "
@@ -1384,6 +1402,7 @@ class MCPSocketServer:
         session = create_session(
             window, resume_id=resume_id, fork=fork, profile=profile_config,
             initial_context=initial_context, backend=backend, focus=False,
+            model=spawn_model,
         )
         print(f"[MCP spawn] created agent_id={session.agent_id} "
               f"view_id={session.output.view.id() if session.output and session.output.view else None} "
@@ -1416,6 +1435,7 @@ class MCPSocketServer:
             "parent_agent_id": parent_agent_id,
             "parent_view_id": parent_view_id,
             "backend": backend,
+            "model": spawn_model or getattr(session, "model", None),
             "fork": fork,
             "profile": profile,
             "checkpoint": checkpoint,
@@ -1437,7 +1457,9 @@ class MCPSocketServer:
             body
             + "\n\nWhen fully done, call MCP signal_complete(result_summary=…) "
             "as its own step after your final message — not in parallel with "
-            "other tools. Parent is notified only after this turn idles; "
+            "other tools. That call IS the parent notification; do not also "
+            "send_to_session the parent with the same summary. "
+            "Parent is notified only after this turn idles; "
             "host attaches context_budget for strategy."
         )
 

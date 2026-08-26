@@ -86,22 +86,24 @@ def main() -> int:
     opts = kimi_q0_options(q0)
     label = AcpBridge._first_answer_label(answers, qs)
     oid = AcpBridge._kimi_q0_option_id(opts, qs, label)
-    extra = AcpBridge._kimi_followup_answers(qs, answers)
     kimi_sees = kimi_outcome_to_answers(q0, oid)
+    elicitation_content = AcpBridge._elicitation_content_from_answers(
+        qs, [f"q{i}" for i in range(len(qs))], answers)
 
     print("host first label", label)
     print("host optionId", oid)
-    print("kimi_sees", kimi_sees)
-    print("followup:\n", extra)
+    print("permission kimi_sees", kimi_sees)
+    print("elicitation content", elicitation_content)
 
     if oid != "q0_opt_0":
         fails.append("host should map Full suite → q0_opt_0, got %r" % oid)
     if kimi_sees is None or len(kimi_sees) != 1:
-        fails.append("Kimi outcomeToQuestionAnswer must return only Q0")
-    if "Bake to 3D LUT" not in extra or "API space only" not in extra:
-        fails.append("followup text must carry Q1 and Q2")
-    if "Full suite" not in extra:
-        fails.append("followup should recap Q0 too")
+        fails.append("permission outcomeToQuestionAnswer is q0-only")
+    if elicitation_content.get("q1") != "Bake to 3D LUT (Recommended)":
+        fails.append("elicitation must send Q1 listed label, got %r" %
+                     elicitation_content.get("q1"))
+    if elicitation_content.get("q2") != "API space only (Recommended)":
+        fails.append("elicitation must send Q2 listed label")
 
     # Live 2-question Other: Kimi elicitationResponseToQuestionAnswers
     # drops values not in declared option labels.
@@ -136,17 +138,36 @@ def main() -> int:
         fails.append("host must not put Other 'all' in q1 — Kimi drops it")
     if live_qs[1]["question"] in kimi_kept:
         fails.append("Kimi enum filter should drop Other 'all'")
-    extra2 = AcpBridge._kimi_followup_answers(live_qs, live_answers)
-    if "all" not in extra2:
-        fails.append("followup must carry Other Phase 1 = all")
+    path = os.path.join(_ROOT, "bridge", "acp_base.py")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    inj = src.find("    def _inject_ask_user_followup")
+    inj_end = src.find("    def _match_option_id_for_label", inj)
+    live = []
+    for line in src[inj:inj_end].splitlines():
+        s = line.lstrip()
+        if s.startswith("#"):
+            continue
+        live.append(line)
+    if any("notification_wake" in ln for ln in live):
+        fails.append("inject_ask_user_followup still sends notification_wake")
+    hq = src.find("    async def handle_query")
+    hq_end = src.find("    def _build_prompt_blocks", hq)
+    hq_live = "\n".join(
+        ln for ln in src[hq:hq_end].splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    if "_pending_ask_followup" not in hq_live or "_send_prompt(extra_blocks)" not in hq_live:
+        fails.append("handle_query must chain freetext session/prompt after end_turn")
+    if "session/cancel" in hq_live.split("_pending_ask_followup")[-1][:900]:
+        fails.append("freetext followup must not session/cancel")
 
     if fails:
         print("FAIL")
         for f in fails:
             print(" -", f)
         return 1
-    print("host maps Q0; Kimi drops Q1+; followup is the only channel")
-    print("live Other 'all' is dropped by elicitation enum filter")
+    print("elicitation sends every listed label; Other omitted; no inject")
     return 0
 
 

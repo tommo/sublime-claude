@@ -225,11 +225,15 @@ class ClaudeSearchSessionsCommand(sublime_plugin.WindowCommand):
                     title = results[idx][1]
                     # Look up backend from saved sessions
                     saved_backend = "claude"
+                    saved_model = None
                     for saved in load_saved_sessions():
                         if saved.get("session_id") == sid:
                             saved_backend = saved.get("backend", "claude")
+                            saved_model = saved.get("model")
                             break
-                    s = create_session(self.window, resume_id=sid, fork=True, backend=saved_backend)
+                    s = create_session(
+                        self.window, resume_id=sid, fork=True,
+                        backend=saved_backend, model=saved_model)
                     from ..session import fork_session_title
                     s.name = fork_session_title(title)
                     s.output.set_name(s.name)
@@ -467,9 +471,11 @@ class ClaudeGarageSearchCommand(sublime_plugin.WindowCommand):
         short_id = result.get("short_id", session_id[:8])
         # Look up backend from saved sessions
         src_backend = "claude"
+        src_model = None
         for saved in load_saved_sessions():
             if saved.get("session_id") == session_id:
                 src_backend = saved.get("backend", "claude")
+                src_model = saved.get("model")
                 break
 
         items = [
@@ -480,7 +486,9 @@ class ClaudeGarageSearchCommand(sublime_plugin.WindowCommand):
         def on_action(idx):
             if idx == 0:
                 # Fork
-                s = create_session(self.window, resume_id=session_id, fork=True, backend=src_backend)
+                s = create_session(
+                    self.window, resume_id=session_id, fork=True,
+                    backend=src_backend, model=src_model)
                 from ..session import fork_session_title
                 s.name = fork_session_title(short_id)
                 s.output.set_name(s.name)

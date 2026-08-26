@@ -48,6 +48,18 @@ def strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
+def _acp_is_compact_text(text: str) -> bool:
+    """kimi auto-compact / /compact client-visible phrases."""
+    low = (text or "").lower()
+    return (
+        "compacting conversation context" in low
+        or "compaction completed" in low
+        or "compaction started" in low
+        or "compacting context" in low
+        or "context compaction" in low
+    )
+
+
 def apply_plain_terminal_env(env: dict) -> dict:
     """Force monochrome non-TTY env for agent-spawned shells/tools."""
     env["TERM"] = "dumb"
@@ -175,6 +187,7 @@ class AcpBridge(BaseBridge):
         self._prompt_cancelled: bool = False
         self._prompt_fut: Optional[asyncio.Future] = None
         self._prompt_acp_id: Optional[int] = None
+        self._query_lock: Optional[asyncio.Lock] = None
         # True from first cancel notify until query fully settles — blocks
         # spam session/cancel (Grok ChatStateActor dies on cancel-after-done).
         self._cancel_in_flight: bool = False
@@ -916,6 +929,8 @@ class AcpBridge(BaseBridge):
         if kind == "agent_message_chunk":
             text = (upd.get("content") or {}).get("text", "")
             if text:
+                if _acp_is_compact_text(text):
+                    self.file_log(f"compact chunk: {text[:160]!r}")
                 send_notification("message",
                                   {"type": "text_delta", "text": text})
         elif kind == "agent_thought_chunk":
@@ -993,13 +1008,8 @@ class AcpBridge(BaseBridge):
                 }
             if is_bg and tid:
                 self._bg_tool_ids.add(tid)
-            send_notification("message", {
-                "type": "tool_use",
-                "id": tid,
-                "name": tool_name,
-                "input": tool_input,
-                "background": bool(is_bg),
-            })
+            self._emit_tool_use(
+                tid, tool_name, tool_input, background=bool(is_bg))
         elif kind == "tool_call_update":
             usage = self.usage_from_tool_update(upd)
             if usage is not None:
@@ -1036,6 +1046,13 @@ class AcpBridge(BaseBridge):
             tool_name, enriched = self._reclassify_read_dir(tool_name, enriched)
             if tid and tool_name and tool_name != "tool":
                 self._tool_names_by_id[tid] = tool_name
+            # Compare against stored args BEFORE merge — otherwise
+            # should_repaint sees old_string already applied and skips
+            # (Kimi Edit JSON-drip then rawInput never painted a diff).
+            need_paint = (
+                status in ("completed", "failed")
+                or self._should_repaint_tool(tid, upd, enriched)
+            )
             if tid and enriched:
                 prev = self._tool_inputs_by_id.get(tid) or {}
                 self._tool_inputs_by_id[tid] = {**prev, **enriched}
@@ -1061,13 +1078,10 @@ class AcpBridge(BaseBridge):
                     )
                     if bg and tid:
                         self._bg_tool_ids.add(tid)
-                    send_notification("message", {
-                        "type": "tool_use",
-                        "id": tid,
-                        "name": tool_name,
-                        "input": enriched or self._tool_inputs_by_id.get(tid) or {},
-                        "background": bg,
-                    })
+                    self._emit_tool_use(
+                        tid, tool_name,
+                        enriched or self._tool_inputs_by_id.get(tid) or {},
+                        background=bg)
             elif tool_name != "tool" or (enriched and status not in ("completed", "failed")):
                 # Enrich open row (same id → output.tool upserts). Prefer real name.
                 # kimi-cli streams arg JSON one token at a time as tool_call_update;
@@ -1076,21 +1090,17 @@ class AcpBridge(BaseBridge):
                 if enrich_name == "tool" and tid:
                     enrich_name = self._tool_names_by_id.get(tid) or "tool"
                 if not self._should_suppress_tool_row(upd, enrich_name):
-                    if status in ("completed", "failed") or self._should_repaint_tool(
-                            tid, upd, enriched):
+                    if need_paint:
                         bg = bool(
                             tid in self._bg_tool_ids
                             or self._looks_like_background_tool(upd, enriched)
                         )
                         if bg and tid:
                             self._bg_tool_ids.add(tid)
-                        send_notification("message", {
-                            "type": "tool_use",
-                            "id": tid,
-                            "name": enrich_name,
-                            "input": enriched or self._tool_inputs_by_id.get(tid) or {},
-                            "background": bg,
-                        })
+                        self._emit_tool_use(
+                            tid, enrich_name,
+                            enriched or self._tool_inputs_by_id.get(tid) or {},
+                            background=bg)
             # Cache run_in_background for create pairing. Do not ⚙ / do not
             # drop pending here — that left ⚙ unbound when create arrived
             # later (or never), so the row never cleared.
@@ -1129,19 +1139,24 @@ class AcpBridge(BaseBridge):
                     self._extract_diff_input(upd)
                     if tool_name in ("Edit", "Write") else None
                 )
-                if diff_input:
-                    # Attach diff onto the open row before closing (upsert).
-                    payload = dict(enriched or {})
-                    payload.update(diff_input)
-                    if tid not in self._tool_ids_emitted:
-                        self._tool_ids_emitted.add(tid)
-                    send_notification("message", {
-                        "type": "tool_use",
-                        "id": tid,
-                        "name": tool_name,
-                        "input": payload,
-                        "background": bool(tid and tid in self._bg_tool_ids),
-                    })
+                if tool_name in ("Edit", "Write"):
+                    # Kimi completed is "Replaced 1 occurrence" text — no
+                    # type=diff. Re-emit stored old/new as unified_diff.
+                    stored = dict(self._tool_inputs_by_id.get(tid) or {})
+                    payload = {**stored, **(enriched or {})}
+                    if diff_input:
+                        payload.update(diff_input)
+                    payload = self._edit_ui_input(payload, tool_name)
+                    if (payload.get("unified_diff")
+                            or payload.get("old_string")
+                            or payload.get("new_string")
+                            or payload.get("file_path")
+                            or payload.get("content")):
+                        if tid not in self._tool_ids_emitted:
+                            self._tool_ids_emitted.add(tid)
+                        self._emit_tool_use(
+                            tid, tool_name, payload,
+                            background=bool(tid and tid in self._bg_tool_ids))
                 # Bind terminal ids on completed payload (Kimi attaches them here)
                 if tid and tid in self._bg_tool_ids:
                     for term_id in self._terminal_ids_from_update(upd):
@@ -1284,6 +1299,16 @@ class AcpBridge(BaseBridge):
             "user_message_chunk", "agent_message_chunk",
             "agent_thought_chunk",
         ):
+            # Auto-compact often starts during session/load. Dropping the
+            # chunk left a silent wait on the next prompt (kimi 0.38:
+            # "Compacting conversation context").
+            if kind == "agent_message_chunk":
+                text = ((upd.get("content") or {}) or {}).get("text") or ""
+                if text and _acp_is_compact_text(text):
+                    self.file_log(f"load compact: {text[:160]!r}")
+                    send_notification("message", {
+                        "type": "text_delta", "text": text,
+                    })
             return
         # if kind == "user_message_chunk":
         #     text = (upd.get("content") or {}).get("text", "")
@@ -2034,14 +2059,16 @@ class AcpBridge(BaseBridge):
             if not prev or any(
                     enriched.get(k) and enriched.get(k) != prev.get(k)
                     for k in ("file_path", "path", "command", "pattern",
-                              "description", "query", "content", "old_string")):
+                              "description", "query", "content",
+                              "old_string", "new_string", "unified_diff")):
                 return True
         if self._parse_content_args_json(upd):
             prev = self._tool_inputs_by_id.get(tid) or {}
             if not prev:
                 return True
             # Only if a display-critical field newly appeared or grew a lot
-            for k in ("file_path", "path", "command", "pattern", "description"):
+            for k in ("file_path", "path", "command", "pattern", "description",
+                      "old_string", "new_string"):
                 a, b = str(prev.get(k) or ""), str(enriched.get(k) or "")
                 if b and (not a or len(b) > len(a) + 8):
                     return True
@@ -2194,7 +2221,46 @@ class AcpBridge(BaseBridge):
                 out["taskId"] = str(ids[0])
             elif out.get("task_id"):
                 out["taskId"] = str(out["task_id"])
+        # Grok: content [{type:diff, oldText, newText}]. Kimi never sends this
+        # (JSON-drip args + completed text "Replaced 1 occurrence").
+        diff = self._extract_diff_input(upd)
+        if diff:
+            for k, v in diff.items():
+                if v is not None and v != "" and not out.get(k):
+                    out[k] = v
         return out
+
+    def _edit_ui_input(self, inp: dict, tool_name: str) -> dict:
+        """Formatter payload: path + unified_diff. Kimi old/new can be huge."""
+        if tool_name not in ("Edit", "Write") or not isinstance(inp, dict):
+            return inp or {}
+        out = dict(inp)
+        old = out.get("old_string") or ""
+        new = out.get("new_string") or ""
+        if tool_name == "Edit" and not out.get("unified_diff") and (old or new):
+            out["unified_diff"] = self._plan_unified_diff(
+                str(old), str(new), max_chars=8000)
+        # Plugin Edit formatter prefers unified_diff; drop bulky bodies so
+        # the host JSON-RPC line is not enormous (drip of a whole function).
+        if tool_name == "Edit" and out.get("unified_diff"):
+            for k in ("old_string", "new_string"):
+                v = out.get(k)
+                if isinstance(v, str) and len(v) > 2000:
+                    out.pop(k, None)
+        return out
+
+    def _emit_tool_use(self, tid, name, tool_input, background=False) -> None:
+        inp = dict(tool_input or {})
+        if name in ("Edit", "Write"):
+            stored = self._tool_inputs_by_id.get(tid) or {}
+            inp = self._edit_ui_input({**stored, **inp}, name)
+        send_notification("message", {
+            "type": "tool_use",
+            "id": tid,
+            "name": name,
+            "input": inp,
+            "background": bool(background),
+        })
 
     @staticmethod
     def _extract_tool_content(upd: dict, tool_name: str = "") -> str:
@@ -3201,6 +3267,9 @@ class AcpBridge(BaseBridge):
         if self.session_id is None:
             send_error(req_id, -32000, "session not initialized")
             return
+        if self._query_lock is None:
+            self._query_lock = asyncio.Lock()
+        await self._query_lock.acquire()
         # A new query must not overlap an agent turn (Kimi: turn.agent_busy).
         # Tool ✔ is not end_turn — wait the live prompt out. Cancel only after
         # user Esc (cancel_in_flight) or when the live prompt is stuck.
@@ -3238,9 +3307,11 @@ class AcpBridge(BaseBridge):
         try:
             result = None
             last_err: Optional[BaseException] = None
-            # Busy: wait the current agent turn out. Do not cancel a healthy
-            # in-progress turn (Bash already HANDLED) on the first hits.
-            for attempt in range(8):
+            # Busy: wait the live turn out. sandbox/kimi_busy overlap_retry:
+            # session/cancel here is what dirtied the path; wait + retry
+            # after end_turn delivers the second prompt. Esc still cancels.
+            attempt = 0
+            while True:
                 try:
                     result = await self._send_prompt(prompt_blocks) or {}
                     last_err = None
@@ -3250,25 +3321,15 @@ class AcpBridge(BaseBridge):
                     if (not self._is_agent_busy_error(e)
                             or self._prompt_cancelled):
                         raise
-                    settle = min(8.0, 0.7 * (2 ** attempt))
+                    attempt += 1
+                    settle = min(10.0, 0.7 * (2 ** min(attempt, 5)))
                     self.file_log(
-                        f"query: agent_busy attempt {attempt + 1}/8 "
-                        f"settle={settle:.1f}s: {e}")
-                    if attempt >= 3:
-                        await self._cancel_agent_turn(
-                            reason=f"busy_retry_{attempt + 1}",
-                            wait_s=2.0 + attempt,
-                            settle_s=settle,
-                            force_local=True,
-                            orphan_ok=True,
-                        )
-                        self._prompt_cancelled = False
-                        self._cancel_in_flight = False
-                    else:
-                        try:
-                            await asyncio.sleep(settle)
-                        except Exception:
-                            pass
+                        f"query: agent_busy attempt {attempt} "
+                        f"settle={settle:.1f}s (no cancel): {e}")
+                    try:
+                        await asyncio.sleep(settle)
+                    except Exception:
+                        pass
             if last_err is not None and result is None:
                 raise last_err
             result = result or {}
@@ -3277,6 +3338,39 @@ class AcpBridge(BaseBridge):
                 self._prompt_cancelled
                 or stop_reason in ("cancelled", "canceled", "interrupted")
             )
+            extra = getattr(self, "_pending_ask_followup", None)
+            if extra and not cancelled:
+                self._pending_ask_followup = None
+                self.file_log(
+                    "ask_user freetext: session/prompt after end_turn "
+                    "(no cancel)")
+                extra_blocks = self._build_prompt_blocks(extra, [])
+                extra_attempt = 0
+                while not self._prompt_cancelled:
+                    try:
+                        extra_res = await self._send_prompt(extra_blocks)
+                        if extra_res:
+                            result = extra_res
+                            stop_reason = result.get(
+                                "stopReason", "end_turn")
+                            cancelled = (
+                                self._prompt_cancelled
+                                or stop_reason in (
+                                    "cancelled", "canceled",
+                                    "interrupted")
+                            )
+                        break
+                    except Exception as e:
+                        if not self._is_agent_busy_error(e):
+                            self.file_log(
+                                f"ask_user freetext followup: {e}")
+                            break
+                        extra_attempt += 1
+                        settle = min(10.0, 0.7 * (2 ** min(extra_attempt, 5)))
+                        self.file_log(
+                            f"ask_user freetext busy retry "
+                            f"{extra_attempt} settle={settle:.1f}s")
+                        await asyncio.sleep(settle)
             usage = self.usage_from_prompt_result(result)
             duration_ms = max(0, int((time.time() - turn_t0) * 1000))
             if usage:
@@ -3324,6 +3418,12 @@ class AcpBridge(BaseBridge):
             # that next query actually starts sending.
             self._prompt_fut = None
             self._prompt_acp_id = None
+            lock = getattr(self, "_query_lock", None)
+            if lock is not None and lock.locked():
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
     def _prompt_caps(self) -> dict:
         return (self.agent_capabilities or {}).get("promptCapabilities") or {}
@@ -4015,7 +4115,8 @@ class AcpBridge(BaseBridge):
             await self._send_acp_response(rid, error={
                 "code": -32000, "message": str(e)})
             return
-        self._flush_ask_followup()
+        # cancel+reprompt anti-pattern. listed Q1 goes through elicitation.
+        # self._flush_ask_followup()
 
     async def _send_acp_response(self, rid: int, *, result: Any = None,
                                   error: Optional[dict] = None) -> None:
@@ -4419,12 +4520,13 @@ class AcpBridge(BaseBridge):
             return {"action": "cancel"}
         extra = self._kimi_followup_answers(questions, answers)
         if extra and self._kimi_answers_dropped(questions, answers, content, keys):
-            # Other / extra questions are not in the enum schema; kimi
-            # drops them. Followup after this RPC reply (cancel+reprompt).
+            # Other cannot enter the tool result (enum filter). Chain a
+            # second session/prompt AFTER this turn end_turn — not cancel.
+            # sandbox/kimi_ask after_prompt: Q1=all on the followup RPC.
             self._pending_ask_followup = extra
         self.file_log(
             f"elicitation/create accept keys={list(content.keys())}"
-            f" dropped={bool(self._pending_ask_followup)}")
+            f" freetext_followup={bool(self._pending_ask_followup)}")
         return {"action": "accept", "content": content}
 
     @staticmethod
@@ -4612,28 +4714,21 @@ class AcpBridge(BaseBridge):
         oid = self._kimi_q0_option_id(options, questions, label)
         extra = self._kimi_followup_answers(questions, answers)
         if extra:
-            # handleQuestion is q0-only. Flush after this RPC is written
-            # (see _dispatch_acp_request) — do not cancel before optionId lands.
-            # loop.call_later(0.08, ...) raced the continuation; kimi already
-            # sampled "Q1 unanswered" before the followup.
             self._pending_ask_followup = extra
         if oid:
             self.file_log(
                 f"ask_user permission selected label={label!r} optionId={oid!r}")
             return {"outcome": {"outcome": "selected", "optionId": oid}}
 
-        # Answered but not a listed q0 option (Other / extra questions).
-        # Never send freeform optionId — Kimi treats it as dismissed.
-        fallback = self._kimi_first_q0_option_id(options)
-        if fallback:
-            self.file_log(
-                f"ask_user unmatched label={label!r} → fallback {fallback}")
-            if not extra:
-                self._pending_ask_followup = (
-                    self._kimi_followup_answers(questions, answers)
-                    or self._kimi_other_followup(questions, answers, label))
-            return {"outcome": {"outcome": "selected", "optionId": fallback}}
-
+        # Other / freeform is not a q0_opt. A fake first-option lied.
+        # outcomeToQuestionAnswer returns null for unknown ids (dismissed).
+        # fallback = self._kimi_first_q0_option_id(options)
+        # if fallback:
+        #     return {"outcome": {"outcome": "selected", "optionId": fallback}}
+        other = self._kimi_other_followup(questions, answers, label)
+        if other:
+            self._pending_ask_followup = other
+        self.file_log(f"ask_user unmatched label={label!r} → skip/cancel")
         if skip_id:
             return {"outcome": {
                 "outcome": "selected", "optionId": skip_id,
@@ -4770,10 +4865,15 @@ class AcpBridge(BaseBridge):
         )
 
     def _flush_ask_followup(self) -> None:
+        # Dead: interrupt+followup was the anti-pattern. Keep the helper
+        # for tests that still parse the source.
         text = getattr(self, "_pending_ask_followup", None)
         self._pending_ask_followup = None
         if text:
-            self._inject_ask_user_followup(text)
+            # self._inject_ask_user_followup(text)
+            self.file_log(
+                f"ask_user follow-up dropped ({len(text)} chars); "
+                "elicitation listed labels only")
 
     @staticmethod
     def _kimi_answers_dropped(
@@ -4809,14 +4909,17 @@ class AcpBridge(BaseBridge):
         return False
 
     def _inject_ask_user_followup(self, text: str) -> None:
+        # Anti-pattern: session/cancel then a prose recap. listed Q1 is
+        # elicitation/create content {q0, q1, ...}. Other is unsupported.
         if not text or not str(text).strip():
             return
-        send_notification("notification_wake", {
-            "wake_prompt": str(text).strip(),
-            "display_message": "AskUserQuestion answers",
-            "interrupt": True,
-        })
-        self.file_log(f"ask_user follow-up injected ({len(text)} chars)")
+        # send_notification("notification_wake", {
+        #     "wake_prompt": str(text).strip(),
+        #     "display_message": "AskUserQuestion answers",
+        #     "interrupt": True,
+        # })
+        self.file_log(
+            f"ask_user follow-up NOT injected ({len(text)} chars)")
 
     @staticmethod
     def _match_option_id_for_label(options: list, label: str) -> str:
@@ -5663,10 +5766,17 @@ class AcpBridge(BaseBridge):
         })
 
     def _should_synth_terminal_ui(self) -> bool:
-        """True when Kimi is using terminal/* without session/update tool_call.
+        """Kimi-only: terminal/* with no session/update tool_call.
 
-        When tool_call is also streaming, synthesizing would double-paint Bash.
+        Grok always streams tool_call first; synthesizing doubles ☐ next to ⚙.
+        Live `/tmp/grok_bridge.93131.log`: create paired the execute then
+        still synth'd because spawn awaited >1.5s past `_last_session_tool_ts`.
         """
+        if getattr(self, "BACKEND_NAME", "") != "kimi":
+            return False
+        pending = getattr(self, "_pending_execute_ids", None) or []
+        if pending:
+            return False
         last = float(getattr(self, "_last_session_tool_ts", 0) or 0)
         return (time.time() - last) > 1.5
 
@@ -5739,14 +5849,19 @@ class AcpBridge(BaseBridge):
 
         # Kimi often runs tools ONLY via terminal/* with zero session/update
         # tool_call — host UI then shows empty "waiting" while agent is busy.
-        # Synthesize Bash rows when no recent session tool stream.
-        if self._should_synth_terminal_ui():
+        # Skip when this create already paired to a streamed tool_call (Grok
+        # timeout:0 paints ⚙ then create — synth was the leftover ☐ Bash).
+        paired = slot.get("tool_use_id")
+        already = paired and paired in getattr(self, "_tool_ids_emitted", set())
+        if already:
+            self.file_log(f"terminal/create {tid} paired {paired}; skip synth")
+        elif self._should_synth_terminal_ui():
             host_id = f"term-ui-{tid}"
             slot["host_tool_id"] = host_id
             self._host_emit_tool_use(
                 host_id, "Bash",
                 {"command": cmd_show or str(cmd)[:240]},
-                background=False,
+                background=bool(slot.get("bg")),
             )
             self.file_log(f"synth host Bash for {tid} (no session tool_call)")
 
@@ -5875,10 +5990,16 @@ class AcpBridge(BaseBridge):
         """⚙ only for this execute's explicit detach or native kimi detached."""
         eid = self._take_pending_execute_id()
         inp = (self._tool_inputs_by_id.get(eid) or {}) if eid else {}
+        grok_timeout0 = (
+            getattr(self, "BACKEND_NAME", "") == "grok"
+            and inp.get("timeout") in (0, 0.0)
+        )
         explicit = bool(
             eid and (
                 inp.get("run_in_background") is True
                 or inp.get("detached") is True
+                or inp.get("background") is True
+                or grok_timeout0
                 or eid in self._bg_tool_ids
             )
         )
@@ -5933,12 +6054,20 @@ class AcpBridge(BaseBridge):
             return {"exitCode": None, "signal": "SIGTERM"}
         # kimi-code AcpTerminalProcess: exitCode ?? -1. A null exit is
         # "killed", then ProcessTask fails and terminal/release kills the
-        # still-running command. wait_for_exit MUST stay pending until the
-        # process actually exits. Dispatch is create_task so this does not
-        # block the ACP reader. session/prompt already returned for
-        # run_in_background; ⚙ clears on real exit via wait_and_close.
-        # if slot.get("bg") and slot.get("exit_status") is None:
-        #     return {"exitCode": None, "signal": None}
+        # still-running command. Kimi wait_for_exit MUST stay pending until
+        # the process actually exits. Grok timeout:0 is the opposite: the
+        # agent still issues wait_for_exit, and holding it blocks the turn
+        # (live term_6820e17b8a: bg=True, wait until interrupt SIGTERM).
+        # Ack 0 without setting slot.exit_status; release detaches.
+        if (
+            slot.get("bg")
+            and slot.get("exit_status") is None
+            and getattr(self, "BACKEND_NAME", "") == "grok"
+        ):
+            self.file_log(
+                f"terminal/wait_for_exit {tid} grok bg ack "
+                f"(process still running cmd={slot.get('cmd')!r})")
+            return {"exitCode": 0, "signal": None}
         reader = slot.get("reader")
         timeout = self.terminal_wait_timeout_s
         if reader is not None and not reader.done():

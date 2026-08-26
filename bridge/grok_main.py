@@ -90,10 +90,14 @@ class GrokBridge(AcpBridge):
             "composer-2.5": "grok-composer-2.5-fast",
             "deepseek-v4-pro": "deepseek-v4-pro",
             "deepseek-v4-flash": "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp": "deepseek-v4-flash-vision-exp",
             "deepseek-pro": "deepseek-v4-pro",
             "deepseek-flash": "deepseek-v4-flash",
+            "deepseek-flash-vision": "deepseek-v4-flash-vision-exp",
             "ds-pro": "deepseek-v4-pro",
             "ds-flash": "deepseek-v4-flash",
+            "ds-flash-vision": "deepseek-v4-flash-vision-exp",
+            "ds-vision": "deepseek-v4-flash-vision-exp",
         }
     # Grok Build tool ids + rawInput.variant values → Claude formatters.
     # Prefer _meta.x.ai/tool.name when present; variants are a common fallback.
