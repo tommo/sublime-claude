@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import uuid as uuidlib
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from base import BaseBridge
@@ -41,11 +42,54 @@ _ANSI_ESCAPE_RE = re.compile(
 )
 
 
+@dataclass
+class _AcpCall:
+    """One ACP toolCallId. Per-call state lives here, not sidecar maps."""
+    id: str
+    name: str = ""
+    input: Dict[str, Any] = field(default_factory=dict)
+    title: str = ""
+    background: bool = False
+    emitted: bool = False
+    result_sent: bool = False
+
+    def merge_input(self, extra: Optional[dict]) -> dict:
+        if extra:
+            self.input = {**self.input, **extra}
+        return self.input
+
+    def set_name(self, name: Optional[str]) -> str:
+        if name and name != "tool":
+            self.name = name
+        return self.name or name or "tool"
+
+    def close(self) -> None:
+        """Result painted; keep the object so late updates don't reopen."""
+        self.result_sent = True
+        self.emitted = False
+        self.background = False
+
+
 def strip_ansi(text: str) -> str:
     """Remove ANSI color/style codes from tool/terminal text."""
     if not text or "\x1b" not in text:
         return text or ""
     return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def retain_terminal_tail(text: str, limit: int) -> str:
+    """ACP outputByteLimit: drop the prefix, keep the last `limit` UTF-8 bytes."""
+    if limit <= 0:
+        return ""
+    if not text:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    start = len(raw) - limit
+    while start < len(raw) and raw[start] & 0xC0 == 0x80:
+        start += 1
+    return raw[start:].decode("utf-8")
 
 
 def _acp_is_compact_text(text: str) -> bool:
@@ -158,16 +202,10 @@ class AcpBridge(BaseBridge):
         self.agent_capabilities: Dict[str, Any] = {}
         self.negotiated_protocol_version: int = 1
         self._terminals: Dict[str, Dict[str, Any]] = {}
-        # Generic ACP bg: tool_use ids marked ⚙ + terminalId → job.
-        # Kimi bash-*.json tracking lives on KimiBgMixin, not here.
-        self._bg_tool_ids: set = set()
+        self._calls: Dict[str, _AcpCall] = {}
         self._terminal_bg: Dict[str, Dict[str, Any]] = {}
         self._bg_notified_tasks: set = set()
         self._bg_notified_tools: set = set()
-        # toolCallIds already shown as tool_use (avoid duplicate ☐ rows).
-        self._tool_ids_emitted: set = set()
-        # toolCallIds already closed with tool_result (avoid a second ✔ row).
-        self._tool_results_sent: set = set()
         # Secondary ExitPlanMode/… toolCallId → primary open id (one UI row).
         self._tool_id_alias: Dict[str, str] = {}
         self._loading_session: bool = False
@@ -187,6 +225,9 @@ class AcpBridge(BaseBridge):
         self._prompt_cancelled: bool = False
         self._prompt_fut: Optional[asyncio.Future] = None
         self._prompt_acp_id: Optional[int] = None
+        # Grok promptId of the host session/prompt RPC. Self-wake uses a
+        # different id (task-completed-*); leftover_end only for those.
+        self._host_prompt_id: Optional[str] = None
         self._query_lock: Optional[asyncio.Lock] = None
         # True from first cancel notify until query fully settles — blocks
         # spam session/cancel (Grok ChatStateActor dies on cancel-after-done).
@@ -196,13 +237,10 @@ class AcpBridge(BaseBridge):
         self._pending_ask_followup: Optional[str] = None
         # Grok scheduler: track next fire for loop banner / wakes.
         self._schedule_next_fire: Optional[float] = None
-        # toolCallId → last known input (completed updates often omit rawInput).
-        self._tool_inputs_by_id: Dict[str, dict] = {}
-        # toolCallId → normalized name (completed updates often omit title/_meta).
-        self._tool_names_by_id: Dict[str, str] = {}
         self._last_execute_id: Optional[str] = None
         self._pending_execute_ids: List[str] = []
         self._last_bg_tool_id: Optional[str] = None
+        self._orphan_turn_notified: bool = False
         self._agent_exited: bool = False
         # Client-side backup timers when host does not inject scheduled prompts.
         # task_id (or toolCallId) → asyncio.Task
@@ -246,6 +284,24 @@ class AcpBridge(BaseBridge):
         if self._acp_write_lock is None:
             self._acp_write_lock = asyncio.Lock()
         return self._acp_write_lock
+
+    def _ensure_call(self, tid: Optional[str]) -> Optional[_AcpCall]:
+        if not tid:
+            return None
+        calls = getattr(self, "_calls", None)
+        if calls is None:
+            self._calls = {}
+            calls = self._calls
+        c = calls.get(tid)
+        if c is None:
+            c = _AcpCall(id=tid)
+            calls[tid] = c
+        return c
+
+    def _call(self, tid: Optional[str]) -> Optional[_AcpCall]:
+        if not tid:
+            return None
+        return (getattr(self, "_calls", None) or {}).get(tid)
 
     # Tools auto-approved under acceptEdits (file + search), matching Claude
     # Code's "accept edits" posture — Bash still prompts unless listed in
@@ -668,9 +724,17 @@ class AcpBridge(BaseBridge):
                 self.file_log(
                     f"← acp {method}: {json.dumps(params)[:600]}")
             elif method in (
+                "x.ai/session/prompt_complete",
+                "_x.ai/session/prompt_complete",
+            ):
+                # Host-driven session/prompt only. Self-wake is internal
+                # SessionCommand::Prompt — closer is turn_completed below.
+                self.file_log(
+                    f"← acp {method}: {json.dumps(params)[:400]}")
+                self._handle_grok_turn_end(params)
+            elif method in (
                 "x.ai/session/update", "_x.ai/session/update",
             ):
-                # Grok may nest schedule lifecycle under x.ai/session/update.
                 if self._is_foreign_session(params):
                     self._ingest_child_session(params)
                     self._note_foreign_session_drop(method, params)
@@ -679,11 +743,59 @@ class AcpBridge(BaseBridge):
                     f"← acp {method}: {json.dumps(params)[:600]}")
                 upd = params.get("update") or params
                 if isinstance(upd, dict):
-                    self._handle_schedule_lifecycle(upd)
+                    kind = str(upd.get("sessionUpdate") or "")
+                    if kind in ("turn_completed", "TurnCompleted"):
+                        # Durable closer for synthetic auto-wake (no RPC).
+                        self._handle_grok_turn_end(params, upd)
+                    else:
+                        self._handle_schedule_lifecycle(upd)
             elif method and self._is_foreign_session(params):
                 self._ingest_child_session(params)
                 self._note_foreign_session_drop(method, params)
             # Other parent notifications (_x.ai/*, etc.) are intentionally ignored.
+
+    def _handle_grok_turn_end(self, params: dict, upd: dict = None) -> None:
+        """Closer for Grok turns that have no host session/prompt RPC.
+
+        Host-driven prompt: RPC result is the closer. prompt_complete and
+        turn_completed for that promptId are ignored (MvpAgent emits
+        prompt_complete only from ACP handle_prompt). Self-wake is an
+        internal SessionCommand::Prompt — closer is `_x.ai/session/update`
+        turn_completed (prompt_id like task-completed-<term>).
+        """
+        src = upd if isinstance(upd, dict) else {}
+        pid = str(
+            src.get("prompt_id")
+            or src.get("promptId")
+            or params.get("promptId")
+            or params.get("prompt_id")
+            or ""
+        )
+        pf = getattr(self, "_prompt_fut", None)
+        if pf is not None and not pf.done():
+            if pid:
+                self._host_prompt_id = pid
+            return
+        if pid and pid == getattr(self, "_host_prompt_id", None):
+            self.file_log(f"grok turn_end skip host pid={pid}")
+            return
+        self._orphan_turn_notified = False
+        stop = (
+            src.get("stop_reason")
+            or src.get("stopReason")
+            or params.get("stopReason")
+            or params.get("stop_reason")
+            or "end_turn"
+        )
+        self.file_log(f"grok turn_end leftover pid={pid or '-'} stop={stop}")
+        send_notification("message", {
+            "type": "result",
+            "leftover_end": True,
+            "session_id": self.session_id or "",
+            "duration_ms": 0,
+            "is_error": False,
+            "stop_reason": stop,
+        })
 
     def _acp_id(self) -> int:
         self.next_acp_id += 1
@@ -812,7 +924,8 @@ class AcpBridge(BaseBridge):
             if not slot:
                 continue
             slot["tool_use_id"] = tool_use_id
-            inp = self._tool_inputs_by_id.get(tool_use_id) or {}
+            call = self._call(tool_use_id)
+            inp = call.input if call else {}
             desc = inp.get("description") or inp.get("title") or ""
             if desc:
                 slot["description"] = desc
@@ -918,6 +1031,20 @@ class AcpBridge(BaseBridge):
             self._prompt_cancelled and host_prompt_live))
         # After user interrupt: drop *new* tool starts / leftover prose.
         # Still accept tool_call_update completions so already-open rows settle.
+        if (
+            not host_prompt_live
+            and not suppress
+            and kind in ("tool_call", "agent_message_chunk")
+            and getattr(self, "BACKEND_NAME", "") == "grok"
+            and not getattr(self, "_orphan_turn_notified", False)
+        ):
+            self._orphan_turn_notified = True
+            self.file_log(f"grok orphan turn start kind={kind}")
+            send_notification("message", {
+                "type": "system",
+                "subtype": "agent_continue",
+                "data": {"reason": kind},
+            })
         if suppress and kind in (
             "tool_call", "agent_message_chunk", "agent_thought_chunk",
         ):
@@ -953,11 +1080,11 @@ class AcpBridge(BaseBridge):
                     f"name={tool_name!r} id={tid!r}")
                 return
             if tid:
+                call = self._ensure_call(tid)
                 if tool_name and tool_name != "tool":
-                    self._tool_names_by_id[tid] = tool_name
+                    call.name = tool_name
                 if tool_input:
-                    prev = self._tool_inputs_by_id.get(tid) or {}
-                    self._tool_inputs_by_id[tid] = {**prev, **tool_input}
+                    call.merge_input(tool_input)
             # Kimi streams tool_call with empty input before title is useful;
             # still emit when we have a real name so UI is not "☐ tool".
             if tool_name == "tool" and not tool_input:
@@ -976,20 +1103,20 @@ class AcpBridge(BaseBridge):
             if tool_name in (
                 "ExitPlanMode", "EnterPlanMode", "ask_user", "AskUserQuestion",
             ) and tid:
-                for oid, oname in list(self._tool_names_by_id.items()):
-                    if (self._same_modal_tool(oname, tool_name) and oid != tid
-                            and oid in self._tool_ids_emitted):
+                for oid, oc in list((getattr(self, "_calls", None) or {}).items()):
+                    if (self._same_modal_tool(oc.name, tool_name) and oid != tid
+                            and oc.emitted):
                         if not hasattr(self, "_tool_id_alias"):
                             self._tool_id_alias = {}
                         self._tool_id_alias[tid] = oid
-                        self._tool_names_by_id[tid] = tool_name
+                        self._ensure_call(tid).name = tool_name
                         if tool_input:
-                            prev = self._tool_inputs_by_id.get(oid) or {}
-                            self._tool_inputs_by_id[oid] = {**prev, **tool_input}
+                            self._ensure_call(oid).merge_input(tool_input)
                         self.file_log(
                             f"alias {tool_name} {tid} → open {oid} (no 2nd row)")
                         return
-            self._tool_ids_emitted.add(tid)
+            call = self._ensure_call(tid)
+            call.emitted = True
             self._note_shell_execute(tid, tool_name)
             is_spawn = self._is_subagent_spawn(tool_name, upd, tool_input)
             is_bg = is_spawn or self._looks_like_background_tool(
@@ -1002,12 +1129,9 @@ class AcpBridge(BaseBridge):
                 is_spawn = False
             if is_bg and tid and isinstance(tool_input, dict):
                 tool_input = {**tool_input, "run_in_background": True}
-                self._tool_inputs_by_id[tid] = {
-                    **(self._tool_inputs_by_id.get(tid) or {}),
-                    **tool_input,
-                }
+                call.merge_input(tool_input)
             if is_bg and tid:
-                self._bg_tool_ids.add(tid)
+                call.background = True
             self._emit_tool_use(
                 tid, tool_name, tool_input, background=bool(is_bg))
         elif kind == "tool_call_update":
@@ -1021,14 +1145,16 @@ class AcpBridge(BaseBridge):
             # Completed updates often strip title/_meta → name becomes "tool".
             # Recover the name we saw on the open tool_call / earlier update.
             if (not tool_name or tool_name == "tool") and tid:
-                tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
+                oc = self._call(tid)
+                tool_name = (oc.name if oc and oc.name else None) or tool_name or "tool"
             elif tid and tool_name and tool_name != "tool":
-                self._tool_names_by_id[tid] = tool_name
+                self._ensure_call(tid).name = tool_name
             if status not in ("completed", "failed"):
                 self._note_shell_execute(tid, tool_name)
             # Lifecycle rows that never opened a real tool — drop entirely
+            oc = self._call(tid) if tid else None
             if (self._should_suppress_tool_row(upd, tool_name)
-                    and (not tid or tid not in self._tool_ids_emitted)):
+                    and (not tid or not (oc and oc.emitted))):
                 self.file_log(
                     f"suppress tool_call_update noise: "
                     f"title={upd.get('title')!r} name={tool_name!r} "
@@ -1037,7 +1163,7 @@ class AcpBridge(BaseBridge):
             # Ext method already closed this id (ask_user / ExitPlanMode).
             # Re-emitting tool_use after ✔ opens a second ☐ (plugin only
             # upserts PENDING rows).
-            if tid and tid in getattr(self, "_tool_results_sent", set()):
+            if tid and oc and oc.result_sent:
                 return
             # Grok: bare tool_call then richer update. Emit tool_use at most
             # once per id (plugin upserts); re-emitting created a second ☐
@@ -1045,7 +1171,7 @@ class AcpBridge(BaseBridge):
             enriched = self._tool_input_from_update(upd, tool_name)
             tool_name, enriched = self._reclassify_read_dir(tool_name, enriched)
             if tid and tool_name and tool_name != "tool":
-                self._tool_names_by_id[tid] = tool_name
+                self._ensure_call(tid).name = tool_name
             # Compare against stored args BEFORE merge — otherwise
             # should_repaint sees old_string already applied and skips
             # (Kimi Edit JSON-drip then rawInput never painted a diff).
@@ -1053,10 +1179,10 @@ class AcpBridge(BaseBridge):
                 status in ("completed", "failed")
                 or self._should_repaint_tool(tid, upd, enriched)
             )
-            if tid and enriched:
-                prev = self._tool_inputs_by_id.get(tid) or {}
-                self._tool_inputs_by_id[tid] = {**prev, **enriched}
-            if tid not in self._tool_ids_emitted:
+            call = self._ensure_call(tid) if tid else None
+            if call and enriched:
+                call.merge_input(enriched)
+            if not call or not call.emitted:
                 # Skip anonymous early stream chunks (Kimi JSON drip without title)
                 if tool_name == "tool" and status not in ("completed", "failed"):
                     return
@@ -1071,67 +1197,66 @@ class AcpBridge(BaseBridge):
                     # Skip opening rows for lifecycle titles at completed
                     if self._should_suppress_tool_row(upd, tool_name):
                         return
-                    self._tool_ids_emitted.add(tid)
+                    if call:
+                        call.emitted = True
                     bg = bool(
-                        tid in self._bg_tool_ids
+                        (call and call.background)
                         or self._looks_like_background_tool(upd, enriched)
                     )
-                    if bg and tid:
-                        self._bg_tool_ids.add(tid)
+                    if bg and call:
+                        call.background = True
                     self._emit_tool_use(
                         tid, tool_name,
-                        enriched or self._tool_inputs_by_id.get(tid) or {},
+                        enriched or (call.input if call else {}),
                         background=bg)
             elif tool_name != "tool" or (enriched and status not in ("completed", "failed")):
                 # Enrich open row (same id → output.tool upserts). Prefer real name.
                 # kimi-cli streams arg JSON one token at a time as tool_call_update;
                 # only re-paint when title/args became usable (not every drip).
                 enrich_name = tool_name
-                if enrich_name == "tool" and tid:
-                    enrich_name = self._tool_names_by_id.get(tid) or "tool"
+                if enrich_name == "tool" and call and call.name:
+                    enrich_name = call.name
                 if not self._should_suppress_tool_row(upd, enrich_name):
                     if need_paint:
                         bg = bool(
-                            tid in self._bg_tool_ids
+                            call.background
                             or self._looks_like_background_tool(upd, enriched)
                         )
-                        if bg and tid:
-                            self._bg_tool_ids.add(tid)
+                        if bg:
+                            call.background = True
                         self._emit_tool_use(
                             tid, enrich_name,
-                            enriched or self._tool_inputs_by_id.get(tid) or {},
+                            enriched or call.input,
                             background=bg)
             # Cache run_in_background for create pairing. Do not ⚙ / do not
             # drop pending here — that left ⚙ unbound when create arrived
             # later (or never), so the row never cleared.
             is_bg = bool(
-                tid and self._is_shell_tool_name(tool_name) and (
-                    tid in self._bg_tool_ids
+                call and self._is_shell_tool_name(tool_name) and (
+                    call.background
                     or self._looks_like_background_tool(upd, enriched)
                 )
             )
-            if is_bg and tid:
-                cached = dict(self._tool_inputs_by_id.get(tid) or {})
+            if is_bg and call:
                 if isinstance(enriched, dict):
-                    cached.update(enriched)
-                cached["run_in_background"] = True
-                self._tool_inputs_by_id[tid] = cached
+                    call.merge_input(enriched)
+                call.merge_input({"run_in_background": True})
                 for term_id in self._terminal_ids_from_update(upd):
                     slot = self._terminals.get(term_id)
                     if slot is None:
                         continue
-                    if tid not in self._bg_tool_ids:
+                    if not call.background:
                         self._register_bg_tool(
-                            tid, cached, str(upd.get("title") or ""))
+                            tid, call.input, str(upd.get("title") or ""))
                     self._bind_terminal_to_bg_tool(term_id, tid)
                     slot["bg"] = True
                     slot["tool_use_id"] = tid
 
             if status in ("completed", "failed"):
-                if tid and tid in getattr(self, "_tool_results_sent", set()):
+                if call and call.result_sent:
                     return
                 # No open row for this id → nothing to close (noise already dropped)
-                if tid not in self._tool_ids_emitted and not self._tool_update_has_substance(upd):
+                if (not call or not call.emitted) and not self._tool_update_has_substance(upd):
                     # may have been suppressed at open
                     if self._should_suppress_tool_row(upd, tool_name) or tool_name == "tool":
                         return
@@ -1142,7 +1267,7 @@ class AcpBridge(BaseBridge):
                 if tool_name in ("Edit", "Write"):
                     # Kimi completed is "Replaced 1 occurrence" text — no
                     # type=diff. Re-emit stored old/new as unified_diff.
-                    stored = dict(self._tool_inputs_by_id.get(tid) or {})
+                    stored = dict(call.input if call else {})
                     payload = {**stored, **(enriched or {})}
                     if diff_input:
                         payload.update(diff_input)
@@ -1152,13 +1277,13 @@ class AcpBridge(BaseBridge):
                             or payload.get("new_string")
                             or payload.get("file_path")
                             or payload.get("content")):
-                        if tid not in self._tool_ids_emitted:
-                            self._tool_ids_emitted.add(tid)
+                        if call:
+                            call.emitted = True
                         self._emit_tool_use(
                             tid, tool_name, payload,
-                            background=bool(tid and tid in self._bg_tool_ids))
+                            background=bool(call and call.background))
                 # Bind terminal ids on completed payload (Kimi attaches them here)
-                if tid and tid in self._bg_tool_ids:
+                if call and call.background:
                     for term_id in self._terminal_ids_from_update(upd):
                         self._bind_terminal_to_bg_tool(term_id, tid)
 
@@ -1197,8 +1322,8 @@ class AcpBridge(BaseBridge):
                 # ACP-terminal / subagent background: tool_result is only an
                 # ack (host keeps ⚙ until task_notification).
                 if (
-                    tid
-                    and tid in self._bg_tool_ids
+                    call
+                    and call.background
                     and status == "completed"
                     and (
                         self._is_shell_tool_name(tool_name)
@@ -1212,14 +1337,14 @@ class AcpBridge(BaseBridge):
                         "content": text or "background",
                         "is_error": False,
                     })
-                    # Keep name/input maps until process / child exit
+                    # Keep the call until process / child exit
                     return
-                if tid and tid in self._bg_tool_ids and (
+                if call and call.background and (
                         is_task_poll or not (
                             self._is_shell_tool_name(tool_name)
                             or self._is_subagent_tool_name(tool_name))):
                     # Drop mistaken bg mark so normal tool_result can close the row
-                    self._bg_tool_ids.discard(tid)
+                    call.background = False
 
                 send_notification("message", {
                     "type": "tool_result",
@@ -1227,9 +1352,8 @@ class AcpBridge(BaseBridge):
                     "content": text,
                     "is_error": is_error,
                 })
-                if tid:
-                    self._tool_results_sent.add(tid)
-                self._tool_ids_emitted.discard(tid)
+                if call:
+                    call.close()
                 # Drop aliases that pointed at this primary
                 for alias, primary in list(
                         getattr(self, "_tool_id_alias", {}).items()):
@@ -1240,16 +1364,13 @@ class AcpBridge(BaseBridge):
                     "scheduler_delete", "CronDelete", "SchedulerDelete",
                 ):
                     # completed updates often drop rawInput — use cached input.
-                    cached = self._tool_inputs_by_id.get(tid) or {}
+                    cached = call.input if call else {}
                     merged = {**cached, **(enriched or {})}
                     self.file_log(
                         f"scheduler complete name={tool_name} tid={tid} "
                         f"keys={list(merged.keys())}")
                     self._note_scheduler_tool_result(
                         tool_name, merged, text, tool_call_id=tid or "")
-                self._tool_inputs_by_id.pop(tid, None)
-                self._tool_names_by_id.pop(tid, None)
-                self._bg_tool_ids.discard(tid)
         elif kind == "user_message_chunk":
             # Agents (notably Grok) re-broadcast the user prompt. The plugin
             # already renders ◎ <prompt> — do not double-print as text_delta.
@@ -1273,9 +1394,10 @@ class AcpBridge(BaseBridge):
             "scheduled_task_deleted",
         ):
             self._handle_schedule_lifecycle(upd)
-        # turn_completed after a finished prompt is not a second result.
-        # Firing leftover_end here double-closed every Grok turn (@done +
-        # ⚠ turn failed when stdout then dropped).
+        elif kind in ("turn_completed", "TurnCompleted"):
+            # Host promptId is ignored inside _handle_grok_turn_end (RPC
+            # already closed that turn). Synthetic self-wake ids close.
+            self._handle_grok_turn_end(params, upd)
 
     def _forward_load_replay(self, params: dict) -> None:
         """Paint session/load history. Kimi replays before load settles.
@@ -1337,12 +1459,12 @@ class AcpBridge(BaseBridge):
             if tool_name == "tool" and not tool_input:
                 return
             if tid:
+                call = self._ensure_call(tid)
                 if tool_name and tool_name != "tool":
-                    self._tool_names_by_id[tid] = tool_name
+                    call.name = tool_name
                 if tool_input:
-                    prev = self._tool_inputs_by_id.get(tid) or {}
-                    self._tool_inputs_by_id[tid] = {**prev, **tool_input}
-                self._tool_ids_emitted.add(tid)
+                    call.merge_input(tool_input)
+                call.emitted = True
             # send_notification("message", {
             #     "type": "tool_use",
             #     "id": tid,
@@ -1357,24 +1479,25 @@ class AcpBridge(BaseBridge):
             tid = self._resolve_tool_id(upd.get("toolCallId"))
             tool_name = self._normalize_tool_name(upd)
             if (not tool_name or tool_name == "tool") and tid:
-                tool_name = self._tool_names_by_id.get(tid) or tool_name or "tool"
+                oc = self._call(tid)
+                tool_name = (oc.name if oc and oc.name else None) or tool_name or "tool"
             elif tid and tool_name and tool_name != "tool":
-                self._tool_names_by_id[tid] = tool_name
+                self._ensure_call(tid).name = tool_name
             enriched = self._tool_input_from_update(upd, tool_name)
             tool_name, enriched = self._reclassify_read_dir(tool_name, enriched)
-            if tid and enriched:
-                prev = self._tool_inputs_by_id.get(tid) or {}
-                self._tool_inputs_by_id[tid] = {**prev, **enriched}
-            if tid not in self._tool_ids_emitted and (
+            call = self._ensure_call(tid) if tid else None
+            if call and enriched:
+                call.merge_input(enriched)
+            if call and not call.emitted and (
                     enriched or upd.get("title")
                     or status in ("completed", "failed")):
                 if not self._should_suppress_tool_row(upd, tool_name):
-                    self._tool_ids_emitted.add(tid)
+                    call.emitted = True
                     # send_notification("message", {
                     #     "type": "tool_use",
                     #     "id": tid,
                     #     "name": tool_name,
-                    #     "input": enriched or self._tool_inputs_by_id.get(tid) or {},
+                    #     "input": enriched or call.input,
                     #     "background": False,
                     #     "replay": True,
                     # })
@@ -1387,7 +1510,8 @@ class AcpBridge(BaseBridge):
                 #     "is_error": status == "failed",
                 #     "replay": True,
                 # })
-                self._tool_ids_emitted.discard(tid)
+                if call:
+                    call.emitted = False
 
     # ── Scheduler / /loop (Grok native) ────────────────────────────────
 
@@ -2045,17 +2169,16 @@ class AcpBridge(BaseBridge):
         if not tid:
             return True
         title = (upd.get("title") or "").strip()
-        prev_title = getattr(self, "_tool_titles_by_id", {}).get(tid) or ""
-        if not hasattr(self, "_tool_titles_by_id"):
-            self._tool_titles_by_id = {}
+        call = self._ensure_call(tid)
+        prev_title = call.title or ""
         if title and title != prev_title:
-            self._tool_titles_by_id[tid] = title
+            call.title = title
             # Prefer titles that gained a subtitle ("Bash: cmd") or Agent label
             if ":" in title or len(title) > len(prev_title) + 2:
                 return True
+        prev = call.input
         # Full rawInput or complete content JSON → paint once usable
         if isinstance(upd.get("rawInput"), dict) and upd.get("rawInput"):
-            prev = self._tool_inputs_by_id.get(tid) or {}
             if not prev or any(
                     enriched.get(k) and enriched.get(k) != prev.get(k)
                     for k in ("file_path", "path", "command", "pattern",
@@ -2063,7 +2186,6 @@ class AcpBridge(BaseBridge):
                               "old_string", "new_string", "unified_diff")):
                 return True
         if self._parse_content_args_json(upd):
-            prev = self._tool_inputs_by_id.get(tid) or {}
             if not prev:
                 return True
             # Only if a display-critical field newly appeared or grew a lot
@@ -2252,7 +2374,8 @@ class AcpBridge(BaseBridge):
     def _emit_tool_use(self, tid, name, tool_input, background=False) -> None:
         inp = dict(tool_input or {})
         if name in ("Edit", "Write"):
-            stored = self._tool_inputs_by_id.get(tid) or {}
+            stored = self._call(tid)
+            stored = stored.input if stored else {}
             inp = self._edit_ui_input({**stored, **inp}, name)
         send_notification("message", {
             "type": "tool_use",
@@ -2282,6 +2405,11 @@ class AcpBridge(BaseBridge):
         if isinstance(raw, str):
             return raw
         if isinstance(raw, dict):
+            result = raw.get("Result") or raw.get("result")
+            if isinstance(result, dict):
+                body = result.get("output") or result.get("stdout") or ""
+                if body:
+                    return str(body)
             if tool_name == "Bash":
                 stdout = raw.get("stdout") or ""
                 stderr = raw.get("stderr") or ""
@@ -2450,9 +2578,9 @@ class AcpBridge(BaseBridge):
             "output_file": output_file,
         })
         if tool_use_id:
-            self._bg_tool_ids.discard(tool_use_id)
-            self._tool_inputs_by_id.pop(tool_use_id, None)
-            self._tool_names_by_id.pop(tool_use_id, None)
+            call = self._call(tool_use_id)
+            if call:
+                call.background = False
 
     _SHELL_BG_NAMES = frozenset({
         "Bash", "Shell", "execute", "run_terminal_command", "tool",
@@ -2575,6 +2703,9 @@ class AcpBridge(BaseBridge):
         """Remember this shell tool so the next terminal/create can pair to it."""
         if not tid or not self._is_shell_tool_name(tool_name):
             return
+        call = self._ensure_call(tid)
+        if tool_name and tool_name != "tool":
+            call.name = tool_name
         self._last_execute_id = tid
         pending = getattr(self, "_pending_execute_ids", None)
         if pending is None:
@@ -2667,7 +2798,8 @@ class AcpBridge(BaseBridge):
         tlow = (title or "").lower()
         if "reading output of task" in tlow or tlow.startswith("taskoutput"):
             return
-        name = self._tool_names_by_id.get(tool_use_id) or "Bash"
+        call = self._ensure_call(tool_use_id)
+        name = call.name or "Bash"
         is_sub = self._is_subagent_tool_name(name)
         # Never promote Read / TaskOutput / etc. to ⚙ background
         if not self._is_shell_tool_name(name) and not is_sub:
@@ -2675,10 +2807,10 @@ class AcpBridge(BaseBridge):
         if name == "tool":
             name = "Bash"
         emit_name = "Subagent" if is_sub else "Bash"
-        already = tool_use_id in self._bg_tool_ids
-        self._bg_tool_ids.add(tool_use_id)
+        already = call.background
+        call.background = True
         self._last_bg_tool_id = tool_use_id
-        inp = dict(tool_input or self._tool_inputs_by_id.get(tool_use_id) or {})
+        inp = dict(tool_input or call.input or {})
         if title and not inp.get("command") and not is_sub:
             cmd = title
             for prefix in (
@@ -2691,30 +2823,28 @@ class AcpBridge(BaseBridge):
             if cmd:
                 inp.setdefault("command", cmd)
         inp["run_in_background"] = True
-        self._tool_inputs_by_id[tool_use_id] = {
-            **(self._tool_inputs_by_id.get(tool_use_id) or {}),
-            **inp,
-        }
-        self._tool_names_by_id[tool_use_id] = emit_name
-        self._tool_ids_emitted.add(tool_use_id)
+        call.merge_input(inp)
+        call.name = emit_name
+        call.emitted = True
         if already:
             return
         send_notification("message", {
             "type": "tool_use",
             "id": tool_use_id,
             "name": emit_name,
-            "input": self._tool_inputs_by_id[tool_use_id],
+            "input": call.input,
             "background": True,
         })
 
     def _bind_terminal_to_bg_tool(self, terminal_id: str, tool_use_id: str) -> None:
         if not terminal_id or not tool_use_id:
             return
-        if tool_use_id not in self._bg_tool_ids:
+        call = self._call(tool_use_id)
+        if not call or not call.background:
             return
         if terminal_id in self._terminal_bg:
             return
-        cmd = (self._tool_inputs_by_id.get(tool_use_id) or {}).get("command", "")
+        cmd = call.input.get("command", "")
         task_id = f"acp-term-{terminal_id}"
         self._terminal_bg[terminal_id] = {
             "task_id": task_id,
@@ -2761,15 +2891,12 @@ class AcpBridge(BaseBridge):
 
     def _reset_conversation_local(self) -> None:
         """Drop turn-local maps that belong to the conversation being cleared."""
-        self._bg_tool_ids.clear()
+        (getattr(self, "_calls", None) or {}).clear()
+        self._calls = {}
         self._terminal_bg.clear()
         self._bg_notified_tasks.clear()
         self._bg_notified_tools.clear()
-        self._tool_ids_emitted.clear()
-        self._tool_results_sent.clear()
         self._tool_id_alias.clear()
-        self._tool_inputs_by_id.clear()
-        self._tool_names_by_id.clear()
         self._pending_execute_ids.clear()
         self._last_execute_id = None
         self._last_bg_tool_id = None
@@ -3518,6 +3645,7 @@ class AcpBridge(BaseBridge):
         self.pending[rid] = fut
         self._prompt_fut = fut
         self._prompt_acp_id = rid
+        self._orphan_turn_notified = False
         params = {"sessionId": self.session_id, "prompt": prompt_blocks}
         # Log without dumping multi-MB base64 image payloads
         def _summarize_block(b: dict) -> dict:
@@ -3582,6 +3710,17 @@ class AcpBridge(BaseBridge):
                     raise RuntimeError(
                         f"agent process exited during prompt (returncode={rc})")
             result = await fut
+            if isinstance(result, dict):
+                meta = result.get("_meta") if isinstance(
+                    result.get("_meta"), dict) else {}
+                pid = (
+                    (meta or {}).get("promptId")
+                    or (meta or {}).get("prompt_id")
+                    or result.get("promptId")
+                    or result.get("prompt_id")
+                )
+                if pid:
+                    self._host_prompt_id = str(pid)
             try:
                 self.file_log(
                     f"← acp session/prompt (id={rid}) result: "
@@ -4378,9 +4517,9 @@ class AcpBridge(BaseBridge):
         # Recover rawInput.questions from earlier tool_call_update (permission
         # payload often only has title + truncated content).
         tid = tool_call.get("toolCallId")
-        if tid and isinstance(self._tool_inputs_by_id.get(tid), dict):
-            prev = self._tool_inputs_by_id[tid]
-            for k, v in prev.items():
+        prev_call = self._call(tid) if tid else None
+        if prev_call:
+            for k, v in prev_call.input.items():
                 tool_input.setdefault(k, v)
 
         # EnterPlanMode: notify host, allow (Claude bridge parity).
@@ -5082,9 +5221,10 @@ class AcpBridge(BaseBridge):
 
         # session/update already opened this id — do not paint a second ☐.
         tool_call_id = params.get("toolCallId") or f"ask_{self.permission_id + 1}"
-        if tool_call_id not in self._tool_ids_emitted:
-            self._tool_ids_emitted.add(tool_call_id)
-            self._tool_names_by_id[tool_call_id] = "ask_user"
+        ask_call = self._ensure_call(tool_call_id)
+        if not ask_call.emitted:
+            ask_call.emitted = True
+            ask_call.name = "ask_user"
             send_notification("message", {
                 "type": "tool_use",
                 "id": tool_call_id,
@@ -5111,8 +5251,8 @@ class AcpBridge(BaseBridge):
 
         if answers is None:
             # User cancelled / interrupted the question UI.
-            if tool_call_id not in self._tool_results_sent:
-                self._tool_results_sent.add(tool_call_id)
+            if not ask_call.result_sent:
+                ask_call.close()
                 send_notification("message", {
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
@@ -5126,8 +5266,8 @@ class AcpBridge(BaseBridge):
 
         summary = "; ".join(
             f"{k}: {', '.join(v)}" for k, v in norm.items())
-        if tool_call_id not in self._tool_results_sent:
-            self._tool_results_sent.add(tool_call_id)
+        if not ask_call.result_sent:
+            ask_call.close()
             send_notification("message", {
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
@@ -5395,10 +5535,11 @@ class AcpBridge(BaseBridge):
             f"exit_plan_mode: toolCallId={tool_call_id!r} "
             f"plan_chars={len(plan_content)}")
 
-        if tool_call_id and tool_call_id not in self._tool_ids_emitted:
+        plan_call = self._ensure_call(tool_call_id) if tool_call_id else None
+        if plan_call and not plan_call.emitted:
             # session/update often already opened this id — don't second-paint
-            self._tool_ids_emitted.add(tool_call_id)
-            self._tool_names_by_id[tool_call_id] = "ExitPlanMode"
+            plan_call.emitted = True
+            plan_call.name = "ExitPlanMode"
             send_notification("message", {
                 "type": "tool_use",
                 "id": tool_call_id,
@@ -5482,8 +5623,8 @@ class AcpBridge(BaseBridge):
             )
         else:
             summary = "Continue planning"
-        if tool_call_id and tool_call_id not in self._tool_results_sent:
-            self._tool_results_sent.add(tool_call_id)
+        if plan_call and not plan_call.result_sent:
+            plan_call.close()
             send_notification("message", {
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
@@ -5714,7 +5855,7 @@ class AcpBridge(BaseBridge):
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.terminate()
-            except ProcessLookupError:
+            except (ProcessLookupError, AttributeError):
                 pass
         # Escalate after a beat if still alive (done by waiters).
 
@@ -5808,7 +5949,9 @@ class AcpBridge(BaseBridge):
         # shell / agent env has TERM=xterm-256color or FORCE_COLOR=1.
         apply_plain_terminal_env(env)
         # ACP outputByteLimit: honor request but hard-cap so one terminal
-        # cannot pin unbounded memory.
+        # cannot pin unbounded memory. Grok bash default is 20k
+        # (DEFAULT_TOOL_OUTPUT_CHARS); bg terminals bump this in
+        # _mark_terminal_bg so long editor logs are not frozen there.
         max_out = max(4096, self.terminal_output_max_bytes)
         raw_lim = params.get("outputByteLimit")
         try:
@@ -5845,14 +5988,15 @@ class AcpBridge(BaseBridge):
         self._mark_terminal_bg(tid, slot)
         self.file_log(
             f"terminal/create {tid} pid={proc.pid} shell={use_shell} "
-            f"bg={bool(slot.get('bg'))}")
+            f"bg={bool(slot.get('bg'))} limit={slot.get('limit')}")
 
         # Kimi often runs tools ONLY via terminal/* with zero session/update
         # tool_call — host UI then shows empty "waiting" while agent is busy.
         # Skip when this create already paired to a streamed tool_call (Grok
         # timeout:0 paints ⚙ then create — synth was the leftover ☐ Bash).
         paired = slot.get("tool_use_id")
-        already = paired and paired in getattr(self, "_tool_ids_emitted", set())
+        pc = self._call(paired) if paired else None
+        already = bool(pc and pc.emitted)
         if already:
             self.file_log(f"terminal/create {tid} paired {paired}; skip synth")
         elif self._should_synth_terminal_ui():
@@ -5866,32 +6010,32 @@ class AcpBridge(BaseBridge):
             self.file_log(f"synth host Bash for {tid} (no session tool_call)")
 
         async def drain(stream, key):
-            buf = []
-            total = 0
+            # ACP: when outputByteLimit is exceeded, truncate from the
+            # *beginning* (keep the tail). Prefix-cap froze Grok's
+            # reconstructed editor log at ~20k (startup) so the agent
+            # never saw shutdown.
+            raw = bytearray()
             try:
                 while True:
                     chunk = await stream.read(4096)
                     if not chunk:
                         break
-                    if total >= slot["limit"]:
+                    raw.extend(chunk)
+                    lim = int(slot.get("limit") or 0)
+                    if lim > 0 and len(raw) > lim:
                         slot["truncated"] = True
-                        continue
-                    if total + len(chunk) > slot["limit"]:
-                        slot["truncated"] = True
-                        remaining = slot["limit"] - total
-                        if remaining > 0:
-                            buf.append(
-                                chunk[:remaining].decode("utf-8", "replace"))
-                            total += remaining
-                        continue
-                    buf.append(chunk.decode("utf-8", "replace"))
-                    total += len(chunk)
+                        del raw[:len(raw) - lim]
+                        i = 0
+                        while i < len(raw) and raw[i] & 0xC0 == 0x80:
+                            i += 1
+                        if i:
+                            del raw[:i]
                     # Incremental: Kimi polls terminal/output while running;
                     # publishing only in finally left every poll empty.
-                    slot[key] = strip_ansi("".join(buf))
+                    slot[key] = strip_ansi(raw.decode("utf-8", "replace"))
             finally:
                 # Plain text for agent + plugin UI (no raw ESC sequences).
-                slot[key] = strip_ansi("".join(buf))
+                slot[key] = strip_ansi(bytes(raw).decode("utf-8", "replace"))
 
         async def wait_and_close():
             try:
@@ -5902,11 +6046,9 @@ class AcpBridge(BaseBridge):
                 code = await proc.wait()
                 slot["exit_status"] = self._exit_status_from_code(code)
             except asyncio.CancelledError:
-                if slot.get("detached"):
-                    if slot.get("exit_status") is None:
-                        slot["exit_status"] = {
-                            "exitCode": 0, "signal": None}
-                    raise
+                # # detach-keep used to stamp exitCode 0 here. That made
+                # # Grok's watch_for_exit treat the job as done
+                # # (xai-grok-shell-terminal/src/exit_watcher.rs).
                 self._kill_terminal_proc(proc)
                 code = None
                 try:
@@ -5941,8 +6083,8 @@ class AcpBridge(BaseBridge):
                             hid, out or f"exit {code}", is_error=is_err)
                     except Exception as e:
                         self.file_log(f"synth tool_result {tid}: {e}")
-                if slot.get("detached"):
-                    return
+                # if slot.get("detached"):
+                #     return
                 # Claude-compatible wake when host is already idle after end_turn
                 try:
                     self._emit_bg_terminal_complete(tid)
@@ -5957,6 +6099,10 @@ class AcpBridge(BaseBridge):
         slot = self._terminals.get(tid)
         if slot:
             out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
+            self.file_log(
+                f"terminal/output {tid} n={len(out)} "
+                f"exit={slot.get('exit_status')!r} "
+                f"truncated={bool(slot.get('truncated'))}")
             return {"output": out, "truncated": bool(slot["truncated"]),
                     "exitStatus": slot.get("exit_status")}
         child = self._child_sessions.get(tid)
@@ -5967,8 +6113,12 @@ class AcpBridge(BaseBridge):
             return self._child_output_payload(child)
         snap = self._detached_snaps.get(tid)
         if snap:
+            out = snap.get("output") or ""
+            self.file_log(
+                f"terminal/output {tid} snap n={len(out)} "
+                f"exit={snap.get('exitStatus')!r}")
             return {
-                "output": snap.get("output") or "",
+                "output": out,
                 "truncated": bool(snap.get("truncated")),
                 "exitStatus": snap.get("exitStatus"),
             }
@@ -5989,7 +6139,8 @@ class AcpBridge(BaseBridge):
     def _mark_terminal_bg(self, tid: str, slot: dict) -> None:
         """⚙ only for this execute's explicit detach or native kimi detached."""
         eid = self._take_pending_execute_id()
-        inp = (self._tool_inputs_by_id.get(eid) or {}) if eid else {}
+        call = self._call(eid) if eid else None
+        inp = call.input if call else {}
         grok_timeout0 = (
             getattr(self, "BACKEND_NAME", "") == "grok"
             and inp.get("timeout") in (0, 0.0)
@@ -6000,7 +6151,7 @@ class AcpBridge(BaseBridge):
                 or inp.get("detached") is True
                 or inp.get("background") is True
                 or grok_timeout0
-                or eid in self._bg_tool_ids
+                or (call and call.background)
             )
         )
         native = None
@@ -6018,9 +6169,15 @@ class AcpBridge(BaseBridge):
             return
         if not eid:
             eid = f"term-bg-{tid}"
+            call = self._call(eid)
         slot["bg"] = True
         slot["tool_use_id"] = eid
-        if eid not in self._bg_tool_ids:
+        cap = int(getattr(self, "terminal_output_max_bytes", 0) or 0)
+        if cap > 0:
+            cap = max(4096, cap)
+            if int(slot.get("limit") or 0) < cap:
+                slot["limit"] = cap
+        if not (call and call.background):
             self._register_bg_tool(
                 eid, inp if inp else {"command": slot.get("cmd")})
         self._bind_terminal_to_bg_tool(tid, eid)
@@ -6047,27 +6204,27 @@ class AcpBridge(BaseBridge):
                         "signal": es.get("signal")}
             snap = self._detached_snaps.get(tid)
             if snap:
-                es = snap.get("exitStatus") or {"exitCode": 0, "signal": None}
+                es = snap.get("exitStatus") or {
+                    "exitCode": None, "signal": "SIGTERM"}
                 return {"exitCode": es.get("exitCode"),
                         "signal": es.get("signal")}
             # Already released/killed (e.g. on interrupt) — report cancelled.
             return {"exitCode": None, "signal": "SIGTERM"}
-        # kimi-code AcpTerminalProcess: exitCode ?? -1. A null exit is
-        # "killed", then ProcessTask fails and terminal/release kills the
-        # still-running command. Kimi wait_for_exit MUST stay pending until
-        # the process actually exits. Grok timeout:0 is the opposite: the
-        # agent still issues wait_for_exit, and holding it blocks the turn
-        # (live term_6820e17b8a: bg=True, wait until interrupt SIGTERM).
-        # Ack 0 without setting slot.exit_status; release detaches.
-        if (
-            slot.get("bg")
-            and slot.get("exit_status") is None
-            and getattr(self, "BACKEND_NAME", "") == "grok"
-        ):
-            self.file_log(
-                f"terminal/wait_for_exit {tid} grok bg ack "
-                f"(process still running cmd={slot.get('cmd')!r})")
-            return {"exitCode": 0, "signal": None}
+        # ACP wait_for_exit returns once the command completes (Zed
+        # acp_thread::Terminal::wait_for_exit; spec terminals.md).
+        # Grok run_background spawns watch_for_exit AFTER create returns
+        # (xai-grok-shell-terminal/src/adapter.rs) — holding wait does not
+        # block the turn. Early ack {exitCode:0} made Grok complete the
+        # task, release, then poll empty+done (grok_bridge.16442.log).
+        # if (
+        #     slot.get("bg")
+        #     and slot.get("exit_status") is None
+        #     and getattr(self, "BACKEND_NAME", "") == "grok"
+        # ):
+        #     self.file_log(
+        #         f"terminal/wait_for_exit {tid} grok bg ack "
+        #         f"(process still running cmd={slot.get('cmd')!r})")
+        #     return {"exitCode": 0, "signal": None}
         reader = slot.get("reader")
         timeout = self.terminal_wait_timeout_s
         if reader is not None and not reader.done():
@@ -6118,9 +6275,11 @@ class AcpBridge(BaseBridge):
         if isinstance(code, int) and code < 0:
             es = self._exit_status_from_code(code)
             slot["exit_status"] = es
+        out_n = len((slot.get("stdout") or "") + (slot.get("stderr") or ""))
         self.file_log(
             f"terminal/wait_for_exit {tid} → "
-            f"exitCode={es.get('exitCode')} signal={es.get('signal')}")
+            f"exitCode={es.get('exitCode')} signal={es.get('signal')} "
+            f"out={out_n}")
         # Ensure Claude bg wake even if bind raced with process exit
         try:
             self._emit_bg_terminal_complete(tid)
@@ -6145,11 +6304,13 @@ class AcpBridge(BaseBridge):
             # Detach the poll handle; the child session keeps running.
             self.file_log(f"terminal/release {tid} is subagent session; ignore")
             return {}
-        slot = self._terminals.get(tid)
-        # Grok timeout:0 / run_in_background: release is detach, not kill.
-        if slot and slot.get("bg"):
-            await self._detach_terminal(tid)
-            return {}
+        # Official ACP + Zed: release kills if still running; the id is
+        # then invalid. Grok only releases AFTER wait_for_exit returns
+        # (exit_watcher.rs complete_and_release). Detach-keep cancelled
+        # the stdout drain and SIGPIPE'd the child.
+        # if slot and slot.get("bg"):
+        #     await self._detach_terminal(tid)
+        #     return {}
         await self._terminal_close(tid)
         return {}
 
@@ -6159,13 +6320,12 @@ class AcpBridge(BaseBridge):
         if not slot:
             return
         slot["detached"] = True
-        if slot.get("exit_status") is None:
-            slot["exit_status"] = {"exitCode": 0, "signal": None}
+        # Do not stamp a fake exit 0 — Grok treats any exitStatus as done.
         out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
         self._detached_snaps[tid] = {
             "output": out,
             "truncated": bool(slot.get("truncated")),
-            "exitStatus": slot["exit_status"],
+            "exitStatus": slot.get("exit_status"),
         }
         extra = list(self._detached_snaps)[:-32]
         for old in extra:
@@ -6206,6 +6366,7 @@ class AcpBridge(BaseBridge):
     async def _terminal_close(self, tid: str) -> None:
         slot = self._terminals.pop(tid, None)
         if not slot:
+            self._released_terminals.add(tid)
             return
         self._released_terminals.add(tid)
         self._kill_terminal_proc(slot.get("proc"))
@@ -6226,6 +6387,17 @@ class AcpBridge(BaseBridge):
                     proc.kill()
                 except Exception:
                     pass
+        out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
+        es = slot.get("exit_status") or {
+            "exitCode": None, "signal": "SIGTERM"}
+        self._detached_snaps[tid] = {
+            "output": out,
+            "truncated": bool(slot.get("truncated")),
+            "exitStatus": es,
+        }
+        extra = list(self._detached_snaps)[:-32]
+        for old in extra:
+            self._detached_snaps.pop(old, None)
         self.file_log(f"terminal/release {tid}")
 
 

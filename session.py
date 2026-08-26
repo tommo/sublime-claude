@@ -14,9 +14,9 @@ from . import backends
 from .context_manager import ContextManager, ContextItem  # ContextItem re-exported for back-compat
 from . import cc_launch
 try:
-    from .turn_state import TurnState
+    from .turn_state import TurnState, _SELF_WAKE_BACKENDS
 except ImportError:
-    from turn_state import TurnState
+    from turn_state import TurnState, _SELF_WAKE_BACKENDS
 
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
@@ -4128,12 +4128,18 @@ class Session:
         )
         # Idle leftover (synth Bash after end_turn): paint, do not own busy.
         # After Esc, leftover *is* the cancelled turn still streaming — re-busy.
+        # Grok self-wake after bg exit emits session/update with no new
+        # session/prompt (grok_bridge.21129.log after wait_for_exit). Own
+        # busy; closer is `_x.ai/session/prompt_complete` leftover_end.
         if not background:
             self._note_agent_activity()
         if (
             not self.working
-            and getattr(self, "_interrupt_stream", False)
             and not params.get("replay")
+            and (
+                getattr(self, "_interrupt_stream", False)
+                or (self.backend or "") in _SELF_WAKE_BACKENDS
+            )
         ):
             self._resume_interrupt_stream()
         if not self.working:
@@ -4280,18 +4286,23 @@ class Session:
         self._update_status_bar()
 
     def _resume_interrupt_stream(self) -> None:
-        """Grok kept streaming after Esc. Own busy until result / next query / Esc."""
+        """Own busy for Grok leftover stream / bg self-wake (no session/prompt)."""
+        if self.working:
+            return
         self._turn.resume_stream()
         self.working = True
         self._awaiting_query_rpc = False
         self._set_turn_phase("responding")
-        if self.output and self.output.current:
-            self.output.current.working = True
         try:
-            self.output._update_title()
+            if self.output:
+                # Must go through prompt() / begin_continued — swapping
+                # current in-place left claude_conversation on the @done
+                # sheet and the next _do_render wiped the session view.
+                self.output.begin_continued()
         except Exception:
             pass
         self._animate()
+        print("[Claude] resume agent stream (self-wake)")
 
     def _adopt_agent_turn(self, label: str = "⚙ task completed") -> None:
         """Leftover inbound must not become a host-owned turn.
@@ -4377,8 +4388,11 @@ class Session:
         # Compaction finished — paint into compact turn, not a new ⚙ wake
         if (
             not self.working
-            and getattr(self, "_interrupt_stream", False)
             and not params.get("replay")
+            and (
+                getattr(self, "_interrupt_stream", False)
+                or (self.backend or "") in _SELF_WAKE_BACKENDS
+            )
         ):
             self._resume_interrupt_stream()
         if getattr(self, "_compacting", False) and self._looks_like_compact_done(text):
@@ -4453,6 +4467,13 @@ class Session:
             print(f"[Claude] usage: {usage}")
         stop = params.get("stop_reason") or params.get("stopReason") or ""
         leftover_end = bool(params.get("leftover_end"))
+        # Duplicate closer: Grok prompt_complete after the RPC already idled.
+        # Host query owns the turn via session/prompt — leftover_end must
+        # not @done that sheet (self-wake closer can arrive late).
+        if leftover_end and (
+                not self.working
+                or getattr(self, "_awaiting_query_rpc", False)):
+            return
         if (
             not leftover_end
             and (
@@ -4575,12 +4596,18 @@ class Session:
             "task_notification": self._on_sys_task_notification,
             "task_progress": self._on_sys_task_progress,
             "api_retry": self._on_sys_api_retry,
+            "agent_continue": self._on_sys_agent_continue,
         }
         h = handlers.get(params.get("subtype", ""))
         if h is not None:
             h(params.get("data", {}) or {})
 
     # ── system message subtypes ──────────────────────────────────────────
+
+    def _on_sys_agent_continue(self, _data: dict) -> None:
+        """Bridge: Grok sent session/update after the prompt RPC already ended."""
+        if (self.backend or "") in _SELF_WAKE_BACKENDS:
+            self._resume_interrupt_stream()
 
     def _on_sys_compact_boundary(self, _data: dict) -> None:
         self.context_usage = None
@@ -4791,6 +4818,14 @@ class Session:
                 tool_use_id, keep=(status == "completed" and bool(output)))
             self._bg_tools.pop(tool_use_id, None)
         self._mark_bg_notify_ids(task_id, tool_use_id)
+
+        # Grok self-wake starts when wait_for_exit completes — own busy now,
+        # not after the 1200ms notify flush (too late; tools already painted).
+        if (
+            not self.working
+            and (self.backend or "") in _SELF_WAKE_BACKENDS
+        ):
+            self._resume_interrupt_stream()
 
         # Mid-turn: only flip ⚙ → ✓ (agent busy / TaskGet path).
         if self.working:

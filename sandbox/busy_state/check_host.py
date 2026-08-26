@@ -30,6 +30,11 @@ if "self._adopt_agent_turn(" in flush:
 query = _live_body(src, "query")
 if "should_queue_prompt" not in query or "queue_prompt" not in query:
     bad.append("query() does not queue while a turn is live")
+resume = _live_body(src, "_resume_interrupt_stream")
+if "self.output.current =" in resume or "Conversation(" in resume:
+    bad.append("self-wake replaces current in-place (wipes last turn)")
+if "begin_continued" not in resume:
+    bad.append("self-wake does not archive last turn via begin_continued")
 if bad:
     print("FAIL:", "; ".join(bad))
     sys.exit(1)

@@ -19,10 +19,9 @@ Notify = Literal["hold", "surface", "query"]
 
 # Agents that inject/auto-continue on bg complete AND emit session/update
 # without a new host query(). Host query() would double the turn.
-# Kimi was here; check_recovery.py (after vs wake) proved the opposite:
-# session/prompt returns while wait_for_exit is still pending, then Kimi
-# self-wakes with fs/permission and no session/update unless the host
-# opens a new session/prompt. surface left the UI idle while the agent ran.
+# Kimi: check_recovery.py — no session/update without a live prompt.
+# Grok: after wait_for_exit the agent keeps sending tool_call (log 21129).
+# Own that with resume_stream; closer is `_x.ai/session/prompt_complete`.
 _SELF_WAKE_BACKENDS = frozenset({"grok"})
 
 

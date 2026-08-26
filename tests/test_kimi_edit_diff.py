@@ -18,12 +18,8 @@ class _Fwd(AcpBridge):
         self.session_id = "session_test"
         self._loading_session = False
         self._foreign_session_drops = 0
-        self._tool_names_by_id = {}
-        self._tool_inputs_by_id = {}
-        self._tool_ids_emitted = set()
-        self._tool_results_sent = set()
+        self._calls = {}
         self._tool_id_alias = {}
-        self._bg_tool_ids = set()
         self._pending_execute_ids = []
         self._last_execute_id = None
         self._terminals = {}
@@ -34,7 +30,6 @@ class _Fwd(AcpBridge):
         self._child_sessions = {}
         self._bg_notified_tasks = set()
         self._bg_notified_tools = set()
-        self._tool_titles_by_id = {}
         self._prompt_fut = None
         self._prompt_cancelled = False
         self._cancel_in_flight = False

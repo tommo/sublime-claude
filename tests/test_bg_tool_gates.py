@@ -11,7 +11,7 @@ for p in (_ROOT, _BRIDGE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from acp_base import AcpBridge  # noqa: E402
+from acp_base import AcpBridge, retain_terminal_tail  # noqa: E402
 
 
 class _NameOnly(AcpBridge):
@@ -180,12 +180,11 @@ class _TermStub(AcpBridge):
     def __init__(self):
         self._last_execute_id = None
         self._pending_execute_ids = []
-        self._tool_inputs_by_id = {}
-        self._bg_tool_ids = set()
+        self._calls = {}
         self._terminal_bg = {}
-        self._tool_names_by_id = {}
-        self._tool_ids_emitted = set()
         self._terminals = {}
+        self.terminal_output_max_bytes = 1024 * 1024
+        self.BACKEND_NAME = "kimi"
 
     def file_log(self, msg):
         pass
@@ -210,8 +209,8 @@ class TestMarkTerminalBg(unittest.TestCase):
     def test_explicit_detached_marks_and_consumes(self):
         b = _TermStub()
         b._note_shell_execute("tool-1", "Bash")
-        b._tool_inputs_by_id["tool-1"] = {
-            "command": "sleep 9", "detached": True}
+        b._ensure_call("tool-1").merge_input({
+            "command": "sleep 9", "detached": True})
         slot = {"cmd": "sleep 9"}
         b._mark_terminal_bg("term_a", slot)
         self.assertTrue(slot.get("bg"))
@@ -226,7 +225,7 @@ class TestMarkTerminalBg(unittest.TestCase):
     def test_running_title_only_is_not_bg(self):
         b = _TermStub()
         b._note_shell_execute("tool-2", "Bash")
-        b._tool_inputs_by_id["tool-2"] = {"command": "echo ok && which pil"}
+        b._ensure_call("tool-2").merge_input({"command": "echo ok && which pil"})
         slot = {"cmd": "echo ok && which pil"}
         b._mark_terminal_bg("term_c", slot)
         self.assertFalse(slot.get("bg"))
@@ -237,16 +236,16 @@ class TestMarkTerminalBg(unittest.TestCase):
         """⚙ only at terminal/create — streamed flag must stay pending."""
         b = _TermStub()
         b._note_shell_execute("tool-rib", "Bash")
-        b._tool_inputs_by_id["tool-rib"] = {
+        b._ensure_call("tool-rib").merge_input({
             "command": "pil test -t ui 2>&1 | tail -40",
             "run_in_background": True,
-        }
-        self.assertNotIn("tool-rib", b._bg_tool_ids)
+        })
+        self.assertFalse(b._call("tool-rib").background)
         slot = {"cmd": "cd '/Volumes/prj/pil' && pil test -t ui 2>&1 | tail -40"}
         b._mark_terminal_bg("term_rib", slot)
         self.assertTrue(slot.get("bg"))
         self.assertEqual(slot.get("tool_use_id"), "tool-rib")
-        self.assertIn("tool-rib", b._bg_tool_ids)
+        self.assertTrue(b._call("tool-rib").background)
         self.assertEqual(b._pending_execute_ids, [])
 
     def test_log_path_is_per_pid(self):
@@ -268,25 +267,16 @@ class TestMarkTerminalBg(unittest.TestCase):
         b._mark_terminal_bg("term_d", slot)
         self.assertTrue(slot.get("bg"))
 
-    def test_wait_for_exit_kimi_has_no_unconditional_fake_success(self):
+    def test_wait_for_exit_has_no_unconditional_fake_success(self):
         import inspect
         src = inspect.getsource(AcpBridge._acp_terminal_wait)
-        # Grok timeout:0 may ack 0; Kimi must still wait on the reader.
-        self.assertIn('BACKEND_NAME', src)
-        self.assertIn('"grok"', src)
         live = [
             ln for ln in src.splitlines()
             if not ln.lstrip().startswith("#")
         ]
         body = "\n".join(live)
-        grok_idx = body.find('"grok"')
-        self.assertGreater(grok_idx, 0)
-        grok_return = body.find(
-            'return {"exitCode": 0, "signal": None}', grok_idx)
-        self.assertGreater(grok_return, grok_idx)
-        before = body[:grok_idx]
         self.assertNotIn(
-            'return {"exitCode": 0, "signal": None}', before)
+            'return {"exitCode": 0, "signal": None}', body)
         self.assertNotIn(
             'return {"exitCode": None, "signal": None}', body)
 
@@ -294,8 +284,8 @@ class TestMarkTerminalBg(unittest.TestCase):
         b = _TermStub()
         b.BACKEND_NAME = "grok"
         b._note_shell_execute("tool-g", "Bash")
-        b._tool_inputs_by_id["tool-g"] = {
-            "command": "pil test -t visual", "timeout": 0}
+        b._ensure_call("tool-g").merge_input({
+            "command": "pil test -t visual", "timeout": 0})
         slot = {"cmd": "pil test -t visual"}
         b._mark_terminal_bg("term_g", slot)
         self.assertTrue(slot.get("bg"))
@@ -305,11 +295,31 @@ class TestMarkTerminalBg(unittest.TestCase):
         b = _TermStub()
         b.BACKEND_NAME = "kimi"
         b._note_shell_execute("tool-k", "Bash")
-        b._tool_inputs_by_id["tool-k"] = {
-            "command": "echo ok", "timeout": 0}
+        b._ensure_call("tool-k").merge_input({
+            "command": "echo ok", "timeout": 0})
         slot = {"cmd": "echo ok"}
         b._mark_terminal_bg("term_k", slot)
         self.assertFalse(slot.get("bg"))
+
+    def test_bg_raises_output_limit(self):
+        b = _TermStub()
+        b.BACKEND_NAME = "grok"
+        b._note_shell_execute("tool-g", "Bash")
+        b._ensure_call("tool-g").merge_input({
+            "command": "pil run editor", "timeout": 0})
+        slot = {"cmd": "pil run editor", "limit": 20000}
+        b._mark_terminal_bg("term_g", slot)
+        self.assertTrue(slot.get("bg"))
+        self.assertEqual(slot["limit"], 1024 * 1024)
+
+    def test_fg_keeps_requested_limit(self):
+        b = _TermStub()
+        b._note_shell_execute("tool-f", "Bash")
+        b._ensure_call("tool-f").merge_input({"command": "echo ok"})
+        slot = {"cmd": "echo ok", "limit": 20000}
+        b._mark_terminal_bg("term_f", slot)
+        self.assertFalse(slot.get("bg"))
+        self.assertEqual(slot["limit"], 20000)
 
 
 class TestOutputViewBgDemote(unittest.TestCase):
@@ -354,9 +364,7 @@ class TestOutputViewBgDemote(unittest.TestCase):
 
 class _ReplayStub(AcpBridge):
     def __init__(self):
-        self._tool_names_by_id = {}
-        self._tool_inputs_by_id = {}
-        self._tool_ids_emitted = set()
+        self._calls = {}
         self._tool_id_alias = {}
 
     def _handle_mode_update(self, upd):
@@ -371,12 +379,8 @@ class _FwdStub(AcpBridge):
         self.session_id = "session_test"
         self._loading_session = False
         self._foreign_session_drops = 0
-        self._tool_names_by_id = {}
-        self._tool_inputs_by_id = {}
-        self._tool_ids_emitted = set()
-        self._tool_results_sent = set()
+        self._calls = {}
         self._tool_id_alias = {}
-        self._bg_tool_ids = set()
         self._pending_execute_ids = []
         self._last_execute_id = None
         self._terminals = {}
@@ -387,8 +391,6 @@ class _FwdStub(AcpBridge):
         self._child_sessions = {}
         self._bg_notified_tasks = set()
         self._bg_notified_tools = set()
-        self._bg_tool_ids = set()
-        self._tool_titles_by_id = {}
         self._prompt_fut = None
         self._prompt_cancelled = False
         self._cancel_in_flight = False
@@ -399,7 +401,8 @@ class _FwdStub(AcpBridge):
 
 
 class TestForwardNoEarlyGear(unittest.TestCase):
-    def test_empty_bash_then_rib_is_not_gear_until_create(self):
+    def test_empty_bash_then_rib_stamps_background_on_the_call(self):
+        """run_in_background is a call attribute, not a later promotion."""
         import acp_base
         notes = []
         orig = acp_base.send_notification
@@ -438,11 +441,10 @@ class TestForwardNoEarlyGear(unittest.TestCase):
             acp_base.send_notification = orig
         uses = [p for _, p in notes if p.get("type") == "tool_use"]
         self.assertEqual(len(uses), 1, uses)
-        self.assertFalse(uses[0].get("background"))
-        self.assertNotIn("19:tool_x", b._bg_tool_ids)
-        self.assertTrue(
-            (b._tool_inputs_by_id.get("19:tool_x") or {}).get(
-                "run_in_background"))
+        self.assertTrue(uses[0].get("background"))
+        c = b._call("19:tool_x")
+        self.assertTrue(c and c.background)
+        self.assertTrue(c.input.get("run_in_background"))
         self.assertIn("19:tool_x", b._pending_execute_ids)
 
     def test_terminal_ids_from_update_is_static(self):
@@ -533,9 +535,10 @@ class TestModalToolDedupe(unittest.TestCase):
         tid = "call-ask-1"
         try:
             b = _FwdStub()
-            b._tool_ids_emitted.add(tid)
-            b._tool_names_by_id[tid] = "ask_user"
-            b._tool_results_sent.add(tid)
+            c = b._ensure_call(tid)
+            c.emitted = True
+            c.name = "ask_user"
+            c.result_sent = True
             b._forward_update({
                 "sessionId": "session_test",
                 "update": {
@@ -688,10 +691,17 @@ class TestSubagentTerminalOutput(unittest.TestCase):
         self.assertTrue(self.b._is_subagent_output_poll(poll, "TaskGet"))
         self.assertTrue(self.b._should_suppress_tool_row(poll, "TaskGet"))
 
-    def test_bg_release_detaches_not_sigterm(self):
+    def test_bg_release_kills_and_snaps_output(self):
+        """ACP release kills; leftover terminal/output still has last stdout."""
         class _P:
             returncode = None
             pid = 1
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
 
         self.b._terminals["term_bg1"] = {
             "proc": _P(),
@@ -711,10 +721,9 @@ class TestSubagentTerminalOutput(unittest.TestCase):
         result = asyncio.run(_go())
         self.assertNotIn("term_bg1", self.b._terminals)
         self.assertEqual(result.get("output"), "starting editor\n")
-        self.assertEqual(
-            (result.get("exitStatus") or {}).get("exitCode"), 0)
-        self.assertNotEqual(
-            (result.get("exitStatus") or {}).get("signal"), "SIGTERM")
+        es = result.get("exitStatus") or {}
+        self.assertEqual(es.get("signal"), "SIGTERM")
+        self.assertIsNone(es.get("exitCode"))
 
     def test_unknown_subagent_id_is_still_running(self):
         async def _go():
@@ -735,9 +744,8 @@ class _WaitStub(AcpBridge):
         self._detached_snaps = {}
         self._detached_procs = {}
         self.terminal_wait_timeout_s = 0
-        self._bg_tool_ids = set()
+        self._calls = {}
         self._pending_execute_ids = []
-        self._tool_ids_emitted = set()
         self._last_session_tool_ts = 0
         self._logs = []
 
@@ -762,23 +770,32 @@ class TestGrokBgWaitAck(unittest.TestCase):
             "reader": fut,
         }, fut
 
-    def test_grok_bg_wait_returns_immediately_without_finishing(self):
+    def test_grok_bg_wait_stays_pending(self):
+        """Grok run_background holds wait_for_exit until the process exits."""
         b = _WaitStub("grok")
 
         async def _go():
             slot, fut = self._hanging_slot()
             b._terminals["term_g"] = slot
-            t0 = asyncio.get_running_loop().time()
-            result = await b._acp_terminal_wait({"terminalId": "term_g"})
-            elapsed = asyncio.get_running_loop().time() - t0
-            return result, elapsed, slot, fut
+            task = asyncio.create_task(
+                b._acp_terminal_wait({"terminalId": "term_g"}))
+            await asyncio.sleep(0.15)
+            still = not task.done()
+            if not still:
+                result = task.result()
+            else:
+                result = None
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self.assertTrue(still, f"grok wait returned {result}")
+            self.assertIsNone(slot.get("exit_status"))
+            self.assertFalse(fut.done())
+            fut.cancel()
 
-        result, elapsed, slot, fut = asyncio.run(_go())
-        self.assertLess(elapsed, 0.2)
-        self.assertEqual(result, {"exitCode": 0, "signal": None})
-        self.assertIsNone(slot.get("exit_status"))
-        self.assertFalse(fut.done())
-        fut.cancel()
+        asyncio.run(_go())
 
     def test_kimi_bg_wait_stays_pending(self):
         b = _WaitStub("kimi")
@@ -819,6 +836,129 @@ class TestGrokBgWaitAck(unittest.TestCase):
         self.assertTrue(b._should_synth_terminal_ui())
         b._pending_execute_ids = ["tool-1"]
         self.assertFalse(b._should_synth_terminal_ui())
+
+
+class TestRetainTerminalTail(unittest.TestCase):
+    def test_keeps_suffix_at_char_boundary(self):
+        self.assertEqual(retain_terminal_tail("abcdefghij", 4), "ghij")
+        self.assertEqual(retain_terminal_tail("abc", 10), "abc")
+        self.assertEqual(retain_terminal_tail("", 8), "")
+        self.assertEqual(retain_terminal_tail("abc", 0), "")
+        # 你 is 3 UTF-8 bytes; limit 4 must not split it.
+        s = "a" + ("你" * 10)
+        out = retain_terminal_tail(s, 4)
+        self.assertTrue(out.endswith("你"))
+        self.assertLessEqual(len(out.encode("utf-8")), 4)
+
+
+class _CreateStub(AcpBridge):
+    def __init__(self, backend="grok"):
+        self.BACKEND_NAME = backend
+        self.cwd = os.getcwd()
+        self._terminals = {}
+        self._child_sessions = {}
+        self._released_terminals = set()
+        self._detached_snaps = {}
+        self._detached_procs = {}
+        self._terminal_bg = {}
+        self._bg_notified_tasks = set()
+        self._bg_notified_tools = set()
+        self._last_bg_tool_id = None
+        self.terminal_wait_timeout_s = 0
+        self.terminal_output_max_bytes = 1024 * 1024
+        self._calls = {}
+        self._pending_execute_ids = []
+        self._last_execute_id = None
+        self._last_session_tool_ts = 0
+        self._prompt_fut = None
+        self._prompt_cancelled = False
+        self._cancel_in_flight = False
+        self._logs = []
+
+    def file_log(self, msg):
+        self._logs.append(msg)
+
+    def _emit_bg_terminal_complete(self, *a, **k):
+        pass
+
+    def _emit_system(self, *a, **k):
+        pass
+
+
+class TestTerminalOutputDrain(unittest.TestCase):
+    def test_fg_keeps_tail_past_byte_limit(self):
+        """ACP: over outputByteLimit, drop the start — not freeze the prefix."""
+        head, tail = "HEAD_MARKER_7a1c", "TAIL_MARKER_9f3a"
+        pad = 40_000
+
+        async def _go():
+            b = _CreateStub("grok")
+            eid = "tool-fg"
+            b._note_shell_execute(eid, "Bash")
+            b._ensure_call(eid).merge_input({"command": "pad"})
+            res = await b._acp_terminal_create({
+                "command": sys.executable,
+                "args": ["-c",
+                         "import sys; sys.stdout.write(%r); "
+                         "sys.stdout.write('x' * %d); "
+                         "sys.stdout.write(%r); sys.stdout.flush()"
+                         % (head + "\n", pad, tail + "\n")],
+                "cwd": os.getcwd(),
+                "outputByteLimit": 8000,
+            })
+            tid = res["terminalId"]
+            wait = await asyncio.wait_for(
+                b._acp_terminal_wait({"terminalId": tid}), timeout=5.0)
+            out = await b._acp_terminal_output({"terminalId": tid})
+            await b._acp_terminal_release({"terminalId": tid})
+            return wait, out, b._terminals[tid] if tid in b._terminals else None
+
+        wait, out, _ = asyncio.run(_go())
+        body = out.get("output") or ""
+        self.assertIsNotNone(wait.get("exitCode"))
+        self.assertTrue(out.get("truncated"), body[:80])
+        self.assertIn(tail, body)
+        self.assertNotIn(head, body)
+        self.assertLessEqual(len(body.encode("utf-8")), 8000 + 4)
+
+    def test_bg_keeps_past_grok_20k(self):
+        """timeout:0 raises the stored cap so 40k of editor log is not frozen."""
+        head, tail = "BG_HEAD_aa01", "BG_TAIL_bb02"
+        pad = 40_000
+
+        async def _go():
+            b = _CreateStub("grok")
+            eid = "tool-bg"
+            b._note_shell_execute(eid, "Bash")
+            b._ensure_call(eid).merge_input({
+                "command": "pad", "timeout": 0})
+            res = await b._acp_terminal_create({
+                "command": sys.executable,
+                "args": ["-c",
+                         "import sys; sys.stdout.write(%r); "
+                         "sys.stdout.write('x' * %d); "
+                         "sys.stdout.write(%r); sys.stdout.flush()"
+                         % (head + "\n", pad, tail + "\n")],
+                "cwd": os.getcwd(),
+                "outputByteLimit": 20000,
+            })
+            tid = res["terminalId"]
+            slot = b._terminals[tid]
+            self.assertTrue(slot.get("bg"))
+            self.assertGreaterEqual(slot.get("limit") or 0, 40_000)
+            wait = await asyncio.wait_for(
+                b._acp_terminal_wait({"terminalId": tid}), timeout=5.0)
+            out = await b._acp_terminal_output({"terminalId": tid})
+            await b._acp_terminal_release({"terminalId": tid})
+            return wait, out
+
+        wait, out = asyncio.run(_go())
+        body = out.get("output") or ""
+        self.assertIsNotNone(wait.get("exitCode"))
+        self.assertIn(head, body)
+        self.assertIn(tail, body)
+        self.assertFalse(out.get("truncated"))
+        self.assertGreater(len(body), 20000)
 
 
 if __name__ == "__main__":

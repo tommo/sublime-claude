@@ -386,6 +386,15 @@ class TestRenderSessionList(unittest.TestCase):
             ),
         )
         self.assertEqual(sl._status_of(unread_working), "working")
+        bg_idle = types.SimpleNamespace(
+            is_sleeping=False, working=False, unread=False, _compacting=False,
+            output=types.SimpleNamespace(
+                pending_permission=None, pending_question=None, pending_plan=None,
+                active_background_tools=lambda: [object()],
+            ),
+        )
+        self.assertEqual(sl._status_of(bg_idle), "bg")
+        self.assertEqual(sl._mark("bg"), "⚙")
         row = {
             "kind": "live", "session_id": "ask", "view_id": 1,
             "name": "needs a choice", "backend": "kimi", "status": "input",

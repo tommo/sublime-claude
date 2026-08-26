@@ -348,6 +348,9 @@ class OutputView:
                 prefix = "◐ " if is_active else "○ "
             else:
                 prefix = "◉ " if is_active else "• "
+        elif session and self.active_background_tools():
+            # Grok timeout:0 / bg bash: turn is idle, process still ⚙.
+            prefix = "⚙ "
         elif session and getattr(session, "unread", False):
             prefix = "* "
         else:
@@ -1787,6 +1790,21 @@ class OutputView:
                 lambda r=list(refs), a=start, b=end: self._refresh_turn_context_phantoms(
                     r, region=(a, b)),
                 15)
+
+    def begin_continued(self) -> None:
+        """Open a live sheet after @done without wiping the last turn.
+
+        _do_render replaces the `claude_conversation` region. Assigning a
+        new Conversation onto `current` leaves that region covering the
+        finished @done sheet, so the next spinner/tool render erases it.
+        `prompt()` freezes the old region and tracks only the new turn.
+        """
+        cur = self.current
+        if cur is not None and not getattr(cur, "has_meta", False):
+            cur.working = True
+            self._update_title()
+            return
+        self.prompt("(continued)")
 
     def tool(self, name: str, tool_input: dict = None, tool_id: str = None, background: bool = False) -> None:
         """Add a pending tool.

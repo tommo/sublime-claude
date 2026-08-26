@@ -67,6 +67,15 @@ def awaiting_input(session) -> bool:
     return False
 
 
+def _has_live_bg_tools(session) -> bool:
+    """⚙ Bash still running after the turn closed (Grok timeout:0 / bg)."""
+    try:
+        ov = getattr(session, "output", None)
+        return bool(ov and ov.active_background_tools())
+    except Exception:
+        return False
+
+
 def _status_of(session) -> str:
     if getattr(session, "is_sleeping", False):
         return "sleeping"
@@ -76,6 +85,8 @@ def _status_of(session) -> str:
     # compaction continues. working can drop; _compacting is the live flag.
     if getattr(session, "working", False) or getattr(session, "_compacting", False):
         return "working"
+    if _has_live_bg_tools(session):
+        return "bg"
     if getattr(session, "unread", False):
         return "unread"
     return "ready"
@@ -103,6 +114,7 @@ def _mark(status: str) -> str:
         "input": "?",
         "unread": "!",
         "working": "●",
+        "bg": "⚙",
         "sleeping": "⏸",
         "ready": "○",
     }.get(status, "·")
@@ -266,7 +278,7 @@ def collect_live(window) -> List[dict]:
             "last_activity": float(getattr(s, "last_activity", 0) or 0),
         })
     # Input wait first, then awake, then sleeping; access time within each band.
-    _band = {"input": 0, "unread": 0, "working": 1, "ready": 1, "sleeping": 2}
+    _band = {"input": 0, "unread": 0, "working": 1, "bg": 1, "ready": 1, "sleeping": 2}
     out.sort(key=lambda r: (
         _band.get(r.get("status"), 1),
         -access_ts(r),
@@ -320,6 +332,7 @@ def history_cap() -> int:
 # 4 letters so the state column is a fixed width.
 _STAMP = {
     "working": "busy",
+    "bg": "busy",
     "ready": "idle",
     "input": "wait",
     "unread": "new",
