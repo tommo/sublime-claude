@@ -5,7 +5,9 @@
 - Client `elicitation.form` → `handleQuestion` calls `elicitation/create`
   with **every** question (`q0`, `q1`, …).
 - `elicitationResponseToQuestionAnswers` keeps only **exact option labels**.
-- `otherLabel` has no elicitation field — Other/freeform is dropped.
+- Native engine Other (session_18b6df1a): `answers[question]=typed string`,
+  `method=enter`. No `{kind:other}` wrapper. Host sends that string as `qN`
+  and chains the same JSON as a followup `session/prompt` after `end_turn`.
 - `request_permission` fallback is still `/^q0_opt_(\d+)$/` only.
 - Do **not** `session/cancel` + prose followup. That is an anti-pattern.
   Listed Q1 is the elicitation accept body.
@@ -19,9 +21,9 @@ python3 sandbox/kimi_ask/check_e2e.py interrupt_during
 Live (`listed`): `{q0: procmotion, q1: dynamics only}` →
 `SANDBOX_RESULT Q0=procmotion Q1=dynamics only` (no second prompt).
 
-Live (`other` / `extra` / `qtext` / `kind`): freetext never enters the
-tool result. TUI uses `{kind: other, text}` → engine `answers[q]=text`.
-ACP mapper requires `opt.label === value`.
+Live (`other`): host accept content includes the typed string (native).
+ACP may still drop it from the tool result; followup `session/prompt`
+carries `{"answers": {question: text}}`.
 
 Live (`after_prompt`): first turn `Q1=MISSING`, then a second
 `session/prompt` **without cancel** → `Q1=all`. Host chains that

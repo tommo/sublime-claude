@@ -583,6 +583,13 @@ class Session:
         if extra_dirs:
             expanded_extras = [os.path.expanduser(d) for d in extra_dirs]
             additional_dirs = additional_dirs + expanded_extras
+        try:
+            from .sidecar_skill import additional_skill_dirs
+            for d in additional_skill_dirs():
+                if d not in additional_dirs:
+                    additional_dirs.append(d)
+        except Exception:
+            pass
         print(f"[Claude] additional_dirs sources: cwd={all_folders[0] if all_folders else None!r} "
               f"secondary_folders={secondary_folders} "
               f"claude_additional_dirs={expanded_extras} "
@@ -2228,6 +2235,13 @@ class Session:
                 self._flush_bg_notifications()
             except Exception as e:
                 print(f"[Claude] flush bg on turn end: {e}")
+        # Kimi end_turn while wait_for_exit is pending is fine; a closer
+        # that skip-dropped left ⚙ under @done (bash-0eaakzzi). Poll now.
+        if self._bg_tools or self._bg_task_ids or self._task_tool_map:
+            try:
+                self._bg_poll()
+            except Exception as e:
+                print(f"[Claude] bg poll on turn end: {e}")
         if self.working:
             return
         sublime.set_timeout(lambda: self._enter_input_with_draft() if not self.working else None, 100)
@@ -4266,7 +4280,15 @@ class Session:
             self.current_tool = None
             return
         if was_background:
-            # Background tool_result is just an ack; final status comes via task_notification
+            # Running-ack only. A completed result (or ACP wait closer)
+            # must flip ⚙ — skip left a stack of dead "background" rows.
+            low = str(content or "").lower()
+            if (
+                "status: running" in low
+                or low.strip() in ("background", "backgrounded")
+            ):
+                return
+            self._finalize_bg_tool(tool_use_id, keep=not is_error)
             return
         if tool_name in ("Edit", "Write") and not is_error:
             self._record_edit(tool_name)
@@ -4692,7 +4714,13 @@ class Session:
         # Read (don't pop) the map: a task_notification may still arrive and
         # needs it to resolve the id (to wake + discard _bg_task_ids). It pops
         # the entry; reconcile cleans it if no notification ever comes.
-        tool_use_id = self._task_tool_map.get(task_id)
+        # Bridge skip-wake still sends tool_use_id here — map may already
+        # have been popped by a sibling closer.
+        tool_use_id = (
+            data.get("tool_use_id")
+            or self._task_tool_map.get(task_id)
+            or ""
+        )
         if not tool_use_id:
             return
         # No output_file on task_updated → keep a completed line as ✓, drop the
@@ -5285,7 +5313,7 @@ class Session:
         """Start bg-task poll timer if not already running."""
         if self._bg_poll_timer is not None:
             return
-        if not self._task_tool_map and not self._bg_task_ids:
+        if not (self._task_tool_map or self._bg_task_ids or self._bg_tools):
             return
         epoch = int(getattr(self, "_bg_poll_epoch", 0))
 
@@ -5306,7 +5334,7 @@ class Session:
         epoch = int(getattr(self, "_bg_poll_epoch", 0))
         if not self.client or not self.initialized:
             return
-        if not self._task_tool_map and not self._bg_task_ids:
+        if not (self._task_tool_map or self._bg_task_ids or self._bg_tools):
             return
 
         def _reschedule(delay_ms: int, e=epoch) -> None:
@@ -5335,7 +5363,7 @@ class Session:
             self.client.send("poll_bg_tasks", {}, _cb)
         except Exception as e:
             print(f"[Claude] bg poll send: {e}")
-            if self._task_tool_map or self._bg_task_ids:
+            if self._task_tool_map or self._bg_task_ids or self._bg_tools:
                 _reschedule(8000)
 
     def _on_bg_poll_result(self, result: dict) -> None:
@@ -5345,7 +5373,7 @@ class Session:
             print(f"[Claude] bg reconcile: {e}")
         if self._bg_poll_timer is not None:
             return
-        if not (self._task_tool_map or self._bg_task_ids):
+        if not (self._task_tool_map or self._bg_task_ids or self._bg_tools):
             return
         epoch = int(getattr(self, "_bg_poll_epoch", 0))
         self._bg_poll_timer = sublime.set_timeout(
@@ -5361,10 +5389,9 @@ class Session:
 
         Always drops registry entries whose ⚙ line was already finalized. When
         the bridge reports its live-task set (`running`), also finalizes any
-        tracked background task that we *saw* running and which has since
-        vanished — i.e. it ended without a terminal event reaching us.
-        Vanished tasks MUST wake the agent (old path only flipped ⚙ → gone,
-        so the agent sat on @done forever after a dropped notify).
+        tracked background task that is no longer live. Requiring
+        `_seen_running` left ⚙ forever: Kimi bash-0eaakzzi exited in 2s,
+        first idle poll already had running=[], vanish never fired.
         """
         from .output import BACKGROUND
         for tid in list(self._bg_tools):
@@ -5375,20 +5402,24 @@ class Session:
             return
         live = set(running or [])
         self._seen_running |= live
+        live_tools = set()
+        for task_id, tool_use_id in self._task_tool_map.items():
+            if task_id in live:
+                live_tools.add(tool_use_id)
+        for tuid in self._bg_task_ids:
+            if tuid in live:
+                live_tools.add(tuid)
+
         for task_id, tool_use_id in list(self._task_tool_map.items()):
-            if not (
-                tool_use_id in self._bg_task_ids
-                and task_id in self._seen_running
-                and task_id not in live
-            ):
+            if task_id in live:
                 continue
-            # Missed terminal event — synthesize the same wake path as
-            # task_notification so the agent actually continues.
-            if self._bg_notify_already(task_id, tool_use_id):
-                self._finalize_bg_tool(tool_use_id, keep=False)
-                self._bg_task_ids.discard(tool_use_id)
-                self._bg_tools.pop(tool_use_id, None)
-            else:
+            # Missed terminal event. Grok still needs a wake; Kimi already
+            # got the native completion mid-turn — only flip ⚙.
+            if (
+                not self._bg_notify_already(task_id, tool_use_id)
+                and not self.working
+                and (self.backend or "") in _SELF_WAKE_BACKENDS
+            ):
                 self._on_sys_task_notification({
                     "task_id": task_id,
                     "tool_use_id": tool_use_id,
@@ -5396,8 +5427,19 @@ class Session:
                     "summary": f"{task_id} (completed)",
                     "output_file": "",
                 })
+            else:
+                self._finalize_bg_tool(tool_use_id, keep=True)
+                self._bg_task_ids.discard(tool_use_id)
+                self._bg_tools.pop(tool_use_id, None)
             self._task_tool_map.pop(task_id, None)
             self._seen_running.discard(task_id)
+
+        for tuid in list(self._bg_task_ids):
+            if tuid in live_tools or tuid in live:
+                continue
+            self._finalize_bg_tool(tuid, keep=True)
+            self._bg_task_ids.discard(tuid)
+            self._bg_tools.pop(tuid, None)
 
     def _set_name(self, name: str) -> None:
         """Set session name and update UI."""

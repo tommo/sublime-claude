@@ -252,11 +252,22 @@ def handle_request(request: dict) -> dict:
     params = request.get("params", {})
 
     if method == "initialize":
-        return make_response(id, {
+        sidecar_rule = ""
+        try:
+            from sidecar_skill import RULE as sidecar_rule
+        except Exception:
+            sidecar_rule = (
+                'Unqualified "sidecar" means SUBLIME SIDECAR: MCP spawn_session, '
+                "not grok/kimi/codex CLI."
+            )
+        payload = {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "sublime-mcp", "version": "0.1.0"}
-        })
+            "serverInfo": {"name": "sublime-mcp", "version": "0.1.0"},
+        }
+        if sidecar_rule:
+            payload["instructions"] = sidecar_rule
+        return make_response(id, payload)
 
     elif method == "notifications/initialized":
         return None
@@ -341,6 +352,9 @@ def handle_request(request: dict) -> dict:
                     "name": "spawn_session",
                     "description": """Spawn a subsession. Returns stable agent_id (+ runtime view_id).
 
+This is the default sidecar when the user says "sidecar" or "SUBLIME sidecar"
+(not grok/kimi/codex CLI). Named CLI drivers still use those CLIs.
+
 ALWAYS address workers by agent_id — view_id changes after Sublime restart.
 Workflow for base context then workers:
   1) spawn_session(prompt=…, name="explorer", backend=X, model=Y)  # returns agent_id
@@ -403,6 +417,42 @@ The target sees a [from agent <your agent_id>] header (or [from user] if no call
                             "agent_id": {"type": "string", "description": "Stable agent_id (preferred)"},
                             "view_id": {"type": "integer", "description": "Legacy runtime view_id"},
                             "lines": {"type": "integer", "description": "Number of lines from end (default: all)"}
+                        },
+                        "required": []
+                    }
+                },
+                {
+                    "name": "read_session_edits",
+                    "description": """Read Edit/Write diffs from a subsession transcript (not the full chat).
+
+Use after spawn_session / list_sessions. Prefer agent_id. Page with offset/limit
+(default limit 10, max 40). Optional file_path filters to one file (suffix ok).
+
+Returns {total, offset, limit, count, has_more, edits:[{i, tool, file_path, line, status, diff}]}.
+If has_more, call again with offset += count.""",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Stable agent_id from spawn_session / list_sessions"
+                            },
+                            "view_id": {
+                                "type": "integer",
+                                "description": "Legacy runtime view_id"
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Skip this many edits (default 0)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max edits to return (default 10, max 40)"
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Optional: only this file (exact or suffix)"
+                            }
                         },
                         "required": []
                     }

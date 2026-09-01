@@ -734,7 +734,13 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
                                            or current_view.settings().get("pty_reveal_owner"))
         current_file = current_view.file_name() if current_view else None
 
-        # Top item when editing a file: new session with that file as context
+        # New Session stays on top (commits accumulated backend/transport/model).
+        _mlabel = f" [{model}]" if model else ""
+        items.append([f"🆕 {backend_prefix}New Session{_mlabel}",
+                      (f"Start fresh with {model}" if model else "Start fresh with default model")])
+        actions.append(("new", None))
+
+        # Next when editing a file: new session with that file as context
         if not in_output_view and current_file:
             filename = os.path.basename(current_file)
             items.append([
@@ -842,12 +848,6 @@ class ClaudeCodeSwitchCommand(sublime_plugin.WindowCommand):
         persona_url = sublime_settings.get("persona_url", "http://localhost:5002/personas")
         items.append(["👤 From Persona...", "Acquire a persona identity"])
         actions.append(("persona", persona_url))
-
-        # Add "New Session" option — commits the accumulated backend/transport/model.
-        _mlabel = f" [{model}]" if model else ""
-        items.append([f"🆕 {backend_prefix}New Session{_mlabel}",
-                      (f"Start fresh with {model}" if model else "Start fresh with default model")])
-        actions.append(("new", None))
 
         # Model selection from settings + cached models
         all_models = sublime_settings.get("models", {})

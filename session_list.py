@@ -654,8 +654,11 @@ def open_row(window, row: dict) -> bool:
     global _last_open
     key = (row.get("session_id"), row.get("view_id"), row.get("kind"))
     now = time.time()
-    if key == _last_open[1] and (now - _last_open[0]) < 0.4:
-        return True
+    last_t, last_key = _last_open
+    if (now - last_t) < 0.4:
+        # One dclick used to fire twice: mousemap on the click row, then
+        # Default drag_select by=words (sel.begin on the previous line).
+        return last_key == key
     _last_open = (now, key)
     if row.get("kind") == "live":
         if focus_live(window, row):
@@ -1027,7 +1030,11 @@ def show_session_list(window) -> Optional[SessionListView]:
 
 
 class SessionListClickListener(sublime_plugin.EventListener):
-    """Dclick is Default `drag_select` by=words; letter keys often fall through to insert."""
+    """Letter keys often fall through to insert. Dclick open is mousemap only.
+
+    Do not also open on Default `drag_select` by=words — word-select begin
+    is often the previous line, so one dclick opened the target and a neighbor.
+    """
 
     def on_query_context(self, view, key, operator, operand, match_all):
         if key != "claude_session_list":
@@ -1058,21 +1065,6 @@ class SessionListClickListener(sublime_plugin.EventListener):
         if ch in ("\n", "\r"):
             return ("claude_session_list_open", {})
         return None
-
-    def on_post_text_command(self, view, name, args):
-        if not view or not view.settings().get(SETTING):
-            return
-        if name != "drag_select":
-            return
-        args = args or {}
-        if args.get("by") != "words":
-            return
-        line = 0
-        if view.sel():
-            line = view.rowcol(view.sel()[0].begin())[0] + 1
-        if line <= 1:
-            return
-        view.run_command("claude_session_list_open")
 
 
 def refresh_session_list(window) -> None:

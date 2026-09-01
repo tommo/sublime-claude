@@ -48,6 +48,9 @@ def additional_dirs(window):
     extra = (project_data.get("settings", {}) or {}).get("claude_additional_dirs", [])
     if isinstance(extra, list):
         dirs += [os.path.expanduser(d) for d in extra]
+    skill_dir = os.path.join(PLUGIN_DIR, "skills")
+    if os.path.isdir(skill_dir) and skill_dir not in dirs:
+        dirs.append(skill_dir)
     return dirs
 
 

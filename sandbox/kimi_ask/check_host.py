@@ -134,10 +134,13 @@ def main() -> int:
             kimi_kept[q["question"]] = val
     print("live Other elicitation content", content)
     print("kimi_kept after enum filter", kimi_kept)
-    if "q1" in content and content["q1"] == "all":
-        fails.append("host must not put Other 'all' in q1 — Kimi drops it")
-    if live_qs[1]["question"] in kimi_kept:
-        fails.append("Kimi enum filter should drop Other 'all'")
+    if content.get("q1") != "all":
+        fails.append("host must send Other freetext as q1 (native answers[question]=text)")
+    extra = AcpBridge._kimi_followup_answers(live_qs, live_answers)
+    if "all" not in extra:
+        fails.append("single/multi Other must still chain native answers JSON followup")
+    if not AcpBridge._kimi_has_freetext(live_qs, live_answers):
+        fails.append("Other 'all' must count as freetext")
     path = os.path.join(_ROOT, "bridge", "acp_base.py")
     with open(path, encoding="utf-8") as f:
         src = f.read()
@@ -167,7 +170,7 @@ def main() -> int:
         for f in fails:
             print(" -", f)
         return 1
-    print("elicitation sends every listed label; Other omitted; no inject")
+    print("listed labels + Other freetext in content; native JSON followup")
     return 0
 
 

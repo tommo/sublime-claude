@@ -653,6 +653,20 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual(by_id["cur"], "CURRENT")
         self.assertEqual(by_id["old"], "HISTORY")
 
+    def test_dclick_does_not_open_neighbor(self):
+        sl = _load()
+        opened = []
+        sl._last_open = (0.0, None)
+        sl.focus_live = lambda w, r, o=opened: (o.append(r["session_id"]) or True)
+        a = {"kind": "live", "session_id": "target", "view_id": 1}
+        b = {"kind": "live", "session_id": "neighbor", "view_id": 2}
+        self.assertTrue(sl.open_row(None, a))
+        self.assertFalse(sl.open_row(None, b))
+        self.assertEqual(opened, ["target"])
+        with open(os.path.join(_ROOT, "session_list.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertNotIn("def on_post_text_command", src)
+
 
 if __name__ == "__main__":
     unittest.main()

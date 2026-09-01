@@ -314,6 +314,14 @@ class Bridge:
         session_id_info = f"sublime.{session_id}"
         view_id_info = view_id or session_id
         parent_view_id = params.get("parent_view_id")
+        sidecar_rule = ""
+        try:
+            from sidecar_skill import RULE as sidecar_rule
+        except Exception:
+            sidecar_rule = (
+                'Unqualified "sidecar" means SUBLIME SIDECAR: MCP spawn_session, '
+                "not grok/kimi/codex CLI."
+            )
         session_guide = f"""
 
 ## Session Info
@@ -321,6 +329,8 @@ class Bridge:
 Session ID: {session_id_info}
 View ID: {view_id_info}
 """
+        if sidecar_rule:
+            session_guide += f"\n{sidecar_rule}\n"
         if parent_view_id is not None:
             session_guide += f"Parent View ID: {parent_view_id}\n"
 

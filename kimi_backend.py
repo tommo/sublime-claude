@@ -16,6 +16,7 @@ _DEFAULT_HOME_BIN = os.path.expanduser("~/.kimi-code/bin/kimi")
 # (do not invent model ids — only what the CLI advertises).
 KIMI_MODELS: List[Tuple[str, str]] = [
     ("kimi-code/k3", "K3"),
+    ("kimi-code/k3-256k", "K3-256k"),
     ("kimi-code/kimi-for-coding", "K2.7 Coding"),
     ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
 ]
@@ -25,6 +26,9 @@ MODEL_ALIASES = {
     "default": "kimi-code/k3",
     "k3": "kimi-code/k3",
     "kimi-code/k3": "kimi-code/k3",
+    "k3-256k": "kimi-code/k3-256k",
+    "256k": "kimi-code/k3-256k",
+    "kimi-code/k3-256k": "kimi-code/k3-256k",
     "k2.7": "kimi-code/kimi-for-coding",
     "kimi-for-coding": "kimi-code/kimi-for-coding",
     "kimi-code/kimi-for-coding": "kimi-code/kimi-for-coding",

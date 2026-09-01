@@ -376,6 +376,7 @@ class MCPSocketServer:
             "list_sessions": self._list_sessions,
             "session_info": self._session_info,
             "read_session_output": self._read_session_output,
+            "read_session_edits": self._read_session_edits,
             "list_profile_docs": self._list_profile_docs,
             "read_profile_doc": self._read_profile_doc,
             "quick_done": self._quick_done,
@@ -1725,6 +1726,35 @@ class MCPSocketServer:
     def _debug_goal(self, args: str = "status", view_id: int = None) -> dict:
         from . import devtools
         return devtools.goal_command(args=args, view_id=view_id)
+
+    def _read_session_edits(
+        self,
+        agent_id: str = None,
+        view_id: int = None,
+        offset: int = 0,
+        limit: int = 10,
+        file_path: str = None,
+    ) -> dict:
+        """Page Edit/Write diffs from a subsession transcript."""
+        from . import session_registry
+        from .session_edits import collect_session_edits, conversations_of, page_edits
+
+        ref = agent_id if agent_id is not None else view_id
+        session = session_registry.get_session_by_ref(ref)
+        if not session:
+            return {
+                "error": f"Session not found for {ref!r}",
+                "hint": "Prefer agent_id from list_sessions / spawn_session",
+                "available_agent_ids": list(
+                    getattr(sublime, "_claude_agents", {}) or {}
+                ),
+            }
+        edits = collect_session_edits(conversations_of(session))
+        page = page_edits(
+            edits, offset=offset, limit=limit, file_path=file_path)
+        page["agent_id"] = getattr(session, "agent_id", None)
+        page["view_id"] = session_registry.runtime_view_id(session)
+        return page
 
     def _read_session_output(
         self,

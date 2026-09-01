@@ -169,6 +169,17 @@ def create_sublime_router() -> ToolRouter:
         + f"lines={args.get('lines')!r})"
         )
 
+    router.register("read_session_edits", lambda args:
+        f"return read_session_edits("
+        + (f"agent_id={args['agent_id']!r}, " if args.get('agent_id') else "")
+        + (f"view_id={args.get('view_id')}, "
+           if args.get('view_id') is not None else "")
+        + f"offset={args.get('offset', 0)!r}, "
+        + f"limit={args.get('limit', 10)!r}"
+        + (f", file_path={args['file_path']!r}" if args.get('file_path') else "")
+        + ")"
+        )
+
     router.register("read_profile_doc", lambda args:
         f"return read_profile_doc({args.get('path', '')!r})")
 

@@ -42,6 +42,10 @@ class TestKimiBackendHelpers(unittest.TestCase):
         self.assertEqual(kimi_backend.normalize_model(None), "kimi-code/k3")
         self.assertEqual(kimi_backend.normalize_model("k3"), "kimi-code/k3")
         self.assertEqual(
+            kimi_backend.normalize_model("k3-256k"),
+            "kimi-code/k3-256k",
+        )
+        self.assertEqual(
             kimi_backend.normalize_model("k2.7"),
             "kimi-code/kimi-for-coding",
         )
@@ -54,6 +58,7 @@ class TestKimiBackendHelpers(unittest.TestCase):
             ids,
             {
                 "kimi-code/k3",
+                "kimi-code/k3-256k",
                 "kimi-code/kimi-for-coding",
                 "kimi-code/kimi-for-coding-highspeed",
             },

@@ -406,6 +406,10 @@ def _edit(view: "OutputView", tool: "ToolCall") -> str:
     if unified:
         diff_str = view._format_unified_diff(unified)
         line_num = view._extract_diff_line_num(unified)
+        if (not line_num or line_num == 1) and file_path and (old or new):
+            found = view._find_line_number(file_path, old, new)
+            if found:
+                line_num = found
     else:
         diff_str = view._format_edit_diff(old, new)
         line_num = view._find_line_number(file_path, old, new)

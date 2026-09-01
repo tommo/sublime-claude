@@ -522,13 +522,33 @@ class AcpBridge(BaseBridge):
         meta: Dict[str, Any] = {}
         if system_prompt:
             meta["systemPromptOverride"] = system_prompt
+        rules = []
         if resume_failed:
-            meta["rules"] = (
+            rules.append(
                 "This Sublime session was reopened without a loadable agent "
                 "transcript. The user can still see prior UI history; do not "
                 "assume you remember earlier turns unless restated."
             )
+        sidecar = self._sidecar_rule()
+        if sidecar:
+            rules.append(sidecar)
+        if rules:
+            meta["rules"] = "\n".join(rules)
         return meta
+
+    @staticmethod
+    def _sidecar_rule() -> str:
+        try:
+            plugin = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            if plugin not in sys.path:
+                sys.path.insert(0, plugin)
+            from sidecar_skill import RULE
+            return RULE
+        except Exception:
+            return (
+                'Unqualified "sidecar" means SUBLIME SIDECAR: MCP spawn_session, '
+                "not grok/kimi/codex CLI."
+            )
 
     def log_path(self) -> str:
         """Per-process file. Shared kimi_bridge.log is truncated on every
@@ -1337,6 +1357,10 @@ class AcpBridge(BaseBridge):
                         "content": text or "background",
                         "is_error": False,
                     })
+                    # Launch ack only — do not leave this id in the create
+                    # FIFO or the next terminal/create (cat, fg bash) binds
+                    # to the dead ⚙ row (kimi_bridge.28053.log term_3c5a).
+                    self._drop_pending_execute(tid)
                     # Keep the call until process / child exit
                     return
                 if call and call.background and (
@@ -2360,8 +2384,12 @@ class AcpBridge(BaseBridge):
         old = out.get("old_string") or ""
         new = out.get("new_string") or ""
         if tool_name == "Edit" and not out.get("unified_diff") and (old or new):
-            out["unified_diff"] = self._plan_unified_diff(
-                str(old), str(new), max_chars=8000)
+            path = (
+                out.get("file_path") or out.get("path")
+                or out.get("target_file") or ""
+            )
+            out["unified_diff"] = self._snippet_unified_diff(
+                str(old), str(new), str(path), max_chars=8000)
         # Plugin Edit formatter prefers unified_diff; drop bulky bodies so
         # the host JSON-RPC line is not enormous (drip of a whole function).
         if tool_name == "Edit" and out.get("unified_diff"):
@@ -2723,16 +2751,36 @@ class AcpBridge(BaseBridge):
             self._last_execute_id = None
 
     def _take_pending_execute_id(self) -> Optional[str]:
-        pending = getattr(self, "_pending_execute_ids", None) or []
-        if pending:
-            eid = pending.pop(0)
-            self._pending_execute_ids = pending
+        pending = list(getattr(self, "_pending_execute_ids", None) or [])
+        bound = {
+            info.get("tool_use_id")
+            for info in (getattr(self, "_terminal_bg", None) or {}).values()
+            if info.get("tool_use_id")
+        }
+
+        def _usable(tid: Optional[str]) -> bool:
+            if not tid or tid in bound:
+                return False
+            call = self._call(tid)
+            if call and getattr(call, "result_sent", False):
+                return False
+            return True
+
+        eid = None
+        kept = []
+        for tid in pending:
+            if eid is None and _usable(tid):
+                eid = tid
+            elif _usable(tid):
+                kept.append(tid)
+        self._pending_execute_ids = kept
+        if eid:
             if getattr(self, "_last_execute_id", None) == eid:
                 self._last_execute_id = None
             return eid
-        eid = getattr(self, "_last_execute_id", None)
+        last = getattr(self, "_last_execute_id", None)
         self._last_execute_id = None
-        return eid
+        return last if _usable(last) else None
 
     @staticmethod
     def _script_from_terminal_params(cmd, args_in) -> str:
@@ -2767,12 +2815,16 @@ class AcpBridge(BaseBridge):
         })
 
     def _should_skip_bg_notify(self, task_id: str, tool_use_id: str = "") -> bool:
-        """True if we already sent task_notification for this logical bg job."""
-        if task_id and task_id in self._bg_notified_tasks:
-            return True
+        """True if this tool row already got a closer.
+
+        Do not skip a new tool_use_id just because a sibling terminal
+        shared a kimi bash-* task_id — that left a stack of ⚙ forever.
+        """
         if tool_use_id and tool_use_id in self._bg_notified_tools:
             return True
-        return False
+        if tool_use_id:
+            return False
+        return bool(task_id and task_id in self._bg_notified_tasks)
 
     def _mark_bg_notified(self, task_id: str, tool_use_id: str = "") -> None:
         if task_id:
@@ -2864,25 +2916,48 @@ class AcpBridge(BaseBridge):
                 reader is None or reader.done()):
             self._emit_bg_terminal_complete(terminal_id)
 
+    def _bg_exit_status_label(self, slot: dict) -> str:
+        es = (slot or {}).get("exit_status") or {}
+        code = es.get("exitCode")
+        if code is None and es.get("signal"):
+            return "failed"
+        if code is None or int(code) == 0:
+            return "completed"
+        return "failed"
+
+    def _ui_close_bg(self, task_id: str, tool_use_id: str, status: str) -> None:
+        """Flip ⚙ even when the agent-wake notify is deduped."""
+        self._emit_system("task_updated", {
+            "task_id": task_id,
+            "tool_use_id": tool_use_id,
+            "patch": {"status": status},
+        })
+
     def _emit_bg_terminal_complete(self, terminal_id: str) -> None:
         """ACP process exit → one Claude task_notification."""
         info = self._terminal_bg.pop(terminal_id, None)
+        slot = self._terminals.get(terminal_id) or {}
         if not info:
-            return
+            tuid = slot.get("tool_use_id") or slot.get("host_tool_id")
+            if not tuid and not slot.get("bg"):
+                return
+            info = {
+                "tool_use_id": tuid or f"term-bg-{terminal_id}",
+                "task_id": f"acp-term-{terminal_id}",
+                "cmd": slot.get("cmd") or "",
+            }
         task_id = info.get("task_id") or f"acp-term-{terminal_id}"
         tool_use_id = info.get("tool_use_id") or f"bg-{task_id}"
+        status = self._bg_exit_status_label(slot)
         if self._should_skip_bg_notify(task_id, tool_use_id):
+            self.file_log(
+                f"bg complete skip wake task={task_id} tool={tool_use_id} "
+                f"status={status}")
+            self._ui_close_bg(task_id, tool_use_id, status)
             return
-        slot = self._terminals.get(terminal_id) or {}
         out = (slot.get("stdout") or "") + (slot.get("stderr") or "")
         es = slot.get("exit_status") or {}
         code = es.get("exitCode")
-        if code is None and es.get("signal"):
-            status = "failed"
-        elif code is None or int(code) == 0:
-            status = "completed"
-        else:
-            status = "failed"
         output_file = self._write_bg_output_file("acp-bg-", out or "")
         raw = (info.get("cmd") or tool_use_id or task_id or "").strip()
         summary = self._clip_bg_summary(raw, code)
@@ -4658,10 +4733,10 @@ class AcpBridge(BaseBridge):
         if not content:
             return {"action": "cancel"}
         extra = self._kimi_followup_answers(questions, answers)
-        if extra and self._kimi_answers_dropped(questions, answers, content, keys):
-            # Other cannot enter the tool result (enum filter). Chain a
-            # second session/prompt AFTER this turn end_turn — not cancel.
-            # sandbox/kimi_ask after_prompt: Q1=all on the followup RPC.
+        if extra and self._kimi_has_freetext(questions, answers):
+            # Native wire: answers[question]=typed string. ACP enum filter
+            # may still drop it from the tool result — chain a followup
+            # session/prompt after end_turn (no cancel).
             self._pending_ask_followup = extra
         self.file_log(
             f"elicitation/create accept keys={list(content.keys())}"
@@ -4749,26 +4824,36 @@ class AcpBridge(BaseBridge):
                     if label in allowed:
                         picked.append(label)
                         continue
+                    hit = False
                     for ol in allowed:
                         if AcpBridge._labels_match(label, ol):
                             picked.append(ol)
+                            hit = True
                             break
-                # declared order
-                picked = [ol for ol in allowed if ol in picked]
-                if picked:
-                    content[key] = picked
+                    if not hit and label:
+                        picked.append(label)
+                listed = [ol for ol in allowed if ol in picked]
+                extra = [p for p in picked if p not in listed]
+                if listed or extra:
+                    content[key] = listed + extra
                 continue
             label = (
                 str(val[0]) if isinstance(val, (list, tuple)) and val
                 else str(val or "")
             )
+            if not label:
+                continue
             if label in allowed:
                 content[key] = label
                 continue
+            matched = ""
             for ol in allowed:
                 if AcpBridge._labels_match(label, ol):
-                    content[key] = ol
+                    matched = ol
                     break
+            # Native Kimi Other: answers[question] is the typed string
+            # (session_18b6df1a wire). Do not omit it.
+            content[key] = matched or label
         return content
 
     async def _handle_acp_ask_user_permission(
@@ -4852,7 +4937,7 @@ class AcpBridge(BaseBridge):
         label = self._first_answer_label(answers, questions)
         oid = self._kimi_q0_option_id(options, questions, label)
         extra = self._kimi_followup_answers(questions, answers)
-        if extra:
+        if extra and self._kimi_has_freetext(questions, answers):
             self._pending_ask_followup = extra
         if oid:
             self.file_log(
@@ -4959,38 +5044,64 @@ class AcpBridge(BaseBridge):
         return ""
 
     @staticmethod
-    def _kimi_followup_answers(questions: list, answers: dict) -> str:
-        """Text for Q1+ (Kimi ACP drops them) or a full recap when useful."""
+    def _kimi_native_answers_map(questions: list, answers: dict) -> dict:
+        """Same shape as native tool.result: {question_text: answer}."""
         if not isinstance(answers, dict) or not answers:
-            return ""
-        if not questions or len(questions) < 2:
-            return ""
-        lines = [
-            "The user answered AskUserQuestion. ACP only forwards the "
-            "first question — do NOT treat this as dismissed. Honor every "
-            "answer below:",
-        ]
-        for q in questions:
+            return {}
+        out = {}
+        for q in questions or []:
             if not isinstance(q, dict):
                 continue
-            header = q.get("header") or ""
-            qtext = q.get("question") or header or "Question"
+            qtext = q.get("question") or q.get("header") or ""
             val = ""
-            for key in (q.get("question") or "", header):
+            for key in (q.get("question") or "", q.get("header") or ""):
+                if key and key in answers:
+                    val = AcpBridge._answer_as_label(answers[key])
+                    if val:
+                        break
+            if qtext and val:
+                out[qtext] = val
+        return out
+
+    @staticmethod
+    def _kimi_followup_answers(questions: list, answers: dict) -> str:
+        """Native AskUserQuestion tool result JSON. Works for one question."""
+        native = AcpBridge._kimi_native_answers_map(questions, answers)
+        if not native:
+            return ""
+        payload = json.dumps({"answers": native}, ensure_ascii=False)
+        return (
+            "AskUserQuestion tool result (user typed Other/free text; "
+            "do NOT treat as dismissed):\n" + payload
+        )
+
+    @staticmethod
+    def _kimi_has_freetext(questions: list, answers: dict) -> bool:
+        """True if any UI answer is not a declared option label."""
+        if not isinstance(answers, dict) or not answers:
+            return False
+        for q in questions or []:
+            if not isinstance(q, dict):
+                continue
+            val = ""
+            for key in (q.get("question") or "", q.get("header") or ""):
                 if key and key in answers:
                     val = AcpBridge._answer_as_label(answers[key])
                     if val:
                         break
             if not val:
                 continue
-            prefix = f"{header}: " if header and header != qtext else ""
-            lines.append(f"- {prefix}{qtext}: {val}" if prefix else f"- {qtext}: {val}")
-        if len(lines) <= 1:
-            return ""
-        lines.append(
-            "If a tool result said the user dismissed or only includes "
-            "the first choice, ignore that and use this list.")
-        return "\n".join(lines)
+            allowed = [
+                str(o.get("label") or "")
+                for o in (q.get("options") or [])
+                if isinstance(o, dict)
+            ]
+            if val in allowed:
+                continue
+            if any(AcpBridge._labels_match(val, ol) for ol in allowed):
+                continue
+            return True
+        return False
 
     @staticmethod
     def _kimi_other_followup(questions: list, answers: dict, label: str) -> str:
@@ -5310,6 +5421,80 @@ class AcpBridge(BaseBridge):
                 root, "*", "session_*", "agents", "*", "plans", "*.md"))
         cands = [p for p in cands if os.path.isfile(p)]
         return max(cands, key=os.path.getmtime) if cands else ""
+
+    _HUNK_RE = re.compile(
+        r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$")
+
+    @staticmethod
+    def _file_line_of_snippet(path: str, snippet: str) -> int:
+        """1-based file line of snippet, or 0 if not found."""
+        if not path or not snippet or not os.path.isfile(path):
+            return 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except Exception:
+            return 0
+        pos = text.find(snippet)
+        if pos < 0:
+            first = (snippet.splitlines() or [""])[0]
+            if first:
+                pos = text.find(first)
+        if pos < 0:
+            return 0
+        return text[:pos].count("\n") + 1
+
+    @staticmethod
+    def _shift_unified_hunks(diff: str, start_line: int) -> str:
+        """Move snippet-relative @@ hunks onto file line numbers."""
+        if start_line <= 1 or not diff:
+            return diff
+        delta = start_line - 1
+        out = []
+        for line in diff.splitlines():
+            m = AcpBridge._HUNK_RE.match(line)
+            if not m:
+                out.append(line)
+                continue
+            old_a, old_n, new_a, new_n, rest = m.groups()
+            oa, na = int(old_a), int(new_a)
+            if oa > 0:
+                oa += delta
+            if na > 0:
+                na += delta
+            old_part = f"-{oa}" + (f",{old_n}" if old_n is not None else "")
+            new_part = f"+{na}" + (f",{new_n}" if new_n is not None else "")
+            out.append(f"@@ {old_part} {new_part} @@{rest}")
+        return "\n".join(out)
+
+    @staticmethod
+    def _snippet_unified_diff(
+            before: str, after: str, path: str = "",
+            *, max_chars: int = 8000) -> str:
+        """Unified diff of an Edit snippet, @@ headers in file coordinates."""
+        import difflib
+        if (before or "") == (after or ""):
+            return ""
+        start = (
+            AcpBridge._file_line_of_snippet(path, before)
+            or AcpBridge._file_line_of_snippet(path, after)
+            or 1
+        )
+        lines = list(difflib.unified_diff(
+            (before or "").splitlines(),
+            (after or "").splitlines(),
+            fromfile=path or "a",
+            tofile=path or "b",
+            lineterm="",
+        ))
+        if not lines:
+            return ""
+        diff = "\n".join(lines)
+        if start > 1:
+            diff = AcpBridge._shift_unified_hunks(diff, start)
+        if len(diff) > max_chars:
+            return diff[:max_chars] + "\n… (diff truncated)"
+        return diff
 
     @staticmethod
     def _plan_unified_diff(before: str, after: str, *, max_chars: int = 12000) -> str:

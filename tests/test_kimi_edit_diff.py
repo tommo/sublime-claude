@@ -136,6 +136,39 @@ class TestKimiEditDiff(unittest.TestCase):
             self.assertIn("-a = 1", inp["unified_diff"])
             self.assertIn("+a = 2", inp["unified_diff"])
 
+    def test_snippet_diff_uses_file_line_not_one(self):
+        import tempfile
+        old = "proc foo(): int =\n  1\n"
+        new = "proc foo(): int =\n  2\n"
+        prefix = "\n".join(f"line {i}" for i in range(1, 21)) + "\n"
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".nim", delete=False, encoding="utf-8") as f:
+            f.write(prefix + old + "tail\n")
+            path = f.name
+        try:
+            diff = AcpBridge._snippet_unified_diff(old, new, path)
+            self.assertIn("@@ -21,", diff)
+            self.assertNotRegex(diff, r"(?m)^@@ -1,")
+            self.assertIn("-  1", diff)
+            self.assertIn("+  2", diff)
+            notes, _b = _fwd([{
+                "sessionUpdate": "tool_call",
+                "toolCallId": "0:tool_edit",
+                "title": "Edit",
+                "kind": "edit",
+                "status": "completed",
+                "rawInput": {
+                    "path": path,
+                    "old_string": old,
+                    "new_string": new,
+                },
+            }])
+            uses = [p for _, p in notes if p.get("type") == "tool_use"]
+            inp = uses[-1].get("input") or {}
+            self.assertIn("@@ -21,", inp.get("unified_diff") or "")
+        finally:
+            os.unlink(path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -240,6 +240,31 @@ def _list_sessions(view: "OutputView", tool: "ToolCall") -> str:
     return ""
 
 
+def _read_session_edits(view: "OutputView", tool: "ToolCall") -> str:
+    inp = _tool_input(tool)
+    aid = inp.get("agent_id")
+    off = inp.get("offset")
+    lim = inp.get("limit")
+    bits = []
+    if aid:
+        bits.append(str(aid)[:12])
+    if off:
+        bits.append(f"off {off}")
+    if lim:
+        bits.append(f"n {lim}")
+    out = _join_bits(*bits)
+    if tool.status == "done" and tool.result:
+        r = tool.result
+        if isinstance(r, dict):
+            tot = r.get("total")
+            n = r.get("count")
+            more = " +" if r.get("has_more") else ""
+            if tot is not None:
+                out += f": {n}/{tot}{more}"
+        out += view._format_mcp_result(tool.result)
+    return out
+
+
 def _read_session_output(view: "OutputView", tool: "ToolCall") -> str:
     inp = _tool_input(tool)
     vid = inp.get("view_id")
@@ -476,6 +501,7 @@ SUBLIME_MCP_FORMATTERS: Dict[str, Callable] = {
     "list_sessions": _list_sessions,
     "session_info": _session_info,
     "read_session_output": _read_session_output,
+    "read_session_edits": _read_session_edits,
     "list_profile_docs": _list_profile_docs,
     "read_profile_doc": _read_profile_doc,
     "lsp": _lsp,

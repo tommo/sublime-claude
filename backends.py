@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from . import grok_backend
+from . import kimi_backend
 
 
 def _pi_available() -> bool:
@@ -332,11 +333,7 @@ BACKENDS: Dict[str, BackendSpec] = {
         abbrev="KM",
         bridge_script="kimi_main.py",
         fallback_model="kimi-code/k3",
-        default_models=[
-            ("kimi-code/k3", "K3"),
-            ("kimi-code/kimi-for-coding", "K2.7 Coding"),
-            ("kimi-code/kimi-for-coding-highspeed", "K2.7 Coding Highspeed"),
-        ],
+        default_models=list(kimi_backend.KIMI_MODELS),
         available=_kimi_available,
         pinned=True,
     ),

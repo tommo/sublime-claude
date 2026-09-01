@@ -157,7 +157,8 @@ class TestKimiElicitationForm(unittest.TestCase):
         self.assertFalse(AcpBridge._kimi_answers_dropped(
             qs, {"Pick one": "B", "Pick many": ["Z", "X"]}, content, keys))
 
-    def test_other_freeform_is_omitted_from_elicitation(self):
+    def test_other_freeform_is_sent_like_native(self):
+        """Native wire: answers[question]=typed string, method=enter."""
         qs = [
             {"question": "What should the new procedural animation package be named?",
              "header": "Pkg name",
@@ -179,11 +180,27 @@ class TestKimiElicitationForm(unittest.TestCase):
         }
         content = AcpBridge._elicitation_content_from_answers(
             qs, ["q0", "q1"], answers)
-        self.assertEqual(content, {"q0": "procmotion"})
-        self.assertTrue(AcpBridge._kimi_answers_dropped(
-            qs, answers, content, ["q0", "q1"]))
+        self.assertEqual(content, {"q0": "procmotion", "q1": "all"})
+        self.assertTrue(AcpBridge._kimi_has_freetext(qs, answers))
         extra = AcpBridge._kimi_followup_answers(qs, answers)
         self.assertIn("all", extra)
+        self.assertIn('"answers"', extra)
+
+    def test_single_question_other_is_not_empty(self):
+        q = "AskUserQuestion tool test: which option do you pick?"
+        qs = [{
+            "question": q, "header": "Test",
+            "options": [{"label": "Option A"}, {"label": "Option B"}],
+            "multiSelect": False,
+        }]
+        answers = {q: "Hello, End here"}
+        content = AcpBridge._elicitation_content_from_answers(
+            qs, ["q0"], answers)
+        self.assertEqual(content, {"q0": "Hello, End here"})
+        self.assertTrue(AcpBridge._kimi_has_freetext(qs, answers))
+        extra = AcpBridge._kimi_followup_answers(qs, answers)
+        self.assertIn("Hello, End here", extra)
+        self.assertIn(q, extra)
 
     def test_inject_followup_is_dead(self):
         path = os.path.join(_ROOT, "bridge", "acp_base.py")
