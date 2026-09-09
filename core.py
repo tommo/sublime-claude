@@ -98,6 +98,17 @@ def plugin_loaded() -> None:
     from . import notalone
     notalone.start()
 
+    # Warm the opencode model catalog off-thread. `opencode models` is the only
+    # place custom providers from opencode.json (e.g. a local Lemonade server)
+    # surface; without this the first model picker after load shows the static
+    # zen-only fallback.
+    try:
+        from . import backends
+        if backends._opencode_available():
+            backends.opencode_picker_models()
+    except Exception as e:
+        print(f"[Claude] opencode catalog warm failed: {e}")
+
     # 1) Immediately strip leftover ◎ from restored buffers so the composer
     #    never flashes before sleep restore (ST session restore leaves ◎ in text).
     # 2) After quiet: register Session objects as sleeping + paint chrome.

@@ -1,6 +1,6 @@
 # Claude Code for Sublime Text
 
-A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), [Grok Build](https://x.ai/) / [Kimi Code](https://moonshotai.github.io/kimi-code/) via **Agent Client Protocol (ACP)**, and any **Anthropic-compatible** provider (DeepSeek, GLM, Moonshot, Qwen, OpenRouter, …).
+A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), [Grok Build](https://x.ai/) / [Kimi Code](https://moonshotai.github.io/kimi-code/) / [opencode](https://opencode.ai) via **Agent Client Protocol (ACP)**, and any **Anthropic-compatible** provider (DeepSeek, GLM, Moonshot, Qwen, OpenRouter, …).
 
 ## Requirements
 
@@ -12,6 +12,7 @@ A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex C
   - GitHub Copilot CLI via `github-copilot-sdk`
   - Grok Build CLI (`grok agent stdio` ACP)
   - **Kimi Code CLI** (`kimi acp` ACP) — native path; see below
+  - **opencode** (`opencode acp` ACP) — `OPENCODE_BIN` or `opencode` on PATH
   - Custom Anthropic-compatible provider — base URL + API key (uses the Claude bridge)
 
 ```bash
@@ -32,6 +33,10 @@ pip install github-copilot-sdk  # Bundles CLI binary
 # Default binary often at ~/.kimi-code/bin/kimi
 kimi login
 kimi doctor
+
+# opencode (optional, native ACP)
+# curl -fsSL https://opencode.ai/install | bash   → ~/.local/bin/opencode
+opencode auth login
 
 # Custom Anthropic-compatible provider (optional) — no extra install,
 # configure under settings.custom_providers (see Custom Providers below).

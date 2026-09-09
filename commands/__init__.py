@@ -6,6 +6,7 @@ from .session_cmds import (  # noqa: F401
     DeepSeekStartCommand,
     PiStartCommand,
     DsrStartCommand,
+    OpencodeStartCommand,
     GrokStartCommand,
     KimiStartCommand,
     ClaudeCodeQueryCommand,

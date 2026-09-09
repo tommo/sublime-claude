@@ -18,6 +18,7 @@ from .commands import (
     ClaudeCodeStartCommand,
     PiStartCommand,
     DsrStartCommand,
+    OpencodeStartCommand,
     GrokStartCommand,
     KimiStartCommand,
     ClaudeCodePtyStartCommand,
