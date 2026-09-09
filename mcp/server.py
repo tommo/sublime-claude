@@ -865,36 +865,6 @@ Example:
                         "required": ["notification_type", "params", "wake_prompt"]
                     }
                 },
-                # ─── Chatroom Tools ────────────────────────────────────────
-                {
-                    "name": "chatroom",
-                    "description": """Multi-agent chat rooms. Commands:
-- list                    → list all rooms
-- rooms                   → list rooms I've joined
-- create <id> [name]      → create a room
-- join <room_id>          → join a room
-- leave <room_id>         → leave a room
-- post <room_id> <msg>    → post a message (other agents wake automatically)
-- history <room_id>       → get chat history
-
-Messages posted to a room automatically wake other agent participants.
-
-Examples:
-  chatroom("list")
-  chatroom("create dev-chat Development Chat")
-  chatroom("join dev-chat")
-  chatroom("post dev-chat Hello!")""",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "cmd": {
-                                "type": "string",
-                                "description": "Command string, e.g. 'post dev-chat Hello!'"
-                            }
-                        },
-                        "required": ["cmd"]
-                    }
-                },
                 # ─── Garage Session Search ──────────────────────────────────
                 {
                     "name": "garage_search",
@@ -1000,9 +970,10 @@ Examples:
 
             # Per-session MCP process: CALLER_VIEW_ID is this sheet. Inject so
             # the agent never has to discover parent/self ids by searching.
-            if tool_name == "spawn_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
-                args["_caller_view_id"] = CALLER_VIEW_ID
-            if tool_name == "send_to_session" and CALLER_VIEW_ID and "_caller_view_id" not in args:
+            if tool_name in (
+                "spawn_session", "send_to_session", "list_sessions",
+                "session_info", "read_session_output", "read_session_edits",
+            ) and CALLER_VIEW_ID and "_caller_view_id" not in args:
                 args["_caller_view_id"] = CALLER_VIEW_ID
             if tool_name in ("signal_complete", "signal_subsession_complete"):
                 if CALLER_VIEW_ID is not None and args.get("session_id") is None:

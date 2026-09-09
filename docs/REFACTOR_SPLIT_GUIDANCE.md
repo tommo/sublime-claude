@@ -11,7 +11,7 @@
 | `commands.py` | 4350 | Group by domain into `commands/` package |
 | `output.py` | 3676 | Extract models + phantoms + strip UI; keep OutputView core |
 | `session.py` | 3120 | Extract persistence, bookmarks, workflow helpers |
-| `mcp_server.py` | 2446 | Extract chatroom/garage/tool handlers |
+| `mcp_server.py` | 2446 | Extract garage/tool handlers |
 | `bridge/acp_base.py` | 2765 | Extract plan/permission/terminal tool handlers (optional phase 2) |
 
 Do **commands.py** and **output.py** first. Stop after those two if time is limited; leave a short NOTES.md of remaining work.

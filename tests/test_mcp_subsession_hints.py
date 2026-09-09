@@ -32,6 +32,24 @@ class TestMcpSubsessionHints(unittest.TestCase):
         self.assertIn("resolve_spawn_model", impl)
         self.assertIn("model=spawn_model", impl)
 
+    def test_chatroom_tool_removed(self):
+        mcp = self._read("mcp", "server.py")
+        router = self._read("tool_router.py")
+        host = self._read("mcp_server.py")
+        fmt = self._read("tool_formatters_sublime.py")
+        self.assertNotIn('"name": "chatroom"', mcp)
+        self.assertNotIn("chatroom_handler", router)
+        self.assertNotIn("def chatroom_list", host)
+        self.assertNotIn('"chatroom":', fmt)
+
+    def test_list_sessions_gets_caller_view_id(self):
+        src = self._read("mcp", "server.py")
+        self.assertIn('"list_sessions"', src)
+        self.assertIn(
+            '"spawn_session", "send_to_session", "list_sessions"', src)
+        router = self._read("tool_router.py")
+        self.assertIn("list_sessions(_caller_view_id=", router)
+
 
 if __name__ == "__main__":
     unittest.main()

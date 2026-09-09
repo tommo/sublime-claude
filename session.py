@@ -360,11 +360,18 @@ class Session:
                 or initial_context.get("subsession_id")
                 or new_agent_id()
             )
-            self.subsession_id = (
-                initial_context.get("subsession_id") or self.agent_id
-            )
+            self.subsession_id = initial_context.get("subsession_id")
+            if not self.subsession_id and (
+                initial_context.get("parent_agent_id")
+                or initial_context.get("parent_view_id")
+            ):
+                self.subsession_id = self.agent_id
             self.parent_view_id = initial_context.get("parent_view_id")
             self.parent_agent_id = initial_context.get("parent_agent_id")
+            self.parent_session_id = initial_context.get("parent_session_id")
+            self.child_agent_ids = list(initial_context.get("child_agent_ids") or [])
+            self.agent_id_aliases = list(initial_context.get("agent_id_aliases") or [])
+            self.view_id_aliases = list(initial_context.get("view_id_aliases") or [])
             # Host goal skeptic subsession (never owns the goal tracker)
             self.goal_role = (initial_context.get("goal_role") or "") or None
         else:
@@ -372,6 +379,10 @@ class Session:
             self.subsession_id = None
             self.parent_view_id = None
             self.parent_agent_id = None
+            self.parent_session_id = None
+            self.child_agent_ids = []
+            self.agent_id_aliases = []
+            self.view_id_aliases = []
             self.goal_role = None
 
         # Persona info (for release on close)
@@ -5471,6 +5482,14 @@ class Session:
                 view.settings().set("claude_subsession_id", self.subsession_id)
             if getattr(self, "parent_agent_id", None):
                 view.settings().set("claude_parent_agent_id", self.parent_agent_id)
+            if getattr(self, "parent_session_id", None):
+                view.settings().set("claude_parent_session_id", self.parent_session_id)
+            kids = getattr(self, "child_agent_ids", None) or []
+            if kids:
+                view.settings().set("claude_child_agent_ids", list(kids))
+            aliases = getattr(self, "agent_id_aliases", None) or []
+            if aliases:
+                view.settings().set("claude_agent_id_aliases", list(aliases))
             sid = self.session_id or self.resume_id
             if sid:
                 view.settings().set("claude_session_id", sid)
@@ -5528,6 +5547,20 @@ class Session:
             entry["parent_agent_id"] = self.parent_agent_id
         else:
             entry.pop("parent_agent_id", None)
+        if getattr(self, "parent_session_id", None):
+            entry["parent_session_id"] = self.parent_session_id
+        else:
+            entry.pop("parent_session_id", None)
+        kids = getattr(self, "child_agent_ids", None) or []
+        if kids:
+            entry["child_agent_ids"] = list(kids)
+        else:
+            entry.pop("child_agent_ids", None)
+        aliases = getattr(self, "agent_id_aliases", None) or []
+        if aliases:
+            entry["agent_id_aliases"] = list(aliases)
+        else:
+            entry.pop("agent_id_aliases", None)
         mid = getattr(self, "model", None)
         if not mid and self.output and self.output.view:
             try:

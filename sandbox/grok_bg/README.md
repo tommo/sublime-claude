@@ -10,6 +10,11 @@ prefix. Background terminals raise the stored cap to
 `terminal_output_max_bytes` (1MB) so long editor logs are not frozen at
 startup.
 
+Interrupt (Esc): host `handle_interrupt` kills **client terminals** so
+`wait_for_exit` unblocks, then `session/cancel`. It must **not** terminate
+the ACP agent process. Idle Esc still reaps leftover shells and must not
+re-send `session/cancel` (Grok ChatStateActor dies).
+
 ```bash
 python3 sandbox/grok_bg/check_wait.py
 python3 tests/test_bg_tool_gates.py TestGrokBgWaitAck TestMarkTerminalBg TestTerminalOutputDrain

@@ -1355,22 +1355,26 @@ class MCPSocketServer:
         subsession_id = agent_id
 
         # Parent identity: prefer stable agent_id; view_id is runtime cache only
-        parent_session = None
-        if _caller_view_id:
-            parent_session = session_registry.get_session_for_view_id(_caller_view_id)
-        if not parent_session:
-            parent_session, _ = self._get_session_for_tool()
+        if _caller_view_id is not None:
+            try:
+                _caller_view_id = int(_caller_view_id)
+            except (TypeError, ValueError):
+                pass
+            self._caller_view_id = _caller_view_id
+        parent_session, resolved_vid = self._resolve_caller_session(_caller_view_id)
         parent_view_id = None
         parent_agent_id = None
+        parent_session_id = None
         if parent_session:
             parent_agent_id = getattr(parent_session, "agent_id", None)
+            parent_session_id = getattr(parent_session, "session_id", None)
             try:
                 if parent_session.output and parent_session.output.view:
                     parent_view_id = parent_session.output.view.id()
             except Exception:
-                parent_view_id = _caller_view_id
+                parent_view_id = resolved_vid or _caller_view_id
         else:
-            parent_view_id = _caller_view_id
+            parent_view_id = resolved_vid or _caller_view_id
 
         # Prepare initial context for subsession
         initial_context = {
@@ -1378,6 +1382,7 @@ class MCPSocketServer:
             "subsession_id": subsession_id,
             "parent_view_id": parent_view_id,
             "parent_agent_id": parent_agent_id,
+            "parent_session_id": parent_session_id,
         }
 
         # Create new session with initial context
@@ -1414,6 +1419,13 @@ class MCPSocketServer:
 
         view_id = session.output.view.id() if session.output.view else None
         try:
+            if parent_session:
+                session_registry.note_child(parent_session, agent_id)
+                try:
+                    parent_session._persist_view_identity()
+                    parent_session._save_session()
+                except Exception:
+                    pass
             session._persist_view_identity()
             session_registry.register_session(session)
         except Exception:
@@ -1435,6 +1447,7 @@ class MCPSocketServer:
             "subsession_id": subsession_id,
             "parent_agent_id": parent_agent_id,
             "parent_view_id": parent_view_id,
+            "parent_session_id": parent_session_id,
             "backend": backend,
             "model": spawn_model or getattr(session, "model", None),
             "fork": fork,
@@ -1620,21 +1633,90 @@ class MCPSocketServer:
             print(f"[MCP] context_budget_snapshot failed: {e}")
         return {"summary": "ctx:unknown", "has_usage": False}
 
-    def _list_sessions(self) -> dict:
+    def _resolve_caller_session(self, caller_view_id: int = None):
+        """Caller sheet for MCP tools. view_id is runtime; agent_id is stable."""
+        from . import session_registry
+        from .core import get_active_session
+
+        vid = caller_view_id
+        if vid is None:
+            vid = getattr(self, "_caller_view_id", None)
+        if vid is not None:
+            try:
+                vid = int(vid)
+            except (TypeError, ValueError):
+                pass
+        if vid is not None:
+            s = session_registry.get_session_for_view_id(vid)
+            if s is not None:
+                return s, vid
+            try:
+                for w in sublime.windows():
+                    for v in w.views():
+                        if v.id() != vid:
+                            continue
+                        aid = v.settings().get("claude_agent_id")
+                        if aid:
+                            s = session_registry.get_session_by_agent_id(aid)
+                            if s is not None:
+                                return s, vid
+            except Exception:
+                pass
+        window = self._get_window()
+        if window:
+            for key in ("claude_executing_view", "claude_active_view"):
+                ev = window.settings().get(key)
+                if ev is not None:
+                    s = session_registry.get_session_for_view_id(ev)
+                    if s is not None:
+                        return s, ev
+            s = get_active_session(window)
+            if s is not None:
+                return s, session_registry.runtime_view_id(s)
+        return None, vid
+
+    def _list_sessions(self, _caller_view_id: int = None) -> dict:
         """List subsessions of the caller (by stable parent_agent_id)."""
         from . import session_registry
 
-        caller_id = self._caller_view_id
-        caller = (
-            session_registry.get_session_for_view_id(caller_id)
-            if caller_id is not None else None
-        )
+        orig_vid = _caller_view_id
+        if orig_vid is not None:
+            try:
+                orig_vid = int(orig_vid)
+            except (TypeError, ValueError):
+                pass
+            self._caller_view_id = orig_vid
+        caller, caller_id = self._resolve_caller_session(orig_vid)
         parent_agent_id = getattr(caller, "agent_id", None) if caller else None
+        extra_vids = [v for v in (orig_vid, caller_id) if v is not None]
 
         children = session_registry.list_children_of(
             parent_view_id=caller_id,
             parent_agent_id=parent_agent_id,
+            extra_view_ids=extra_vids,
+            parent=caller,
         )
+        if caller:
+            text = ""
+            try:
+                view = caller.output.view if caller.output else None
+                if view and view.is_valid():
+                    text = view.substr(sublime.Region(0, view.size()))
+            except Exception:
+                text = ""
+            if text:
+                seen = {id(s) for s in children}
+                for s in session_registry.harvest_mentioned_orphans(caller, text):
+                    if id(s) not in seen:
+                        session_registry.relink_child_to_parent(s, caller)
+                        children.append(s)
+                        seen.add(id(s))
+            if children:
+                try:
+                    caller._persist_view_identity()
+                    caller._save_session()
+                except Exception:
+                    pass
         sessions = []
         lines = []
         for session in children:
@@ -1685,11 +1767,23 @@ class MCPSocketServer:
             })
 
         if not lines:
+            if caller is None and not parent_agent_id:
+                return {
+                    "summary": "No caller session for list_sessions "
+                               "(MCP view_id missing or stale). "
+                               "Spawned children are still listed by agent_id "
+                               "from spawn_session.",
+                    "sessions": [],
+                    "count": 0,
+                    "caller_view_id": caller_id,
+                }
             return {
                 "summary": "No subsessions (use agent_id from spawn; "
                            "view_id alone is not stable across ST restart)",
                 "sessions": [],
                 "count": 0,
+                "caller_agent_id": parent_agent_id,
+                "caller_view_id": caller_id,
             }
         return {"summary": "\n".join(lines), "sessions": sessions, "count": len(sessions)}
 
@@ -3184,6 +3278,8 @@ class MCPSocketServer:
                     for type_name, type_info in types.items():
                         if type_name.startswith("_") or not isinstance(type_info, dict):
                             continue
+                        if "chatroom" in type_name.lower() or service_name.lower() == "chatroom":
+                            continue
                         entry = {
                             "type": type_name,
                             "mode": type_info.get("mode", "notify"),
@@ -3197,6 +3293,10 @@ class MCPSocketServer:
                 # Already flat list format from daemon
                 for svc in daemon_services:
                     if isinstance(svc, dict) and "type" in svc:
+                        kind = str(svc.get("type") or "")
+                        svc_name = str(svc.get("service") or "")
+                        if "chatroom" in kind.lower() or svc_name.lower() == "chatroom":
+                            continue
                         services.append(svc)
 
             return {"services": services}
@@ -3280,92 +3380,6 @@ class MCPSocketServer:
 
         else:
             return f"error: Unknown action: {action}"
-
-
-# ============================================================================
-# Chatroom functions
-# ============================================================================
-
-def _chatroom_command(req: dict) -> dict:
-    """Send chatroom command to daemon."""
-    socket_path = str(Path.home() / ".notalone" / "notalone.sock")
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(10)
-        sock.connect(socket_path)
-        sock.sendall((json.dumps(req) + "\n").encode())
-
-        data = b""
-        while b"\n" not in data:
-            chunk = sock.recv(4096)
-            if not chunk:
-                break
-            data += chunk
-
-        sock.close()
-        return json.loads(data.decode().strip())
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def chatroom_list() -> dict:
-    """List all chatrooms."""
-    return _chatroom_command({"method": "chatroom_list"})
-
-
-def chatroom_rooms_for_session(view_id: int) -> dict:
-    """List rooms a session has joined."""
-    return _chatroom_command({
-        "method": "chatroom_rooms_for_session",
-        "session_id": f"sublime.{view_id}"
-    })
-
-
-def chatroom_create(room_id: str = None, name: str = None, max_chars: int = 1000, prompt_hint: int = 500) -> dict:
-    """Create a new chatroom."""
-    req = {"method": "chatroom_create", "max_chars": max_chars, "prompt_hint": prompt_hint}
-    if room_id:
-        req["room_id"] = room_id
-    if name:
-        req["name"] = name
-    return _chatroom_command(req)
-
-
-def chatroom_join(view_id: int, room_id: str, role: str = "agent") -> dict:
-    """Join a chatroom."""
-    return _chatroom_command({
-        "method": "chatroom_join",
-        "room_id": room_id,
-        "session_id": f"sublime.{view_id}",
-        "role": role
-    })
-
-
-def chatroom_leave(view_id: int, room_id: str) -> dict:
-    """Leave a chatroom."""
-    return _chatroom_command({
-        "method": "chatroom_leave",
-        "room_id": room_id,
-        "session_id": f"sublime.{view_id}"
-    })
-
-
-def chatroom_post(view_id: int, room_id: str, content: str) -> dict:
-    """Post a message to a chatroom."""
-    return _chatroom_command({
-        "method": "chatroom_post",
-        "room_id": room_id,
-        "session_id": f"sublime.{view_id}",
-        "content": content
-    })
-
-
-def chatroom_history(room_id: str, limit: int = 50, before_id: int = 0) -> dict:
-    """Get chat history."""
-    req = {"method": "chatroom_history", "room_id": room_id, "limit": limit}
-    if before_id > 0:
-        req["before_id"] = before_id
-    return _chatroom_command(req)
 
 
 def garage_search(query: str, k: int = 5) -> list:

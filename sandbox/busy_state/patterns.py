@@ -153,6 +153,20 @@ class TestInterrupt(unittest.TestCase):
         self.assertFalse(t.begin_interrupt())
         self.assertEqual(t.kind, "idle")
 
+    def test_interrupt_during_bg_wait_settles_idle(self):
+        t, log = _play([
+            {"t": "begin_query"},
+            {"t": "tool_use_bg"},
+            {"t": "wait_for_exit"},
+            {"t": "interrupt"},
+            {"t": "settle_interrupt"},
+            {"t": "terminal_kill"},
+            {"t": "terminal_create", "synth_bash": True},
+        ])
+        self.assertEqual(t.kind, "idle")
+        self.assertFalse(t.working)
+        self.assertIn("paint_bg", log)
+
 
 class TestParentNotify(unittest.TestCase):
     def test_parent_idle_may_query_child_complete(self):

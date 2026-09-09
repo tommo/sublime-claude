@@ -21,6 +21,7 @@ import acp_base  # noqa: E402
 from acp_base import AcpBridge  # noqa: E402
 
 acp_base.send_notification = lambda *a, **k: None
+acp_base.send_result = lambda *a, **k: None
 
 N_BG = 4
 N_PARALLEL = 3
@@ -48,6 +49,14 @@ class Bridge(AcpBridge):
         self._prompt_fut = None
         self._prompt_cancelled = False
         self._cancel_in_flight = False
+        self._query_req_id = None
+        self.session_id = "sess-sandbox"
+        self.proc = None
+        self.pending = {}
+        self.pending_permissions = {}
+        self.pending_questions = {}
+        self.pending_plan_approvals = {}
+        self._notifies = []
         self._logs = []
 
     def file_log(self, msg):
@@ -55,6 +64,12 @@ class Bridge(AcpBridge):
 
     def _emit_bg_terminal_complete(self, *a, **k):
         pass
+
+    async def _notify_acp(self, method, params):
+        self._notifies.append((method, params))
+        if method == "session/cancel" and self._prompt_fut is not None:
+            if not self._prompt_fut.done():
+                self._prompt_fut.set_result({"stopReason": "cancelled"})
 
 
 def _alive(pid: int) -> bool:
@@ -381,6 +396,125 @@ async def check_output_limit() -> list:
     return fails
 
 
+async def _make_bg_sleep(b: Bridge, tag: str) -> tuple:
+    eid = f"tool-{tag}"
+    call = b._ensure_call(eid)
+    call.merge_input({"command": f"sleep-{tag}", "background": True})
+    call.background = True
+    b._note_shell_execute(eid, "Bash")
+    res = await b._acp_terminal_create({
+        "command": sys.executable,
+        "args": ["-c", "import time; time.sleep(30)"],
+        "cwd": os.getcwd(),
+    })
+    tid = res["terminalId"]
+    slot = b._terminals[tid]
+    return tid, slot, slot["proc"].pid
+
+
+async def check_interrupt_bg(backend: str) -> list:
+    """Esc during a live turn: kill bg shell, session/cancel, ACP agent lives."""
+    fails = []
+    b = Bridge(backend)
+    loop = asyncio.get_running_loop()
+    b._prompt_fut = loop.create_future()
+    b._query_req_id = 7
+    agent = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "import time; time.sleep(30)",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    b.proc = agent
+    agent_pid = agent.pid
+    tid = None
+    pid = None
+    wait = None
+    try:
+        tid, slot, pid = await _make_bg_sleep(b, f"int-{backend}")
+        wait = asyncio.create_task(
+            b._acp_terminal_wait({"terminalId": tid}))
+        await asyncio.sleep(0.2)
+        if wait.done():
+            fails.append(f"{backend} wait returned before interrupt")
+        if not _alive(pid):
+            fails.append(f"{backend} bg shell died before interrupt")
+        await b.handle_interrupt(9, {})
+        await asyncio.sleep(0.25)
+        if _alive(pid):
+            fails.append(f"{backend} interrupt left bg shell alive pid={pid}")
+        if not _alive(agent_pid):
+            fails.append(f"{backend} interrupt killed ACP agent pid={agent_pid}")
+        cancels = [m for m, _ in b._notifies if m == "session/cancel"]
+        if not cancels:
+            fails.append(f"{backend} interrupt skipped session/cancel")
+        if wait is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(wait), timeout=2.0)
+            except Exception as e:
+                fails.append(f"{backend} wait after interrupt: {e!r}")
+    finally:
+        if wait is not None and not wait.done():
+            wait.cancel()
+            try:
+                await wait
+            except (asyncio.CancelledError, Exception):
+                pass
+        if tid and tid in b._terminals:
+            await b._acp_terminal_release({"terminalId": tid})
+        for p in (pid, agent_pid):
+            if p and _alive(p):
+                try:
+                    os.killpg(p, 9)
+                except OSError:
+                    pass
+        if agent.returncode is None:
+            try:
+                agent.kill()
+                await asyncio.wait_for(agent.wait(), timeout=1.0)
+            except Exception:
+                pass
+    return fails
+
+
+async def check_interrupt_idle_leftover() -> list:
+    """Idle Esc still reaps leftover Grok/Kimi shells; no session/cancel."""
+    fails = []
+    b = Bridge("grok")
+    tid, slot, pid = await _make_bg_sleep(b, "idle-left")
+    try:
+        await b.handle_interrupt(3, {})
+        await asyncio.sleep(0.25)
+        if _alive(pid):
+            fails.append(f"idle interrupt left leftover shell pid={pid}")
+        if any(m == "session/cancel" for m, _ in b._notifies):
+            fails.append("idle interrupt sent session/cancel")
+    finally:
+        if tid in b._terminals:
+            await b._acp_terminal_release({"terminalId": tid})
+        if _alive(pid):
+            try:
+                os.killpg(pid, 9)
+            except OSError:
+                pass
+    return fails
+
+
+def check_interrupt_source() -> list:
+    import inspect
+    src = inspect.getsource(AcpBridge.handle_interrupt)
+    live = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    fails = []
+    if "_terminal_close" not in live:
+        fails.append("handle_interrupt does not close terminals")
+    if "self.proc.terminate" in live or "self.proc.kill" in live:
+        fails.append("handle_interrupt kills the ACP agent process")
+    if "_cancel_agent_turn" not in live:
+        fails.append("handle_interrupt does not session/cancel")
+    return fails
+
+
 async def check_kimi() -> list:
     fails = []
     b = Bridge("kimi")
@@ -415,9 +549,13 @@ async def main() -> int:
         check_grok_many(),
         check_stdout_after_kill(),
         check_output_limit(),
+        check_interrupt_bg("grok"),
+        check_interrupt_bg("kimi"),
+        check_interrupt_idle_leftover(),
     )
     for g in groups:
         fails.extend(g)
+    fails.extend(check_interrupt_source())
     if fails:
         print("FAIL")
         for f in fails:
@@ -430,6 +568,8 @@ async def main() -> int:
     print("PASS stdout still present after kill + wait")
     print("PASS grok does not synth host Bash")
     print("PASS bg output past 20k kept; fg outputByteLimit keeps the tail")
+    print("PASS interrupt kills bg shell + session/cancel; ACP agent lives")
+    print("PASS idle interrupt reaps leftover shells without session/cancel")
     return 0
 
 

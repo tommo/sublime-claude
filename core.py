@@ -233,6 +233,22 @@ def create_session(window: sublime.Window, resume_id: Optional[str] = None, fork
                     return existing
         except Exception:
             pass
+        # Keep public agent_id across sheet recreate (else list_sessions
+        # misses children stamped with the old parent_agent_id).
+        if not (initial_context and initial_context.get("agent_id")):
+            try:
+                from .session import load_saved_sessions
+                from .session_registry import identity_from_saved_entry
+                for entry in load_saved_sessions():
+                    if entry.get("session_id") == resume_id:
+                        ident = identity_from_saved_entry(entry)
+                        if ident:
+                            initial_context = dict(initial_context or {})
+                            for k, v in ident.items():
+                                initial_context.setdefault(k, v)
+                        break
+            except Exception:
+                pass
     if backend is None:
         backend = sublime.load_settings("ClaudeCode.sublime-settings").get("default_backend", "claude")
 

@@ -579,6 +579,21 @@ class ClaudeOutputEventListener(sublime_plugin.ViewEventListener):
                 or (matched or {}).get("parent_agent_id")
                 or None
             )
+            session.parent_session_id = (
+                view.settings().get("claude_parent_session_id")
+                or (matched or {}).get("parent_session_id")
+                or None
+            )
+            session.child_agent_ids = list(
+                view.settings().get("claude_child_agent_ids")
+                or (matched or {}).get("child_agent_ids")
+                or []
+            )
+            session.agent_id_aliases = list(
+                view.settings().get("claude_agent_id_aliases")
+                or (matched or {}).get("agent_id_aliases")
+                or []
+            )
             # parent_view_id is cache only — relinked after all sheets restore
             session.parent_view_id = None
 

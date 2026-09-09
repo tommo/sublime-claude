@@ -55,7 +55,7 @@ Verified all external importers still resolve:
 
 Per REFACTOR_SPLIT_GUIDANCE.md:
 - `session.py` (3120 LOC) — NOT split. Contains session persistence, bookmarks, workflow helpers
-- `mcp_server.py` (2446 LOC) — NOT split. Contains chatroom/garage/tool handlers
+- `mcp_server.py` (2446 LOC) — NOT split. Contains garage/tool handlers
 - `bridge/acp_base.py` (2765 LOC) — NOT split. Optional phase 2
 
 ## Residual risks

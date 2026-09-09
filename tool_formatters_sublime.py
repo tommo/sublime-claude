@@ -413,15 +413,6 @@ def _subscribe(view: "OutputView", tool: "ToolCall") -> str:
     return _join_bits(*bits)
 
 
-def _chatroom(view: "OutputView", tool: "ToolCall") -> str:
-    inp = _tool_input(tool)
-    cmd = inp.get("cmd") or ""
-    out = _join_bits(_clip(str(cmd), 70)) if cmd else ""
-    if tool.status == "done" and tool.result:
-        out += view._format_mcp_result(tool.result)
-    return out
-
-
 def _garage_search(view: "OutputView", tool: "ToolCall") -> str:
     inp = _tool_input(tool)
     q = inp.get("query") or ""
@@ -520,7 +511,6 @@ SUBLIME_MCP_FORMATTERS: Dict[str, Callable] = {
     "discover_services": _discover_services,
     "unregister_notification": _unregister_notification,
     "subscribe": _subscribe,
-    "chatroom": _chatroom,
     "garage_search": _garage_search,
     "order": _order,
     "ask_user": _ask_user,

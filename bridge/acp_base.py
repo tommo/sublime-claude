@@ -1050,7 +1050,10 @@ class AcpBridge(BaseBridge):
         suppress = bool(self._cancel_in_flight or (
             self._prompt_cancelled and host_prompt_live))
         # After user interrupt: drop *new* tool starts / leftover prose.
-        # Still accept tool_call_update completions so already-open rows settle.
+        # Still accept tool_call_update for already-open rows so ⚙ can close.
+        # Do NOT open a brand-new failed row from a post-cancel update —
+        # Grok/DeepSeek keeps run_terminal_command after MidTurnAbort and the
+        # failed "turn cancelled" paint is what the user still sees.
         if (
             not host_prompt_live
             and not suppress
@@ -1073,6 +1076,15 @@ class AcpBridge(BaseBridge):
                     f"drop tool_call after cancel: "
                     f"{(upd.get('title') or upd.get('toolCallId') or '')!r}")
             return
+        if suppress and kind == "tool_call_update":
+            tid = self._resolve_tool_id(upd.get("toolCallId"))
+            oc = self._call(tid) if tid else None
+            if not oc or not oc.emitted:
+                self.file_log(
+                    f"drop tool_call_update after cancel: "
+                    f"{(upd.get('title') or tid or '')!r} "
+                    f"status={upd.get('status')!r}")
+                return
         if kind == "agent_message_chunk":
             text = (upd.get("content") or {}).get("text", "")
             if text:

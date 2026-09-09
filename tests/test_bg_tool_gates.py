@@ -527,6 +527,63 @@ class TestModalToolDedupe(unittest.TestCase):
         self.assertEqual(
             [p.get("type") for _, p in notes], [])
 
+    def test_cancel_drops_failed_update_for_unopened_tool(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _FwdStub()
+            b._cancel_in_flight = True
+            b._prompt_cancelled = True
+            b._prompt_fut = None
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-after-esc",
+                    "title": "run_terminal_command",
+                    "status": "failed",
+                    "content": [{"type": "content", "content": {
+                        "type": "text",
+                        "text": "terminal/create rejected: turn cancelled",
+                    }}],
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        kinds = [p.get("type") for _, p in notes]
+        self.assertNotIn("tool_use", kinds)
+        self.assertNotIn("tool_result", kinds)
+
+    def test_cancel_still_settles_already_open_row(self):
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        tid = "call-open-bg"
+        try:
+            b = _FwdStub()
+            b._cancel_in_flight = True
+            b._prompt_cancelled = True
+            b._prompt_fut = None
+            c = b._ensure_call(tid)
+            c.emitted = True
+            c.name = "Bash"
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tid,
+                    "status": "failed",
+                    "title": "Bash",
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        kinds = [p.get("type") for _, p in notes]
+        self.assertIn("tool_result", kinds)
+
     def test_completed_update_after_result_does_not_reopen(self):
         import acp_base
         notes = []

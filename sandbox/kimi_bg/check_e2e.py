@@ -3,18 +3,16 @@
 
 Does not write ~/.kimi-code/mcp.json. Spawns `kimi acp` like the host.
 
-Measures, against real 0.37.2:
-  - does session/prompt return before the sleep finishes?
-  - terminal/create / wait_for_exit / release counts
-  - Bash tool_result (task_id, pid, automatic_notification)
-  - bash-*.json on disk
-  - whether the process actually ran (marker file)
-  - TaskOutput retrieval_status / output while still running
+0.39.1 (this machine): session/prompt stays open until wait_for_exit
+returns. ACP completed update is often a terminal block (no task_id
+text). Native tool.result still has task_id + automatic_notification.
+Release kills (same as host _terminal_close).
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import subprocess
 import sys
@@ -56,6 +54,7 @@ class Acp:
         self.agent_text = []
         self.methods = []
         self.tool_results = []
+        self.titles = []
         self.term_creates = []
         self.wait_exits = []
         self.releases = []
@@ -141,13 +140,13 @@ class Acp:
             t = c.get("text") if isinstance(c, dict) else ""
             if t:
                 self.agent_text.append(t)
-        if st == "tool_call":
+        if st in ("tool_call", "tool_call_update"):
+            title = str(upd.get("title") or "")
+            if title:
+                self.titles.append(title)
             raw = upd.get("rawInput") or {}
-            self.events.append((
-                "tool_call", upd.get("title"),
-                _short(raw),
-            ))
-        if st == "tool_call_update":
+            if st == "tool_call":
+                self.events.append(("tool_call", title, _short(raw)))
             content = upd.get("content")
             text = ""
             if isinstance(content, list):
@@ -157,7 +156,9 @@ class Acp:
                     inner = c.get("content") or {}
                     if isinstance(inner, dict) and inner.get("text"):
                         text += inner["text"]
-            if text:
+                    elif c.get("type") == "terminal":
+                        text += f" terminal:{c.get('terminalId')}"
+            if "task_id:" in text or "retrieval_status" in text:
                 self.tool_results.append(text)
                 self.events.append(("tool_result", text[:300]))
 
@@ -231,7 +232,17 @@ class Acp:
     def _term_release(self, msg: dict):
         tid = (msg.get("params") or {}).get("terminalId")
         self.releases.append(tid)
-        # Detach — do not kill. Matches host timeout:0 / bg release.
+        # Host: release kills if still running (ACP + Zed).
+        slot = self.terms.get(tid) or {}
+        proc = slot.get("proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, 15)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
         self._reply(msg.get("id"), {})
 
     def _term_kill(self, msg: dict):
@@ -428,22 +439,36 @@ def main() -> int:
     proc.kill()
 
     fails = []
+    # 0.39 holds session/prompt until wait_for_exit. 0.37 returned early.
     returned_early = elapsed < (SLEEP_S - 1.5)
-    if not returned_early:
-        fails.append("session/prompt did not return before sleep finished "
-                     f"(elapsed={elapsed:.1f}s sleep={SLEEP_S})")
-    if not parsed.get("task_id"):
-        fails.append("Bash tool_result missing task_id")
-    if not parsed.get("auto"):
-        fails.append("Bash tool_result missing automatic_notification")
+    tid = (
+        parsed.get("task_id")
+        or next((t.get("taskId") for t in tasks if t.get("taskId")), "")
+    )
+    if not re.search(r"bash-[\w-]+", " ".join(acp.agent_text) + " " + tid):
+        fails.append("no bash-* task id in agent text or task json")
     if not tasks:
         fails.append("no bash-*.json on disk")
-    # Process must actually run. Marker may appear after prompt return.
+    if not acp.term_creates:
+        fails.append("no terminal/create")
+    if not acp.wait_exits:
+        fails.append("no terminal/wait_for_exit")
+    if not acp.releases:
+        fails.append("no terminal/release")
+    # Marker can lag the prompt RPC by a beat (0.39 write after wait).
+    if not marker_later:
+        for _ in range(20):
+            time.sleep(0.25)
+            if os.path.isfile(MARKER):
+                marker_later = True
+                break
     if not marker_later:
         fails.append(f"marker file never written ({MARKER}) — process did not run")
 
     print("sid", sid)
-    print("elapsed_s", round(elapsed, 2), "sleep", SLEEP_S)
+    print("elapsed_s", round(elapsed, 2), "sleep", SLEEP_S,
+          "prompt_held" if not returned_early else "prompt_early")
+    print("titles", acp.titles[:8])
     print("first_prompt", _short(first.get("error") or first.get("result")))
     print("second_prompt", _short(second.get("error") or second.get("result")))
     print("n_terminal/create", len(acp.term_creates))
