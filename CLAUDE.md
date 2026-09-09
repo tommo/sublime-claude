@@ -1,5 +1,5 @@
 # smart use of context:
-- use the serach tool instead of immediate glob/grep loop
+- use the search tool instead of immediate glob/grep loop
 
 ## code style
 - keep docs/comments minimal
