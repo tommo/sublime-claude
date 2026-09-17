@@ -4,6 +4,7 @@ Spawns `grok agent stdio` (optionally with --model / --always-approve),
 authenticates via cached_token, and uses standard session/set_model +
 session/set_mode.
 """
+import asyncio
 import os
 import shutil
 import sys
@@ -243,15 +244,101 @@ class GrokBridge(AcpBridge):
             env[key] = _MCP_IMAGE_OUTPUT_BYTES
         # Prefer monochrome tool output; terminal/create re-forces this too.
         apply_plain_terminal_env(env)
+        # DeepSeek V4: shrink context_window so Grok auto-compacts before
+        # (prompt + reserved max_completion) blows the shared 1M API cap.
+        try:
+            from grok_backend import apply_deepseek_shared_window_config
+            apply_deepseek_shared_window_config()
+        except Exception:
+            pass
         return env
+
+    def format_query_error(self, e: BaseException) -> str:
+        raw = f"{self.BACKEND_NAME} query failed: {e}"
+        try:
+            from grok_backend import rewrite_grok_query_error
+            return rewrite_grok_query_error(raw)
+        except Exception:
+            return raw
+
+    async def recover_prompt_error(self, e: BaseException, prompt_blocks: list):
+        """Compact once, then retry — context-window 400 (DeepSeek or Grok)."""
+        try:
+            from grok_backend import (
+                is_context_overflow_error,
+                parse_input_too_large,
+                parse_shared_window_overflow,
+            )
+        except Exception:
+            return None
+        err = str(e)
+        if not is_context_overflow_error(err):
+            return None
+        if getattr(self, "_overflow_compact_retried", False):
+            return None
+        self._overflow_compact_retried = True
+        shared = parse_shared_window_overflow(err)
+        too_big = parse_input_too_large(err)
+        if shared:
+            self.file_log(
+                f"shared-window overflow: messages={shared['messages']} "
+                f"+ completion={shared['completion']} > "
+                f"{shared['max_context']}; compact+retry")
+            note = (
+                f"\n*DeepSeek shared window: {shared['messages']} input + "
+                f"{shared['completion']} reserved output exceeds "
+                f"{shared['max_context']}. Compacting…*\n"
+            )
+        else:
+            self.file_log(
+                f"input_too_large: packed={too_big['prompt']} > "
+                f"{too_big['max_context']}; compact+retry")
+            note = (
+                f"\n*Packed prompt {too_big['prompt']} > "
+                f"{too_big['max_context']} window. Grok occupancy "
+                f"never hit auto-compact. Compacting…*\n"
+            )
+        try:
+            from rpc_helpers import send_notification
+            send_notification("message", {"type": "text_delta", "text": note})
+        except Exception:
+            pass
+        compacted = False
+        for method in (
+            "_x.ai/compact_conversation",
+            "x.ai/compact_conversation",
+        ):
+            try:
+                await asyncio.wait_for(
+                    self._send_acp(
+                        method, {"sessionId": self.session_id}),
+                    timeout=90.0,
+                )
+                compacted = True
+                self.file_log(f"overflow recover: {method} ok")
+                break
+            except Exception as ce:
+                self.file_log(f"overflow recover {method}: {ce}")
+        if not compacted:
+            try:
+                await self._send_prompt(
+                    self._build_prompt_blocks("/compact", []))
+                compacted = True
+                self.file_log("overflow recover: /compact prompt ok")
+            except Exception as ce:
+                self.file_log(f"overflow recover /compact: {ce}")
+                return None
+        if self._prompt_cancelled or not compacted:
+            return None
+        return await self._send_prompt(prompt_blocks) or {}
 
     def build_session_meta(self, *, system_prompt: str = "",
                            resume_failed: bool = False) -> Dict:
         meta = super().build_session_meta(
             system_prompt=system_prompt, resume_failed=resume_failed)
         # Grok does not expose MCP tools as bare names — discover with
-        # search_tool, call with use_tool. Vision only when read_image is on
-        # (DeepSeek BYOK has no vision — leave tool off and warn).
+        # search_tool, call with use_tool. Vision when read_image is on
+        # (native Grok + DeepSeek V4). Older DeepSeek: tool off, warn.
         existing = meta.get("rules") or ""
         if self._mcp_enable_read_image:
             image_rule = (

@@ -16,6 +16,7 @@ grok_dynamic_env, grok_available, GrokProxyManager.
 import http.client
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -64,6 +65,31 @@ DEFAULT_PORT = 8787
 DEFAULT_DATA_DIR = os.path.expanduser("~/.claude/grok_proxy")
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
 
+# DeepSeek V4 hosted API: input + reserved max_tokens share this envelope.
+# Grok still sends the full max_completion_tokens (default 384k) on every
+# request, so usable prompt is context − reservation. Auto-compact at 85% of
+# a 1_000_000 context_window fires at 850k — after the 664,576 cliff.
+DEEPSEEK_V4_CONTEXT_TOKENS = 1_048_576
+DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 384_000
+_SHARED_WINDOW_COMMENT = (
+    "# sublime-claude: usable input (API context minus reserved "
+    "max_completion; Grok auto-compacts at 85% of this and still sends "
+    "the full reservation)"
+)
+_OVERFLOW_RE = re.compile(
+    r"maximum context length is (?P<max>\d+)\s*tokens?"
+    r".*?requested (?P<requested>\d+)\s*tokens?"
+    r".*?\((?P<messages>\d+)\s+in the messages,\s*"
+    r"(?P<completion>\d+)\s+in the completion\)",
+    re.I | re.S,
+)
+_INPUT_TOO_LARGE_RE = re.compile(
+    r"(?:input_too_large.{0,80})?prompt is too long.{0,80}?"
+    r"context window\s*\((?P<prompt>\d+)\s*tokens?\s*>\s*"
+    r"(?P<max>\d+)\s*tokens?\)",
+    re.I | re.S,
+)
+
 
 def _is_deepseek_model(model_id: str) -> bool:
     m = (model_id or "").strip().lower()
@@ -77,6 +103,234 @@ def _is_deepseek_model(model_id: str) -> bool:
     )
 
 
+def usable_prompt_tokens(context: int, max_completion: int) -> int:
+    """Largest prompt that still fits with a reserved completion budget."""
+    try:
+        ctx = int(context)
+        out = int(max_completion)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, ctx - out)
+
+
+def parse_shared_window_overflow(text: str):
+    """Parse DeepSeek/OpenAI shared-window 400: messages + completion > cap.
+
+    Returns None if `text` is not that error. Extra promptUsage fields in the
+    same blob (session-cumulative inputTokens / cachedReadTokens) are ignored
+    — they are not the in-window size.
+    """
+    if not text:
+        return None
+    m = _OVERFLOW_RE.search(str(text))
+    if not m:
+        return None
+    max_ctx = int(m.group("max"))
+    requested = int(m.group("requested"))
+    messages = int(m.group("messages"))
+    completion = int(m.group("completion"))
+    return {
+        "max_context": max_ctx,
+        "requested": requested,
+        "messages": messages,
+        "completion": completion,
+        "over_by": requested - max_ctx,
+        "usable_input": usable_prompt_tokens(max_ctx, completion),
+    }
+
+
+def format_shared_window_overflow(parsed: dict) -> str:
+    """One-line host error: math, not the 11M cumulative cache ledger."""
+    messages = int(parsed.get("messages") or 0)
+    completion = int(parsed.get("completion") or 0)
+    max_ctx = int(parsed.get("max_context") or 0)
+    requested = int(parsed.get("requested") or (messages + completion))
+    over = int(parsed.get("over_by") or (requested - max_ctx))
+    usable = int(parsed.get("usable_input") or usable_prompt_tokens(
+        max_ctx, completion))
+    return (
+        f"DeepSeek shares a {max_ctx}-token window between input and "
+        f"reserved output. This request: {messages} messages + "
+        f"{completion} completion = {requested} ({over} over the cap). "
+        f"Grok sent the full max_completion_tokens instead of clamping. "
+        f"Usable input with that reservation is {usable}. Compact or "
+        f"start a new session. promptUsage.inputTokens is session-cumulative "
+        f"(cached reads), not the in-window size."
+    )
+
+
+def parse_input_too_large(text: str):
+    """Parse Grok Build 400: packed prompt > model window.
+
+    Occupancy (`promptUsage.inputTokens`) is often far below this packed
+    size, so auto-compact at 85% of context_tokens never fires.
+    """
+    if not text:
+        return None
+    m = _INPUT_TOO_LARGE_RE.search(str(text))
+    if not m:
+        return None
+    prompt = int(m.group("prompt"))
+    max_ctx = int(m.group("max"))
+    return {
+        "max_context": max_ctx,
+        "prompt": prompt,
+        "over_by": prompt - max_ctx,
+        "kind": "input_too_large",
+    }
+
+
+def format_input_too_large(parsed: dict) -> str:
+    prompt = int(parsed.get("prompt") or 0)
+    max_ctx = int(parsed.get("max_context") or 0)
+    over = int(parsed.get("over_by") or (prompt - max_ctx))
+    trip = int(max_ctx * 0.85)
+    return (
+        f"Grok packed prompt {prompt} tokens > {max_ctx} window "
+        f"({over} over). Auto-compact trips at 85% of occupancy "
+        f"(~{trip}), not the API packed size — occupancy often "
+        f"undercounts tools/skills so it never fires. Compact or "
+        f"start a new session. promptUsage.inputTokens is billed "
+        f"input (mostly cache), not the packed prompt."
+    )
+
+
+def rewrite_grok_query_error(text: str) -> str:
+    """Keep non-overflow errors intact; rewrite window 400s."""
+    raw = text if isinstance(text, str) else str(text)
+    parsed = parse_shared_window_overflow(raw)
+    if parsed:
+        return format_shared_window_overflow(parsed)
+    too_big = parse_input_too_large(raw)
+    if too_big:
+        return format_input_too_large(too_big)
+    return raw
+
+
+def is_context_overflow_error(text: str) -> bool:
+    """True if Grok/DeepSeek rejected the turn for context length."""
+    raw = text if isinstance(text, str) else str(text)
+    return bool(
+        parse_shared_window_overflow(raw) or parse_input_too_large(raw)
+    )
+
+
+def _toml_int_assign(body: str, key: str, default=None):
+    pat = re.compile(
+        r"^" + re.escape(key) + r"\s*=\s*([0-9_]+)\s*$", re.M)
+    m = pat.search(body or "")
+    if not m:
+        return default
+    try:
+        return int(m.group(1).replace("_", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_deepseek_v4_section(mid: str, body: str) -> bool:
+    blob = f"{mid}\n{body or ''}".lower()
+    if not _is_deepseek_model(mid) and "deepseek" not in blob:
+        return False
+    if "v4" in blob:
+        return True
+    # picker aliases without v4 in the section key still point at V4
+    if any(s in blob for s in ("flash", "pro", "vision")):
+        return "chat" not in (mid or "").lower() and "reasoner" not in blob
+    return False
+
+
+def patch_deepseek_shared_window_toml(text: str) -> str:
+    """Shrink DeepSeek V4 context_window to API context − max_completion.
+
+    Grok auto-compacts at 85% of context_window and still sends the full
+    max_completion_tokens. A 1_000_000 window + 384_000 reservation overflows
+    at 664_576 in-window tokens — before that 85% trip.
+    """
+    if not text:
+        return text
+    section_re = re.compile(
+        r'^\[model\.(?:"([^"]+)"|([A-Za-z0-9_.\-]+))\]\s*$', re.M)
+    parts = section_re.split(text)
+    if len(parts) < 4:
+        return text
+    out = [parts[0]]
+    i = 1
+    changed = False
+    while i + 2 < len(parts):
+        g1, g2, body = parts[i], parts[i + 1], parts[i + 2]
+        mid = (g1 or g2 or "").strip()
+        if g1:
+            header = f'[model."{g1}"]'
+        else:
+            header = f"[model.{g2}]"
+        nxt = ""
+        cut = re.search(r"^\[", body, re.M)
+        if cut:
+            nxt = body[cut.start():]
+            body = body[: cut.start()]
+        if _is_deepseek_v4_section(mid, body):
+            max_out = _toml_int_assign(
+                body, "max_completion_tokens", DEEPSEEK_V4_MAX_OUTPUT_TOKENS)
+            ctx = _toml_int_assign(
+                body, "context_window", DEEPSEEK_V4_CONTEXT_TOKENS)
+            safe = usable_prompt_tokens(DEEPSEEK_V4_CONTEXT_TOKENS, max_out)
+            if ctx is None or ctx > safe:
+                body, did = _set_toml_int(
+                    body, "context_window", safe, comment=_SHARED_WINDOW_COMMENT)
+                changed = changed or did
+        out.append(header)
+        if body and not body.startswith("\n"):
+            out.append("\n")
+        out.append(body)
+        out.append(nxt)
+        i += 3
+    new = "".join(out)
+    return new if changed else text
+
+
+def _set_toml_int(body: str, key: str, value: int, comment: str = ""):
+    """Replace or insert `key = value`. Returns (body, changed)."""
+    want = f"{key} = {int(value)}"
+    pat = re.compile(
+        r"^" + re.escape(key) + r"\s*=\s*[0-9_]+\s*$", re.M)
+    m = pat.search(body or "")
+    block = ((comment + "\n") if comment else "") + want
+    if m:
+        before = body[: m.start()]
+        if comment and before.rstrip().endswith(comment.strip()):
+            if m.group(0) == want:
+                return body, False
+            return before + want + body[m.end():], True
+        replacement = block
+        if replacement == m.group(0):
+            return body, False
+        return before + replacement + body[m.end():], True
+    insert = ("\n" if body and not body.endswith("\n") else "") + block + "\n"
+    return (body or "") + insert, True
+
+
+def apply_deepseek_shared_window_config(path=None) -> bool:
+    """Patch grok config.toml on disk. True if the file changed."""
+    if not path:
+        path = next((p for p in _grok_config_paths() if os.path.isfile(p)), None)
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return False
+    new = patch_deepseek_shared_window_toml(text)
+    if new == text:
+        return False
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new)
+    except OSError:
+        return False
+    return True
+
+
 def model_supports_reasoning_effort(model_id: str) -> bool:
     """DeepSeek BYOK via Grok is chat_completions — no reasoningEffort."""
     if not (model_id or "").strip():
@@ -85,9 +339,12 @@ def model_supports_reasoning_effort(model_id: str) -> bool:
 
 
 def model_supports_vision(model_id: str) -> bool:
-    """Most DeepSeek BYOK has no image/vision — read_image would error the turn.
+    """Whether sublime MCP read_image should be advertised for this Grok model.
 
-    `deepseek-v4-flash-vision-exp` is the exception (multimodal).
+    Native Grok: yes. DeepSeek V4 / V4.1 BYOK (pro, flash, vision-exp, and
+    wire aliases like deepseek-v4.1-flash-expires-on-*) : yes — ACP
+    read_file still rejects binary, so they need sublime__read_image.
+    Older DeepSeek without v4: no (tool call can hard-fail the turn).
     """
     if not (model_id or "").strip():
         return True  # unknown → keep Grok default vision
@@ -95,7 +352,12 @@ def model_supports_vision(model_id: str) -> bool:
     low = (wire or model_id).strip().lower()
     if "vision" in low:
         return True
-    return not _is_deepseek_model(wire or model_id)
+    if not _is_deepseek_model(wire or model_id):
+        return True
+    # v4, v4.1, v41, deepseek-v4-flash, expires-on aliases
+    if "v4" in low:
+        return True
+    return False
 
 
 def normalize_grok_model(model_id: str, default: str = "grok-4.6") -> str:

@@ -1469,10 +1469,13 @@ class MCPSocketServer:
             return body
         return (
             body
-            + "\n\nWhen fully done, call MCP signal_complete(result_summary=…) "
-            "as its own step after your final message — not in parallel with "
-            "other tools. That call IS the parent notification; do not also "
-            "send_to_session the parent with the same summary. "
+            + "\n\nUse this project's knowledge first (list_profile_docs / irr / "
+            "existing code) — do not invent APIs or layout. "
+            "When fully done, call the Sublime MCP tool signal_complete"
+            "(result_summary=…) as its own last step after your final message "
+            "— not in parallel with other tools. That call IS the parent "
+            "notification; do not also send_to_session the parent with the "
+            "same summary, and do not use a CLI/fake complete. "
             "Parent is notified only after this turn idles; "
             "host attaches context_budget for strategy."
         )

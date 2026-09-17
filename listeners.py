@@ -58,7 +58,7 @@ def _find_saved_session_for_view(view, saved_sessions: list):
         for saved in saved_sessions:
             if saved.get("session_id") == view_sid:
                 return saved
-        # Id stamped on view but pruned from the 200-entry list — still resume
+        # Id stamped on view but pruned from the resume list — still resume
         return {
             "session_id": view_sid,
             "backend": view_backend or "claude",

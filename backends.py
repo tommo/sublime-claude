@@ -374,9 +374,10 @@ BACKENDS: Dict[str, BackendSpec] = {
         abbrev="CX",
         bridge_script="codex_main.py",
         # From `codex debug models` (list visibility, priority order).
-        fallback_model="gpt-5.6-sol",
+        fallback_model="gpt-6-astra",
         theme="Packages/ClaudeCode/ClaudeOutput-codex.hidden-tmTheme",
         default_models=[
+            ("gpt-6-astra", "GPT-6 Astra"),
             ("gpt-5.6-sol", "GPT-5.6 Sol"),
             ("gpt-5.6-terra", "GPT-5.6 Terra"),
             ("gpt-5.6-luna", "GPT-5.6 Luna"),

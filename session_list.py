@@ -11,14 +11,16 @@ import sublime
 import sublime_plugin
 
 from .session import (
-    load_saved_sessions, load_bookmarks, remove_saved_session, toggle_bookmark,
+    load_saved_sessions, load_bookmarks, load_bookmark_records,
+    remove_saved_session, toggle_bookmark,
     rename_saved_session, fork_session_title,
 )
 
 
 SETTING = "claude_session_list"
 ROWS_KEY = "claude_session_list_rows"
-HISTORY_CAP = 200  # default; override with session_list_history_limit
+HISTORY_CAP = 400  # default; override with session_list_history_limit
+SAVED_SESSIONS_CAP = 400  # disk prune in Session._save_session; starred kept past this
 # Full row needs ~backend(7) + title(16+) + status/time. Below this, abbrev.
 COMPACT_COLS = 56
 
@@ -385,6 +387,35 @@ def _right_meta(r: dict) -> str:
     return _q_col(r) + (" " * _GAP) + stamp
 
 
+def cap_saved_sessions(sessions, starred=None, cap: int = SAVED_SESSIONS_CAP):
+    """Newest `cap` resume rows, plus every starred row past that.
+
+    `_save_session` used to slice to a bare cap, which deleted old starred
+    entries from `.sessions.json` so the list could not resurrect them.
+    """
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = SAVED_SESSIONS_CAP
+    if cap <= 0:
+        cap = SAVED_SESSIONS_CAP
+    starred = set(starred or ())
+    kept, extra = [], []
+    seen = set()
+    for s in sessions or []:
+        if not isinstance(s, dict):
+            continue
+        sid = s.get("session_id")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        if len(kept) < cap:
+            kept.append(s)
+        elif sid in starred:
+            extra.append(s)
+    return kept + extra
+
+
 def pin_starred(rows: List[dict], starred: set) -> List[dict]:
     """Starred rows first within a group; relative order otherwise."""
     ids = set(starred or ())
@@ -459,32 +490,51 @@ def build_for_window(window, cols: int = 0) -> Tuple[str, List[dict]]:
 
 def _include_starred_saved(here: List[dict], live_ids: set, cwd: str,
                            starred: set) -> List[dict]:
-    """History cap can drop a starred saved row — put it back, pinned in HISTORY."""
+    """History cap / sessions.json prune can drop a starred row — put it back.
+
+    Starred ids belong to this window's bookmarks, so they list even when the
+    saved `project` path differs (symlink cwd) or the disk cap
+    already deleted the resume row. Missing metadata becomes a stub so the
+    star still shows; resume may still work from the agent transcript.
+    """
     if not starred:
         return here
     have = {r.get("session_id") for r in here}
-    extra = []
-    cwd = (cwd or "").rstrip("/")
+    saved_by = {}
     for s in load_saved_sessions():
-        sid = s.get("session_id")
-        if not sid or sid in live_ids or sid in have or sid not in starred:
+        sid = (s or {}).get("session_id")
+        if sid:
+            saved_by[sid] = s
+    records = {}
+    try:
+        records = load_bookmark_records(cwd or None) or {}
+    except Exception:
+        records = {}
+    extra = []
+    for sid in starred:
+        if not sid or sid in live_ids or sid in have:
             continue
-        proj = (s.get("project") or "").rstrip("/")
-        if cwd and proj and proj != cwd:
-            continue
+        s = saved_by.get(sid) or records.get(sid) or {}
+        if not isinstance(s, dict):
+            s = {}
+        try:
+            q = int(s.get("query_count") or 0)
+        except (TypeError, ValueError):
+            q = 0
         extra.append({
             "kind": "saved",
             "session_id": sid,
             "view_id": None,
-            "name": one_line_title(s.get("name") or "") or "(unnamed)",
+            "name": one_line_title(s.get("name") or "") or sid,
             "backend": s.get("backend") or "claude",
             "model": s.get("model"),
             "status": s.get("state") or "closed",
-            "query_count": int(s.get("query_count") or 0),
-            "project": s.get("project") or "",
+            "query_count": q,
+            "project": s.get("project") or cwd or "",
             "last_activity": s.get("last_activity"),
             "last_access": access_ts(s),
         })
+        have.add(sid)
     return here + extra if extra else here
 
 
@@ -1319,7 +1369,16 @@ class ClaudeSessionListStarCommand(sublime_plugin.TextCommand):
                 cwd = folders[0]
         except Exception:
             cwd = ""
-        now = toggle_bookmark(sid, cwd or None)
+        rec = {
+            "name": row.get("name"),
+            "backend": row.get("backend"),
+            "project": row.get("project") or cwd,
+            "model": row.get("model"),
+            "query_count": row.get("query_count"),
+            "last_activity": row.get("last_activity"),
+            "last_access": row.get("last_access"),
+        }
+        now = toggle_bookmark(sid, cwd or None, record=rec)
         name = (row.get("name") or "").strip() or sid
         refresh_session_list(win)
         sublime.status_message(

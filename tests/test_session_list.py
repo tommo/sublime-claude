@@ -28,8 +28,9 @@ def _load():
         sess = types.ModuleType(sess_name)
         sess.load_saved_sessions = lambda: []
         sess.load_bookmarks = lambda p=None: set()
+        sess.load_bookmark_records = lambda p=None: {}
         sess.remove_saved_session = lambda sid: False
-        sess.toggle_bookmark = lambda sid, p=None: True
+        sess.toggle_bookmark = lambda sid, p=None, record=None: True
         sess.rename_saved_session = lambda sid, name: True
         sess.fork_session_title = lambda name: (
             name if (name or "").lower().startswith("(fork)")
@@ -47,7 +48,7 @@ def _load():
         sys.modules[be_name] = be
     name = _PKG + ".session_list"
     cached = sys.modules.get(name)
-    if cached is not None and hasattr(cached, "format_when"):
+    if cached is not None and hasattr(cached, "cap_saved_sessions"):
         return cached
     sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(
@@ -76,7 +77,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertIn("CURRENT (1)", text)
         self.assertIn("HISTORY (1)", text)
         self.assertIn("Skin editor", text)
-        self.assertIn("△ old plan", text)
+        self.assertIn("✨ old plan", text)
         self.assertNotIn("★", text)
         self.assertIn("r rename", text)
         self.assertNotIn("refresh", text)
@@ -458,7 +459,7 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertEqual([r["session_id"] for r in here], ["b", "a"])
         self.assertEqual(other, [])
         self.assertEqual(sl.history_cap(), sl.HISTORY_CAP)
-        self.assertEqual(sl.HISTORY_CAP, 200)
+        self.assertEqual(sl.HISTORY_CAP, 400)
 
     def test_live_filters_to_window_project(self):
         sl = _load()
@@ -542,10 +543,10 @@ class TestRenderSessionList(unittest.TestCase):
         self.assertIn("HISTORY (2)", text)
         ids = [r["session_id"] for r in index]
         self.assertEqual(ids, ["pin", "run", "oldpin", "old"])
-        self.assertIn("△ pinned live", text)
-        self.assertIn("△ pinned hist", text)
-        self.assertNotIn("△ plain live", text)
-        self.assertNotIn("△ plain hist", text)
+        self.assertIn("✨ pinned live", text)
+        self.assertIn("✨ pinned hist", text)
+        self.assertNotIn("✨ plain live", text)
+        self.assertNotIn("✨ plain hist", text)
         cur = text.split("CURRENT")[1].split("HISTORY")[0]
         self.assertLess(cur.find("pinned live"), cur.find("plain live"))
         hist = text.split("HISTORY")[1]
@@ -666,6 +667,63 @@ class TestRenderSessionList(unittest.TestCase):
         with open(os.path.join(_ROOT, "session_list.py"), encoding="utf-8") as f:
             src = f.read()
         self.assertNotIn("def on_post_text_command", src)
+
+    def test_cap_saved_keeps_starred_past_limit(self):
+        sl = _load()
+        rows = [{"session_id": "n%d" % i, "name": str(i)} for i in range(5)]
+        rows.append({"session_id": "oldstar", "name": "keep me"})
+        out = sl.cap_saved_sessions(rows, starred={"oldstar"}, cap=5)
+        ids = [r["session_id"] for r in out]
+        self.assertEqual(ids[:5], ["n%d" % i for i in range(5)])
+        self.assertIn("oldstar", ids)
+        self.assertEqual(len(out), 6)
+        dropped = sl.cap_saved_sessions(rows, starred=set(), cap=5)
+        self.assertEqual([r["session_id"] for r in dropped],
+                         ["n%d" % i for i in range(5)])
+
+    def test_include_starred_missing_from_disk(self):
+        sl = _load()
+        sl.load_saved_sessions = lambda: [
+            {"session_id": "recent", "name": "fresh", "backend": "grok",
+             "project": "/p", "query_count": 2, "last_access": 9},
+        ]
+        sl.load_bookmark_records = lambda p=None: {
+            "ghost": {"name": "BIGWORLD", "backend": "kimi",
+                      "query_count": 4, "project": "/p"},
+        }
+        here = [{
+            "kind": "saved", "session_id": "recent", "name": "fresh",
+            "backend": "grok", "query_count": 2, "project": "/p",
+        }]
+        out = sl._include_starred_saved(
+            here, set(), "/p", {"ghost", "recent", "stub-only"})
+        ids = [r["session_id"] for r in out]
+        self.assertEqual(ids[0], "recent")
+        self.assertIn("ghost", ids)
+        self.assertIn("stub-only", ids)
+        ghost = [r for r in out if r["session_id"] == "ghost"][0]
+        self.assertEqual(ghost["name"], "BIGWORLD")
+        stub = [r for r in out if r["session_id"] == "stub-only"][0]
+        self.assertEqual(stub["name"], "stub-only")
+
+    def test_include_starred_other_project_path(self):
+        sl = _load()
+        sl.load_saved_sessions = lambda: [
+            {"session_id": "star", "name": "pinned", "backend": "grok",
+             "project": "/Volumes/prj/pil", "query_count": 3},
+        ]
+        sl.load_bookmark_records = lambda p=None: {}
+        out = sl._include_starred_saved(
+            [], set(), "/Users/tommo/prj/pil", {"star"})
+        self.assertEqual([r["session_id"] for r in out], ["star"])
+        self.assertEqual(out[0]["name"], "pinned")
+
+    def test_save_session_source_keeps_starred(self):
+        with open(os.path.join(_ROOT, "session.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("cap_saved_sessions", src)
+        self.assertIn("starred_ids_for_projects", src)
+        self.assertNotIn("sessions = sessions[:200]", src)
 
 
 if __name__ == "__main__":

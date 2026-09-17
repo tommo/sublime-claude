@@ -20,6 +20,7 @@ except ImportError:
 
 
 SESSIONS_FILE = os.path.join(os.path.dirname(__file__), ".sessions.json")
+SAVED_SESSIONS_CAP = 400  # newest N; starred rows are kept past this
 
 # PhantomSet keys owned by ClaudeCode.
 #
@@ -148,39 +149,113 @@ def _bookmarks_path(project_path: str = None) -> str:
     return os.path.expanduser("~/.claude/bookmarks.json")
 
 
-def load_bookmarks(project_path: str = None) -> set:
-    """Load starred session IDs for a project."""
+def load_bookmark_state(project_path: str = None) -> dict:
+    """Raw bookmarks.json: {starred: [id], records: {id: {name, backend, ...}}}."""
     path = _bookmarks_path(project_path)
     if os.path.exists(path):
         try:
             with open(path) as f:
-                return set(json.load(f).get("starred", []))
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
         except Exception:
             pass
-    return set()
+    return {"starred": []}
 
 
-def save_bookmarks(starred: set, project_path: str = None) -> None:
+def load_bookmarks(project_path: str = None) -> set:
+    """Load starred session IDs for a project."""
+    return set(load_bookmark_state(project_path).get("starred") or [])
+
+
+def load_bookmark_records(project_path: str = None) -> dict:
+    """id → snapshot so a starred row can list after sessions.json prune."""
+    rec = load_bookmark_state(project_path).get("records") or {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def save_bookmark_state(state: dict, project_path: str = None) -> None:
     path = _bookmarks_path(project_path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(path, "w") as f:
-            json.dump({"starred": list(starred)}, f, indent=2)
+            json.dump(state or {"starred": []}, f, indent=2)
     except Exception as e:
         print(f"[Claude] Failed to save bookmarks: {e}")
 
 
-def toggle_bookmark(session_id: str, project_path: str = None) -> bool:
+def save_bookmarks(starred: set, project_path: str = None,
+                   records: dict = None) -> None:
+    state = load_bookmark_state(project_path)
+    ids = set(starred or ())
+    state["starred"] = list(ids)
+    rec = dict(state.get("records") or {})
+    if records is not None:
+        rec = dict(records)
+    for k in list(rec):
+        if k not in ids:
+            rec.pop(k, None)
+    if rec:
+        state["records"] = rec
+    else:
+        state.pop("records", None)
+    save_bookmark_state(state, project_path)
+
+
+def remember_bookmark_record(session_id: str, record: dict,
+                             project_path: str = None) -> None:
+    """Keep name/backend for a starred id (survives sessions.json cap)."""
+    if not session_id or not isinstance(record, dict):
+        return
+    state = load_bookmark_state(project_path)
+    starred = set(state.get("starred") or [])
+    if session_id not in starred:
+        return
+    recs = dict(state.get("records") or {})
+    snap = {}
+    for key in ("name", "backend", "project", "model", "query_count",
+                "last_activity", "last_access"):
+        if record.get(key) is not None:
+            snap[key] = record.get(key)
+    if not snap:
+        return
+    recs[session_id] = {**(recs.get(session_id) or {}), **snap}
+    state["records"] = recs
+    save_bookmark_state(state, project_path)
+
+
+def toggle_bookmark(session_id: str, project_path: str = None,
+                    record: dict = None) -> bool:
     """Toggle star for a session. Returns True if now starred."""
-    starred = load_bookmarks(project_path)
+    if not session_id:
+        return False
+    state = load_bookmark_state(project_path)
+    starred = set(state.get("starred") or [])
+    recs = dict(state.get("records") or {})
     if session_id in starred:
         starred.discard(session_id)
+        recs.pop(session_id, None)
         now_starred = False
     else:
         starred.add(session_id)
         now_starred = True
-    save_bookmarks(starred, project_path)
+        if isinstance(record, dict) and record:
+            recs[session_id] = dict(record)
+    save_bookmarks(starred, project_path, records=recs)
     return now_starred
+
+
+def starred_ids_for_projects(*projects) -> set:
+    """Union of global + per-project bookmark files."""
+    ids = set(load_bookmarks(None) or ())
+    seen = {""}
+    for p in projects:
+        p = (p or "").rstrip("/")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        ids |= load_bookmarks(p)
+    return ids
 
 
 def load_saved_sessions() -> List[Dict]:
@@ -340,6 +415,8 @@ class Session:
         self._inject_pending: bool = False
         self._interrupting: bool = False
         self._interrupt_stream: bool = False
+        # After Esc, Grok leftover tools must not re-busy via resume_stream.
+        self._user_cancelled_turn: bool = False
         # Buffer for coalescing background-task notifications (idle only).
         # Multiple bg tasks finishing close together → single wake.
         self._pending_bg_notifications: List[str] = []
@@ -435,6 +512,9 @@ class Session:
 
         # Pending retain content (set by compact_boundary, sent after interrupt)
         self._pending_retain: Optional[str] = None
+        # Grok self-wake: leftover_end can arrive before agent_continue.
+        self._pending_leftover_end: bool = False
+        self._self_wake_idle_gen: int = 0
 
     def start(self, resume_session_at: str = None) -> None:
         # Live bridge starting — still no ◎ until _on_init succeeds
@@ -871,7 +951,7 @@ class Session:
                 self.output.clear_asking_state()
             except Exception:
                 pass
-        if self.resume_id and not self.fork and not getattr(self, "quick_mode", False):
+        if self.resume_id and not getattr(self, "quick_mode", False):
             try:
                 self._paint_resume_preview()
             except Exception as e:
@@ -879,7 +959,7 @@ class Session:
         # Same inline input UX as a normal session
         self._enter_input_with_draft()
         # Load-replay / preview prompt() can exit ◎ after this returns.
-        if self.resume_id and not self.fork:
+        if self.resume_id:
             self._ensure_resume_input()
 
     def _load_env(self, settings) -> dict:
@@ -1760,6 +1840,7 @@ class Session:
 
         self._suppress_adopt = False
         self._interrupt_stream = False
+        self._user_cancelled_turn = False
         self.touch_access()
         if getattr(self, "_turn", None) is None:
             self._turn = TurnState()
@@ -2840,6 +2921,7 @@ class Session:
 
         self._interrupting = True
         self._interrupt_stream = True
+        self._user_cancelled_turn = True
         self._note_activity()
         try:
             self._turn.begin_interrupt()
@@ -2945,10 +3027,7 @@ class Session:
                 # clear interrupting when it arrives (or after a short grace).
                 def _clear_interrupting(_gen=gen):
                     if getattr(self, "_interrupt_gen", 0) == _gen:
-                        self._interrupting = False
-                        # One last re-arm in case a drip wiped ◎ after settle
-                        if not self.working:
-                            self._ensure_idle_input(reason="interrupt flag clear")
+                        self._unstick_stale_interrupt()
 
                 sublime.set_timeout(_clear_interrupting, 3000)
 
@@ -2956,6 +3035,38 @@ class Session:
         if break_channel and self.output and self.output.view:
             from . import notalone
             notalone.interrupt_channel(self.output.view.id())
+
+    def _unstick_stale_interrupt(self) -> bool:
+        """If cancel ACK never arrived, stop queueing follow-ups into a hole.
+
+        Esc leaves working=True / turn=interrupting until the bridge ACK.
+        Missing ACK meant every later Enter was queue_prompt'd and never
+        flushed. Returns True if a queued prompt was started.
+        """
+        self._interrupting = False
+        kind = ""
+        try:
+            kind = getattr(self._turn, "kind", "") or ""
+        except Exception:
+            kind = ""
+        if kind == "interrupting":
+            try:
+                self._turn.settle_interrupt()
+            except Exception:
+                pass
+            self.working = False
+            self._set_turn_phase("idle")
+            self._interrupt_stream = False
+            try:
+                if self.output and self.output.current:
+                    self.output.current.working = False
+            except Exception:
+                pass
+        if self.working:
+            return False
+        before = list(getattr(self, "_queued_prompts", None) or [])
+        self._ensure_idle_input(reason="interrupt flag clear")
+        return bool(before) and not getattr(self, "_queued_prompts", None)
 
     def stop(self) -> None:
         # Persist closed state before cleanup
@@ -4161,10 +4272,9 @@ class Session:
         if (
             not self.working
             and not params.get("replay")
-            and (
-                getattr(self, "_interrupt_stream", False)
-                or (self.backend or "") in _SELF_WAKE_BACKENDS
-            )
+            and (self.backend or "") in _SELF_WAKE_BACKENDS
+            and not getattr(self, "_user_cancelled_turn", False)
+            and not getattr(self, "_interrupt_stream", False)
         ):
             self._resume_interrupt_stream()
         if not self.working:
@@ -4321,11 +4431,18 @@ class Session:
     def _resume_interrupt_stream(self) -> None:
         """Own busy for Grok leftover stream / bg self-wake (no session/prompt)."""
         if self.working:
+            self._arm_self_wake_idle()
+            return
+        if getattr(self, "_pending_leftover_end", False):
+            # Closer already arrived — do not adopt a turn that is done.
+            self._pending_leftover_end = False
+            print("[Claude] skip self-wake; leftover_end already arrived")
             return
         self._turn.resume_stream()
         self.working = True
         self._awaiting_query_rpc = False
         self._set_turn_phase("responding")
+        self._arm_self_wake_idle()
         try:
             if self.output:
                 # Must go through prompt() / begin_continued — swapping
@@ -4422,10 +4539,9 @@ class Session:
         if (
             not self.working
             and not params.get("replay")
-            and (
-                getattr(self, "_interrupt_stream", False)
-                or (self.backend or "") in _SELF_WAKE_BACKENDS
-            )
+            and (self.backend or "") in _SELF_WAKE_BACKENDS
+            and not getattr(self, "_user_cancelled_turn", False)
+            and not getattr(self, "_interrupt_stream", False)
         ):
             self._resume_interrupt_stream()
         if getattr(self, "_compacting", False) and self._looks_like_compact_done(text):
@@ -4503,9 +4619,13 @@ class Session:
         # Duplicate closer: Grok prompt_complete after the RPC already idled.
         # Host query owns the turn via session/prompt — leftover_end must
         # not @done that sheet (self-wake closer can arrive late).
-        if leftover_end and (
-                not self.working
-                or getattr(self, "_awaiting_query_rpc", False)):
+        if leftover_end and getattr(self, "_awaiting_query_rpc", False):
+            return
+        # Self-wake closer can beat agent_continue by a tick (same timestamp
+        # in 01a09e39: agent_message_chunk + turn_completed). Remember it
+        # so resume_stream does not adopt a turn with no closer.
+        if leftover_end and not self.working:
+            self._pending_leftover_end = True
             return
         if (
             not leftover_end
@@ -4560,6 +4680,9 @@ class Session:
             except Exception:
                 pass
             self.working = False
+            self._pending_leftover_end = False
+            self._self_wake_idle_gen = int(
+                getattr(self, "_self_wake_idle_gen", 0) or 0) + 1
             self._set_turn_phase("idle")
             if self.output and self.output.current:
                 self.output.current.working = False
@@ -4639,6 +4762,8 @@ class Session:
 
     def _on_sys_agent_continue(self, _data: dict) -> None:
         """Bridge: Grok sent session/update after the prompt RPC already ended."""
+        if getattr(self, "_user_cancelled_turn", False):
+            return
         if (self.backend or "") in _SELF_WAKE_BACKENDS:
             self._resume_interrupt_stream()
 
@@ -4961,6 +5086,41 @@ class Session:
     def _note_agent_activity(self) -> None:
         """Mark that auto-continue / soft-wake produced visible work."""
         self._bg_soft_activity = True
+        if (
+            self.working
+            and not getattr(self, "_awaiting_query_rpc", False)
+            and (self.backend or "") in _SELF_WAKE_BACKENDS
+        ):
+            self._arm_self_wake_idle()
+
+    def _arm_self_wake_idle(self) -> None:
+        """Idle a Grok self-wake if leftover_end never arrives.
+
+        Session 01a09e39: bg `pil run editor` exited, Grok self-woke
+        (task-completed-term_*), host resume_stream()'d, turn_completed
+        never closed the sheet. Quiet timeout is the backup closer.
+        """
+        if getattr(self, "_awaiting_query_rpc", False):
+            return
+        if (self.backend or "") not in _SELF_WAKE_BACKENDS:
+            return
+        if not self.working:
+            return
+        gen = int(getattr(self, "_self_wake_idle_gen", 0) or 0) + 1
+        self._self_wake_idle_gen = gen
+        sublime.set_timeout(lambda g=gen: self._maybe_idle_self_wake(g), 6000)
+
+    def _maybe_idle_self_wake(self, gen: int) -> None:
+        if gen != getattr(self, "_self_wake_idle_gen", 0):
+            return
+        if not self.working or getattr(self, "_awaiting_query_rpc", False):
+            return
+        print("[Claude] self-wake idle (no leftover_end)")
+        self._on_msg_result({
+            "leftover_end": True,
+            "stop_reason": "end_turn",
+            "is_error": False,
+        })
 
     def _bg_soft_fallback_query(self) -> None:
         """If soft adopt got no streams, hard-query once (last resort)."""
@@ -5593,8 +5753,36 @@ class Session:
         if self.name:
             entry["first_prompt"] = str(self.name).split("\n", 1)[0].strip()[:200]
         sessions.insert(0, entry)
-        # Keep last 200 sessions
-        sessions = sessions[:200]
+        projects = [self._cwd(), entry.get("project")]
+        projects.extend(s.get("project") for s in sessions)
+        starred = starred_ids_for_projects(*projects)
+        try:
+            from .session_list import cap_saved_sessions
+            sessions = cap_saved_sessions(
+                sessions, starred, cap=SAVED_SESSIONS_CAP)
+        except Exception:
+            # Keep starred past the disk cap even if the list module is unloadable.
+            kept, extra, seen = [], [], set()
+            for s in sessions:
+                sid = (s or {}).get("session_id")
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                if len(kept) < SAVED_SESSIONS_CAP:
+                    kept.append(s)
+                elif sid in starred:
+                    extra.append(s)
+            sessions = kept + extra
+        if self.session_id in starred:
+            remember_bookmark_record(self.session_id, {
+                "name": entry.get("name"),
+                "backend": entry.get("backend"),
+                "project": entry.get("project"),
+                "model": entry.get("model"),
+                "query_count": entry.get("query_count"),
+                "last_activity": entry.get("last_activity"),
+                "last_access": entry.get("last_access"),
+            }, self._cwd() or None)
         save_sessions(sessions)
         try:
             from .session_list import schedule_session_list_refresh
@@ -5629,9 +5817,9 @@ class Session:
 
         settings.mcp_enable_read_image:
           true / false — force on/off for all backends
-          "auto" (default) — on only for Grok ACP with vision-capable models
-        DeepSeek (and other no-vision BYOK models) never get read_image even if
-        force-true would apply — calling it can hard-fail the agent turn.
+          "auto" (default) — on for Grok ACP with vision-capable models
+          (native Grok + DeepSeek V4/V4.1 BYOK). Older no-vision DeepSeek
+          stays off — calling read_image can hard-fail the turn.
         """
         if settings is None:
             settings = sublime.load_settings("ClaudeCode.sublime-settings")

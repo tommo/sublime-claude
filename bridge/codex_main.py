@@ -343,7 +343,7 @@ class CodexBridge(BaseBridge):
         # Map Claude model names to codex default, or use as-is
         claude_models = ("opus", "sonnet", "haiku", "claude")
         if not model or any(m in model.lower() for m in claude_models):
-            model = "gpt-5.6-sol"
+            model = "gpt-6-astra"
         config.append(f'model="{model}"')
 
         # Map permission modes to codex approval_policy

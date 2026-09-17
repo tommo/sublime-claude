@@ -356,18 +356,27 @@ This is the default sidecar when the user says "sidecar" or "SUBLIME sidecar"
 (not grok/kimi/codex CLI). Named CLI drivers still use those CLIs.
 
 ALWAYS address workers by agent_id — view_id changes after Sublime restart.
+Reuse warm sheets: list_sessions first; send_to_session(agent_id=…) an
+idle/sleeping child. spawn_session only if none fit.
+Honor the user's model: pass model= (and matching backend) from their
+request; list_backends if unsure. Do not substitute a default. Reuse only
+a warm child that already has that model.
+
 Workflow for base context then workers:
   1) spawn_session(prompt=…, name="explorer", backend=X, model=Y)  # returns agent_id
   2) spawn workers with fork_from_agent_id=<explorer agent_id>  # keeps X/Y unless model= set
+
+In the child prompt require: (a) project knowledge first (list_profile_docs,
+irr, existing code); (b) finish with MCP sublime signal_complete as its own
+last tool step.
 
 Fork rules:
   - fork_current: fork THIS (caller) session
   - fork_from_agent_id: fork any open session (preferred)
   - fork_from_view_id: legacy only
-  - Prefer list_sessions + send_to_session(agent_id=…) over re-spawning.
 
 Host appends signal_complete reminder. Parent linkage uses parent_agent_id.
-Child reports done via signal_complete only — not send_to_session(parent).""",
+Child reports done via MCP sublime signal_complete only — not send_to_session(parent).""",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

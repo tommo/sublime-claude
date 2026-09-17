@@ -394,6 +394,9 @@ class _FwdStub(AcpBridge):
         self._prompt_fut = None
         self._prompt_cancelled = False
         self._cancel_in_flight = False
+        self._drop_grok_leftover = False
+        self._orphan_turn_notified = False
+        self.BACKEND_NAME = "grok"
         self.TOOL_TO_CANONICAL = dict(AcpBridge.TOOL_TO_CANONICAL)
 
     def file_log(self, msg):
@@ -555,6 +558,34 @@ class TestModalToolDedupe(unittest.TestCase):
         kinds = [p.get("type") for _, p in notes]
         self.assertNotIn("tool_use", kinds)
         self.assertNotIn("tool_result", kinds)
+
+    def test_drop_grok_leftover_after_cancel_lid_cleared(self):
+        """Esc then idle: Grok leftover tools must not agent_continue."""
+        import acp_base
+        notes = []
+        orig = acp_base.send_notification
+        acp_base.send_notification = lambda m, p: notes.append((m, p))
+        try:
+            b = _FwdStub()
+            b._cancel_in_flight = False
+            b._prompt_cancelled = False
+            b._prompt_fut = None
+            b._drop_grok_leftover = True
+            b._forward_update({
+                "sessionId": "session_test",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-after-esc-idle",
+                    "title": "run_terminal_command",
+                    "rawInput": {"command": "echo leftover"},
+                },
+            })
+        finally:
+            acp_base.send_notification = orig
+        subtypes = [
+            p.get("subtype") for _, p in notes if p.get("type") == "system"]
+        self.assertNotIn("agent_continue", subtypes)
+        self.assertEqual([p.get("type") for _, p in notes], [])
 
     def test_cancel_still_settles_already_open_row(self):
         import acp_base

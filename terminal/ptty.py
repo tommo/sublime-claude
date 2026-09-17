@@ -18,6 +18,8 @@ from pyte import control as ctrl
 from ptyprocess import PtyProcess
 is_windows = False
 
+from .csi import dispatch_call as _csi_dispatch_call
+
 
 logger = logging.getLogger('Terminus')
 
@@ -468,8 +470,11 @@ class TerminalScreen(pyte.Screen):
     # def report_device_attributes(self, mode=0, **kwargs):
     #     pass
 
-    # def report_device_status(self, mode):
-    #     pass
+    def report_device_status(self, mode, private=False):
+        # CSI n and CSI ? n (DECXCPR). pyte's handler has no private=.
+        if private and mode != 6:
+            return
+        super().report_device_status(mode)
 
     def write_process_input(self, data):
         self._process.write(data)
@@ -671,10 +676,8 @@ class TerminalStream(pyte.Stream):
                         if char == ";":
                             current = ""
                         else:
-                            if private:
-                                csi_dispatch[char](*params, private=True)
-                            else:
-                                csi_dispatch[char](*params)
+                            _csi_dispatch_call(
+                                csi_dispatch[char], params, private)
                             break  # CSI is finished.
 
             elif char == OSC_C1:

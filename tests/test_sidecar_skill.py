@@ -21,10 +21,18 @@ class TestSidecarSkill(unittest.TestCase):
         self.assertIn("SUBLIME SIDECAR", body)
         self.assertIn("spawn_session", body)
         self.assertIn("grok -p", body)
+        self.assertIn("Reuse warm sheets", body)
+        self.assertIn("Honor the user's model", body)
+        self.assertIn("list_profile_docs", body)
+        self.assertIn("signal_complete", body)
 
     def test_rule_points_at_skill(self):
         self.assertIn("SUBLIME SIDECAR", RULE)
         self.assertIn("spawn_session", RULE)
+        self.assertIn("list_sessions", RULE)
+        self.assertIn("Honor the user's model", RULE)
+        self.assertIn("list_profile_docs", RULE)
+        self.assertIn("signal_complete", RULE)
         self.assertIn(SKILL_PATH, RULE)
 
     def test_additional_skill_dirs(self):
@@ -61,6 +69,10 @@ class TestSidecarSkill(unittest.TestCase):
             src = f.read()
         self.assertIn('says "sidecar"', src)
         self.assertIn("SUBLIME sidecar", src)
+        self.assertIn("Reuse warm sheets", src)
+        self.assertIn("Honor the user's model", src)
+        self.assertIn("list_profile_docs", src)
+        self.assertIn("signal_complete", src)
 
 
 if __name__ == "__main__":

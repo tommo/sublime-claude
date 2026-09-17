@@ -1,0 +1,6 @@
+agent_id: agent-0
+actual_subagent_type: explore
+status: completed
+
+[summary]
+I have everything I need. Here's the status report.

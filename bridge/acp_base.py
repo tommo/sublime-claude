@@ -232,6 +232,10 @@ class AcpBridge(BaseBridge):
         # True from first cancel notify until query fully settles — blocks
         # spam session/cancel (Grok ChatStateActor dies on cancel-after-done).
         self._cancel_in_flight: bool = False
+        # Grok MidTurnAbort keeps sending tool_call / terminal/create after
+        # the host query RPC is already cancelled. Hold this until the next
+        # session/prompt is on the wire so leftover does not re-busy the sheet.
+        self._drop_grok_leftover: bool = False
         # AskUser Q1+/Other: inject after the elicitation/permission RPC
         # reply is on the wire (kimi 0.37.2 drops non-enum answers).
         self._pending_ask_followup: Optional[str] = None
@@ -346,6 +350,20 @@ class AcpBridge(BaseBridge):
 
     def spawn_env(self) -> Optional[Dict[str, str]]:
         """Optional env overrides for the agent process (None → inherit)."""
+        return None
+
+    def format_query_error(self, e: BaseException) -> str:
+        """Host-visible session/prompt failure. Subclasses may rewrite."""
+        return f"{self.BACKEND_NAME} query failed: {e}"
+
+    async def recover_prompt_error(
+        self, e: BaseException, prompt_blocks: list
+    ) -> Optional[Any]:
+        """Optional one-shot recovery after session/prompt raises.
+
+        Return a prompt result dict to continue the success path, or None
+        to surface `e` via format_query_error.
+        """
         return None
 
     def normalize_model(self, model: Optional[str]) -> str:
@@ -774,6 +792,12 @@ class AcpBridge(BaseBridge):
                 self._note_foreign_session_drop(method, params)
             # Other parent notifications (_x.ai/*, etc.) are intentionally ignored.
 
+    @staticmethod
+    def _is_synthetic_grok_prompt_id(pid: str) -> bool:
+        """Grok bg self-wake ids: task-completed-term_<terminalId>."""
+        p = (pid or "").strip().lower()
+        return p.startswith("task-completed")
+
     def _handle_grok_turn_end(self, params: dict, upd: dict = None) -> None:
         """Closer for Grok turns that have no host session/prompt RPC.
 
@@ -791,12 +815,21 @@ class AcpBridge(BaseBridge):
             or params.get("prompt_id")
             or ""
         )
+        synthetic = self._is_synthetic_grok_prompt_id(pid)
         pf = getattr(self, "_prompt_fut", None)
-        if pf is not None and not pf.done():
+        host_live = pf is not None and not pf.done()
+        # Never bind a self-wake id onto the host RPC — that swallowed
+        # leftover_end for task-completed-term_* while the sheet stayed busy.
+        if host_live and not synthetic:
             if pid:
                 self._host_prompt_id = pid
+            self.file_log(f"grok turn_end skip host-live pid={pid or '-'}")
             return
-        if pid and pid == getattr(self, "_host_prompt_id", None):
+        if (
+            pid
+            and pid == getattr(self, "_host_prompt_id", None)
+            and not synthetic
+        ):
             self.file_log(f"grok turn_end skip host pid={pid}")
             return
         self._orphan_turn_notified = False
@@ -1045,15 +1078,19 @@ class AcpBridge(BaseBridge):
             self._prompt_cancelled
             and not host_prompt_live
             and not self._cancel_in_flight
+            and not getattr(self, "_drop_grok_leftover", False)
         ):
             self._prompt_cancelled = False
-        suppress = bool(self._cancel_in_flight or (
+        drop_leftover = bool(getattr(self, "_drop_grok_leftover", False))
+        suppress = bool(self._cancel_in_flight or drop_leftover or (
             self._prompt_cancelled and host_prompt_live))
         # After user interrupt: drop *new* tool starts / leftover prose.
         # Still accept tool_call_update for already-open rows so ⚙ can close.
         # Do NOT open a brand-new failed row from a post-cancel update —
         # Grok/DeepSeek keeps run_terminal_command after MidTurnAbort and the
         # failed "turn cancelled" paint is what the user still sees.
+        # Never agent_continue leftover after Esc — that re-busied the sheet
+        # while idle Esc did nothing (grok_bridge.66497.log).
         if (
             not host_prompt_live
             and not suppress
@@ -1353,6 +1390,16 @@ class AcpBridge(BaseBridge):
 
                 # ACP-terminal / subagent background: tool_result is only an
                 # ack (host keeps ⚙ until task_notification).
+                # Kimi native Agent returns agent_id + status in the same
+                # completed update — that IS the closer, not a launch ack.
+                if (
+                    call
+                    and call.background
+                    and status == "completed"
+                    and "agent_id:" in (text or "")
+                    and "status:" in (text or "").lower()
+                ):
+                    call.background = False
                 if (
                     call
                     and call.background
@@ -3127,7 +3174,9 @@ class AcpBridge(BaseBridge):
 
             can_load = bool(self.agent_capabilities.get("loadSession"))
             loaded = False
-            if resume_id and not fork_session and can_load:
+            if resume_id and fork_session:
+                loaded = await self._try_fork_session(resume_id, mcp_servers)
+            elif resume_id and can_load:
                 loaded = await self._try_load_session(resume_id, mcp_servers)
 
             if not loaded:
@@ -3140,8 +3189,19 @@ class AcpBridge(BaseBridge):
                 if resume_id and not fork_session:
                     self._resume_fallback = True
                 if fork_session and resume_id:
-                    self.log(f"fork from {resume_id}: ACP has no fork; "
-                             f"opened new session {self.session_id}")
+                    self.log(
+                        f"fork from {resume_id} failed; "
+                        f"opened empty session {self.session_id}")
+                    send_notification("message", {
+                        "type": "system",
+                        "subtype": "init",
+                        "data": {
+                            "message": (
+                                f"Could not fork ACP session {resume_id}; "
+                                "started empty. Agent has no prior turns."
+                            ),
+                        },
+                    })
 
             await self.apply_mode()
             if self.model:
@@ -3181,6 +3241,77 @@ class AcpBridge(BaseBridge):
         except Exception as e:
             send_error(req_id, -32000,
                        f"{self.BACKEND_NAME} initialize failed: {e}")
+
+    @staticmethod
+    def _parse_fork_session_id(result: dict, source_id: str) -> Optional[str]:
+        """New session id from session/fork. Reject reuse of the source id."""
+        if not isinstance(result, dict):
+            return None
+        keys = (
+            "sessionId", "session_id", "newSessionId", "new_session_id",
+        )
+        cands = []
+        for k in keys:
+            v = result.get(k)
+            if isinstance(v, str) and v.strip():
+                cands.append(v.strip())
+        sess = result.get("session")
+        if isinstance(sess, dict):
+            for k in ("sessionId", "session_id", "id"):
+                v = sess.get(k)
+                if isinstance(v, str) and v.strip():
+                    cands.append(v.strip())
+        src = (source_id or "").strip()
+        for sid in cands:
+            if sid and sid != src:
+                return sid
+        return None
+
+    def _fork_params_for_method(
+        self, method: str, source_id: str, mcp_servers: list
+    ) -> dict:
+        if method == "session/fork":
+            p: Dict[str, Any] = {
+                "sessionId": source_id,
+                "cwd": self.cwd,
+                "mcpServers": list(mcp_servers or []),
+            }
+            if self._additional_dirs:
+                p["additionalDirectories"] = list(self._additional_dirs)
+            return p
+        return {
+            "sourceSessionId": source_id,
+            "sourceCwd": self.cwd,
+            "newCwd": self.cwd,
+        }
+
+    async def _try_fork_session(self, source_id: str,
+                                 mcp_servers: list) -> bool:
+        """ACP session/fork, then Grok `_x.ai/session/fork`. Never session/load.
+
+        Load would reuse the source id. Empty session/new is last resort.
+        """
+        if not source_id:
+            return False
+        methods = ("session/fork", "_x.ai/session/fork", "x.ai/session/fork")
+        for method in methods:
+            params = self._fork_params_for_method(method, source_id, mcp_servers)
+            try:
+                result = await self._send_acp(method, params) or {}
+            except Exception as e:
+                self.file_log(f"{method} failed: {e}")
+                continue
+            sid = self._parse_fork_session_id(result, source_id)
+            if not sid:
+                self.file_log(
+                    f"{method} no new sessionId: {str(result)[:300]}")
+                continue
+            self.session_id = sid
+            self._ingest_session_result(result)
+            self._resumed = False
+            self.log(f"{method} ok: {source_id} → {sid}")
+            return True
+        return False
 
     async def _try_load_session(self, resume_id: str,
                                  mcp_servers: list) -> bool:
@@ -3408,6 +3539,26 @@ class AcpBridge(BaseBridge):
         cand = os.path.expanduser("~/.irr-pil/db/pil-core")
         return cand if os.path.isdir(cand) else ""
 
+    def _should_precancel_before_prompt(self) -> bool:
+        """Whether the next session/prompt needs session/cancel first.
+
+        After Esc we leave `_cancel_in_flight` so Kimi can settle
+        `turn.agent_busy`. Re-sending cancel when nothing is live postpones
+        or drops the user's follow-up on Grok (orphan cancel).
+        """
+        if not self._cancel_in_flight:
+            return False
+        fut = self._prompt_fut
+        if fut is not None and not fut.done():
+            return True
+        if self._query_req_id is not None:
+            return True
+        if getattr(self, "BACKEND_NAME", "") == "kimi":
+            return True
+        if getattr(self, "_orphan_turn_notified", False):
+            return True
+        return False
+
     def _is_agent_busy_error(self, e: BaseException) -> bool:
         msg = str(e).lower()
         return (
@@ -3445,6 +3596,8 @@ class AcpBridge(BaseBridge):
             return
         self._prompt_cancelled = True
         self._cancel_in_flight = True
+        if getattr(self, "BACKEND_NAME", "") == "grok":
+            self._drop_grok_leftover = True
         if self.session_id is not None:
             try:
                 await self._notify_acp(
@@ -3487,10 +3640,18 @@ class AcpBridge(BaseBridge):
         # A new query must not overlap an agent turn (Kimi: turn.agent_busy).
         # Tool ✔ is not end_turn — wait the live prompt out. Cancel only after
         # user Esc (cancel_in_flight) or when the live prompt is stuck.
-        if self._cancel_in_flight:
+        # Stale _cancel_in_flight with no live prompt: do NOT orphan-cancel
+        # (Grok ChatStateActor dies / new prompt is postponed). Kimi still
+        # needs a settle cancel when the local fut was forced done early.
+        if self._should_precancel_before_prompt():
             await self._cancel_agent_turn(
                 reason="post_interrupt", wait_s=2.0, settle_s=0.8,
                 force_local=True, orphan_ok=True)
+        elif self._cancel_in_flight:
+            self.file_log(
+                "query: skip stale orphan session/cancel "
+                f"(backend={self.BACKEND_NAME})")
+            self._cancel_in_flight = False
         elif self._prompt_fut is not None and not self._prompt_fut.done():
             self.file_log("query: waiting for in-flight session/prompt")
             try:
@@ -3517,6 +3678,7 @@ class AcpBridge(BaseBridge):
         self._query_req_id = req_id
         self._prompt_cancelled = False
         self._cancel_in_flight = False
+        self._overflow_compact_retried = False
         turn_t0 = time.time()
         try:
             result = None
@@ -3532,18 +3694,32 @@ class AcpBridge(BaseBridge):
                     break
                 except Exception as e:
                     last_err = e
-                    if (not self._is_agent_busy_error(e)
-                            or self._prompt_cancelled):
-                        raise
-                    attempt += 1
-                    settle = min(10.0, 0.7 * (2 ** min(attempt, 5)))
-                    self.file_log(
-                        f"query: agent_busy attempt {attempt} "
-                        f"settle={settle:.1f}s (no cancel): {e}")
-                    try:
-                        await asyncio.sleep(settle)
-                    except Exception:
-                        pass
+                    if (self._is_agent_busy_error(e)
+                            and not self._prompt_cancelled):
+                        attempt += 1
+                        settle = min(10.0, 0.7 * (2 ** min(attempt, 5)))
+                        self.file_log(
+                            f"query: agent_busy attempt {attempt} "
+                            f"settle={settle:.1f}s (no cancel): {e}")
+                        try:
+                            await asyncio.sleep(settle)
+                        except Exception:
+                            pass
+                        continue
+                    recovered = None
+                    if not self._prompt_cancelled:
+                        try:
+                            recovered = await self.recover_prompt_error(
+                                e, prompt_blocks)
+                        except Exception as rec_err:
+                            self.file_log(
+                                f"recover_prompt_error: {rec_err}")
+                            recovered = None
+                    if recovered is not None:
+                        result = recovered or {}
+                        last_err = None
+                        break
+                    raise
             if last_err is not None and result is None:
                 raise last_err
             result = result or {}
@@ -3621,8 +3797,7 @@ class AcpBridge(BaseBridge):
                 })
                 send_result(req_id, {"status": "interrupted"})
             else:
-                send_error(req_id, -32000,
-                           f"{self.BACKEND_NAME} query failed: {e}")
+                send_error(req_id, -32000, self.format_query_error(e))
         finally:
             if self._query_req_id == req_id:
                 self._query_req_id = None
@@ -3733,6 +3908,7 @@ class AcpBridge(BaseBridge):
         self._prompt_fut = fut
         self._prompt_acp_id = rid
         self._orphan_turn_notified = False
+        self._drop_grok_leftover = False
         params = {"sessionId": self.session_id, "prompt": prompt_blocks}
         # Log without dumping multi-MB base64 image payloads
         def _summarize_block(b: dict) -> dict:
@@ -3844,10 +4020,18 @@ class AcpBridge(BaseBridge):
         fut = self._prompt_fut
         active = fut is not None and not fut.done()
         has_query = self._query_req_id is not None
+        grok_leftover = (
+            getattr(self, "BACKEND_NAME", "") == "grok"
+            and (
+                getattr(self, "_drop_grok_leftover", False)
+                or getattr(self, "_orphan_turn_notified", False)
+            )
+        )
         # Idle / already cancelled: do not re-send session/cancel (Grok
-        # ChatStateActor dies). Still kill leftover shells Grok keeps using.
-        if (not active and not has_query) or (
-                self._cancel_in_flight and not active):
+        # ChatStateActor dies) UNLESS leftover MidTurnAbort is still
+        # spawning tools — then one more cancel, not four idle no-ops.
+        if ((not active and not has_query) or (
+                self._cancel_in_flight and not active)) and not grok_leftover:
             n = 0
             for tid in list(self._terminals):
                 try:
@@ -5910,6 +6094,10 @@ class AcpBridge(BaseBridge):
                 f"fs/read_text_file: missing kimi plan file {path!r} → empty")
             return {"content": ""}
 
+        if os.path.isdir(path):
+            return {"content": await asyncio.to_thread(
+                self._fs_read_directory_as_text, path)}
+
         low = path.lower()
         by_ext = any(low.endswith(ext) for ext in self._IMAGE_EXTS)
 
@@ -5944,8 +6132,33 @@ class AcpBridge(BaseBridge):
                     f"(max {max_chars}); reduce limit")
             return content
 
-        content = await asyncio.to_thread(_read)
+        try:
+            content = await asyncio.to_thread(_read)
+        except IsADirectoryError:
+            return {"content": await asyncio.to_thread(
+                self._fs_read_directory_as_text, path)}
         return {"content": content}
+
+    def _fs_read_directory_as_text(self, path: str, limit: int = 80) -> str:
+        """read_file on a directory → listing, not Errno 21."""
+        names = []
+        try:
+            entries = sorted(os.listdir(path))
+        except OSError as e:
+            raise ValueError(
+                f"fs/read_text_file: cannot list directory {path!r}: {e}")
+        extra = len(entries) - limit
+        for name in entries[:limit]:
+            p = os.path.join(path, name)
+            names.append(name + "/" if os.path.isdir(p) else name)
+        body = "\n".join(names)
+        if extra > 0:
+            body += f"\n… ({extra} more)"
+        self.file_log(f"fs/read_text_file: directory {path!r} → {len(names)} names")
+        return (
+            f"Directory: {path}\n{body}\n"
+            "(path is a directory; read a file inside)"
+        )
 
     def _fs_read_image_as_text(
             self, path: str, mime_hint: Optional[str] = None) -> str:
@@ -5987,7 +6200,7 @@ class AcpBridge(BaseBridge):
         return note
 
     async def _acp_fs_write(self, params: dict) -> dict:
-        if self._cancel_in_flight:
+        if self._cancel_in_flight or getattr(self, "_drop_grok_leftover", False):
             raise ValueError("fs/write_text_file rejected: turn cancelled")
         path = params.get("path") or ""
         if not path or not os.path.isabs(path):
@@ -6123,7 +6336,7 @@ class AcpBridge(BaseBridge):
         # work while the prompt is winding down — only while host prompt lives.
         host_prompt_live = (
             self._prompt_fut is not None and not self._prompt_fut.done())
-        if self._cancel_in_flight or (
+        if self._cancel_in_flight or getattr(self, "_drop_grok_leftover", False) or (
                 self._prompt_cancelled and host_prompt_live):
             raise ValueError("terminal/create rejected: turn cancelled")
         cmd = params.get("command")

@@ -365,7 +365,10 @@ class Terminal:
                 if buf:
                     logger.debug("receieved: {}".format(buf))
                     with self.lock:
-                        self.stream.feed(buf)
+                        try:
+                            self.stream.feed(buf)
+                        except Exception:
+                            logger.exception("terminal stream.feed failed")
 
             while True:
                 with intermission(period=0.03):
