@@ -1,5 +1,3 @@
-# Claude Code for Sublime Text
-
 > **Deprecated — superseded by [Submarine](https://github.com/tommo/submarine).**
 > This plugin is no longer developed. Submarine is its continuation: the same
 > backends (Claude Code, Codex, Grok, Kimi, Anthropic-compatible providers),
@@ -10,6 +8,8 @@
 > imports this plugin's `.sessions.json`, user settings and loop files
 > (read-only, once; `legacy_claude_dir` in Submarine's settings points it at a
 > non-default install). Then remove this package.
+
+# Claude Code for Sublime Text
 
 A Sublime Text plugin for [Claude Code](https://claude.ai/claude-code), [Codex CLI](https://github.com/openai/codex), [GitHub Copilot CLI](https://github.com/features/copilot/cli), [Grok Build](https://x.ai/) / [Kimi Code](https://moonshotai.github.io/kimi-code/) via **Agent Client Protocol (ACP)**, and any **Anthropic-compatible** provider (DeepSeek, GLM, Moonshot, Qwen, OpenRouter, …).
 
